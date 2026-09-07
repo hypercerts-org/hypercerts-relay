@@ -51,7 +51,7 @@ jobs:
           node-version: 22
           cache: npm
       - name: Install release tooling
-        run: npm ci
+        run: npm ci --ignore-scripts
       - name: Verify Relay and Rainbow
         run: ./scripts/verify.sh
       - name: Create release pull request or tag release

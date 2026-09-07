@@ -7,7 +7,7 @@ cd "$repo_root"
 base_file=.hypercerts/upstream-base
 paths_file=.hypercerts/upstream-paths
 
-if [ ! -f "$base_file" ] || [ ! -f "$paths_file" ]; then
+if [[ ! -f "$base_file" || ! -f "$paths_file" ]]; then
   echo 'Missing .hypercerts upstream synchronization metadata.' >&2
   exit 1
 fi
@@ -26,7 +26,7 @@ if ! git merge-base --is-ancestor "$base" "$target"; then
 fi
 
 mapfile -t paths < <(sed -e '/^[[:space:]]*$/d' -e '/^[[:space:]]*#/d' "$paths_file")
-if [ "${#paths[@]}" -eq 0 ]; then
+if [[ "${#paths[@]}" -eq 0 ]]; then
   echo 'The upstream path allowlist is empty.' >&2
   exit 1
 fi
@@ -35,7 +35,7 @@ patch=$(mktemp)
 trap 'rm -f "$patch"' EXIT
 
 git diff --binary --full-index "$base" "$target" -- "${paths[@]}" > "$patch"
-if [ ! -s "$patch" ]; then
+if [[ ! -s "$patch" ]]; then
   echo 'No allowed upstream changes are pending.'
   exit 0
 fi
