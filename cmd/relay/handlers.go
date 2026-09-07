@@ -25,7 +25,7 @@ func (s *Service) handleComAtprotoSyncRequestCrawl(c echo.Context, body *comatpr
 
 	hostname, noSSL, err := relay.ParseHostname(body.Hostname)
 	if err != nil {
-		return c.JSON(http.StatusBadRequest, atclient.ErrorBody{Name: "BadRequest", Message: fmt.Sprintf("hostname field empty or invalid: %s", body.Hostname)})
+		return c.JSON(http.StatusBadRequest, atclient.ErrorBody{Name: "BadRequest", Message: "hostname field is empty or invalid"})
 	}
 
 	if noSSL && !s.config.AllowInsecureHosts && !admin {
@@ -42,30 +42,41 @@ func (s *Service) handleComAtprotoSyncRequestCrawl(c echo.Context, body *comatpr
 	} else {
 		banned, err := s.relay.DomainIsBanned(ctx, hostname)
 		if err != nil {
-			return nil
+			return c.JSON(http.StatusBadRequest, atclient.ErrorBody{Name: "DomainBan", Message: "hostname is not allowed"})
 		}
 		if banned {
-			return c.JSON(http.StatusUnauthorized, atclient.ErrorBody{Name: "DomainBan", Message: "host domain is banned"})
+			return c.JSON(http.StatusForbidden, atclient.ErrorBody{Name: "DomainBan", Message: "hostname is not allowed"})
 		}
 	}
 
-	hostURL := "https://" + hostname
-	if noSSL {
-		hostURL = "http://" + hostname
+	// hypercerts: Delegate admission and validation to the durable source policy.
+	if err := s.relay.SubscribeToHost(ctx, hostname, noSSL, admin); err != nil {
+		return requestCrawlError(c, err)
 	}
 
-	if err := s.relay.HostChecker.CheckHost(ctx, hostURL); err != nil {
-		return c.JSON(http.StatusBadRequest, atclient.ErrorBody{Name: "HostNotFound", Message: fmt.Sprintf("host server unreachable: %s", err)})
-	}
-
-	// forward on to any sibling instances (note that sometimes is, sometimes isn't an admin request)
+	// hypercerts: Forward only after this relay accepts the source change.
 	b, err := json.Marshal(body)
 	if err != nil {
 		return err
 	}
 	go s.ForwardSiblingRequest(c, b)
 
-	return s.relay.SubscribeToHost(ctx, hostname, noSSL, admin)
+	return nil
+}
+
+func requestCrawlError(c echo.Context, err error) error {
+	switch {
+	case errors.Is(err, relay.ErrHostNotFound), errors.Is(err, relay.ErrSourceNotFound):
+		return c.JSON(http.StatusNotFound, atclient.ErrorBody{Name: "HostNotFound", Message: "managed source not found"})
+	case errors.Is(err, relay.ErrSourceDisabled):
+		return c.JSON(http.StatusForbidden, atclient.ErrorBody{Name: "Forbidden", Message: "managed source is disabled"})
+	case errors.Is(err, relay.ErrSourceValidationFailed), errors.Is(err, relay.ErrHostNotPDS):
+		return c.JSON(http.StatusBadRequest, atclient.ErrorBody{Name: "InvalidRequest", Message: "managed source validation failed"})
+	case errors.Is(err, relay.ErrSourceDomainBanned):
+		return c.JSON(http.StatusForbidden, atclient.ErrorBody{Name: "DomainBan", Message: "hostname is not allowed"})
+	default:
+		return err
+	}
 }
 
 func (s *Service) handleComAtprotoSyncListHosts(c echo.Context, cursor int64, limit int) (*comatproto.SyncListHosts_Output, error) {
