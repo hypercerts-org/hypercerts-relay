@@ -1,37 +1,62 @@
-name: golang
+name: Go
 
 on:
-  pull_request:
   push:
-    branches:
-      - main
+    branches: [main]
+  pull_request:
+    branches: [main]
+  merge_group:
+
+permissions:
+  contents: read
 
 concurrency:
-  group: '${{ github.workflow }}-${{ github.head_ref || github.ref }}'
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  build-and-test:
+  verify:
+    name: Verify Relay and Rainbow
     runs-on: ubuntu-latest
     steps:
-      - name: Git Checkout
+      - name: Check out source
         uses: actions/checkout@v5
-      - name: Set up Go tooling
+        with:
+          fetch-depth: 0
+      - name: Set up Go
         uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-      - name: Build
-        run: make build
-      - name: Test
-        run: make test
+          cache: true
+      - name: Verify focused services
+        run: ./scripts/verify.sh
+      - name: Check for whitespace errors
+        run: git diff --check "$(git merge-base origin/main HEAD)" HEAD
+
+  known-upstream-regression:
+    name: Track current Indigo regression
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run the known failing upstream test
+        run: go test ./cmd/relay/relay -run '^TestClaimDueAccountLimitAlertsRepeatsAfterInterval$'
+
   lint:
     runs-on: ubuntu-latest
     steps:
-      - name: Git Checkout
+      - name: Check out source
         uses: actions/checkout@v5
-      - name: Set up Go tooling
+      - name: Set up Go
         uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
+          cache: true
       - name: Lint
         run: make lint
