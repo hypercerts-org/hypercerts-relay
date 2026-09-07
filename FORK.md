@@ -52,6 +52,8 @@ This repository does not merge `upstream/main`. `.hypercerts/upstream-paths` is 
 
 The `Check Indigo upstream` workflow checks weekly and opens a review pull request only when allowed paths changed. It never merges `upstream/main`, resolves conflicts, commits conflict markers, or merges the pull request.
 
+Only a human may merge a pull request. Automation must never push a commit directly to `main`, including while correcting a failed review flow.
+
 For a manual update:
 
 1. Start a dedicated branch from current `main` and fetch `upstream/main`.

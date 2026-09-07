@@ -47,6 +47,7 @@ Read `FORK.md` before changing upstream-derived code or synchronizing Indigo. It
 - For an unavoidable upstream-file edit, add a short `// hypercerts:` comment explaining why the fork diverges. Keep the diff narrow.
 - Never automatically resolve an upstream merge conflict, commit conflict markers, or auto-merge an upstream-sync pull request.
 - Never merge `upstream/main` directly. Use `scripts/apply-upstream-update.sh`, which applies only `.hypercerts/upstream-paths` and advances `.hypercerts/upstream-base`.
+- Only a human may merge a pull request. Do not directly push, fast-forward, reset, or force-update `main`, including while repairing a failed review flow.
 - Review upstream changes that overlap `// hypercerts:` markers, then run the focused verification before the sync pull request is merged.
 
 ## Validation

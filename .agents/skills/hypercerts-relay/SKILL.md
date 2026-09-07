@@ -21,6 +21,7 @@ Do not implement Jetstream filtering/backfill or the planned OAuth administratio
 Read `FORK.md` before any upstream update. It gives the exact Indigo remote URL, how to add and verify it when missing, and the required review process. Keep new behavior isolated where practical. Mark unavoidable edits to upstream-owned Go files with `// hypercerts:` and a short reason. Never resolve upstream merge conflicts automatically or commit conflict markers.
 
 For an upstream update, branch from current `main`, run `./scripts/apply-upstream-update.sh`, inspect its staged allowlisted diff, `git log upstream/main..main`, and every marked Hypercerts edit, then run `./scripts/verify.sh` and open a review pull request. Do not merge `upstream/main` directly.
+Only a human may merge a pull request. Never push, fast-forward, reset, or force-update `main`.
 
 ## Validation and release work
 
