@@ -33,7 +33,7 @@ git remote add upstream https://github.com/bluesky-social/indigo.git
 ./scripts/verify.sh
 ```
 
-The verification script runs focused tests for Relay and Rainbow, static checks, and builds both binaries. One upstream Relay test currently fails at the tracked Indigo baseline: `TestClaimDueAccountLimitAlertsRepeatsAfterInterval`. The script skips only that test and prints the reason. CI also runs it in a visible, non-blocking job so that a future upstream correction is apparent.
+The verification script runs focused tests for Relay and Rainbow, static checks, and builds both binaries. One Relay test is inconsistent across environments at the tracked Indigo baseline: `TestClaimDueAccountLimitAlertsRepeatsAfterInterval` fails in the local verification environment but passed the published GitHub Actions run. The script skips only that local failure. CI runs the test separately as a non-blocking signal while the difference is investigated.
 
 Build a service locally with:
 

@@ -24,6 +24,6 @@ For an upstream update, branch from current `main`, merge `upstream/main`, inspe
 
 ## Validation and release work
 
-Run `./scripts/verify.sh` and `git diff --check` for Relay or Rainbow changes. The script excludes one documented current Indigo regression, while CI runs it separately as a visible non-blocking signal. Do not suppress additional tests without a documented upstream issue and removal condition.
+Run `./scripts/verify.sh` and `git diff --check` for Relay or Rainbow changes. The script excludes one documented local baseline test failure, while CI runs it separately as a visible non-blocking signal. Do not suppress additional tests without a documented observed behavior and removal condition.
 
 A release is a reviewed version tag and GitHub Release, created only through the manual workflow from `main` after `CHANGELOG.md` is updated. It is not authority to deploy or change a running relay.

@@ -61,7 +61,7 @@ Run this before requesting review for Relay or Rainbow changes:
 git diff --check
 ```
 
-`./scripts/verify.sh` runs Relay and Rainbow tests, `go vet`, and builds both commands. It excludes only the currently failing upstream test `TestClaimDueAccountLimitAlertsRepeatsAfterInterval`; the CI workflow runs that test separately as a non-blocking regression signal. Do not add further skipped tests without recording the upstream issue, the observed behavior, and removal condition in the script and README.
+`./scripts/verify.sh` runs Relay and Rainbow tests, `go vet`, and builds both commands. It excludes only the locally failing baseline test `TestClaimDueAccountLimitAlertsRepeatsAfterInterval`; the CI workflow runs that test separately as a non-blocking signal. Do not add further skipped tests without recording the observed behavior and removal condition in the script and README.
 
 Use `gofmt` on changed Go files. Validate workflow changes with the repository's workflow checks when available, and inspect the rendered YAML for permissions, branch conditions, and write steps.
 

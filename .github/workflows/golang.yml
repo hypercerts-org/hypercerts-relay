@@ -34,7 +34,7 @@ jobs:
         run: git diff --check "$(git merge-base origin/main HEAD)" HEAD
 
   known-upstream-regression:
-    name: Track current Indigo regression
+    name: Track local baseline test
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:

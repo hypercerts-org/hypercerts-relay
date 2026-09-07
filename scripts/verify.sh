@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# The current Indigo baseline has a reproducible failure in this exact test.
-# Keep it visible in CI's non-blocking regression job and remove this exclusion
-# when the upstream behavior is corrected and the test passes.
+# This exact baseline test fails in the local verification environment but passed
+# on GitHub Actions. Keep it visible in CI while the environment difference is
+# understood, then remove this exclusion.
 known_upstream_failure='^TestClaimDueAccountLimitAlertsRepeatsAfterInterval$'
 
-echo 'Testing Relay and Rainbow (excluding the documented upstream regression)'
+echo 'Testing Relay and Rainbow (excluding the documented local baseline test)'
 go test ./cmd/relay/... ./cmd/rainbow -skip "$known_upstream_failure"
 
 echo 'Running static checks'
