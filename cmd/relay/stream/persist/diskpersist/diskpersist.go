@@ -49,20 +49,20 @@ type DiskPersistence struct {
 	buffers *sync.Pool
 	scratch []byte
 
-	outbuf *bytes.Buffer
-	evtbuf []persistJob
-
 	shutdown chan struct{}
 
 	log *slog.Logger
 
-	lk sync.Mutex
-}
+	// hypercerts: Persist acknowledgements require durable writes and metadata.
+	writeFile func(*os.File, []byte) (int, error)
+	syncFile  func(*os.File) error
+	syncDir   func(string) error
 
-type persistJob struct {
-	Bytes  []byte
-	Evt    *stream.XRPCStreamEvent
-	Buffer *bytes.Buffer // so we can put it back in the pool when we're done
+	lk           sync.Mutex
+	failed       error
+	shutdownOnce sync.Once
+	shutdownErr  error
+	background   sync.WaitGroup
 }
 
 const (
@@ -134,6 +134,9 @@ func NewDiskPersistence(primaryDir, archiveDir string, db *gorm.DB, opts *DiskPe
 	if opts.InitialSeq <= 0 {
 		return nil, fmt.Errorf("negative or zero initial seq: %d", opts.InitialSeq)
 	}
+	if opts.EventsPerFile <= 0 {
+		return nil, fmt.Errorf("negative or zero events per file: %d", opts.EventsPerFile)
+	}
 
 	dp := &DiskPersistence{
 		meta:            db,
@@ -146,11 +149,17 @@ func NewDiskPersistence(primaryDir, archiveDir string, db *gorm.DB, opts *DiskPe
 		didCache:        didCache,
 		eventsPerFile:   opts.EventsPerFile,
 		scratch:         make([]byte, headerSize),
-		outbuf:          new(bytes.Buffer),
 		writeBufferSize: opts.WriteBufferSize,
 		shutdown:        make(chan struct{}),
 		log:             opts.Logger,
 		initialSeq:      opts.InitialSeq,
+		writeFile: func(f *os.File, b []byte) (int, error) {
+			return f.Write(b)
+		},
+		syncFile: func(f *os.File) error {
+			return f.Sync()
+		},
+		syncDir: syncDirectory,
 	}
 	if dp.log == nil {
 		dp.log = slog.Default().With("system", "diskpersist")
@@ -160,8 +169,7 @@ func NewDiskPersistence(primaryDir, archiveDir string, db *gorm.DB, opts *DiskPe
 		return nil, err
 	}
 
-	go dp.flushRoutine()
-
+	dp.background.Add(1)
 	go dp.garbageCollectRoutine()
 
 	return dp, nil
@@ -172,6 +180,16 @@ type LogFileRef struct {
 	Path     string
 	Archived bool
 	SeqStart int64
+}
+
+func syncDirectory(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = dir.Close() }()
+
+	return dir.Sync()
 }
 
 func (dp *DiskPersistence) SetUidSource(uids UidSource) {
@@ -197,6 +215,7 @@ func (dp *DiskPersistence) resumeLog() error {
 
 	seq, err := scanForLastSeq(fi, -1)
 	if err != nil {
+		_ = fi.Close()
 		return fmt.Errorf("failed to scan log file for last seqno: %w", err)
 	}
 
@@ -220,6 +239,11 @@ func (dp *DiskPersistence) resumeLog() error {
 	}
 
 	dp.curSeq = seq
+	seqStart := lfr.SeqStart
+	if seqStart < dp.initialSeq {
+		seqStart = dp.initialSeq
+	}
+	dp.eventCounter = seq - seqStart
 	dp.logfi = fi
 	currentSeqGuage.Set(float64(dp.curSeq))
 
@@ -230,17 +254,29 @@ func (dp *DiskPersistence) initLogFile() error {
 	if err := os.MkdirAll(dp.primaryDir, 0775); err != nil {
 		return err
 	}
+	if err := dp.syncDir(filepath.Dir(dp.primaryDir)); err != nil {
+		return fmt.Errorf("failed to sync log parent directory: %w", err)
+	}
 
 	p := filepath.Join(dp.primaryDir, "evts-0")
 	fi, err := os.Create(p)
 	if err != nil {
 		return err
 	}
+	if err := dp.syncFile(fi); err != nil {
+		_ = fi.Close()
+		return fmt.Errorf("failed to sync new log file: %w", err)
+	}
+	if err := dp.syncDir(dp.primaryDir); err != nil {
+		_ = fi.Close()
+		return fmt.Errorf("failed to sync log directory: %w", err)
+	}
 
 	if err := dp.meta.Create(&LogFileRef{
 		Path:     "evts-0",
 		SeqStart: 0, // NOTE: not dp.initialSeq
 	}).Error; err != nil {
+		_ = fi.Close()
 		return err
 	}
 
@@ -264,20 +300,48 @@ func (dp *DiskPersistence) swapLog(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if err := dp.syncFile(fi); err != nil {
+		_ = fi.Close()
+		return fmt.Errorf("failed to sync new log file: %w", err)
+	}
+	if err := dp.syncDir(dp.primaryDir); err != nil {
+		_ = fi.Close()
+		return fmt.Errorf("failed to sync log directory: %w", err)
+	}
 
-	if err := dp.meta.Create(&LogFileRef{
+	if err := dp.meta.WithContext(ctx).Create(&LogFileRef{
 		Path:     fname,
 		SeqStart: dp.curSeq,
 	}).Error; err != nil {
+		_ = fi.Close()
 		return err
 	}
 
 	dp.logfi = fi
+	dp.eventCounter = 0
 	return nil
 }
 
 func scanForLastSeq(fi *os.File, end int64) (int64, error) {
 	scratch := make([]byte, headerSize)
+	info, err := fi.Stat()
+	if err != nil {
+		return 0, err
+	}
+	// hypercerts: Recover only incomplete trailing writes during startup, never during playback.
+	recoverTail := func(offset int64, lastSeq int64) (int64, error) {
+		if end != -1 {
+			return 0, io.ErrUnexpectedEOF
+		}
+		if err := fi.Truncate(offset); err != nil {
+			return 0, err
+		}
+		if err := fi.Sync(); err != nil {
+			return 0, err
+		}
+		_, err := fi.Seek(offset, io.SeekStart)
+		return lastSeq, err
+	}
 
 	var lastSeq int64 = -1
 	var offset int64
@@ -287,7 +351,13 @@ func scanForLastSeq(fi *os.File, end int64) (int64, error) {
 			if errors.Is(err, io.EOF) {
 				return lastSeq, nil
 			}
+			if errors.Is(err, io.ErrUnexpectedEOF) {
+				return recoverTail(offset, lastSeq)
+			}
 			return 0, err
+		}
+		if offset+headerSize+int64(eh.Len) > info.Size() {
+			return recoverTail(offset, lastSeq)
 		}
 
 		if end > 0 && eh.Seq > end {
@@ -331,70 +401,10 @@ const (
 
 var emptyHeader = make([]byte, headerSize)
 
-func (dp *DiskPersistence) addJobToQueue(ctx context.Context, job persistJob) error {
-	dp.lk.Lock()
-	defer dp.lk.Unlock()
-
-	if err := dp.doPersist(ctx, job); err != nil {
-		return err
-	}
-
-	// TODO: for some reason replacing this constant with p.writeBufferSize dramatically reduces perf...
-	if len(dp.evtbuf) > 400 {
-		if err := dp.flushLog(ctx); err != nil {
-			return fmt.Errorf("failed to flush disk log: %w", err)
-		}
-	}
-
-	return nil
-}
-
-func (dp *DiskPersistence) flushRoutine() {
-	t := time.NewTicker(time.Millisecond * 100)
-
-	for {
-		ctx := context.Background()
-		select {
-		case <-dp.shutdown:
-			return
-		case <-t.C:
-			dp.lk.Lock()
-			if err := dp.flushLog(ctx); err != nil {
-				// TODO: this happening is quite bad. Need a recovery strategy
-				dp.log.Error("failed to flush disk log", "err", err)
-			}
-			dp.lk.Unlock()
-		}
-	}
-}
-
-func (dp *DiskPersistence) flushLog(ctx context.Context) error {
-	if len(dp.evtbuf) == 0 {
-		return nil
-	}
-
-	_, err := io.Copy(dp.logfi, dp.outbuf)
-	if err != nil {
-		return err
-	}
-
-	dp.outbuf.Truncate(0)
-
-	for _, ej := range dp.evtbuf {
-		if dp.broadcast != nil {
-			dp.broadcast(ej.Evt)
-		}
-		ej.Buffer.Truncate(0)
-		dp.buffers.Put(ej.Buffer)
-	}
-
-	dp.evtbuf = dp.evtbuf[:0]
-
-	return nil
-}
-
 func (dp *DiskPersistence) garbageCollectRoutine() {
 	t := time.NewTicker(time.Hour)
+	defer dp.background.Done()
+	defer t.Stop()
 
 	for {
 		ctx := context.Background()
@@ -495,49 +505,73 @@ func (dp *DiskPersistence) garbageCollect(ctx context.Context) []error {
 	return errs
 }
 
-func (dp *DiskPersistence) doPersist(ctx context.Context, pjob persistJob) error {
-	seq := dp.curSeq
-	dp.curSeq++
-	currentSeqGuage.Set(float64(dp.curSeq))
-
-	// Set sequence number in event header
-	// the rest of the header is set in DiskPersistence.Persist()
-	binary.LittleEndian.PutUint64(pjob.Bytes[20:], uint64(seq))
-
-	// update the seq in the message
-	// copy the message from outside to a new object, clobber the seq, add it back to the event
-	switch {
-	case pjob.Evt.RepoCommit != nil:
-		pjob.Evt.RepoCommit.Seq = seq
-	case pjob.Evt.RepoSync != nil:
-		pjob.Evt.RepoSync.Seq = seq
-	case pjob.Evt.RepoIdentity != nil:
-		pjob.Evt.RepoIdentity.Seq = seq
-	case pjob.Evt.RepoAccount != nil:
-		pjob.Evt.RepoAccount.Seq = seq
-	default:
-		// only those three get peristed right now
-		// we should not actually ever get here...
-		return nil
+func (dp *DiskPersistence) writeAll(data []byte) error {
+	for len(data) > 0 {
+		n, err := dp.writeFile(dp.logfi, data)
+		if n < 0 || n > len(data) {
+			return fmt.Errorf("invalid write count: %d", n)
+		}
+		data = data[n:]
+		if err != nil {
+			if n > 0 && len(data) > 0 {
+				continue
+			}
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
 	}
 
-	_, err := dp.outbuf.Write(pjob.Bytes)
-	if err != nil {
+	return nil
+}
+
+func (dp *DiskPersistence) failLocked(err error) error {
+	if dp.failed == nil {
+		dp.failed = fmt.Errorf("disk persistence requires restart: %w", err)
+	}
+
+	return dp.failed
+}
+
+func (dp *DiskPersistence) persistLocked(ctx context.Context, xevt *stream.XRPCStreamEvent, data []byte) error {
+	if dp.failed != nil {
+		return dp.failed
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-
-	dp.evtbuf = append(dp.evtbuf, pjob)
-
-	dp.eventCounter++
-	if dp.eventCounter%dp.eventsPerFile == 0 {
-		if err := dp.flushLog(ctx); err != nil {
-			return err
-		}
-
-		// time to roll the log file
+	if dp.eventCounter > 0 && dp.eventCounter%dp.eventsPerFile == 0 {
 		if err := dp.swapLog(ctx); err != nil {
-			return err
+			return dp.failLocked(fmt.Errorf("failed to rotate disk log: %w", err))
 		}
+	}
+
+	seq := dp.curSeq
+	binary.LittleEndian.PutUint64(data[20:], uint64(seq))
+	if err := dp.writeAll(data); err != nil {
+		return dp.failLocked(fmt.Errorf("failed to write disk log: %w", err))
+	}
+	if err := dp.syncFile(dp.logfi); err != nil {
+		return dp.failLocked(fmt.Errorf("failed to sync disk log: %w", err))
+	}
+
+	switch {
+	case xevt.RepoCommit != nil:
+		xevt.RepoCommit.Seq = seq
+	case xevt.RepoSync != nil:
+		xevt.RepoSync.Seq = seq
+	case xevt.RepoIdentity != nil:
+		xevt.RepoIdentity.Seq = seq
+	case xevt.RepoAccount != nil:
+		xevt.RepoAccount.Seq = seq
+	}
+
+	dp.curSeq++
+	dp.eventCounter++
+	currentSeqGuage.Set(float64(dp.curSeq))
+	if dp.broadcast != nil {
+		dp.broadcast(xevt)
 	}
 
 	return nil
@@ -547,6 +581,10 @@ func (dp *DiskPersistence) doPersist(ctx context.Context, pjob persistJob) error
 // Persist may mutate contents of xevt and what it points to
 func (dp *DiskPersistence) Persist(ctx context.Context, xevt *stream.XRPCStreamEvent) error {
 	buffer := dp.buffers.Get().(*bytes.Buffer)
+	defer func() {
+		buffer.Truncate(0)
+		dp.buffers.Put(buffer)
+	}()
 	cw := dp.writers.Get().(*cbg.CborWriter)
 	defer dp.writers.Put(cw)
 	cw.SetWriter(buffer)
@@ -604,11 +642,10 @@ func (dp *DiskPersistence) Persist(ctx context.Context, xevt *stream.XRPCStreamE
 	binary.LittleEndian.PutUint64(b[12:], uint64(uid))
 	// set seq at [20:] inside mutex section inside doPersist
 
-	return dp.addJobToQueue(ctx, persistJob{
-		Bytes:  b,
-		Evt:    xevt,
-		Buffer: buffer,
-	})
+	dp.lk.Lock()
+	defer dp.lk.Unlock()
+
+	return dp.persistLocked(ctx, xevt, b)
 }
 
 type evtHeader struct {
@@ -979,21 +1016,40 @@ func (dp *DiskPersistence) mutateUserEventsInLog(ctx context.Context, uid uint64
 func (dp *DiskPersistence) Flush(ctx context.Context) error {
 	dp.lk.Lock()
 	defer dp.lk.Unlock()
-	if len(dp.evtbuf) > 0 {
-		return dp.flushLog(ctx)
+	if dp.failed != nil {
+		return dp.failed
 	}
-	return nil
-}
-
-func (dp *DiskPersistence) Shutdown(ctx context.Context) error {
-	close(dp.shutdown)
-	if err := dp.Flush(ctx); err != nil {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 
-	return dp.logfi.Close()
+	return dp.syncFile(dp.logfi)
+}
+
+func (dp *DiskPersistence) Shutdown(ctx context.Context) error {
+	dp.shutdownOnce.Do(func() {
+		close(dp.shutdown)
+		dp.background.Wait()
+
+		dp.lk.Lock()
+		defer dp.lk.Unlock()
+		if dp.failed != nil {
+			dp.shutdownErr = dp.failed
+		} else if err := ctx.Err(); err != nil {
+			dp.shutdownErr = err
+		} else if err := dp.syncFile(dp.logfi); err != nil {
+			dp.shutdownErr = err
+		}
+		if err := dp.logfi.Close(); err != nil && dp.shutdownErr == nil {
+			dp.shutdownErr = err
+		}
+	})
+
+	return dp.shutdownErr
 }
 
 func (dp *DiskPersistence) SetEventBroadcaster(f func(*stream.XRPCStreamEvent)) {
+	dp.lk.Lock()
+	defer dp.lk.Unlock()
 	dp.broadcast = f
 }

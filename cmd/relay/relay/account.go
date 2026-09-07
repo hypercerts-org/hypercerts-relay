@@ -14,6 +14,9 @@ import (
 	"gorm.io/gorm"
 )
 
+// hypercerts: Separate confirmed inactivity from status lookup and storage failures.
+var ErrAccountInactive = errors.New("account is inactive")
+
 func (r *Relay) GetAccount(ctx context.Context, did syntax.DID) (*models.Account, error) {
 	ctx, span := tracer.Start(ctx, "GetAccount")
 	defer span.End()
@@ -202,7 +205,7 @@ func (r *Relay) EnsureAccountActive(ctx context.Context, acc *models.Account) er
 	}
 	// NOTE: this is checking local takedown
 	if acc.Status != models.AccountStatusActive {
-		return fmt.Errorf("account %s has non-active local status: %s", acc.DID, acc.Status)
+		return fmt.Errorf("%w: local status %s", ErrAccountInactive, acc.Status)
 	}
 
 	did := syntax.DID(acc.DID)
@@ -228,7 +231,7 @@ func (r *Relay) EnsureAccountActive(ctx context.Context, acc *models.Account) er
 	if acc.IsActive() {
 		return nil
 	}
-	return fmt.Errorf("account is not active (%s): %s", acc.DID, acc.UpstreamStatus)
+	return fmt.Errorf("%w: upstream status %s", ErrAccountInactive, acc.UpstreamStatus)
 }
 
 // This updates the account's "upstream" status (eg, at the account's PDS). Usually this is called in response to an `#account` event.

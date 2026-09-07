@@ -9,9 +9,11 @@ import (
 	"net/http"
 	"os"
 	"reflect"
+	"strings"
 
 	"github.com/bluesky-social/indigo/atproto/identity"
 	"github.com/bluesky-social/indigo/cmd/relay/relay"
+	"github.com/bluesky-social/indigo/cmd/relay/relay/models"
 	"github.com/bluesky-social/indigo/cmd/relay/stream"
 	"github.com/bluesky-social/indigo/cmd/relay/stream/eventmgr"
 	"github.com/bluesky-social/indigo/cmd/relay/stream/persist/diskpersist"
@@ -52,6 +54,8 @@ func MustSimpleRelay(dir identity.Directory, tmpd string, lenient bool) *SimpleR
 	if err != nil {
 		panic(err)
 	}
+	// hypercerts: Keep scenario validation on the local fixture source.
+	r.HostChecker = scenarioHostChecker{relay: r}
 	persister.SetUidSource(r)
 
 	listener, err := net.Listen("tcp", ":0")
@@ -79,6 +83,26 @@ func MustSimpleRelay(dir identity.Directory, tmpd string, lenient bool) *SimpleR
 		}
 	}()
 	return &sr
+}
+
+type scenarioHostChecker struct {
+	relay *relay.Relay
+}
+
+func (hc scenarioHostChecker) CheckHost(ctx context.Context, host string) error {
+	hostname, _, err := relay.ParseHostname(host)
+	if err != nil || !strings.HasPrefix(hostname, "localhost:") {
+		return relay.ErrHostNotPDS
+	}
+	return ctx.Err()
+}
+
+func (hc scenarioHostChecker) FetchAccountStatus(ctx context.Context, ident *identity.Identity) (models.AccountStatus, error) {
+	account, err := hc.relay.GetAccount(ctx, ident.DID)
+	if err != nil {
+		return "", err
+	}
+	return account.UpstreamStatus, nil
 }
 
 func LoadAndRunScenario(ctx context.Context, fpath string) error {

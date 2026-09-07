@@ -25,6 +25,9 @@ type Relay struct {
 	Events      *eventmgr.EventManager
 	HostChecker HostChecker
 	Config      RelayConfig
+	// hypercerts: Serialize each account across source connections during migration.
+	eventLocks [256]sync.Mutex
+	sourcesLk  sync.Mutex
 
 	// Management of Socket Consumers
 	consumersLk    sync.RWMutex
@@ -99,7 +102,7 @@ func NewRelay(db *gorm.DB, evtman *eventmgr.EventManager, dir identity.Directory
 	slurpConfig.PersistCursorCallback = r.PersistHostCursors
 	slurpConfig.PersistHostStatusCallback = r.UpdateHostStatus
 
-	s, err := NewSlurper(r.processRepoEvent, slurpConfig)
+	s, err := NewSlurper(r.processSourceEvent, slurpConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -119,6 +122,10 @@ func (r *Relay) MigrateDatabase() error {
 		return err
 	}
 	if err := r.db.AutoMigrate(models.AccountRepo{}); err != nil {
+		return err
+	}
+	// hypercerts: Retain rejection outcomes before acknowledging invalid source events.
+	if err := r.db.AutoMigrate(models.RejectedEvent{}); err != nil {
 		return err
 	}
 	return nil

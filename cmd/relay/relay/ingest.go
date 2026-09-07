@@ -29,33 +29,55 @@ func (r *Relay) processRepoEvent(ctx context.Context, evt *stream.XRPCStreamEven
 	}()
 
 	EventsReceivedCounter.WithLabelValues(hostname).Add(1)
+	// hypercerts: Reuse the durable decision when the same source position is replayed.
+	rejected, lookupErr := r.wasRejectedEvent(ctx, evt, hostID)
+	if lookupErr != nil {
+		return lookupErr
+	}
+	if rejected {
+		return nil
+	}
 
+	var err error
 	switch {
 	case evt.RepoCommit != nil:
 		repoCommitsReceivedCounter.WithLabelValues(hostname).Add(1)
-		return r.processCommitEvent(ctx, evt.RepoCommit, hostname, hostID)
+		err = r.processCommitEvent(ctx, evt.RepoCommit, hostname, hostID)
 	case evt.RepoSync != nil:
 		repoSyncReceivedCounter.WithLabelValues(hostname).Add(1)
-		return r.processSyncEvent(ctx, evt.RepoSync, hostname, hostID)
+		err = r.processSyncEvent(ctx, evt.RepoSync, hostname, hostID)
 	case evt.RepoIdentity != nil:
 		//repoIdentityReceivedCounter.WithLabelValues(hostname).Add(1)
-		return r.processIdentityEvent(ctx, evt.RepoIdentity, hostname, hostID)
+		err = r.processIdentityEvent(ctx, evt.RepoIdentity, hostname, hostID)
 	case evt.RepoAccount != nil:
 		//repoAccountReceivedCounter.WithLabelValues(hostname).Add(1)
-		return r.processAccountEvent(ctx, evt.RepoAccount, hostname, hostID)
+		err = r.processAccountEvent(ctx, evt.RepoAccount, hostname, hostID)
 	default:
 		return fmt.Errorf("unhandled repo stream event type")
 	}
+	if err == nil {
+		return nil
+	}
+
+	// hypercerts: only an explicit permanent decision may acknowledge a rejected source event.
+	reasonCode, permanent := permanentRejectionReason(err)
+	if !permanent {
+		return err
+	}
+	if err := r.persistRejectedEvent(ctx, evt, hostID, reasonCode); err != nil {
+		return err
+	}
+	return nil
 }
 
 // Implements the shared part of event processing: that the account existing, is associated with this host, etc.
 //
-// If there is no error, the returned account is always non-nil, but the identity may be nil (if there was a resolution error).
+// If there is no error, both returned values are non-nil.
 func (r *Relay) preProcessEvent(ctx context.Context, didStr string, hostname string, hostID uint64, logger *slog.Logger) (*models.Account, *identity.Identity, error) {
 
 	did, err := syntax.ParseDID(didStr)
 	if err != nil {
-		return nil, nil, fmt.Errorf("invalid DID in message: %w", err)
+		return nil, nil, newPermanentEventError(rejectionReasonMalformedEvent, err)
 	}
 	// TODO: add a test case for non-normalized DID
 	did = NormalizeDID(did)
@@ -79,7 +101,8 @@ func (r *Relay) preProcessEvent(ctx context.Context, didStr string, hostname str
 
 	ident, err := r.Dir.LookupDID(ctx, did)
 	if err != nil {
-		logger.Warn("failed to load identity", "did", did, "err", err)
+		// Do not acknowledge until a signature policy can be evaluated.
+		return nil, nil, ErrIdentityUnavailable
 	}
 
 	return acc, ident, nil
@@ -94,15 +117,14 @@ func (r *Relay) processCommitEvent(ctx context.Context, evt *comatproto.SyncSubs
 		return err
 	}
 
-	// verify that the account has active status
+	// hypercerts: Skip confirmed inactivity but preserve retries for failed status checks.
 	if err := r.EnsureAccountActive(ctx, acc); err != nil {
-		logger.Info("dropping message for inactive account", "status", acc.Status, "upstreamStatus", acc.UpstreamStatus)
-		eventsWarningsCounter.WithLabelValues(hostname, "inactive-account").Add(1)
-		return nil
-	}
-
-	if ident == nil {
-		// TODO: what to do if identity resolution fails
+		if errors.Is(err, ErrAccountInactive) {
+			logger.Info("dropping message for inactive account", "status", acc.Status, "upstreamStatus", acc.UpstreamStatus)
+			eventsWarningsCounter.WithLabelValues(hostname, "inactive-account").Add(1)
+			return nil
+		}
+		return fmt.Errorf("ensuring account is active: %w", err)
 	}
 
 	prevRepo, err := r.GetAccountRepo(ctx, acc.UID)
@@ -122,25 +144,23 @@ func (r *Relay) processCommitEvent(ctx context.Context, evt *comatproto.SyncSubs
 	// most commit validation happens in this method. Note that is handles lenient/strict modes.
 	newRepo, err := r.VerifyRepoCommit(ctx, evt, ident, prevRepo, hostname)
 	if err != nil {
-		logger.Warn("commit message failed verification", "err", err)
 		return err
 	}
 
-	err = r.UpsertAccountRepo(ctx, acc.UID, syntax.TID(newRepo.Rev), newRepo.CommitCID, newRepo.CommitDataCID)
-	if err != nil {
-		return fmt.Errorf("failed to upsert account repo (%s): %w", acc.DID, err)
-	}
-
-	// emit the event
-	// TODO: is this copy important?
+	// hypercerts: durable outbound persistence precedes revision advancement so a
+	// failed output remains eligible for at-least-once replay.
 	commitCopy := *evt
 	err = r.Events.AddEvent(ctx, &stream.XRPCStreamEvent{
 		RepoCommit: &commitCopy,
 		PrivUid:    acc.UID,
 	})
 	if err != nil {
-		logger.Error("failed to broadcast event", "error", err)
 		return fmt.Errorf("failed to broadcast #commit event: %w", err)
+	}
+
+	err = r.UpsertAccountRepo(ctx, acc.UID, syntax.TID(newRepo.Rev), newRepo.CommitCID, newRepo.CommitDataCID)
+	if err != nil {
+		return fmt.Errorf("failed to upsert account repo (%s): %w", acc.DID, err)
 	}
 
 	return nil
@@ -155,15 +175,13 @@ func (r *Relay) processSyncEvent(ctx context.Context, evt *comatproto.SyncSubscr
 		return err
 	}
 
-	// verify that the account has active status
 	if err := r.EnsureAccountActive(ctx, acc); err != nil {
-		logger.Info("dropping message for inactive account", "status", acc.Status, "upstreamStatus", acc.UpstreamStatus)
-		eventsWarningsCounter.WithLabelValues(hostname, "inactive-account").Add(1)
-		return nil
-	}
-
-	if ident == nil {
-		// TODO: what to do if identity resolution fails
+		if errors.Is(err, ErrAccountInactive) {
+			logger.Info("dropping message for inactive account", "status", acc.Status, "upstreamStatus", acc.UpstreamStatus)
+			eventsWarningsCounter.WithLabelValues(hostname, "inactive-account").Add(1)
+			return nil
+		}
+		return fmt.Errorf("ensuring account is active: %w", err)
 	}
 
 	// TODO: should we load account 'rev' here and prevent roll-backs? or allow roll-backs?
@@ -173,20 +191,19 @@ func (r *Relay) processSyncEvent(ctx context.Context, evt *comatproto.SyncSubscr
 		return err
 	}
 
-	err = r.UpsertAccountRepo(ctx, acc.UID, syntax.TID(newRepo.Rev), newRepo.CommitCID, newRepo.CommitDataCID)
-	if err != nil {
-		return fmt.Errorf("failed to upsert account repo (%s): %w", acc.DID, err)
-	}
-
-	// emit the event
+	// hypercerts: keep source retries possible until the consumer-visible event is durable.
 	evtCopy := *evt
 	err = r.Events.AddEvent(ctx, &stream.XRPCStreamEvent{
 		RepoSync: &evtCopy,
 		PrivUid:  acc.UID,
 	})
 	if err != nil {
-		logger.Error("failed to broadcast event", "error", err)
 		return fmt.Errorf("failed to broadcast #sync event: %w", err)
+	}
+
+	err = r.UpsertAccountRepo(ctx, acc.UID, syntax.TID(newRepo.Rev), newRepo.CommitCID, newRepo.CommitDataCID)
+	if err != nil {
+		return fmt.Errorf("failed to upsert account repo (%s): %w", acc.DID, err)
 	}
 	return nil
 }
@@ -199,12 +216,12 @@ func (r *Relay) processIdentityEvent(ctx context.Context, evt *comatproto.SyncSu
 	did, err := syntax.ParseDID(evt.Did)
 	if err != nil {
 		logger.Warn("invalid DID in message")
-		return fmt.Errorf("invalid DID in message: %w", err)
+		return newPermanentEventError(rejectionReasonMalformedEvent, err)
 	}
 	did = NormalizeDID(did)
 	err = r.Dir.Purge(ctx, did.AtIdentifier())
 	if err != nil {
-		logger.Error("problem purging identity directory cache", "err", err)
+		return ErrIdentityRefresh
 	}
 	r.accountCache.Remove(did.String())
 
@@ -212,16 +229,13 @@ func (r *Relay) processIdentityEvent(ctx context.Context, evt *comatproto.SyncSu
 	handle := evt.Handle
 	_, ident, err := r.preProcessEvent(ctx, evt.Did, hostname, hostID, logger)
 	if err != nil {
-		// don't pass-through handle if there was a problem with event (eg, account on another host, or inactive status)
-		handle = nil
+		return err
 	}
 
 	// check that handle at least matches that in the DID document (if available)
 	if ident != nil && handle != nil && ident.Handle.String() != *handle {
 		handle = nil
 	}
-
-	// NOTE: not doing other validation or processing here; eg not strictly checking account host mapping or account status. Any PDS host can emit an identity event for any account, and it will be passed through (other than handle)
 
 	// Broadcast the identity event to all consumers
 	err = r.Events.AddEvent(ctx, &stream.XRPCStreamEvent{
@@ -258,7 +272,7 @@ func (r *Relay) processAccountEvent(ctx context.Context, evt *comatproto.SyncSub
 	}
 
 	if !evt.Active && evt.Status == nil {
-		logger.Warn("invalid account event", "active", evt.Active, "status", evt.Status)
+		return newPermanentEventError(rejectionReasonMalformedEvent, errors.New("inactive account event has no status"))
 	}
 
 	newStatus := models.AccountStatusInactive

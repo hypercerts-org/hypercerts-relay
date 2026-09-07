@@ -10,7 +10,15 @@ The administration control plane will manage PDS sources, record collections, ra
 
 ## Status
 
-This repository establishes the maintained Relay and Rainbow base and its delivery process. It does not yet contain the Hypercerts PDS policy, Jetstream integration, collection retention, backfill behavior, or the new administration control plane. Those changes are tracked as component work before deployment.
+This repository contains the maintained Relay and Rainbow base and Relay processing with durable acknowledgments and explicit verification rejections. Jetstream integration, collection retention, backfill behavior, and the new administration control plane remain separate component work before deployment.
+
+## Event durability
+
+Relay saves output before advancing account revisions or source cursors. Processing and storage failures stop acknowledgment and reconnect from successful progress. Source cursor transactions preserve administrative status and never reduce saved progress. Shutdown waits for source processing before closing output persistence.
+
+An unavailable identity remains retryable. Permanent verification failures create a durable rejection containing source metadata and a fixed reason, without record contents. Signature failures require identity refresh before rejection. Startup adds the rejection table; back up Relay state before upgrading. Stored output can repeat after a failed revision update, so downstream consumers must tolerate duplicates.
+
+An ambiguous disk write or sync failure stops further persistence until restart. Startup discards only an incomplete trailing write before resuming; complete retained events remain replayable. Per-event file synchronization replaces buffered acknowledgments and can reduce throughput.
 
 ## Included components
 
