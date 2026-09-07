@@ -1,0 +1,81 @@
+name: Check Indigo upstream
+
+on:
+  schedule:
+    - cron: '23 8 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: indigo-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out fork main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Check for an existing sync pull request
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          count=$(gh pr list --base main --state open --search 'Indigo upstream sync in:title' --json number --jq 'length')
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+      - name: Fetch Indigo upstream
+        if: steps.existing.outputs.count == '0'
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/bluesky-social/indigo.git 2>/dev/null || git remote set-url upstream https://github.com/bluesky-social/indigo.git
+          git fetch upstream main
+      - name: Prepare a review pull request
+        if: steps.existing.outputs.count == '0'
+        id: prepare
+        run: |
+          set -euo pipefail
+          if [ "$(git rev-list --count origin/main..upstream/main)" = '0' ]; then
+            echo 'needed=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          branch="upstream-sync/$(date -u +%Y-%m-%d)-${GITHUB_RUN_ID}"
+          git switch -c "$branch" origin/main
+          if ! git merge --no-ff --no-commit upstream/main; then
+            git merge --abort
+            echo '::error::Indigo merge has conflicts. No conflict resolution or pull request was created; resolve it manually on a dedicated upstream-sync branch.'
+            exit 1
+          fi
+          git commit -m "chore: sync Indigo upstream $(git rev-parse --short upstream/main)"
+          git push origin "$branch"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo 'needed=true' >> "$GITHUB_OUTPUT"
+      - name: Open Indigo upstream sync pull request
+        if: steps.prepare.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.prepare.outputs.branch }}
+        run: |
+          set -euo pipefail
+          base_sha=$(git rev-parse --short origin/main)
+          upstream_sha=$(git rev-parse --short upstream/main)
+          marked_paths=$(git grep -l 'hypercerts:' origin/main -- . || true)
+          cat > pr-body.md <<EOF
+          Merges Indigo upstream `$upstream_sha` into Hypercerts main `$base_sha`.
+
+          This is a review-only upstream synchronization. It was created only after Git completed a clean merge. The workflow did not resolve conflicts, commit conflict markers, or merge this pull request.
+
+          Review the full upstream diff, all affected `// hypercerts:` edits, and Relay/Rainbow verification before merging.
+
+          Hypercerts-marked files on main at creation:
+          ```text
+          ${marked_paths:-None found}
+          ```
+          EOF
+          gh pr create --base main --head "$BRANCH" --title "chore: Indigo upstream sync $upstream_sha" --body-file pr-body.md

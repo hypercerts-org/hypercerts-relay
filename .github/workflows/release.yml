@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version without the v prefix, for example 0.1.0
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Validate release version and changelog
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo '::error::Version must use X.Y.Z without a v prefix.'
+            exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
+            echo "::error::Tag v$VERSION already exists."
+            exit 1
+          fi
+          if ! grep -q "^## \[$VERSION\] - " CHANGELOG.md; then
+            echo "::error::CHANGELOG.md needs a dated [$VERSION] section before release."
+            exit 1
+          fi
+      - name: Verify Relay and Rainbow
+        run: ./scripts/verify.sh
+      - name: Create tag and release notes
+        env:
+          VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          awk -v section="## [$VERSION] - " '
+            $0 ~ "^## \\[" { if (found) exit }
+            index($0, section) == 1 { found = 1; next }
+            found { print }
+            END { if (!found) exit 1 }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "::error::CHANGELOG.md section for $VERSION has no release notes."
+            exit 1
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git tag -a "v$VERSION" -m "Hypercerts Relay v$VERSION"
+          git push origin "v$VERSION"
+          gh release create "v$VERSION" --title "Hypercerts Relay v$VERSION" --notes-file release-notes.md

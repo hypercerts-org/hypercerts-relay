@@ -44,3 +44,13 @@ updates:
       - dependency-name: ghcr.io/bluesky-social/atproto
       - dependency-name: ghcr.io/bluesky-social/did-method-plc
       - dependency-name: ghcr.io/bluesky-social/indigo
+
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
