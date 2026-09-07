@@ -41,25 +41,13 @@ The Go module path intentionally stays `github.com/bluesky-social/indigo`. Do no
 
 ## Fork and upstream policy
 
-`origin` is the Hypercerts fork. A new clone normally has no `upstream` remote. Before upstream work, add and verify the exact Indigo remote:
-
-```bash
-if ! git remote get-url upstream >/dev/null 2>&1; then
-  git remote add upstream https://github.com/bluesky-social/indigo.git
-fi
-git remote get-url upstream
-```
-
-The final command must print `https://github.com/bluesky-social/indigo.git`. If `upstream` already points elsewhere, stop and resolve that repository identity before fetching or merging. Work based on Indigo must use a dedicated branch and review pull request.
+Read `FORK.md` before changing upstream-derived code or synchronizing Indigo. It owns the exact remote URL, the required remote verification, and the merge process.
 
 - Put new Hypercerts behavior in clearly owned packages or configuration whenever practical.
 - For an unavoidable upstream-file edit, add a short `// hypercerts:` comment explaining why the fork diverges. Keep the diff narrow.
 - Never automatically resolve an upstream merge conflict, commit conflict markers, or auto-merge an upstream-sync pull request.
 - Merge `upstream/main` into a branch from current `main`; do not rebase `main` onto upstream.
-- Run `git log upstream/main..main` before and during an upstream update to identify fork-only commits.
 - Review upstream changes that overlap `// hypercerts:` markers, then run the focused verification before the sync pull request is merged.
-
-The scheduled `Check Indigo upstream` workflow creates a review pull request only for a clean merge. A conflict is a deliberate stop: resolve it manually with the affected component owners.
 
 ## Validation
 
