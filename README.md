@@ -29,7 +29,10 @@ Install Go 1.26.1 or the toolchain selected by `go.mod`. Relay links SQLite thro
 ```bash
 git clone git@github.com:hypercerts-org/hypercerts-relay.git
 cd hypercerts-relay
-git remote add upstream https://github.com/bluesky-social/indigo.git
+if ! git remote get-url upstream >/dev/null 2>&1; then
+  git remote add upstream https://github.com/bluesky-social/indigo.git
+fi
+git remote get-url upstream
 ./scripts/verify.sh
 ```
 
@@ -55,7 +58,7 @@ Read [AGENTS.md](AGENTS.md) before changing code. The short form:
 
 ## Updating from Indigo
 
-`origin` is `hypercerts-org/hypercerts-relay`; `upstream` is `bluesky-social/indigo`. Every changed upstream line can become a future merge conflict, so upstream synchronization is reviewed work:
+`origin` is `git@github.com:hypercerts-org/hypercerts-relay.git`. A fresh clone does not normally have `upstream`; add it as `https://github.com/bluesky-social/indigo.git` before any synchronization work, then confirm `git remote get-url upstream` prints that exact URL. Every changed upstream line can become a future merge conflict, so upstream synchronization is reviewed work:
 
 1. The `Check Indigo upstream` workflow checks weekly whether `upstream/main` is ahead and opens a review pull request when it can merge cleanly.
 2. The workflow never resolves conflicts, commits conflict markers, or merges the pull request. If Git reports a conflict, it fails and a maintainer resolves it on a dedicated upstream-sync branch.
@@ -66,7 +69,7 @@ For a manual sync, create a branch from current `main`, fetch `upstream/main`, m
 
 ## Releases
 
-Releases are manually initiated from `main` with the `Release` GitHub workflow. Before starting it, update [CHANGELOG.md](CHANGELOG.md) with a dated version section and ensure the intended changes have passed review. The workflow runs verification, creates a signed-off annotated `vX.Y.Z` tag, and creates a GitHub Release from that changelog section. It does not publish a container image or claim a deployment.
+Releases use Changesets, like the other maintained Hypercerts services. Add a named release note for an operator-visible change, then run the `Release` workflow from `main`. It opens a reviewed version pull request; merging that pull request creates the version tag and GitHub Release. It does not publish a container image or claim a deployment.
 
 See [RELEASING.md](RELEASING.md) for the exact process and rollback guidance.
 

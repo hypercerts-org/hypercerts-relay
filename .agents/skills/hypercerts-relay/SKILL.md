@@ -18,7 +18,7 @@ Do not implement Jetstream filtering/backfill or the planned OAuth administratio
 
 ## Fork work
 
-`origin` is the Hypercerts fork and `upstream` is Bluesky Indigo. Keep new behavior isolated where practical. Mark unavoidable edits to upstream-owned Go files with `// hypercerts:` and a short reason. Never resolve upstream merge conflicts automatically or commit conflict markers.
+`origin` is the Hypercerts fork. Before any upstream update, ensure the clone has `upstream` set to `https://github.com/bluesky-social/indigo.git`; add it with `git remote add upstream https://github.com/bluesky-social/indigo.git` when it is missing, and stop if an existing `upstream` points elsewhere. Keep new behavior isolated where practical. Mark unavoidable edits to upstream-owned Go files with `// hypercerts:` and a short reason. Never resolve upstream merge conflicts automatically or commit conflict markers.
 
 For an upstream update, branch from current `main`, merge `upstream/main`, inspect `git log upstream/main..main` and every marked Hypercerts edit, run `./scripts/verify.sh`, then open a review pull request. Do not rebase `main` onto upstream.
 

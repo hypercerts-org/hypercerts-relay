@@ -17,15 +17,23 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
+      - name: Generate release bot token
+        id: generate-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_APP_PRIVATE_KEY }}
       - name: Check out fork main
-        uses: actions/checkout@v4
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: main
+          token: ${{ steps.generate-token.outputs.token }}
+          persist-credentials: true
           fetch-depth: 0
       - name: Check for an existing sync pull request
         id: existing
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
         run: |
           set -euo pipefail
           count=$(gh pr list --base main --state open --search 'Indigo upstream sync in:title' --json number --jq 'length')
@@ -59,7 +67,7 @@ jobs:
       - name: Open Indigo upstream sync pull request
         if: steps.prepare.outputs.needed == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
           BRANCH: ${{ steps.prepare.outputs.branch }}
         run: |
           set -euo pipefail
@@ -67,15 +75,15 @@ jobs:
           upstream_sha=$(git rev-parse --short upstream/main)
           marked_paths=$(git grep -l 'hypercerts:' origin/main -- . || true)
           cat > pr-body.md <<EOF
-          Merges Indigo upstream `$upstream_sha` into Hypercerts main `$base_sha`.
+          Merges Indigo upstream \`$upstream_sha\` into Hypercerts main \`$base_sha\`.
 
           This is a review-only upstream synchronization. It was created only after Git completed a clean merge. The workflow did not resolve conflicts, commit conflict markers, or merge this pull request.
 
-          Review the full upstream diff, all affected `// hypercerts:` edits, and Relay/Rainbow verification before merging.
+          Review the full upstream diff, all affected \`// hypercerts:\` edits, and Relay/Rainbow verification before merging.
 
           Hypercerts-marked files on main at creation:
-          ```text
+          \`\`\`text
           ${marked_paths:-None found}
-          ```
+          \`\`\`
           EOF
           gh pr create --base main --head "$BRANCH" --title "chore: Indigo upstream sync $upstream_sha" --body-file pr-body.md

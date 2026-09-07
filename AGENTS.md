@@ -41,7 +41,16 @@ The Go module path intentionally stays `github.com/bluesky-social/indigo`. Do no
 
 ## Fork and upstream policy
 
-`origin` is the Hypercerts fork and `upstream` is `https://github.com/bluesky-social/indigo.git`. Work based on upstream must use a dedicated branch and review pull request.
+`origin` is the Hypercerts fork. A new clone normally has no `upstream` remote. Before upstream work, add and verify the exact Indigo remote:
+
+```bash
+if ! git remote get-url upstream >/dev/null 2>&1; then
+  git remote add upstream https://github.com/bluesky-social/indigo.git
+fi
+git remote get-url upstream
+```
+
+The final command must print `https://github.com/bluesky-social/indigo.git`. If `upstream` already points elsewhere, stop and resolve that repository identity before fetching or merging. Work based on Indigo must use a dedicated branch and review pull request.
 
 - Put new Hypercerts behavior in clearly owned packages or configuration whenever practical.
 - For an unavoidable upstream-file edit, add a short `// hypercerts:` comment explaining why the fork diverges. Keep the diff narrow.
@@ -67,9 +76,9 @@ Use `gofmt` on changed Go files. Validate workflow changes with the repository's
 
 ## Releases
 
-The repository releases source tags and GitHub Release notes. Before a release, update the dated section in `CHANGELOG.md`, run verification on `main`, and use the manual `Release` workflow from `main`. The workflow creates the tag only after verification succeeds. It does not deploy a service, publish a container, or alter a running relay.
+The repository uses Changesets, consistent with other Hypercerts services. Add a named `.changeset/` file for an operator-visible change; the `Release` workflow opens a version pull request from `main`, and its merge creates the tag and GitHub Release. Do not hand-edit `CHANGELOG.md` or tag a release. The workflow does not deploy a service, publish a container, or alter a running relay.
 
-See `RELEASING.md` for version naming, release notes, and correction procedures.
+See `RELEASING.md` and the `writing-changesets` project skill for release notes, version selection, and correction procedures.
 
 ## Safety
 
