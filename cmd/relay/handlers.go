@@ -32,8 +32,6 @@ func (s *Service) handleComAtprotoSyncRequestCrawl(c echo.Context, body *comatpr
 		return c.JSON(http.StatusBadRequest, atclient.ErrorBody{Name: "BadRequest", Message: "this relay requires host SSL"})
 	}
 
-	// TODO: could ensure that query and path are empty
-
 	if strings.HasPrefix(hostname, "localhost:") {
 		if !admin {
 			return c.JSON(http.StatusBadRequest, atclient.ErrorBody{Name: "BadRequest", Message: "can not configure localhost via public endpoint"})
@@ -42,7 +40,7 @@ func (s *Service) handleComAtprotoSyncRequestCrawl(c echo.Context, body *comatpr
 	} else {
 		banned, err := s.relay.DomainIsBanned(ctx, hostname)
 		if err != nil {
-			return c.JSON(http.StatusBadRequest, atclient.ErrorBody{Name: "DomainBan", Message: "hostname is not allowed"})
+			return err
 		}
 		if banned {
 			return c.JSON(http.StatusForbidden, atclient.ErrorBody{Name: "DomainBan", Message: "hostname is not allowed"})

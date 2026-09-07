@@ -46,6 +46,7 @@ func loadIngestFixture(t *testing.T) (identity.Identity, comatproto.SyncSubscrib
 
 	var commit comatproto.SyncSubscribeRepos_Commit
 	require.NoError(t, json.Unmarshal(fixture.Messages[2].Frame.Body, &commit))
+	fixture.Accounts[0].Identity.Services["atproto_pds"] = identity.ServiceEndpoint{Type: "AtprotoPersonalDataServer", URL: "https://source.example"}
 	return fixture.Accounts[0].Identity, commit
 }
 
@@ -83,6 +84,10 @@ func newIngestTestRelay(t *testing.T, directory identity.Directory, did syntax.D
 
 	db, err := gorm.Open(sqlite.Open("file:"+t.Name()+"?mode=memory&cache=shared"), &gorm.Config{})
 	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
 
 	persistence := &testEventPersistence{persistErr: persistErr}
 	config := DefaultRelayConfig()
@@ -91,6 +96,9 @@ func newIngestTestRelay(t *testing.T, directory identity.Directory, did syntax.D
 	if migrateRejections {
 		require.NoError(t, db.AutoMigrate(&models.RejectedEvent{}))
 	}
+	require.NoError(t, db.Create(&models.Host{ID: ingestTestHostID, Hostname: "source.example", AccountLimit: 100, AccountCount: 1}).Error)
+	require.NoError(t, db.Create(&models.Source{HostID: ingestTestHostID, State: models.SourceStateEnabled, ValidationStatus: models.SourceValidationPassed}).Error)
+	t.Cleanup(func() { require.NoError(t, relay.Slurper.Shutdown()) })
 	require.NoError(t, db.Create(&models.Account{
 		UID:            1,
 		DID:            did.String(),

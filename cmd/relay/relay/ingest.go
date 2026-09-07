@@ -81,6 +81,34 @@ func (r *Relay) preProcessEvent(ctx context.Context, didStr string, hostname str
 	}
 	// TODO: add a test case for non-normalized DID
 	did = NormalizeDID(did)
+	// hypercerts: Resolve current placement even when the account still names the former source.
+	ident, err := r.Dir.LookupDID(ctx, did)
+	if err != nil || ident == nil {
+		return nil, nil, ErrIdentityUnavailable
+	}
+	resolvedHost, _, err := ParseHostname(ident.PDSEndpoint())
+	if err != nil {
+		return nil, nil, ErrIdentityUnavailable
+	}
+	if resolvedHost != hostname && !r.Config.SkipAccountHostCheck {
+		if err := r.Dir.Purge(ctx, did.AtIdentifier()); err != nil {
+			return nil, nil, ErrIdentityRefresh
+		}
+		ident, err = r.Dir.LookupDID(ctx, did)
+		if err != nil || ident == nil {
+			return nil, nil, ErrIdentityUnavailable
+		}
+		resolvedHost, _, err = ParseHostname(ident.PDSEndpoint())
+		if err != nil {
+			return nil, nil, ErrIdentityUnavailable
+		}
+		if resolvedHost != hostname {
+			if err := r.ObserveAccountSource(ctx, did.String(), hostID, ident.PDSEndpoint()); err != nil {
+				return nil, nil, err
+			}
+			return nil, nil, newPermanentEventError("source_host_mismatch", errors.New("resolved host does not match source"))
+		}
+	}
 
 	acc, err := r.GetAccount(ctx, did)
 	if err != nil {
@@ -99,10 +127,8 @@ func (r *Relay) preProcessEvent(ctx context.Context, didStr string, hostname str
 		return nil, nil, err
 	}
 
-	ident, err := r.Dir.LookupDID(ctx, did)
-	if err != nil {
-		// Do not acknowledge until a signature policy can be evaluated.
-		return nil, nil, ErrIdentityUnavailable
+	if err := r.ObserveAccountSource(ctx, did.String(), hostID, ident.PDSEndpoint()); err != nil {
+		return nil, nil, err
 	}
 
 	return acc, ident, nil

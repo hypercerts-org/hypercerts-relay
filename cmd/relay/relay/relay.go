@@ -128,7 +128,13 @@ func (r *Relay) MigrateDatabase() error {
 	if err := r.db.AutoMigrate(models.RejectedEvent{}); err != nil {
 		return err
 	}
-	return nil
+	// hypercerts: Preserve explicit source policy separately from runtime host status.
+	if err := r.db.AutoMigrate(models.Source{}, models.AccountSourceObservation{}); err != nil {
+		return err
+	}
+	return r.db.Exec(`INSERT INTO source (host_id, state, revision, validation_status, recovery_required, last_operation)
+		SELECT id, CASE WHEN status = 'banned' THEN 'disabled' ELSE 'enabled' END, 1, 'passed', true, 'migration'
+		FROM host WHERE true ON CONFLICT (host_id) DO NOTHING`).Error
 }
 
 // simple check of connection to database

@@ -24,7 +24,9 @@ func (r *Relay) GetAccount(ctx context.Context, did syntax.DID) (*models.Account
 	// first try cache
 	a, ok := r.accountCache.Get(did.String())
 	if ok {
-		return a, nil
+		// hypercerts: Keep cached snapshots separate from mutable caller state.
+		copy := *a
+		return &copy, nil
 	}
 
 	var acc models.Account
@@ -40,7 +42,8 @@ func (r *Relay) GetAccount(ctx context.Context, did syntax.DID) (*models.Account
 		return nil, ErrAccountNotFound
 	}
 
-	r.accountCache.Add(did.String(), &acc)
+	cached := acc
+	r.accountCache.Add(did.String(), &cached)
 
 	return &acc, nil
 }
@@ -96,18 +99,18 @@ func (r *Relay) CreateAccountHost(ctx context.Context, did syntax.DID, hostID ui
 		UpstreamStatus: models.AccountStatusActive,
 	}
 
-	host, err := r.GetHostByID(ctx, hostID)
-	if err != nil {
-		return nil, err
-	}
-	if host.AccountCount >= host.AccountLimit {
-		acc.Status = models.AccountStatusHostThrottled
-	}
-
 	// create Account row and increment host count in the same transaction
 	err = r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Model(&models.Host{}).Where("id = ?", hostID).Update("account_count", gorm.Expr("account_count + 1")).Error; err != nil {
 			return fmt.Errorf("failed to increment account count for host (%s): %w", hostname, err)
+		}
+		// hypercerts: Decide admission after the host increment holds the transaction lock.
+		var host models.Host
+		if err := tx.First(&host, hostID).Error; err != nil {
+			return err
+		}
+		if host.AccountCount > host.AccountLimit {
+			acc.Status = models.AccountStatusHostThrottled
 		}
 		if err := tx.Create(&acc).Error; err != nil {
 			return fmt.Errorf("failed to create account: %w", err)
@@ -118,7 +121,8 @@ func (r *Relay) CreateAccountHost(ctx context.Context, did syntax.DID, hostID ui
 		return nil, err
 	}
 
-	r.accountCache.Add(did.String(), &acc)
+	cached := acc
+	r.accountCache.Add(did.String(), &cached)
 
 	//newUserDiscoveryDuration.Observe(time.Since(start).Seconds())
 	return &acc, nil
@@ -173,14 +177,25 @@ func (r *Relay) EnsureAccountHost(ctx context.Context, acc *models.Account, host
 	// create Account row and increment host count in the same transaction
 	err = r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// decrement old host count
-		if err := tx.Model(&models.Host{}).Where("id = ?", acc.HostID).Update("account_count", gorm.Expr("account_count - 1")).Error; err != nil {
+		if err := tx.Model(&models.Host{}).Where("id = ? AND account_count > 0", acc.HostID).Update("account_count", gorm.Expr("account_count - 1")).Error; err != nil {
 			return fmt.Errorf("failed to decrement account count for former host (%d): %w", acc.HostID, err)
 		}
 		// increment new host count
 		if err := tx.Model(&models.Host{}).Where("id = ?", hostID).Update("account_count", gorm.Expr("account_count + 1")).Error; err != nil {
 			return fmt.Errorf("failed to increment account count for host (%s): %w", hostname, err)
 		}
-		if err := tx.Model(models.Account{}).Where("uid = ?", acc.UID).Update("host_id", hostID).Error; err != nil {
+		var host models.Host
+		if err := tx.First(&host, hostID).Error; err != nil {
+			return err
+		}
+		// hypercerts: Apply the target quota without clearing unrelated account restrictions.
+		if acc.Status == models.AccountStatusActive || acc.Status == models.AccountStatusHostThrottled {
+			acc.Status = models.AccountStatusActive
+			if host.AccountCount > host.AccountLimit {
+				acc.Status = models.AccountStatusHostThrottled
+			}
+		}
+		if err := tx.Model(models.Account{}).Where("uid = ?", acc.UID).Updates(map[string]any{"host_id": hostID, "status": acc.Status}).Error; err != nil {
 			return fmt.Errorf("failed update account HostID: %w", err)
 		}
 		return nil

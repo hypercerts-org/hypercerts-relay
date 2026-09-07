@@ -72,7 +72,16 @@ func (r *Relay) ListHosts(ctx context.Context, cursor int64, limit int, everActi
 }
 
 func (r *Relay) UpdateHostStatus(ctx context.Context, hostID uint64, status models.HostStatus) error {
-	return r.db.WithContext(ctx).Model(models.Host{}).Where("id = ?", hostID).Update("status", status).Error
+	// hypercerts: Security bans also survive source-policy restarts.
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if status == models.HostStatusBanned {
+			if err := tx.Model(&models.Source{}).Where("host_id = ? AND state = ?", hostID, models.SourceStateEnabled).
+				Updates(map[string]any{"state": models.SourceStateDisabled, "revision": gorm.Expr("revision + 1"), "last_operation": "ban"}).Error; err != nil {
+				return err
+			}
+		}
+		return tx.Model(models.Host{}).Where("id = ?", hostID).Update("status", status).Error
+	})
 }
 
 func (r *Relay) UpdateHostAccountLimit(ctx context.Context, hostID uint64, accountLimit int64) error {
@@ -153,6 +162,10 @@ func ParseHostname(raw string) (hostname string, noSSL bool, err error) {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return "", false, fmt.Errorf("not a valid host URL: %w", err)
+	}
+	// hypercerts: Source admission accepts origins without credentials or request parameters.
+	if u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+		return "", false, fmt.Errorf("host URL must contain only an origin")
 	}
 	noSSL = false
 

@@ -12,6 +12,7 @@ import (
 	comatproto "github.com/bluesky-social/indigo/api/atproto"
 	"github.com/bluesky-social/indigo/atproto/identity"
 	"github.com/bluesky-social/indigo/atproto/syntax"
+	"github.com/bluesky-social/indigo/cmd/relay/relay/models"
 	"github.com/bluesky-social/indigo/cmd/relay/stream"
 	"github.com/bluesky-social/indigo/cmd/relay/stream/eventmgr"
 	"github.com/bluesky-social/indigo/cmd/relay/stream/persist/diskpersist"
@@ -21,7 +22,7 @@ import (
 	"gorm.io/gorm"
 )
 
-func TestTwoSourcesRetainRawReplayAfterDisconnect(t *testing.T) {
+func TestTwoSourcesRetainRawReplayAfterRemoval(t *testing.T) {
 	ctx := context.Background()
 	fixtures := []*sourceFixture{newSourceFixture(t), newSourceFixture(t)}
 	dids := []syntax.DID{"did:plc:abcdefghijklmnopqrstuvwx", "did:plc:bcdefghijklmnopqrstuvwxy2"}
@@ -72,7 +73,12 @@ func TestTwoSourcesRetainRawReplayAfterDisconnect(t *testing.T) {
 		return true
 	}, 5*time.Second, time.Millisecond)
 	for _, f := range fixtures {
-		require.NoError(t, r.Slurper.StopSource(ctx, f.host))
+		host, err := r.GetHost(ctx, f.host)
+		require.NoError(t, err)
+		var source models.Source
+		require.NoError(t, db.First(&source, "host_id = ?", host.ID).Error)
+		_, err = r.SetSourceState(ctx, host.ID, source.Revision, models.SourceStateRemoved)
+		require.NoError(t, err)
 	}
 	since := int64(0)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
