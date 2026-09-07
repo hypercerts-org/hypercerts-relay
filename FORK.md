@@ -46,14 +46,18 @@ Every changed upstream line can become a future merge conflict.
 
 ## Synchronize from Indigo
 
-The `Check Indigo upstream` workflow checks weekly whether `upstream/main` is ahead. When Git can merge cleanly, it opens a review pull request. It never resolves conflicts or merges the pull request.
+This repository does not merge `upstream/main`. `.hypercerts/upstream-paths` is the authoritative allowlist of upstream paths: it contains Relay, Rainbow, their required Go packages, `go.mod`, `go.sum`, and the upstream licenses. It explicitly excludes the inherited Relay Basic-auth web UI.
+
+`.hypercerts/upstream-base` records the last Indigo commit applied to those paths. `scripts/apply-upstream-update.sh` produces a binary diff from that baseline to `upstream/main`, restricted to the allowlist, then applies it with Git's three-way merge support. An excluded upstream file can never enter a sync pull request.
+
+The `Check Indigo upstream` workflow checks weekly and opens a review pull request only when allowed paths changed. It never merges `upstream/main`, resolves conflicts, commits conflict markers, or merges the pull request.
 
 For a manual update:
 
-1. Start a dedicated branch from current `main`.
-2. Fetch `upstream/main` and merge it with a merge commit. Do not rebase `main` onto upstream.
-3. Run `git log upstream/main..main` to identify fork-only commits, then review every affected `// hypercerts:` edit.
+1. Start a dedicated branch from current `main` and fetch `upstream/main`.
+2. Run `./scripts/apply-upstream-update.sh`.
+3. Review the staged diff, `git log upstream/main..main`, and every affected `// hypercerts:` edit.
 4. Run `./scripts/verify.sh` and open a review pull request.
 5. Merge the reviewed synchronization pull request into `main`.
 
-A merge conflict is a deliberate stop. Resolve it manually with the affected component owners, then repeat verification before requesting review.
+A three-way application conflict is a deliberate stop. Resolve it manually with the affected component owners, then repeat verification before requesting review.

@@ -44,23 +44,19 @@ jobs:
           set -euo pipefail
           git remote add upstream https://github.com/bluesky-social/indigo.git 2>/dev/null || git remote set-url upstream https://github.com/bluesky-social/indigo.git
           git fetch upstream main
-      - name: Prepare a review pull request
+      - name: Apply allowed Indigo changes
         if: steps.existing.outputs.count == '0'
         id: prepare
         run: |
           set -euo pipefail
-          if [ "$(git rev-list --count origin/main..upstream/main)" = '0' ]; then
+          branch="upstream-sync/$(date -u +%Y-%m-%d)-${GITHUB_RUN_ID}"
+          git switch -c "$branch" origin/main
+          ./scripts/apply-upstream-update.sh
+          if git diff --cached --quiet; then
             echo 'needed=false' >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          branch="upstream-sync/$(date -u +%Y-%m-%d)-${GITHUB_RUN_ID}"
-          git switch -c "$branch" origin/main
-          if ! git merge --no-ff --no-commit upstream/main; then
-            git merge --abort
-            echo '::error::Indigo merge has conflicts. No conflict resolution or pull request was created; resolve it manually on a dedicated upstream-sync branch.'
-            exit 1
-          fi
-          git commit -m "chore: sync Indigo upstream $(git rev-parse --short upstream/main)"
+          git commit -m "chore: apply allowed Indigo upstream changes $(git rev-parse --short upstream/main)"
           git push origin "$branch"
           echo "branch=$branch" >> "$GITHUB_OUTPUT"
           echo 'needed=true' >> "$GITHUB_OUTPUT"
@@ -75,11 +71,11 @@ jobs:
           upstream_sha=$(git rev-parse --short upstream/main)
           marked_paths=$(git grep -l 'hypercerts:' origin/main -- . || true)
           cat > pr-body.md <<EOF
-          Merges Indigo upstream \`$upstream_sha\` into Hypercerts main \`$base_sha\`.
+          Applies the allowlisted Indigo changes through \`$upstream_sha\` to Hypercerts main \`$base_sha\`.
 
-          This is a review-only upstream synchronization. It was created only after Git completed a clean merge. The workflow did not resolve conflicts, commit conflict markers, or merge this pull request.
+          This is a review-only upstream synchronization. It applies only the paths in \`.hypercerts/upstream-paths\`; it does not merge \`upstream/main\`, resolve conflicts, commit conflict markers, or merge this pull request.
 
-          Review the full upstream diff, all affected \`// hypercerts:\` edits, and Relay/Rainbow verification before merging.
+          Review the full diff, every affected \`// hypercerts:\` edit, and Relay/Rainbow verification before merging.
 
           Hypercerts-marked files on main at creation:
           \`\`\`text
