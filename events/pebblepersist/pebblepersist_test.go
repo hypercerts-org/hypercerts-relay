@@ -2,209 +2,78 @@ package pebblepersist
 
 import (
 	"context"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	atproto "github.com/bluesky-social/indigo/api/atproto"
-	"github.com/bluesky-social/indigo/api/bsky"
-	"github.com/bluesky-social/indigo/carstore"
 	"github.com/bluesky-social/indigo/events"
-	"github.com/bluesky-social/indigo/events/diskpersist"
 	lexutil "github.com/bluesky-social/indigo/lex/util"
-	"github.com/bluesky-social/indigo/models"
-	"github.com/bluesky-social/indigo/repomgr"
-	pds "github.com/bluesky-social/indigo/testing/pdsmodels"
-	"github.com/bluesky-social/indigo/util"
-
-	"gorm.io/driver/sqlite"
-	"gorm.io/gorm"
+	"github.com/ipfs/go-cid"
+	mh "github.com/multiformats/go-multihash"
 )
 
+func testCID() cid.Cid {
+	value, err := cid.NewPrefixV1(cid.Raw, mh.SHA2_256).Sum(make([]byte, 32))
+	if err != nil {
+		panic(err)
+	}
+	return value
+}
+
+// hypercerts: keep this Relay persistence test independent from non-Relay
+// storage packages so the scoped fork can test every retained package.
 func TestPebblePersist(t *testing.T) {
-	factory := func(tempPath string, db *gorm.DB) (events.EventPersistence, error) {
-		opts := DefaultPebblePersistOptions
-		opts.DbPath = filepath.Join(tempPath, "pebble.db")
-		return NewPebblePersistance(&opts)
+	options := DefaultPebblePersistOptions
+	options.DbPath = filepath.Join(t.TempDir(), "pebble.db")
+	persistence, err := NewPebblePersistance(&options)
+	if err != nil {
+		t.Fatal(err)
 	}
-	testPersister(t, factory)
-}
+	t.Cleanup(func() {
+		if persistence.db != nil {
+			if err := persistence.Shutdown(context.Background()); err != nil {
+				t.Error(err)
+			}
+		}
+	})
 
-func testPersister(t *testing.T, perisistenceFactory func(path string, db *gorm.DB) (events.EventPersistence, error)) {
+	eventManager := events.NewEventManager(persistence)
 	ctx := context.Background()
-
-	db, _, cs, tempPath, err := setupDBs(t)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	db.AutoMigrate(&pds.User{})
-	db.AutoMigrate(&pds.Peering{})
-	db.AutoMigrate(&models.ActorInfo{})
-
-	db.Create(&models.ActorInfo{
-		Uid: 1,
-		Did: "did:example:123",
-	})
-
-	mgr := repomgr.NewRepoManager(cs, &util.FakeKeyManager{})
-
-	err = mgr.InitNewActor(ctx, 1, "alice", "did:example:123", "Alice", "", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	_, cid, err := mgr.CreateRecord(ctx, 1, "app.bsky.feed.post", &bsky.FeedPost{
-		Text:      "hello world",
-		CreatedAt: time.Now().Format(util.ISO8601),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	defer os.RemoveAll(tempPath)
-
-	// Initialize a persister
-	dp, err := perisistenceFactory(tempPath, db)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Create a bunch of events
-	evtman := events.NewEventManager(dp)
-
-	userRepoHead, err := mgr.GetRepoRoot(ctx, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	n := 100
-	inEvts := make([]*events.XRPCStreamEvent, n)
-	for i := range n {
-		cidLink := lexutil.LexLink(cid)
-		headLink := lexutil.LexLink(userRepoHead)
-		inEvts[i] = &events.XRPCStreamEvent{
+	const eventCount = 100
+	for i := range eventCount {
+		commit := lexutil.LexLink(testCID())
+		record := lexutil.LexLink(testCID())
+		event := &events.XRPCStreamEvent{
 			RepoCommit: &atproto.SyncSubscribeRepos_Commit{
 				Repo:   "did:example:123",
-				Commit: headLink,
-				Ops: []*atproto.SyncSubscribeRepos_RepoOp{
-					{
-						Action: "add",
-						Cid:    &cidLink,
-						Path:   "path1",
-					},
-				},
-				Time: time.Now().Format(util.ISO8601),
+				Commit: commit,
+				Ops: []*atproto.SyncSubscribeRepos_RepoOp{{
+					Action: "create",
+					Cid:    &record,
+					Path:   "app.bsky.feed.post/test",
+				}},
 				Seq:  int64(i),
+				Time: time.Now().UTC().Format(time.RFC3339Nano),
 			},
 		}
-	}
-
-	// Add events in parallel
-	for i := range n {
-		err = evtman.AddEvent(ctx, inEvts[i])
-		if err != nil {
+		if err := eventManager.AddEvent(ctx, event); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	if err := dp.Flush(ctx); err != nil {
+	if err := persistence.Flush(ctx); err != nil {
 		t.Fatal(err)
 	}
 
-	outEvtCount := 0
-	expectedEvtCount := n
-
-	dp.Playback(ctx, 0, func(evt *events.XRPCStreamEvent) error {
-		outEvtCount++
+	playbackCount := 0
+	if err := persistence.Playback(ctx, 0, func(*events.XRPCStreamEvent) error {
+		playbackCount++
 		return nil
-	})
-
-	if outEvtCount != expectedEvtCount {
-		t.Fatalf("expected %d events, got %d", expectedEvtCount, outEvtCount)
-	}
-
-	dp.Shutdown(ctx)
-
-	time.Sleep(time.Millisecond * 100)
-
-	dp2, err := diskpersist.NewDiskPersistence(filepath.Join(tempPath, "diskPrimary"), filepath.Join(tempPath, "diskArchive"), db, &diskpersist.DiskPersistOptions{
-		EventsPerFile: 10,
-		UIDCacheSize:  100000,
-		DIDCacheSize:  100000,
-	})
-	if err != nil {
+	}); err != nil {
 		t.Fatal(err)
 	}
-
-	evtman2 := events.NewEventManager(dp2)
-
-	inEvts = make([]*events.XRPCStreamEvent, n)
-	for i := range n {
-		cidLink := lexutil.LexLink(cid)
-		headLink := lexutil.LexLink(userRepoHead)
-		inEvts[i] = &events.XRPCStreamEvent{
-			RepoCommit: &atproto.SyncSubscribeRepos_Commit{
-				Repo:   "did:example:123",
-				Commit: headLink,
-				Ops: []*atproto.SyncSubscribeRepos_RepoOp{
-					{
-						Action: "add",
-						Cid:    &cidLink,
-						Path:   "path1",
-					},
-				},
-				Time: time.Now().Format(util.ISO8601),
-			},
-		}
+	if playbackCount != eventCount {
+		t.Fatalf("expected %d events, got %d", eventCount, playbackCount)
 	}
-
-	for i := range n {
-		err = evtman2.AddEvent(ctx, inEvts[i])
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-}
-
-func setupDBs(t testing.TB) (*gorm.DB, *gorm.DB, carstore.CarStore, string, error) {
-	dir, err := os.MkdirTemp("", "integtest")
-	if err != nil {
-		return nil, nil, nil, "", err
-	}
-
-	maindb, err := gorm.Open(sqlite.Open(filepath.Join(dir, "test.sqlite?cache=shared&mode=rwc")))
-	if err != nil {
-		return nil, nil, nil, "", err
-	}
-
-	tx := maindb.Exec("PRAGMA journal_mode=WAL;")
-	if tx.Error != nil {
-		return nil, nil, nil, "", tx.Error
-	}
-
-	tx.Commit()
-
-	cardb, err := gorm.Open(sqlite.Open(filepath.Join(dir, "car.sqlite?cache=shared&mode=rwc")))
-	if err != nil {
-		return nil, nil, nil, "", err
-	}
-
-	tx = cardb.Exec("PRAGMA journal_mode=WAL;")
-	if tx.Error != nil {
-		return nil, nil, nil, "", tx.Error
-	}
-
-	cspath := filepath.Join(dir, "carstore")
-	if err := os.Mkdir(cspath, 0775); err != nil {
-		return nil, nil, nil, "", err
-	}
-
-	cs, err := carstore.NewCarStore(cardb, []string{cspath})
-	if err != nil {
-		return nil, nil, nil, "", err
-	}
-
-	return maindb, cardb, cs, dir, nil
 }
