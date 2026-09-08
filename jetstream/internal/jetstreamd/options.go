@@ -46,6 +46,8 @@ type CompactionPassResult struct {
 type Options struct {
 	// hypercerts: Explicit initial direct-PDS sources get durable jobs, even when quiet.
 	InitialPDSSources []string
+	// hypercerts: Private service credential, loaded from a mounted secret file by the CLI.
+	ControlToken string
 	// hypercerts: The CLI always enables policy; initial collections apply only to new state.
 	CollectionSelection bool
 	InitialCollections  []string

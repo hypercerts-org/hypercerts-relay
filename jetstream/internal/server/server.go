@@ -45,6 +45,8 @@ type Config struct {
 	// /status on the public listener. cmd/jetstream constructs this via
 	// the web package; tests can pass any http.Handler.
 	StatusHandler http.Handler
+	// hypercerts: Authenticated service API is mounted only on the private debug listener.
+	PrivateControlHandler http.Handler
 
 	// PublicListener and DebugListener, when non-nil, are served instead of
 	// binding a TCP socket for PublicAddr/DebugAddr. Production leaves them
@@ -366,6 +368,10 @@ func routeLabel(pattern string) string {
 // for those handler functions, not for its init()-time side effect.
 func (s *Server) debugMux() http.Handler {
 	mux := http.NewServeMux()
+	// hypercerts: Never register administrative routes on the public mux.
+	if s.cfg.PrivateControlHandler != nil {
+		mux.Handle("/hypercerts/", s.cfg.PrivateControlHandler)
+	}
 
 	mux.Handle("GET /metrics", promhttp.HandlerFor(s.metrics.Registry, promhttp.HandlerOpts{
 		Registry: s.metrics.Registry,

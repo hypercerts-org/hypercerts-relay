@@ -138,3 +138,46 @@ explicit retry. Local persistence failures stop the runtime without acknowledgin
 completion. Each repository request has a two-minute deadline. Reconciliation
 currently scans the archive under its rewrite lock, so large archives can pause
 live appends during an individual repository reconciliation.
+
+## Private service interface
+
+Mount a secret file containing a random service credential of at least 32 bytes,
+then set `JETSTREAM_CONTROL_TOKEN_FILE=/run/secrets/jetstream-control` and
+`JETSTREAM_DEBUG_ADDR=127.0.0.1:6060` (or use the matching CLI flags). The token is
+read at startup; rotation requires restart. No credential means no control routes.
+A credential without an operations listener is a configuration error. Keep this
+listener private: its existing metrics and pprof endpoints have their existing
+access behavior. The control routes require `Authorization: Bearer <credential>`
+and return `Cache-Control: no-store`. Use TLS/private transport between services.
+The public listener does not expose the API. This is a service contract for the
+separate administration control plane, not the OAuth administration UI.
+
+All paths below start with `/hypercerts/v1`:
+
+| Method and path | Request / result |
+| --- | --- |
+| `GET /policy` | Current revision and exact collection list. |
+| `PUT /policy` | `{"expectedRevision":1,"collections":["app.bsky.feed.post"]}`; atomically updates policy and jobs. Explicit `[]` disables record acquisition. |
+| `GET /sources` | Explicit PDS origins and enabled flags. |
+| `POST /sources` | `{"pds":"https://pds.example"}`; adds source and returns its job. |
+| `DELETE /sources` | Same body; cancels acquisition without deleting the archive. |
+| `POST /jobs` | `{"pds":"https://pds.example","reason":"backfill"}` or reason `quota_recovery`; duplicate active work is reused, a later terminal recovery creates a fresh job. |
+| `GET /jobs?limit=100&after=<cursor>` | Sorted page, maximum 200 jobs, optional `nextCursor`. Concurrent additions may require a fresh listing. |
+| `GET /jobs/{id}` | Durable state, progress, attempt count, and coverage. |
+| `POST /jobs/{id}/cancel` | Cancels pending/running work. |
+| `POST /jobs/{id}/retry` | Resumes current-policy work from durable progress; a removed source or obsolete revision returns conflict. |
+
+Each job reports `id`, `pds`, `policy.revision`, `policy.collections`, `reason`,
+`state`, `attempts`, `completedRepos` (count), page `cursor`, bounded `errorCode`,
+creation/start/finish times, `coverage`, and `historyComplete`. Job states are
+`pending`, `running`, `failed`, `canceled`, `incomplete`, and `complete`. A completed
+job identifies the exact PDS origin and policy revision whose **current state** it
+covers. `historyComplete: false` explicitly records that older history is not
+proven recoverable; administration clients must not present this as full historical
+coverage. An unreachable PDS returns `incomplete`, never `complete`.
+
+Errors use a bounded JSON `error` code: 400 invalid input, 401 authentication,
+404 unknown job/source, 409 policy/state conflict, and 500 persistence failure.
+Mutation bodies are limited to 64 KiB and reject unknown fields/trailing JSON.
+Local persistence errors do not acknowledge a successful change or expose raw
+storage errors. Job progress and outcomes survive restart.

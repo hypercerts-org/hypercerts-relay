@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/control"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/jobs"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 	"log/slog"
+	"net/http"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
@@ -522,13 +524,26 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		return fail(fmt.Errorf("serve: build status handler: %w", err))
 	}
 
+	// hypercerts: Private API is opt-in and requires both a credential and an operations listener.
+	var controlHandler http.Handler
+	if opts.ControlToken != "" {
+		if opts.DebugAddr == "" && opts.DebugListener == nil {
+			return fail(errors.New("control API requires a private debug listener"))
+		}
+		h, err := control.New(opts.ControlToken, rt.BackfillJobs, rt.CollectionPolicy)
+		if err != nil {
+			return fail(err)
+		}
+		controlHandler = h
+	}
 	srv := server.New(server.Config{
-		PublicAddr:      opts.PublicAddr,
-		DebugAddr:       opts.DebugAddr,
-		ShutdownTimeout: opts.ShutdownTimeout,
-		StatusHandler:   statusHandler,
-		PublicListener:  opts.PublicListener,
-		DebugListener:   opts.DebugListener,
+		PrivateControlHandler: controlHandler,
+		PublicAddr:            opts.PublicAddr,
+		DebugAddr:             opts.DebugAddr,
+		ShutdownTimeout:       opts.ShutdownTimeout,
+		StatusHandler:         statusHandler,
+		PublicListener:        opts.PublicListener,
+		DebugListener:         opts.DebugListener,
 	}, processLogger, metrics)
 
 	// HandlerDeps.WriterRef is read at request time via writerPtr.Load();

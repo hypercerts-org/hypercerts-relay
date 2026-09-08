@@ -34,6 +34,7 @@ const stateKey = "hypercerts/backfill-jobs"
 
 var ErrConflict = errors.New("job or source state conflict")
 var ErrNotFound = errors.New("job not found")
+var ErrInvalidInput = errors.New("invalid job input")
 
 type Job struct {
 	ID              string            `json:"id"`
@@ -107,10 +108,10 @@ func Open(db *store.Store, policy *selection.Manager) (*Manager, error) {
 func normalizeSource(raw string) (string, error) {
 	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
-		return "", errors.New("PDS must be an HTTP(S) origin")
+		return "", fmt.Errorf("%w: PDS must be an HTTP(S) origin", ErrInvalidInput)
 	}
 	if u.Scheme != "https" && !(u.Scheme == "http" && (u.Hostname() == "localhost" || net.ParseIP(u.Hostname()).IsLoopback())) {
-		return "", errors.New("PDS requires HTTPS except loopback fixtures")
+		return "", fmt.Errorf("%w: PDS requires HTTPS except loopback fixtures", ErrInvalidInput)
 	}
 	u.Host = strings.ToLower(u.Host)
 	u.Path = ""
@@ -247,7 +248,7 @@ func (m *Manager) SetPolicy(expected uint64, collections []string) (selection.Po
 }
 func (m *Manager) Request(raw, reason string) (Job, error) {
 	if reason != "quota_recovery" && reason != "backfill" {
-		return Job{}, errors.New("unsupported job reason")
+		return Job{}, fmt.Errorf("%w: unsupported job reason", ErrInvalidInput)
 	}
 	pds, err := normalizeSource(raw)
 	if err != nil {

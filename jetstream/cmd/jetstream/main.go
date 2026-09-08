@@ -54,7 +54,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"sort"
@@ -206,6 +208,8 @@ func serveCommand() *cli.Command {
 				Value:   10 * time.Second,
 			},
 			// hypercerts: Explicit source origins schedule quiet-PDS backfill.
+			// hypercerts: Credentials come from mounted files, never command-line values.
+			&cli.StringFlag{Name: "control-token-file", Usage: "Mounted secret file for the private service API; requires debug-addr", Sources: cli.EnvVars("JETSTREAM_CONTROL_TOKEN_FILE")},
 			&cli.StringSliceFlag{Name: "pds-sources", Usage: "Initial admitted direct-PDS HTTPS origins to backfill; comma-separated", Sources: cli.EnvVars("JETSTREAM_PDS_SOURCES")},
 			// hypercerts: A new archive starts fail-closed unless exact collections are supplied.
 			&cli.StringSliceFlag{Name: "collections", Usage: "Initial exact collection NSIDs for a new data directory; empty stores no records. Existing persisted policy wins.", Sources: cli.EnvVars("JETSTREAM_COLLECTIONS")},
@@ -419,6 +423,23 @@ func serveCommand() *cli.Command {
 }
 
 func serveOptionsFromCommand(cmd *cli.Command) (jetstreamd.Options, error) {
+	// hypercerts: Read a bounded secret without printing its contents on errors.
+	var controlToken string
+	if path := cmd.String("control-token-file"); path != "" {
+		file, err := os.Open(path)
+		if err != nil {
+			return jetstreamd.Options{}, errors.New("cannot open control token file")
+		}
+		contents, err := io.ReadAll(io.LimitReader(file, 4097))
+		file.Close()
+		if err != nil || len(contents) > 4096 {
+			return jetstreamd.Options{}, errors.New("cannot read bounded control token file")
+		}
+		controlToken = strings.TrimSpace(string(contents))
+		if len(controlToken) < 32 {
+			return jetstreamd.Options{}, errors.New("control token must contain at least 32 bytes")
+		}
+	}
 	backfillRepos, err := parseBackfillRepos(cmd.String("backfill-repos"))
 	if err != nil {
 		return jetstreamd.Options{}, err
@@ -434,9 +455,10 @@ func serveOptionsFromCommand(cmd *cli.Command) (jetstreamd.Options, error) {
 	}
 
 	return jetstreamd.Options{
-		PublicAddr: cmd.String("addr"),
-		DebugAddr:  cmd.String("debug-addr"),
-		DataDir:    cmd.String("data-dir"),
+		ControlToken: controlToken,
+		PublicAddr:   cmd.String("addr"),
+		DebugAddr:    cmd.String("debug-addr"),
+		DataDir:      cmd.String("data-dir"),
 		// hypercerts: Production serve always enforces the durable collection policy.
 		CollectionSelection:            true,
 		InitialPDSSources:              cmd.StringSlice("pds-sources"),
