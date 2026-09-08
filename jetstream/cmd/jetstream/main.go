@@ -205,6 +205,8 @@ func serveCommand() *cli.Command {
 				Sources: cli.EnvVars("JETSTREAM_CLIENT_DRAIN_TIMEOUT"),
 				Value:   10 * time.Second,
 			},
+			// hypercerts: Explicit source origins schedule quiet-PDS backfill.
+			&cli.StringSliceFlag{Name: "pds-sources", Usage: "Initial admitted direct-PDS HTTPS origins to backfill; comma-separated", Sources: cli.EnvVars("JETSTREAM_PDS_SOURCES")},
 			// hypercerts: A new archive starts fail-closed unless exact collections are supplied.
 			&cli.StringSliceFlag{Name: "collections", Usage: "Initial exact collection NSIDs for a new data directory; empty stores no records. Existing persisted policy wins.", Sources: cli.EnvVars("JETSTREAM_COLLECTIONS")},
 			&cli.StringFlag{
@@ -437,6 +439,7 @@ func serveOptionsFromCommand(cmd *cli.Command) (jetstreamd.Options, error) {
 		DataDir:    cmd.String("data-dir"),
 		// hypercerts: Production serve always enforces the durable collection policy.
 		CollectionSelection:            true,
+		InitialPDSSources:              cmd.StringSlice("pds-sources"),
 		InitialCollections:             cmd.StringSlice("collections"),
 		RelayURL:                       cmd.String("relay-url"),
 		PLCURL:                         cmd.String("plc-url"),

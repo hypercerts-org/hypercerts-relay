@@ -102,3 +102,39 @@ and transient full-repository CAR downloads can contain excluded records; this
 does not promise their absence from upstream storage or transient input buffers.
 The internal embedding API retains upstream behavior unless `CollectionSelection`
 is enabled; the production `serve` command always enables it.
+
+## Scoped PDS backfill jobs
+
+On a new data directory, `JETSTREAM_PDS_SOURCES` (or `--pds-sources`) initializes
+explicit direct-PDS origins, separated by commas. HTTPS is required except for
+loopback fixtures. These are Jetstream acquisition targets; admitting a PDS into
+the raw Relay remains a separate Relay operation. Persisted sources override the
+startup list, so a removed source is not silently re-enabled after restart.
+
+Adding a source schedules its current collection policy immediately, including
+for a quiet PDS. Changing the enabled collection list atomically records the next
+policy revision, cancels older pending/running work, and schedules each enabled
+source. Backfill and quota-recovery requests, cancellation, and retry use durable
+job IDs scoped to the exact origin and policy revision. Removal cancels that
+source's work without purging archived rows or enrolling a migration destination.
+
+Jobs enumerate repositories directly from the named PDS, verify signed snapshots
+against the DID identity, and reconcile only selected collections. Missing selected
+records produce per-record deletes; another collection is not replaced by a
+DID-wide tombstone. Managed steady-state whole-repository live/retry syncs use scoped record
+replacements and deletes instead of a DID-wide sync tombstone. This preserves newer collection snapshots across delayed sync delivery.
+Inactive account events block stale snapshot publication. Archive writes and
+per-collection revision boundaries are
+synced before repository progress is acknowledged. Delayed older live/retry rows
+cannot overwrite a completed snapshot; newer live rows win. Restart retries a
+running job from its persisted page/repository progress. A crash before progress
+acknowledgment may replay work safely.
+
+Coverage is explicitly `current_state`, with `historyComplete: false`: a PDS
+snapshot cannot prove historical event completeness. Unavailable sources, changed
+DID hosting, stale snapshots, and the 64 MiB per-repository input limit produce
+`incomplete`; malformed or unverifiable input produces `failed`. Both require an
+explicit retry. Local persistence failures stop the runtime without acknowledging
+completion. Each repository request has a two-minute deadline. Reconciliation
+currently scans the archive under its rewrite lock, so large archives can pause
+live appends during an individual repository reconciliation.

@@ -10,6 +10,7 @@ import (
 
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/segment"
+	"github.com/cockroachdb/pebble"
 	"github.com/jcalabro/atmos"
 )
 
@@ -77,6 +78,48 @@ func (m *Manager) Current() Policy {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return Policy{Revision: m.policy.Revision, Collections: slices.Clone(m.policy.Collections)}
+}
+
+var ErrRevision = errors.New("collection policy revision conflict")
+
+// Update atomically commits a policy and its dependent jobs. The caller owns
+// the job-manager lock; no callback may call back into this selection manager.
+func (m *Manager) Update(expected uint64, collections []string, stage func(Policy, *pebble.Batch) error) (Policy, error) {
+	collections, err := Normalize(collections)
+	if err != nil {
+		return Policy{}, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if expected != m.policy.Revision {
+		return Policy{}, ErrRevision
+	}
+	if slices.Equal(collections, m.policy.Collections) {
+		return Policy{Revision: m.policy.Revision, Collections: slices.Clone(m.policy.Collections)}, nil
+	}
+	if expected == ^uint64(0) {
+		return Policy{}, errors.New("collection policy revision exhausted")
+	}
+	next := Policy{Revision: expected + 1, Collections: collections}
+	data, err := json.Marshal(next)
+	if err != nil {
+		return Policy{}, err
+	}
+	b := m.db.NewBatch()
+	defer b.Close()
+	if err := b.Set([]byte(key), data, nil); err != nil {
+		return Policy{}, err
+	}
+	if stage != nil {
+		if err := stage(next, b); err != nil {
+			return Policy{}, err
+		}
+	}
+	if err := m.db.Commit(b, store.SyncWrites); err != nil {
+		return Policy{}, err
+	}
+	m.policy = next
+	return Policy{Revision: next.Revision, Collections: slices.Clone(next.Collections)}, nil
 }
 
 // Allows preserves protocol markers while filtering every record operation.

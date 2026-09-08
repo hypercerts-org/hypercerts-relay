@@ -87,6 +87,32 @@ func (h *SegmentHandler) HandleRepo(ctx context.Context, did atmos.DID, r *repo.
 // replacement row before appending anything so a malformed CAR cannot leave a
 // durable tombstone without its replacement rows.
 func (h *SegmentHandler) HandleRepoResync(ctx context.Context, did atmos.DID, r *repo.Repo, commit *repo.Commit) error {
+	// hypercerts: Retry snapshots cannot erase newer scoped snapshots.
+	if needed, err := h.writer.NeedsScopedSync(string(did)); err != nil {
+		return err
+	} else if needed {
+		var rows []segment.Event
+		err := r.Tree.Walk(func(key string, cid cbor.CID) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			collection, rkey := repo.SplitMSTKey(key)
+			payload, err := r.Store.GetBlock(cid)
+			if err != nil {
+				return err
+			}
+			rows = append(rows, segment.Event{DID: string(did), Rev: commit.Rev, Kind: segment.KindCreateResync, Collection: collection, Rkey: rkey, Payload: payload, WitnessedAt: h.now().UnixMicro()})
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		_, err = h.writer.ReconcileSync(ctx, string(did), commit.Rev, rows)
+		if err != nil {
+			h.abortOnWriterError(err)
+		}
+		return err
+	}
 	return h.handleRepo(ctx, did, r, commit, segment.KindCreateResync, true)
 }
 

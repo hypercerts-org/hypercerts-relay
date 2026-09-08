@@ -61,7 +61,10 @@ func run() error {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /xrpc/com.atproto.sync.subscribeRepos", func(w http.ResponseWriter, req *http.Request) {
-		var cursor *int64
+		// The fixture replays from zero on the first connection so an event
+		// emitted before the WebSocket handshake is still delivered.
+		zero := int64(0)
+		cursor := &zero
 		if raw := req.URL.Query().Get("cursor"); raw != "" {
 			n, err := strconv.ParseInt(raw, 10, 64)
 			if err != nil {

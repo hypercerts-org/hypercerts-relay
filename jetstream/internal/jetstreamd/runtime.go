@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/jobs"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 	"log/slog"
 	"path/filepath"
@@ -44,6 +45,9 @@ import (
 
 // Runtime is one fully constructed jetstream daemon instance.
 type Runtime struct {
+	// hypercerts: Durable scoped backfill jobs share the process lifecycle.
+	BackfillJobs *jobs.Manager
+	jobProcessor jobs.Processor
 	// hypercerts: Runtime-owned durable policy is shared by every acquisition writer.
 	CollectionPolicy *selection.Manager
 	opts             Options
@@ -211,6 +215,13 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	if opts.CollectionSelection {
 		rt.CollectionPolicy, err = selection.Open(metaStore, opts.InitialCollections)
 		if err != nil {
+			return fail(err)
+		}
+		rt.BackfillJobs, err = jobs.Open(metaStore, rt.CollectionPolicy)
+		if err != nil {
+			return fail(err)
+		}
+		if err := rt.BackfillJobs.SeedSources(opts.InitialPDSSources); err != nil {
 			return fail(err)
 		}
 	}
@@ -448,6 +459,10 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		return fail(fmt.Errorf("serve: build orchestrator: %w", err))
 	}
 	rt.orchestrator = orch
+	// hypercerts: Snapshots use the same identity directory and direct-PDS HTTP client.
+	if rt.BackfillJobs != nil {
+		rt.jobProcessor = jobs.PDSProcessor{Manager: rt.BackfillJobs, HTTPClient: xrpcClient.HTTPClient.Val(), Directory: directory, Reconcile: orch.ReconcileSnapshot}.Run
+	}
 
 	// Timestamp-import job manager (design §8 M6). Always constructed so the
 	// endpoints exist and return a secure-by-default 401 when no token is set;
@@ -657,6 +672,16 @@ func (r *Runtime) Run(ctx context.Context) (runErr error) {
 	g.Go(r.goroutineRoot("orchestrator", func() error {
 		return r.orchestrator.Run(gctx)
 	}))
+
+	// hypercerts: Resume durable scoped jobs only after the steady-state writer is ready.
+	if r.BackfillJobs != nil {
+		g.Go(r.goroutineRoot("scoped_backfill", func() error {
+			if err := r.WaitSteadyState(gctx); err != nil {
+				return err
+			}
+			return r.BackfillJobs.Run(gctx, r.jobProcessor)
+		}))
+	}
 
 	// Auto-resume a timestamp-import job that a prior process left incomplete
 	// (design Q-RESUME), but only after the steady-state writer is published:

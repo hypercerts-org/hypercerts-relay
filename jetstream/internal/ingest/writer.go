@@ -417,6 +417,13 @@ func (w *Writer) appendLocked(ctx context.Context, ev *segment.Event) (*asyncFlu
 		ev.Seq = 0
 		return nil, nil
 	}
+	// hypercerts: A verified scoped snapshot can be ahead of delayed live input.
+	if superseded, err := w.snapshotSupersedes(ev); err != nil {
+		return nil, err
+	} else if superseded {
+		ev.Seq = 0
+		return nil, nil
+	}
 
 	candidate := *ev
 	candidate.Seq = w.nextSeq

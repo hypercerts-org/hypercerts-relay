@@ -122,6 +122,7 @@ func Open(cfg Config) (*Consumer, error) {
 	w, err := ingest.Open(ingest.Config{
 		// hypercerts: The writer also gates sync replacements and retry materializations.
 		CollectionPolicy:      cfg.CollectionPolicy,
+		ReconcileSnapshot:     cfg.ReconcileSnapshot,
 		SegmentsDir:           cfg.SegmentsDir,
 		FS:                    cfg.FS,
 		DataDir:               cfg.DataDir,
@@ -716,6 +717,19 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 			} else if replayed {
 				c.noteUpstreamSeq(evt.Seq)
 				continue
+			}
+
+			// hypercerts: A full sync must preserve newer per-collection snapshots.
+			if len(segEvts) > 0 && segEvts[0].Kind == segment.KindSync {
+				handled, err := c.writer.ReconcileSync(ctx, segEvts[0].DID, segEvts[0].Rev, segEvts[1:])
+				if err != nil {
+					return err
+				}
+				if handled {
+					c.promoteSyncState(segEvts)
+					c.noteUpstreamSeq(evt.Seq)
+					continue
+				}
 			}
 
 			for i := range segEvts {

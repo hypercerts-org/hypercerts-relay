@@ -1,6 +1,7 @@
 package live
 
 import (
+	"context"
 	"fmt"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 	"log/slog"
@@ -41,6 +42,8 @@ const (
 type Config struct {
 	// hypercerts: Filter record materialization with the shared durable policy.
 	CollectionPolicy *selection.Manager
+	// hypercerts: Scope syncs after direct-PDS snapshot boundaries.
+	ReconcileSnapshot func(context.Context, ingest.Snapshot) error
 	// DataDir is the root jetstream data directory. Optional outside the
 	// production orchestrator; forwarded to ingest.Writer for fatal
 	// persistence error context.

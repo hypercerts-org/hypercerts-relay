@@ -136,7 +136,8 @@ func TestHypercertsIndigoArchiveRestartAndLive(t *testing.T) {
 		}
 	}
 	archived := read("archived")
-	require.Greater(t, consumer.Stats().Pages, uint64(0), "consumer must read the archive planner")
+	// The client records page completion after yielding its final batch.
+	require.Eventually(t, func() bool { return consumer.Stats().Pages > 0 }, time.Second, time.Millisecond, "consumer must read the archive planner")
 	emit("live")
 	latest := read("live")
 	require.Greater(t, latest.Seq, archived.Seq)

@@ -38,6 +38,8 @@ const defaultMaxEventsPerBlock = segment.DefaultMaxEventsPerBlock
 type Config struct {
 	// hypercerts: Filter record materialization with the shared durable policy.
 	CollectionPolicy *selection.Manager
+	// hypercerts: Steady-state replacements share the archive rewrite lock.
+	ReconcileSnapshot func(context.Context, Snapshot) error
 	// DataDir is the root jetstream data directory. Optional outside the
 	// production orchestrator; when set it is included in fatal persistence
 	// errors such as ENOSPC.

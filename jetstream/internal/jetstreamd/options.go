@@ -44,6 +44,8 @@ type CompactionPassResult struct {
 // Options is the typed runtime configuration for one jetstream daemon
 // instance, after CLI and environment inputs have been resolved.
 type Options struct {
+	// hypercerts: Explicit initial direct-PDS sources get durable jobs, even when quiet.
+	InitialPDSSources []string
 	// hypercerts: The CLI always enables policy; initial collections apply only to new state.
 	CollectionSelection bool
 	InitialCollections  []string
