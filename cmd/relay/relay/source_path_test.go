@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -201,6 +202,57 @@ func TestSourceReconnectUsesSuccessfulCursor(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("source event was not retried")
 	}
+}
+
+func TestSourceShutdownFlushesCursorWithoutCancelledWrite(t *testing.T) {
+	f := newSourceFixture(t)
+	r, db := testRelayWithHostDB(t)
+	host := models.Host{Hostname: f.host, NoSSL: true, LastSeq: 10, AccountLimit: 100}
+	require.NoError(t, db.Create(&host).Error)
+
+	processed := make(chan struct{}, 1)
+	var cancelledWrites atomic.Int32
+	config := DefaultSlurperConfig()
+	config.ConcurrencyPerHost = 1
+	config.PersistCursorPeriod = time.Hour
+	config.PersistCursorCallback = func(ctx context.Context, cursors *[]HostCursor) error {
+		if ctx.Err() != nil {
+			cancelledWrites.Add(1)
+		}
+		return r.PersistHostCursors(ctx, cursors)
+	}
+	s, err := NewSlurper(func(context.Context, *stream.XRPCStreamEvent, string, uint64) error {
+		processed <- struct{}{}
+		return nil
+	}, config)
+	require.NoError(t, err)
+	require.NoError(t, s.Subscribe(&host))
+	connection := f.next(t)
+	connection.emit(t, &stream.XRPCStreamEvent{RepoIdentity: &comatproto.SyncSubscribeRepos_Identity{
+		Seq: 11, Did: "did:plc:abcdefghijklmnopqrstuvwx", Time: "2026-09-07T12:00:00Z",
+	}})
+	select {
+	case <-processed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("source event was not processed")
+	}
+	require.Eventually(t, func() bool {
+		s.subsLk.Lock()
+		sub := s.subs[host.Hostname]
+		s.subsLk.Unlock()
+		if sub == nil {
+			return false
+		}
+		sub.lk.RLock()
+		defer sub.lk.RUnlock()
+		return sub.scheduler != nil && sub.scheduler.LastSeq() == 11
+	}, 5*time.Second, time.Millisecond)
+
+	require.NoError(t, s.Shutdown())
+	require.Zero(t, cancelledWrites.Load())
+	saved, err := r.GetHostByID(context.Background(), host.ID)
+	require.NoError(t, err)
+	require.Equal(t, int64(11), saved.LastSeq)
 }
 
 func TestSourceRestartAfterCursorStorageFailure(t *testing.T) {

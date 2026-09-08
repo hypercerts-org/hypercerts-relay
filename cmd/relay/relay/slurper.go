@@ -415,11 +415,16 @@ func (s *Slurper) subscribeWithRedialer(ctx context.Context, host *models.Host, 
 			cursor = updatedCursor
 			backoff = 0
 
+			// hypercerts: The deferred bounded flush owns cursor persistence after cancellation.
+			if ctx.Err() != nil {
+				return
+			}
+
 			// persist updated cursor
 			if s.Config.PersistCursorCallback != nil {
 				batch := []HostCursor{sub.HostCursor()}
 				if err := s.Config.PersistCursorCallback(ctx, &batch); err != nil {
-					logger.Warn("failed to persist cursor")
+					logger.Warn("failed to persist cursor", "err", err)
 				}
 			}
 		}
