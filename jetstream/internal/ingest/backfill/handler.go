@@ -134,8 +134,13 @@ func (h *SegmentHandler) handleRepo(ctx context.Context, did atmos.DID, r *repo.
 				h.abortOnWriterError(err)
 				return err
 			}
-			lastSeq = batch[len(batch)-1].Seq
-			appended = true
+			// hypercerts: Filtered records have no archive sequence; retain the last actual write.
+			for _, ev := range batch {
+				if ev.Seq > 0 {
+					lastSeq = ev.Seq
+					appended = true
+				}
+			}
 			batch = batch[:0]
 			return nil
 		}

@@ -205,6 +205,8 @@ func serveCommand() *cli.Command {
 				Sources: cli.EnvVars("JETSTREAM_CLIENT_DRAIN_TIMEOUT"),
 				Value:   10 * time.Second,
 			},
+			// hypercerts: A new archive starts fail-closed unless exact collections are supplied.
+			&cli.StringSliceFlag{Name: "collections", Usage: "Initial exact collection NSIDs for a new data directory; empty stores no records. Existing persisted policy wins.", Sources: cli.EnvVars("JETSTREAM_COLLECTIONS")},
 			&cli.StringFlag{
 				Name:    "relay-url",
 				Usage:   "Base URL of the upstream relay",
@@ -430,9 +432,12 @@ func serveOptionsFromCommand(cmd *cli.Command) (jetstreamd.Options, error) {
 	}
 
 	return jetstreamd.Options{
-		PublicAddr:                     cmd.String("addr"),
-		DebugAddr:                      cmd.String("debug-addr"),
-		DataDir:                        cmd.String("data-dir"),
+		PublicAddr: cmd.String("addr"),
+		DebugAddr:  cmd.String("debug-addr"),
+		DataDir:    cmd.String("data-dir"),
+		// hypercerts: Production serve always enforces the durable collection policy.
+		CollectionSelection:            true,
+		InitialCollections:             cmd.StringSlice("collections"),
 		RelayURL:                       cmd.String("relay-url"),
 		PLCURL:                         cmd.String("plc-url"),
 		OTelServiceName:                cmd.String("otel-service-name"),

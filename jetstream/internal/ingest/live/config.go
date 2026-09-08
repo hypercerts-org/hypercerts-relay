@@ -2,6 +2,7 @@ package live
 
 import (
 	"fmt"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 	"log/slog"
 	"time"
 
@@ -38,6 +39,8 @@ const (
 
 // Config controls Consumer behavior.
 type Config struct {
+	// hypercerts: Filter record materialization with the shared durable policy.
+	CollectionPolicy *selection.Manager
 	// DataDir is the root jetstream data directory. Optional outside the
 	// production orchestrator; forwarded to ingest.Writer for fatal
 	// persistence error context.

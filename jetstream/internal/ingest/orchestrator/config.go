@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"fmt"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 	"log/slog"
 	"net/http"
 	"time"
@@ -40,6 +41,8 @@ type CompactionPassResult struct {
 // prometheus registry. The orchestrator-level Metrics covers
 // transitions and per-state durations.
 type Config struct {
+	// hypercerts: Filter record materialization with the shared durable policy.
+	CollectionPolicy *selection.Manager
 	// DataDir is the root data directory. The orchestrator writes to
 	// <DataDir>/segments and <DataDir>/backfill/live_segments.
 	DataDir string

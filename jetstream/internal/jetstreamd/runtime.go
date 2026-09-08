@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 	"log/slog"
 	"path/filepath"
 	"runtime"
@@ -43,7 +44,9 @@ import (
 
 // Runtime is one fully constructed jetstream daemon instance.
 type Runtime struct {
-	opts Options
+	// hypercerts: Runtime-owned durable policy is shared by every acquisition writer.
+	CollectionPolicy *selection.Manager
+	opts             Options
 
 	processLogger *slog.Logger
 	logger        *slog.Logger
@@ -204,6 +207,13 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		return fail(err)
 	}
 	rt.metaStore = metaStore
+	// hypercerts: Restore policy before any archive producer starts.
+	if opts.CollectionSelection {
+		rt.CollectionPolicy, err = selection.Open(metaStore, opts.InitialCollections)
+		if err != nil {
+			return fail(err)
+		}
+	}
 
 	importRules, err := timestamp.OpenRuleStore(timestamp.RuleStoreConfig{
 		DataDir: opts.DataDir,
@@ -359,15 +369,17 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		}
 	}
 	orch, err := orchestrator.New(orchestrator.Config{
-		DataDir:        opts.DataDir,
-		FS:             opts.StorageFS,
-		Store:          metaStore,
-		RelayURL:       opts.RelayURL,
-		HTTPClient:     xrpcClient.HTTPClient.Val(),
-		Directory:      directory,
-		Verifier:       verifier,
-		SyncStateStore: stateStore,
-		Tombstones:     tombstones,
+		// hypercerts: A single policy owner spans bootstrap, live, retries and restart.
+		CollectionPolicy: rt.CollectionPolicy,
+		DataDir:          opts.DataDir,
+		FS:               opts.StorageFS,
+		Store:            metaStore,
+		RelayURL:         opts.RelayURL,
+		HTTPClient:       xrpcClient.HTTPClient.Val(),
+		Directory:        directory,
+		Verifier:         verifier,
+		SyncStateStore:   stateStore,
+		Tombstones:       tombstones,
 		// Bare logger; orchestrator.New attaches component=orchestrator
 		// itself, and its children (live, ingest, backfill) attach
 		// their own component on top of the bare parent.

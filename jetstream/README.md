@@ -60,6 +60,7 @@ Run it behind the owned Relay using a persistent, Jetstream-owned data path:
 ```bash
 JETSTREAM_RELAY_URL=http://relay:2470 \
 JETSTREAM_DATA_DIR=/data/jetstream \
+JETSTREAM_COLLECTIONS=org.hypercerts.claim.activity \
 go run ./cmd/jetstream serve
 ```
 
@@ -74,11 +75,22 @@ jetstream`. It does not publish a service or make a deployment decision.
 
 ## Hypercerts policy work
 
-TECH-587 owns versioned selected-collection policy and durable scoped backfill
-jobs. The imported upstream runtime is deliberately the baseline for that
-work, not proof that its whole-network defaults satisfy Hypercerts policy. A
-Hypercerts policy must be enforced before record payloads are materialized on
-bootstrap, live ingestion, retries, replacement syncs, and restart; required
-identity, account, sync, delete, cursor, and progress behavior remains
-durable. Job outcomes must identify the source and policy revision and report
-unavailable history as incomplete.
+`serve` opens a durable global exact-NSID policy before ingestion. On a new data
+directory, `JETSTREAM_COLLECTIONS` (or `--collections`) initializes revision 1.
+The example NSID above is illustrative: configure your actual enabled collections.
+An empty list stores no record payloads; prefixes and malformed NSIDs are rejected.
+Restart restores the persisted revision, including an intentionally empty list.
+Startup environment changes do not overwrite the persisted policy.
+
+The acquisition writers enforce the same policy on bootstrap segments, temporary
+bootstrap live segments, steady-state live commits, failed-repository retries,
+and sync replacement rows, before segment or readable-log writes. Selected deletes
+and required identity/account/sync markers are retained. Filtered-only commits
+still advance the durable source/verifier boundary. Archive merging and compaction
+do not apply the current acquisition policy to previously retained rows.
+
+This boundary concerns Jetstream record materialization. Raw Relay/Rainbow data
+and transient full-repository CAR downloads can contain excluded records; this
+does not promise their absence from upstream storage or transient input buffers.
+The internal embedding API retains upstream behavior unless `CollectionSelection`
+is enabled; the production `serve` command always enables it.

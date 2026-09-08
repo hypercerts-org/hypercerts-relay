@@ -50,6 +50,8 @@ func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 
 		// Backfill writer (shared with the backfill engine).
 		bw, err := ingest.Open(ingest.Config{
+			// hypercerts: Gate direct-PDS bootstrap materialization before durable storage.
+			CollectionPolicy:       o.cfg.CollectionPolicy,
 			SegmentsDir:            segmentsDir,
 			DataDir:                o.cfg.DataDir,
 			FS:                     o.cfg.FS,
@@ -67,6 +69,8 @@ func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 
 		// Bootstrap-time live consumer.
 		bootstrapLive, err := live.Open(live.Config{
+			// hypercerts: Bootstrap and restart share the same persisted collection policy.
+			CollectionPolicy:  o.cfg.CollectionPolicy,
 			DataDir:           o.cfg.DataDir,
 			SegmentsDir:       liveSegmentsDir,
 			FS:                o.cfg.FS,

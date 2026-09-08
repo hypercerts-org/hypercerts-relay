@@ -62,6 +62,8 @@ type jetstreamProcess struct {
 }
 
 func startJetstreamForTest(t *testing.T, ctx context.Context, bin string, args []string, output *lockedBuffer) *jetstreamProcess {
+	// hypercerts: Upstream simulator fixtures explicitly select their five generated collections.
+	args = append(append([]string(nil), args...), "--collections=app.bsky.feed.post,app.bsky.feed.like,app.bsky.graph.follow,app.bsky.feed.repost,app.bsky.actor.profile")
 	t.Helper()
 
 	cmd := newJetstreamCmd(ctx, bin, args)

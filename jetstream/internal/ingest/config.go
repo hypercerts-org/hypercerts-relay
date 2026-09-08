@@ -3,6 +3,7 @@ package ingest
 import (
 	"context"
 	"fmt"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 	"log/slog"
 
 	"github.com/bluesky-social/jetstream/internal/store"
@@ -35,6 +36,8 @@ const defaultMaxEventsPerBlock = segment.DefaultMaxEventsPerBlock
 
 // Config controls Writer behavior.
 type Config struct {
+	// hypercerts: Filter record materialization with the shared durable policy.
+	CollectionPolicy *selection.Manager
 	// DataDir is the root jetstream data directory. Optional outside the
 	// production orchestrator; when set it is included in fatal persistence
 	// errors such as ENOSPC.

@@ -332,6 +332,7 @@ func (w *Writer) SealActiveAndClose() error {
 // mutates ev.Seq in place to the allocated value; on error ev.Seq
 // is left untouched so callers can safely retry without observing
 // a phantom allocation. Goroutine-safe.
+// hypercerts: A policy-filtered row succeeds with Seq=0 and writes no bytes.
 func (w *Writer) Append(ctx context.Context, ev *segment.Event) error {
 	if w.async != nil {
 		w.drainMu.Lock()
@@ -370,6 +371,7 @@ func (w *Writer) Append(ctx context.Context, ev *segment.Event) error {
 // allocated value. On an error before an event is appended, that event and all
 // later events are left untouched. If a flush or hook fails after appending an
 // event, the error semantics match Append.
+// hypercerts: Filtered rows are left with Seq=0; only retained rows allocate sequences.
 func (w *Writer) AppendBatch(ctx context.Context, events []segment.Event) error {
 	if len(events) == 0 {
 		return nil
@@ -408,6 +410,12 @@ func (w *Writer) appendLocked(ctx context.Context, ev *segment.Event) (*asyncFlu
 	if w.closed {
 		w.cfg.Metrics.incAppendErrors()
 		return nil, ErrClosed
+	}
+
+	// hypercerts: Selection precedes segment bytes, timestamps, and read-log publication.
+	if !w.cfg.CollectionPolicy.Allows(ev) {
+		ev.Seq = 0
+		return nil, nil
 	}
 
 	candidate := *ev

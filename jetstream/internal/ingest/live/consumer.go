@@ -120,6 +120,8 @@ func Open(cfg Config) (*Consumer, error) {
 	}
 
 	w, err := ingest.Open(ingest.Config{
+		// hypercerts: The writer also gates sync replacements and retry materializations.
+		CollectionPolicy:      cfg.CollectionPolicy,
 		SegmentsDir:           cfg.SegmentsDir,
 		FS:                    cfg.FS,
 		DataDir:               cfg.DataDir,
@@ -473,6 +475,30 @@ func (c *Consumer) Run(ctx context.Context) error {
 		return fmt.Errorf("livestream: new client: %w", err)
 	}
 	c.client.Store(client)
+	// hypercerts: An excluded-only stream still checkpoints metadata, ordered
+	// behind every pending selected write. Persistence failure stops ingestion.
+	if c.cfg.CollectionPolicy != nil {
+		var cancel context.CancelCauseFunc
+		ctx, cancel = context.WithCancelCause(ctx)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					if err := c.writer.DrainDurability(ctx); err != nil {
+						cancel(fmt.Errorf("selection progress checkpoint: %w", err))
+						return
+					}
+				}
+			}
+		}()
+		defer func() { cancel(nil); <-done }()
+	}
 	defer func() {
 		// On a clean ctx-cancel shutdown atmos's Events iterator has
 		// already torn the socket down (consumeLoop calls conn.CloseNow
@@ -505,7 +531,7 @@ func (c *Consumer) Run(ctx context.Context) error {
 		}
 	}
 
-	return ctx.Err()
+	return context.Cause(ctx)
 }
 
 // noteStreamError records one stream-level (nil, err) yield from the
@@ -724,8 +750,8 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 				c.maybeTriggerCompaction()
 
 				// Forward to downstream subscribers AFTER durable append.
-				// segEvts[i].Seq has been populated by Append.
-				if c.cfg.OnEvent != nil {
+				// hypercerts: Seq=0 means the policy filtered this row before storage.
+				if c.cfg.OnEvent != nil && segEvts[i].Seq != 0 {
 					c.cfg.OnEvent(&segEvts[i])
 				}
 			}
