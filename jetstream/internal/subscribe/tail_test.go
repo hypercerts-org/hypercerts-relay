@@ -76,6 +76,8 @@ func TestTail_ReadFrom_CtxCancelWhileBlocked(t *testing.T) {
 	tl, w := newReadLogTail(t, 1<<20, noCold)
 	appendToWriter(t, w, &segment.Event{Kind: segment.KindCreate, DID: "did:plc:h", Payload: []byte{0xa0}})
 	ctx, cancel := context.WithCancel(context.Background())
+	// hypercerts: Keep cancellation owned by the test even if its callback fails.
+	defer cancel()
 	go func() {
 		waitTailBlocked(t, tl)
 		cancel()

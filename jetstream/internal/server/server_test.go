@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -92,14 +93,29 @@ func TestDebugHandler_Readyz(t *testing.T) {
 	require.Equal(t, "ok\n", mustGet(t, base+"/readyz"))
 }
 
+// hypercerts: Profiling is an independent opt-in on the operations listener.
 func TestDebugHandler_Pprof(t *testing.T) {
-	t.Parallel()
-	base := mountDebug(t, newServer(t))
-
-	resp, err := doGet(t.Context(), base+"/debug/pprof/")
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = resp.Body.Close() })
-	require.Equal(t, http.StatusOK, resp.StatusCode)
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprint(enabled), func(t *testing.T) {
+			srv := New(Config{PublicAddr: "127.0.0.1:0", DebugAddr: "127.0.0.1:0", EnablePprof: enabled, ShutdownTimeout: time.Second}, slog.Default(), obs.NewMetrics())
+			debugURL := mountDebug(t, srv)
+			publicURL := mountPublic(t, srv)
+			for _, path := range []string{"/debug/pprof/", "/debug/pprof/heap", "/debug/pprof/cmdline", "/debug/pprof/symbol"} {
+				resp, err := doGet(t.Context(), debugURL+path)
+				require.NoError(t, err)
+				resp.Body.Close()
+				want := http.StatusNotFound
+				if enabled {
+					want = http.StatusOK
+				}
+				require.Equal(t, want, resp.StatusCode, path)
+				resp, err = doGet(t.Context(), publicURL+path)
+				require.NoError(t, err)
+				resp.Body.Close()
+				require.Equal(t, http.StatusNotFound, resp.StatusCode)
+			}
+		})
+	}
 }
 
 // TestServer_RecordsMetricsForPublicRequests is the one cross-cutting test

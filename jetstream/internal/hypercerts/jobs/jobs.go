@@ -382,22 +382,42 @@ func (m *Manager) Run(ctx context.Context, process Processor) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		m.mu.Lock()
-		var job Job
-		for _, j := range m.data.Jobs {
-			if j.State == Pending {
-				job = j
-				break
-			}
+		worked, err := m.runNext(ctx, process)
+		if err != nil {
+			return err
 		}
-		if job.ID == "" {
-			m.mu.Unlock()
+		if !worked {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
 			case <-ticker.C:
-				continue
 			}
+		}
+	}
+}
+
+// Claim and register cancellation under the same lock so removal/policy changes
+// cannot slip between the durable Running transition and the active worker.
+func (m *Manager) runNext(ctx context.Context, process Processor) (bool, error) {
+	m.mu.Lock()
+	job, err := m.claimNextLocked()
+	if err != nil || job.ID == "" {
+		m.mu.Unlock()
+		return false, err
+	}
+	jobCtx, cancel := context.WithCancel(ctx)
+	m.cancel = cancel
+	m.runningID = job.ID
+	m.mu.Unlock()
+	processErr := process(jobCtx, clone(job))
+	cancel()
+	return true, m.finishJob(ctx, job.ID, processErr)
+}
+
+func (m *Manager) claimNextLocked() (Job, error) {
+	for _, job := range m.data.Jobs {
+		if job.State != Pending {
+			continue
 		}
 		next := clone(m.data)
 		job.State = Running
@@ -405,50 +425,52 @@ func (m *Manager) Run(ctx context.Context, process Processor) error {
 		job.StartedAt = time.Now().UTC()
 		next.Jobs[job.ID] = job
 		if err := m.commit(next); err != nil {
-			m.mu.Unlock()
-			return err
+			return Job{}, err
 		}
-		jobCtx, cancel := context.WithCancel(ctx)
-		m.cancel = cancel
-		m.runningID = job.ID
-		m.mu.Unlock()
-		err := process(jobCtx, clone(job))
-		cancel()
-		m.mu.Lock()
-		m.cancel = nil
-		m.runningID = ""
-		if ctx.Err() != nil {
-			m.mu.Unlock()
-			return ctx.Err()
-		} // persisted Running resumes on Open.
-		if !m.active(job.ID) {
-			m.mu.Unlock()
-			continue
-		}
-		next = clone(m.data)
-		job = next.Jobs[job.ID]
-		job.FinishedAt = time.Now().UTC()
-		job.State = Complete
-		if err != nil {
-			var input *InputError
-			if errors.As(err, &input) {
-				job.State = Failed
-				if input.Unavailable {
-					job.State = Incomplete
-				}
-				job.ErrorCode = input.Code
-			} else if errors.Is(err, context.Canceled) {
-				job.State = Pending
-			} else {
-				m.mu.Unlock()
-				return err
-			} // local persistence/invariant failures stop the runtime.
-		}
-		next.Jobs[job.ID] = job
-		if err := m.commit(next); err != nil {
-			m.mu.Unlock()
-			return err
-		}
-		m.mu.Unlock()
+		return job, nil
 	}
+	return Job{}, nil
+}
+
+func (m *Manager) finishJob(ctx context.Context, id string, processErr error) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cancel = nil
+	m.runningID = ""
+	if err := ctx.Err(); err != nil {
+		return err
+	} // Persisted Running resumes on Open.
+	if !m.active(id) {
+		return nil
+	}
+	state, code, err := jobOutcome(processErr)
+	if err != nil {
+		return err
+	} // Local persistence/invariant failures stop the runtime.
+	next := clone(m.data)
+	job := next.Jobs[id]
+	job.FinishedAt = time.Now().UTC()
+	job.State = state
+	if code != "" {
+		job.ErrorCode = code
+	}
+	next.Jobs[id] = job
+	return m.commit(next)
+}
+
+func jobOutcome(err error) (State, string, error) {
+	if err == nil {
+		return Complete, "", nil
+	}
+	var input *InputError
+	if errors.As(err, &input) {
+		if input.Unavailable {
+			return Incomplete, input.Code, nil
+		}
+		return Failed, input.Code, nil
+	}
+	if errors.Is(err, context.Canceled) {
+		return Pending, "", nil
+	}
+	return "", "", err
 }

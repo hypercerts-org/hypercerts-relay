@@ -146,8 +146,11 @@ then set `JETSTREAM_CONTROL_TOKEN_FILE=/run/secrets/jetstream-control` and
 `JETSTREAM_DEBUG_ADDR=127.0.0.1:6060` (or use the matching CLI flags). The token is
 read at startup; rotation requires restart. No credential means no control routes.
 A credential without an operations listener is a configuration error. Keep this
-listener private: its existing metrics and pprof endpoints have their existing
-access behavior. The control routes require `Authorization: Bearer <credential>`
+listener private: metrics retain their existing access behavior. Profiling is
+disabled even when this listener is enabled. For a diagnostic session, explicitly
+set `JETSTREAM_ENABLE_PPROF=true` (or `--enable-pprof`); without a private listener
+this is a configuration error. The enabled pprof routes are unauthenticated and
+must stay on private transport. Restart with the option unset to disable them. The control routes require `Authorization: Bearer <credential>`
 and return `Cache-Control: no-store`. Use TLS/private transport between services.
 The public listener does not expose the API. This is a service contract for the
 separate administration control plane, not the OAuth administration UI.

@@ -88,6 +88,12 @@ func TestHypercertsPrivateInterfaceReportsUnavailablePDS(t *testing.T) {
 	require.Equal(t, unavailable.URL, response.Jobs[0].PDS)
 	require.Equal(t, uint64(1), response.Jobs[0].Policy.Revision)
 	require.False(t, response.Jobs[0].HistoryComplete)
+	// Enabling control must leave profiling disabled on the same listener.
+	resp, err := http.Get("http://" + private.Addr().String() + "/debug/pprof/")
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusNotFound, resp.StatusCode)
+
 	status, body = fetch("http://"+rt.PublicAddr(), opts.ControlToken)
 	require.Equal(t, 404, status)
 	require.NotContains(t, string(body), unavailable.URL)
@@ -103,4 +109,12 @@ func TestHypercertsControlRequiresManagedPolicyAndPrivateListener(t *testing.T) 
 		_, err := Build(t.Context(), opts)
 		require.Error(t, err)
 	}
+}
+
+func TestHypercertsProfilingRequiresPrivateListener(t *testing.T) {
+	opts := testOptions(t)
+	opts.EnablePprof = true
+	opts.DebugAddr = ""
+	_, err := Build(t.Context(), opts)
+	require.ErrorContains(t, err, "profiling requires a private debug listener")
 }

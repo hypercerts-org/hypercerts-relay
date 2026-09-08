@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/store"
@@ -72,118 +73,19 @@ func (w *Writer) ReconcileSnapshot(ctx context.Context, snapshot Snapshot) error
 	if err := w.flushAndRotateLocked(ctx); err != nil {
 		return err
 	}
-	latest := map[string]segment.Event{}
-	var syncRev string
-	var accountSeq uint64
-	var accountUnavailable bool
-	files, err := SegmentFilesFS(w.cfg.FS, w.cfg.SegmentsDir)
+	state, err := w.scanSnapshotArchive(ctx, snapshot)
 	if err != nil {
 		return err
 	}
-	visit := func(rows []segment.Event) error {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		for _, row := range rows {
-			if row.DID != snapshot.DID {
-				continue
-			}
-			if row.Kind == segment.KindAccount && row.Seq > accountSeq {
-				var account comatproto.SyncSubscribeRepos_Account
-				if err := account.UnmarshalCBOR(row.Payload); err != nil {
-					return err
-				}
-				accountSeq = row.Seq
-				accountUnavailable = !account.Active
-			}
-			if row.Kind == segment.KindSync && row.Rev > syncRev {
-				syncRev = row.Rev
-			}
-			if !row.Kind.IsCommit() || !slices.Contains(snapshot.Collections, row.Collection) {
-				continue
-			}
-			key := row.Collection + "/" + row.Rkey
-			old, ok := latest[key]
-			if !ok || row.Rev > old.Rev || row.Rev == old.Rev && row.Seq > old.Seq {
-				row.Payload = nil
-				latest[key] = row
-			}
-		}
-		return nil
-	}
-	for _, file := range files {
-		r, err := segment.Open(segment.ReaderConfig{Path: file.Path, FS: w.cfg.FS})
-		if errors.Is(err, segment.ErrActiveSegment) {
-			err = segment.WalkActiveFS(w.cfg.FS, file.Path, visit)
-		} else if err == nil {
-			for i := range r.Blocks() {
-				rows, e := r.DecodeBlock(i)
-				if e != nil {
-					err = e
-					break
-				}
-				if e = visit(rows); e != nil {
-					err = e
-					break
-				}
-			}
-			closeErr := r.Close()
-			if err == nil {
-				err = closeErr
-			}
-		}
-		if err != nil {
-			return fmt.Errorf("snapshot archive scan: %w", err)
-		}
-	}
-	if accountUnavailable {
+	if state.accountUnavailable {
 		return ErrAccountUnavailable
 	}
-	if syncRev > snapshot.Rev {
+	if state.syncRev > snapshot.Rev {
 		return nil
 	} // A newer whole-repo replacement already won.
-	keys := map[string]bool{}
-	var rows []segment.Event
-	for _, row := range snapshot.Records {
-		if row.DID != snapshot.DID || row.Rev != snapshot.Rev || !slices.Contains(snapshot.Collections, row.Collection) || !row.Kind.IsMaterialization() {
-			return errors.New("snapshot record outside verified scope")
-		}
-		key := row.Collection + "/" + row.Rkey
-		if keys[key] {
-			return errors.New("duplicate snapshot record")
-		}
-		keys[key] = true
-		if old, ok := latest[key]; ok && old.Rev >= row.Rev {
-			continue
-		}
-		row.Kind = segment.KindUpdate // Scoped replacement invalidates older versions of this key.
-		rows = append(rows, row)
-	}
-	for key, old := range latest {
-		if keys[key] || old.Kind == segment.KindDelete || old.Rev >= snapshot.Rev || old.Rev < syncRev {
-			continue
-		}
-		rows = append(rows, segment.Event{Kind: segment.KindDelete, DID: snapshot.DID, Rev: snapshot.Rev, Collection: old.Collection, Rkey: old.Rkey, WitnessedAt: time.Now().UnixMicro()})
-	}
-	slices.SortFunc(rows, func(a, b segment.Event) int {
-		if a.Collection != b.Collection {
-			if a.Collection < b.Collection {
-				return -1
-			}
-			return 1
-		}
-		if a.Rkey < b.Rkey {
-			return -1
-		}
-		if a.Rkey > b.Rkey {
-			return 1
-		}
-		return 0
-	})
-	for _, row := range rows {
-		if err := segment.ValidateEvent(row); err != nil {
-			return err
-		}
+	rows, err := state.planReplacement(snapshot)
+	if err != nil {
+		return err
 	}
 	for i := range rows {
 		if err := ctx.Err(); err != nil {
@@ -196,6 +98,144 @@ func (w *Writer) ReconcileSnapshot(ctx context.Context, snapshot Snapshot) error
 	if err := w.flushAndRotateLocked(ctx); err != nil {
 		return err
 	}
+	return w.persistSnapshotBoundary(snapshot)
+}
+
+// snapshotArchiveState retains only metadata needed to reconcile one DID.
+type snapshotArchiveState struct {
+	latest             map[string]segment.Event
+	syncRev            string
+	accountSeq         uint64
+	accountUnavailable bool
+}
+
+func (s *snapshotArchiveState) observe(snapshot Snapshot, row segment.Event) error {
+	if row.DID != snapshot.DID {
+		return nil
+	}
+	if row.Kind == segment.KindAccount && row.Seq > s.accountSeq {
+		var account comatproto.SyncSubscribeRepos_Account
+		if err := account.UnmarshalCBOR(row.Payload); err != nil {
+			return err
+		}
+		s.accountSeq = row.Seq
+		s.accountUnavailable = !account.Active
+	}
+	if row.Kind == segment.KindSync && row.Rev > s.syncRev {
+		s.syncRev = row.Rev
+	}
+	if row.Kind.IsCommit() && slices.Contains(snapshot.Collections, row.Collection) {
+		s.observeRecord(row)
+	}
+	return nil
+}
+
+func (s *snapshotArchiveState) observeRecord(row segment.Event) {
+	key := row.Collection + "/" + row.Rkey
+	old, ok := s.latest[key]
+	if !ok || row.Rev > old.Rev || row.Rev == old.Rev && row.Seq > old.Seq {
+		row.Payload = nil
+		s.latest[key] = row
+	}
+}
+
+// Caller holds writer/rewrite locks throughout this scan and the later write.
+func (w *Writer) scanSnapshotArchive(ctx context.Context, snapshot Snapshot) (*snapshotArchiveState, error) {
+	state := &snapshotArchiveState{latest: map[string]segment.Event{}}
+	files, err := SegmentFilesFS(w.cfg.FS, w.cfg.SegmentsDir)
+	if err != nil {
+		return nil, err
+	}
+	visit := func(rows []segment.Event) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		for _, row := range rows {
+			if err := state.observe(snapshot, row); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	for _, file := range files {
+		if err := w.walkSnapshotSegment(file.Path, visit); err != nil {
+			return nil, fmt.Errorf("snapshot archive scan: %w", err)
+		}
+	}
+	return state, nil
+}
+
+func (w *Writer) walkSnapshotSegment(path string, visit func([]segment.Event) error) (err error) {
+	r, err := segment.Open(segment.ReaderConfig{Path: path, FS: w.cfg.FS})
+	if errors.Is(err, segment.ErrActiveSegment) {
+		return segment.WalkActiveFS(w.cfg.FS, path, visit)
+	}
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := r.Close(); err == nil {
+			err = closeErr
+		}
+	}()
+	for i := range r.Blocks() {
+		rows, err := r.DecodeBlock(i)
+		if err != nil {
+			return err
+		}
+		if err := visit(rows); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *snapshotArchiveState) planReplacement(snapshot Snapshot) ([]segment.Event, error) {
+	keys := map[string]bool{}
+	var rows []segment.Event
+	for _, row := range snapshot.Records {
+		if row.DID != snapshot.DID || row.Rev != snapshot.Rev || !slices.Contains(snapshot.Collections, row.Collection) || !row.Kind.IsMaterialization() {
+			return nil, errors.New("snapshot record outside verified scope")
+		}
+		key := row.Collection + "/" + row.Rkey
+		if keys[key] {
+			return nil, errors.New("duplicate snapshot record")
+		}
+		keys[key] = true
+		if old, ok := s.latest[key]; ok && old.Rev >= row.Rev {
+			continue
+		}
+		row.Kind = segment.KindUpdate // Scoped replacement invalidates older versions of this key.
+		rows = append(rows, row)
+	}
+	rows = append(rows, s.missingRecordDeletes(snapshot, keys)...)
+	slices.SortFunc(rows, func(a, b segment.Event) int {
+		if order := strings.Compare(a.Collection, b.Collection); order != 0 {
+			return order
+		}
+		return strings.Compare(a.Rkey, b.Rkey)
+	})
+	for _, row := range rows {
+		if err := segment.ValidateEvent(row); err != nil {
+			return nil, err
+		}
+	}
+	return rows, nil
+}
+
+func (s *snapshotArchiveState) missingRecordDeletes(snapshot Snapshot, keys map[string]bool) []segment.Event {
+	var rows []segment.Event
+	for key, old := range s.latest {
+		if keys[key] || old.Kind == segment.KindDelete || old.Rev >= snapshot.Rev || old.Rev < s.syncRev {
+			continue
+		}
+		rows = append(rows, segment.Event{Kind: segment.KindDelete, DID: snapshot.DID, Rev: snapshot.Rev, Collection: old.Collection, Rkey: old.Rkey, WitnessedAt: time.Now().UnixMicro()})
+	}
+	return rows
+}
+
+// Called only after the replacement rows have crossed the archive durability boundary.
+func (w *Writer) persistSnapshotBoundary(snapshot Snapshot) error {
 	previous := snapshotBoundary{Revisions: map[string]string{}}
 	if b, closer, err := w.cfg.Store.Get(snapshotKey(snapshot.DID)); err == nil {
 		err = json.Unmarshal(b, &previous)

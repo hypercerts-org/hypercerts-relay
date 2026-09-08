@@ -183,9 +183,11 @@ func serveCommand() *cli.Command {
 				Sources: cli.EnvVars("JETSTREAM_ADDR"),
 				Value:   ":8080",
 			},
+			// hypercerts: Control and metrics do not require profiling endpoints.
+			&cli.BoolFlag{Name: "enable-pprof", Usage: "Explicitly enable profiling on the private debug listener", Sources: cli.EnvVars("JETSTREAM_ENABLE_PPROF")},
 			&cli.StringFlag{
 				Name:    "debug-addr",
-				Usage:   "Bind address for the debug HTTP listener (metrics, pprof, health). Empty disables it.",
+				Usage:   "Bind address for the private HTTP listener (metrics, control, health). Empty disables it.",
 				Sources: cli.EnvVars("JETSTREAM_DEBUG_ADDR"),
 				Value:   "",
 			},
@@ -458,6 +460,7 @@ func serveOptionsFromCommand(cmd *cli.Command) (jetstreamd.Options, error) {
 		ControlToken: controlToken,
 		PublicAddr:   cmd.String("addr"),
 		DebugAddr:    cmd.String("debug-addr"),
+		EnablePprof:  cmd.Bool("enable-pprof"),
 		DataDir:      cmd.String("data-dir"),
 		// hypercerts: Production serve always enforces the durable collection policy.
 		CollectionSelection:            true,

@@ -19,6 +19,8 @@ import (
 
 const Prefix = "/hypercerts/v1"
 
+const sourcesPath = Prefix + "/sources"
+
 type Handler struct {
 	jobs   *jobs.Manager
 	policy *selection.Manager
@@ -37,11 +39,11 @@ func New(token string, manager *jobs.Manager, policy *selection.Manager) (*Handl
 	h := &Handler{jobs: manager, policy: policy, token: sha256.Sum256([]byte(token)), mux: http.NewServeMux()}
 	h.mux.HandleFunc("GET "+Prefix+"/policy", func(w http.ResponseWriter, r *http.Request) { reply(w, http.StatusOK, h.policy.Current()) })
 	h.mux.HandleFunc("PUT "+Prefix+"/policy", h.setPolicy)
-	h.mux.HandleFunc("GET "+Prefix+"/sources", func(w http.ResponseWriter, r *http.Request) {
+	h.mux.HandleFunc("GET "+sourcesPath, func(w http.ResponseWriter, r *http.Request) {
 		reply(w, http.StatusOK, map[string]any{"sources": h.jobs.Sources()})
 	})
-	h.mux.HandleFunc("POST "+Prefix+"/sources", h.addSource)
-	h.mux.HandleFunc("DELETE "+Prefix+"/sources", h.removeSource)
+	h.mux.HandleFunc("POST "+sourcesPath, h.addSource)
+	h.mux.HandleFunc("DELETE "+sourcesPath, h.removeSource)
 	h.mux.HandleFunc("GET "+Prefix+"/jobs", h.listJobs)
 	h.mux.HandleFunc("GET "+Prefix+"/jobs/{id}", h.getJob)
 	h.mux.HandleFunc("POST "+Prefix+"/jobs", h.requestJob)

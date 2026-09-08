@@ -65,17 +65,45 @@ func inputFailure(ctx context.Context, code string) error {
 func (p PDSProcessor) repository(ctx context.Context, client *atmossync.Client, job Job, entry atmossync.ListReposEntry) error {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	ident, err := p.Directory.LookupDID(ctx, entry.DID)
+	if err := p.verifySource(ctx, entry.DID, job.PDS); err != nil {
+		return err
+	}
+	r, commit, err := fetchRepository(ctx, client, entry.DID)
+	if err != nil {
+		return err
+	}
+	if err := p.verifySnapshot(ctx, client, job, entry, commit); err != nil {
+		return err
+	}
+	snapshot, err := projectSnapshot(ctx, job, entry.DID, r, commit.Rev)
+	if err != nil {
+		return err
+	}
+	if err := p.Manager.Apply(job.ID, func() error { return p.Reconcile(ctx, snapshot) }); err != nil {
+		if errors.Is(err, ingest.ErrAccountUnavailable) {
+			return &InputError{Code: "account_unavailable", Unavailable: true}
+		}
+		return err
+	}
+	return p.Manager.Checkpoint(job.ID, string(entry.DID), commit.Rev, job.Cursor)
+}
+
+func (p PDSProcessor) verifySource(ctx context.Context, did atmos.DID, pds string) error {
+	ident, err := p.Directory.LookupDID(ctx, did)
 	if err != nil {
 		return inputFailure(ctx, "identity_unavailable")
 	}
 	actual, err := normalizeSource(ident.PDSEndpoint())
-	if err != nil || actual != job.PDS {
+	if err != nil || actual != pds {
 		return &InputError{Code: "source_changed", Unavailable: true}
 	}
-	body, err := client.GetRepoStream(ctx, entry.DID, "")
+	return nil
+}
+
+func fetchRepository(ctx context.Context, client *atmossync.Client, did atmos.DID) (*repo.Repo, *repo.Commit, error) {
+	body, err := client.GetRepoStream(ctx, did, "")
 	if err != nil {
-		return inputFailure(ctx, "repository_unavailable")
+		return nil, nil, inputFailure(ctx, "repository_unavailable")
 	}
 	defer body.Close()
 	// Bound transient full-CAR input. Exceeding the bound is explicit incomplete
@@ -83,11 +111,15 @@ func (p PDSProcessor) repository(ctx context.Context, client *atmossync.Client, 
 	limited := &io.LimitedReader{R: body, N: 64 << 20}
 	r, commit, err := repo.LoadFromCAR(limited)
 	if limited.N == 0 {
-		return &InputError{Code: "repository_size_limit", Unavailable: true}
+		return nil, nil, &InputError{Code: "repository_size_limit", Unavailable: true}
 	}
 	if err != nil {
-		return &InputError{Code: "invalid_repository"}
+		return nil, nil, &InputError{Code: "invalid_repository"}
 	}
+	return r, commit, nil
+}
+
+func (p PDSProcessor) verifySnapshot(ctx context.Context, client *atmossync.Client, job Job, entry atmossync.ListReposEntry, commit *repo.Commit) error {
 	if commit.DID != string(entry.DID) {
 		return &InputError{Code: "repository_did_mismatch"}
 	}
@@ -99,20 +131,19 @@ func (p PDSProcessor) repository(ctx context.Context, client *atmossync.Client, 
 		if err := client.VerifyCommit(ctx, commit); err != nil {
 			return &InputError{Code: "verification_failed"}
 		}
-		refreshed, err := p.Directory.LookupDID(ctx, entry.DID)
-		if err != nil {
-			return inputFailure(ctx, "identity_unavailable")
-		}
-		refreshedSource, err := normalizeSource(refreshed.PDSEndpoint())
-		if err != nil || refreshedSource != job.PDS {
-			return &InputError{Code: "source_changed", Unavailable: true}
+		if err := p.verifySource(ctx, entry.DID, job.PDS); err != nil {
+			return err
 		}
 	}
 	if commit.Rev < entry.Rev {
 		return &InputError{Code: "snapshot_behind_listing", Unavailable: true}
 	}
-	snapshot := ingest.Snapshot{DID: string(entry.DID), Rev: commit.Rev, Collections: job.Policy.Collections}
-	err = r.Tree.Walk(func(key string, cid cbor.CID) error {
+	return nil
+}
+
+func projectSnapshot(ctx context.Context, job Job, did atmos.DID, r *repo.Repo, rev string) (ingest.Snapshot, error) {
+	snapshot := ingest.Snapshot{DID: string(did), Rev: rev, Collections: job.Policy.Collections}
+	err := r.Tree.Walk(func(key string, cid cbor.CID) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -124,7 +155,7 @@ func (p PDSProcessor) repository(ctx context.Context, client *atmossync.Client, 
 		if err != nil {
 			return err
 		}
-		event := segment.Event{Kind: segment.KindCreateResync, DID: string(entry.DID), Rev: commit.Rev, Collection: collection, Rkey: rkey, Payload: payload, WitnessedAt: time.Now().UnixMicro()}
+		event := segment.Event{Kind: segment.KindCreateResync, DID: string(did), Rev: rev, Collection: collection, Rkey: rkey, Payload: payload, WitnessedAt: time.Now().UnixMicro()}
 		if err := segment.ValidateEvent(event); err != nil {
 			return err
 		}
@@ -133,15 +164,9 @@ func (p PDSProcessor) repository(ctx context.Context, client *atmossync.Client, 
 	})
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
-			return err
+			return ingest.Snapshot{}, err
 		}
-		return &InputError{Code: "unrepresentable_snapshot", Unavailable: true}
+		return ingest.Snapshot{}, &InputError{Code: "unrepresentable_snapshot", Unavailable: true}
 	}
-	if err := p.Manager.Apply(job.ID, func() error { return p.Reconcile(ctx, snapshot) }); err != nil {
-		if errors.Is(err, ingest.ErrAccountUnavailable) {
-			return &InputError{Code: "account_unavailable", Unavailable: true}
-		}
-		return err
-	}
-	return p.Manager.Checkpoint(job.ID, string(entry.DID), commit.Rev, job.Cursor)
+	return snapshot, nil
 }

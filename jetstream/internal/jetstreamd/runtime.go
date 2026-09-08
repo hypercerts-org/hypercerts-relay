@@ -82,6 +82,10 @@ type Runtime struct {
 // Build constructs the production service graph without starting listeners or
 // ingestion. Call Run to drive the graph, then Close during shutdown.
 func Build(ctx context.Context, opts Options) (*Runtime, error) {
+	// hypercerts: Reject an ineffective profiling request before opening persistent state.
+	if opts.EnablePprof && opts.DebugAddr == "" && opts.DebugListener == nil {
+		return nil, errors.New("profiling requires a private debug listener")
+	}
 	if opts.SegmentCacheMaxAge < 0 {
 		return nil, fmt.Errorf("serve: --segment-cache-max-age must be >= 0 (SegmentCacheMaxAge must be >= 0), got %s", opts.SegmentCacheMaxAge)
 	}
@@ -538,6 +542,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	}
 	srv := server.New(server.Config{
 		PrivateControlHandler: controlHandler,
+		EnablePprof:           opts.EnablePprof,
 		PublicAddr:            opts.PublicAddr,
 		DebugAddr:             opts.DebugAddr,
 		ShutdownTimeout:       opts.ShutdownTimeout,

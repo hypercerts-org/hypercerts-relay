@@ -412,6 +412,8 @@ document.addEventListener("input", function (event) {
     <a class="{{if eq .Request.HostSort "largest"}}active{{end}}" href="/status?tab=hosts&amp;sort=largest">Largest hosts</a>
     <a class="{{if eq .Request.HostSort "failing"}}active{{end}}" href="/status?tab=hosts&amp;sort=failing">Failing hosts</a>
   </div>
+  {{/* hypercerts: Name the filter for assistive technology. */}}
+  <label for="host-filter">Filter hosts</label>
   <input id="host-filter" class="filter" placeholder="filter host, class, DID, or error">
   {{if .Hosts.Rows}}
   <div class="table-wrap">
@@ -472,7 +474,9 @@ document.addEventListener("input", function (event) {
   <h2>Accounts</h2>
   <form method="get" action="/status" class="toolbar">
     <input type="hidden" name="tab" value="accounts">
-    <input name="account" class="lookup-input" placeholder="DID or handle" value="{{.Request.Account}}">
+    {{/* hypercerts: Associate account lookup with a visible label. */}}
+    <label for="account-lookup">DID or handle</label>
+    <input id="account-lookup" name="account" class="lookup-input" placeholder="DID or handle" value="{{.Request.Account}}">
     <button type="submit">Lookup</button>
   </form>
 

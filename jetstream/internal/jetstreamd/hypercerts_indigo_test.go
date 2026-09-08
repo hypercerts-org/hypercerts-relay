@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -77,6 +78,9 @@ func TestHypercertsIndigoArchiveRestartAndLive(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		done := make(chan error, 1)
 		go func() { done <- rt.Run(ctx) }()
+		// Register before assertions: explicit restart and failed setup share cleanup.
+		cleanup := sync.OnceFunc(func() { cancel(); <-done; require.NoError(t, rt.Close(context.Background())) })
+		t.Cleanup(cleanup)
 		ready, stop := context.WithTimeout(t.Context(), 10*time.Second)
 		defer stop()
 		require.NoError(t, rt.WaitSteadyState(ready))
@@ -87,7 +91,7 @@ func TestHypercertsIndigoArchiveRestartAndLive(t *testing.T) {
 			t.Fatal("writer unavailable")
 		}
 		require.Eventually(t, func() bool { return rt.PublicAddr() != "" }, time.Second, time.Millisecond)
-		return rt, writer, func() { cancel(); <-done; require.NoError(t, rt.Close(context.Background())) }
+		return rt, writer, cleanup
 	}
 	rt, writer, stop := start()
 	emit("archived")

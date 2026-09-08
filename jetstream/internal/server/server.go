@@ -36,6 +36,8 @@ type Config struct {
 	// DebugAddr is the bind address for the metrics/pprof listener (e.g. ":6060").
 	// Empty disables the listener unless DebugListener is supplied.
 	DebugAddr string
+	// hypercerts: Profiling must be explicitly enabled independently of the control listener.
+	EnablePprof bool
 
 	// ShutdownTimeout bounds how long graceful shutdown is allowed to take.
 	// After this elapses, in-flight requests are abandoned.
@@ -394,18 +396,22 @@ func (s *Server) debugMux() http.Handler {
 		_, _ = w.Write([]byte("ok\n"))
 	})
 
-	// pprof. Index dispatches to the per-profile handlers based on path, so
-	// the trailing-slash route covers /debug/pprof/heap, /debug/pprof/goroutine,
-	// etc. The four explicit routes below are the special-cased non-profile
-	// endpoints that need their own handler functions. We deliberately do
-	// not method-restrict any of these: pprof.Index uses its own path
-	// matching for sub-profile dispatch, and pprof.Symbol legitimately
-	// accepts POST for large symbol resolution requests from go tool pprof.
-	mux.HandleFunc("/debug/pprof/", pprof.Index)
-	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
-	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	// hypercerts: Enabling control/metrics must not implicitly expose profiling.
+	if s.cfg.EnablePprof {
+		// pprof. Index dispatches to the per-profile handlers based on path, so
+		// the trailing-slash route covers /debug/pprof/heap, /debug/pprof/goroutine,
+		// etc. The four explicit routes below are the special-cased non-profile
+		// endpoints that need their own handler functions. We deliberately do
+		// not method-restrict any of these: pprof.Index uses its own path
+		// matching for sub-profile dispatch, and pprof.Symbol legitimately
+		// accepts POST for large symbol resolution requests from go tool pprof.
+		mux.HandleFunc("/debug/pprof/", pprof.Index)
+		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+
+	}
 
 	return mux
 }

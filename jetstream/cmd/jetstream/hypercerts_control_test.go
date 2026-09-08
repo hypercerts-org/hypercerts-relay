@@ -40,3 +40,19 @@ func TestHypercertsControlSecretFile(t *testing.T) {
 		})
 	}
 }
+
+func TestHypercertsProfilingFlag(t *testing.T) {
+	app := newTestApp()
+	var got jetstreamd.Options
+	for _, cmd := range app.Commands {
+		if cmd.Name == "serve" {
+			cmd.Action = func(_ context.Context, cmd *cli.Command) error {
+				var err error
+				got, err = serveOptionsFromCommand(cmd)
+				return err
+			}
+		}
+	}
+	require.NoError(t, app.Run(t.Context(), []string{"jetstream", "serve", "--enable-pprof", "--debug-addr", "127.0.0.1:6060"}))
+	require.True(t, got.EnablePprof)
+}

@@ -422,6 +422,8 @@ func TestLiveConsumerContextCancelCleanStop(t *testing.T) {
 	dial, _ := scriptedDialer(conn)
 
 	ctx, cancel := context.WithCancel(context.Background())
+	// hypercerts: Keep cancellation owned by the test even if its callback fails.
+	defer cancel()
 	c := newLiveConsumer(liveConfig{host: "https://h", dial: dial})
 	var got int
 	errCh := make(chan error, 1)
