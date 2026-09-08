@@ -432,6 +432,10 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		CrashInjector:                  opts.CrashInjector,
 		SegmentIOFaultInjector:         opts.SegmentIOFaultInjector,
 		OnSteadyStateWriter: func(w *ingest.Writer) {
+			// hypercerts: Expose the ready writer to deterministic integration fixtures.
+			if opts.OnSteadyStateWriter != nil {
+				opts.OnSteadyStateWriter(w)
+			}
 			// Fires after the steady writer opens and before any producer
 			// (live consumer, retry runner, compactor) starts, so subscribers
 			// read the writer-owned log from its first event.

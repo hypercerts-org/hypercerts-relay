@@ -164,6 +164,8 @@ type Options struct {
 	SegmentIOFaultInjector segment.IOFaultInjector
 	OnBootstrapLiveEvent   func(*segment.Event)
 	OnSteadyStateEvent     func(*segment.Event)
+	// hypercerts: Integration fixtures can seal a real archive boundary deterministically.
+	OnSteadyStateWriter func(*ingest.Writer)
 }
 
 func (o Options) effectiveBackfillGlobalDownloads() int {

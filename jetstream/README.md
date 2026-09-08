@@ -82,6 +82,14 @@ An empty list stores no record payloads; prefixes and malformed NSIDs are reject
 Restart restores the persisted revision, including an intentionally empty list.
 Startup environment changes do not overwrite the persisted policy.
 
+`go test ./internal/jetstreamd -run '^TestHypercertsIndigoArchiveRestartAndLive$'`
+checks the owned Indigo Relay's disk event manager and real `subscribeRepos`
+handler, the Jetstream archive across restart, and a public client that replays
+the archive, continues live, and reconnects from its saved cursor. It builds the
+loopback-only `tests/jetstream-source` fixture from the parent Go module and uses
+disposable state. The fixture injects signed PDS frames at Relay's admitted-event
+boundary; PDS admission and Relay validation have their own Relay tests.
+
 The acquisition writers enforce the same policy on bootstrap segments, temporary
 bootstrap live segments, steady-state live commits, failed-repository retries,
 and sync replacement rows, before segment or readable-log writes. Selected deletes
