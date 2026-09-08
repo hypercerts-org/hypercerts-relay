@@ -22,6 +22,30 @@ update this provenance section, and run the Jetstream test suite. The copied
 code retains its upstream module path and dual MIT/Apache-2.0 license; see
 `LICENSE-MIT`, `LICENSE-APACHE`, and `LICENSE-DUAL`.
 
+The current applied revision is `.hypercerts/jetstream-upstream-base`; the initial
+revision above remains the provenance of the import. The exact copied upstream
+paths are in `.hypercerts/jetstream-upstream-paths`. New upstream dependencies or
+paths need an explicit maintainer review and allowlist update.
+
+For an update, create a dated review branch from current `main`, then run:
+
+```bash
+git fetch https://github.com/bluesky-social/jetstream.git main
+python3 scripts/jetstream-upstream.py FETCH_HEAD
+python3 scripts/jetstream-upstream.py FETCH_HEAD --apply
+./scripts/verify-jetstream.sh
+git diff --cached --check
+```
+
+The script reports affected Hypercerts markers and applies only the recorded
+closure under `jetstream/`. It stops at conflicts without advancing the baseline;
+a maintainer must resolve each conflict and explicitly update the baseline after
+resolution. Never auto-resolve conflicts or merge an upstream branch into `main`.
+The weekly `Check Jetstream upstream` workflow opens a review PR after verification;
+only a human may merge it. Verification includes the full module suite, vet, build,
+stress lifecycle oracle, and restart oracle checks. The Indigo remote and update
+script remain independent. See [deployment source and build contexts](../docs/deployment.md).
+
 ## Operation
 
 Build and test from this directory:
