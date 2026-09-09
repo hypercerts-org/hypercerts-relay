@@ -13,7 +13,8 @@
   let error = "";
   let input: HTMLInputElement;
   $: if (policy.revision !== revision) {
-    changedElsewhere = !sameCollections(draft, applied);
+    changedElsewhere =
+      !sameCollections(draft, applied) && !sameCollections(draft, policy.collections);
     if (!changedElsewhere) {
       draft = [...policy.collections];
       applied = [...policy.collections];
@@ -22,7 +23,10 @@
   }
 
   function sameCollections(left: string[], right: string[]) {
-    return left.length === right.length && left.every((value, index) => value === right[index]);
+    if (left.length !== right.length) return false;
+    const a = [...left].sort();
+    const b = [...right].sort();
+    return a.every((value, index) => value === b[index]);
   }
 
   function addCollection() {

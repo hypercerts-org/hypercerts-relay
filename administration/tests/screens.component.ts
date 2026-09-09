@@ -123,6 +123,36 @@ test("collection suggestions use the pinned seed without restricting exact NSIDs
   await fireEvent.click(screen.getByRole("button", { name: "Add collection" }));
   expect(screen.getByText("app.bsky.feed.post")).toBeTruthy();
 });
+test("collection acknowledgement adopts canonical collections at the new revision", async () => {
+  const submit = vi.fn().mockResolvedValue(undefined);
+  const view = render(Collections, {
+    policy: { revision: 4, collections: ["app.bsky.feed.post"] },
+    submit,
+  });
+  await fireEvent.input(screen.getByLabelText("Collection NSID"), {
+    target: { value: "app.bsky.feed.like" },
+  });
+  await fireEvent.click(screen.getByRole("button", { name: "Add collection" }));
+  await fireEvent.click(screen.getByRole("button", { name: "Request policy change" }));
+  expect(submit).toHaveBeenCalledWith({
+    kind: "collections",
+    expectedRevision: 4,
+    collections: ["app.bsky.feed.post", "app.bsky.feed.like"],
+  });
+  await view.rerender({
+    policy: {
+      revision: 5,
+      collections: ["app.bsky.feed.like", "app.bsky.feed.post"],
+    },
+  });
+  expect(screen.queryByRole("status")).toBeNull();
+  await fireEvent.click(screen.getByRole("button", { name: "Request policy change" }));
+  expect(submit).toHaveBeenLastCalledWith({
+    kind: "collections",
+    expectedRevision: 5,
+    collections: ["app.bsky.feed.like", "app.bsky.feed.post"],
+  });
+});
 test("collection drafts survive polling and require reset after a stale revision", async () => {
   const submit = vi.fn().mockResolvedValue(undefined);
   const policy = { revision: 4, collections: ["app.bsky.feed.post"] };
