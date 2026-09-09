@@ -72,7 +72,16 @@ func (r *Relay) ListHosts(ctx context.Context, cursor int64, limit int, everActi
 }
 
 func (r *Relay) UpdateHostStatus(ctx context.Context, hostID uint64, status models.HostStatus) error {
-	return r.db.WithContext(ctx).Model(models.Host{}).Where("id = ?", hostID).Update("status", status).Error
+	// hypercerts: Security bans also survive source-policy restarts.
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if status == models.HostStatusBanned {
+			if err := tx.Model(&models.Source{}).Where("host_id = ? AND state = ?", hostID, models.SourceStateEnabled).
+				Updates(map[string]any{"state": models.SourceStateDisabled, "revision": gorm.Expr("revision + 1"), "last_operation": "ban"}).Error; err != nil {
+				return err
+			}
+		}
+		return tx.Model(models.Host{}).Where("id = ?", hostID).Update("status", status).Error
+	})
 }
 
 func (r *Relay) UpdateHostAccountLimit(ctx context.Context, hostID uint64, accountLimit int64) error {
@@ -121,20 +130,19 @@ func (r *Relay) UpdateHostAccountLimit(ctx context.Context, hostID uint64, accou
 	return nil
 }
 
-// Persists all the host cursors in a single database transaction. Also updates status to "active" for hosts which have a positive cursor.
-//
-// Note that in some situations this may have partial success.
+// hypercerts: Save cursors atomically without changing source policy or reducing saved progress.
 func (r *Relay) PersistHostCursors(ctx context.Context, cursors *[]HostCursor) error {
-	tx := r.db.WithContext(ctx).Begin()
-	for _, cur := range *cursors {
-		if cur.LastSeq <= 0 {
-			continue
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		for _, cur := range *cursors {
+			if cur.LastSeq <= 0 {
+				continue
+			}
+			if err := tx.Model(models.Host{}).Where("id = ? AND last_seq < ?", cur.HostID, cur.LastSeq).UpdateColumn("last_seq", cur.LastSeq).Error; err != nil {
+				return fmt.Errorf("persisting host cursor: %w", err)
+			}
 		}
-		if err := tx.WithContext(ctx).Model(models.Host{}).Where("id = ?", cur.HostID).UpdateColumn("last_seq", cur.LastSeq).UpdateColumn("status", models.HostStatusActive).Error; err != nil {
-			r.Logger.Error("failed to persist host cursor", "hostID", cur.HostID, "lastSeq", cur.LastSeq)
-		}
-	}
-	return tx.WithContext(ctx).Commit().Error
+		return nil
+	})
 }
 
 // parses, normalizes, and validates a raw URL (HTTP or WebSocket) in to a hostname for subscriptions
@@ -154,6 +162,10 @@ func ParseHostname(raw string) (hostname string, noSSL bool, err error) {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return "", false, fmt.Errorf("not a valid host URL: %w", err)
+	}
+	// hypercerts: Source admission accepts origins without credentials or request parameters.
+	if u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+		return "", false, fmt.Errorf("host URL must contain only an origin")
 	}
 	noSSL = false
 

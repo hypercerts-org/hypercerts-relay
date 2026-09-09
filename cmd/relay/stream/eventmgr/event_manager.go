@@ -97,21 +97,24 @@ func (em *EventManager) broadcastEvent(evt *stream.XRPCStreamEvent) {
 	}
 }
 
-func (em *EventManager) persistAndSendEvent(ctx context.Context, evt *stream.XRPCStreamEvent) {
+func (em *EventManager) persistAndSendEvent(ctx context.Context, evt *stream.XRPCStreamEvent) error {
 	// TODO: can cut 5-10% off of disk persister benchmarks by making this function
 	// accept a uid. The lookup inside the persister is notably expensive (despite
 	// being an lru cache?)
+	// hypercerts: Propagate persistence failures before source acknowledgement.
 	if err := em.persister.Persist(ctx, evt); err != nil {
 		em.log.Error("failed to persist outbound event", "err", err)
+		return err
 	}
+
+	return nil
 }
 
 func (em *EventManager) AddEvent(ctx context.Context, ev *stream.XRPCStreamEvent) error {
 	ctx, span := otel.Tracer("events").Start(ctx, "AddEvent")
 	defer span.End()
 
-	em.persistAndSendEvent(ctx, ev)
-	return nil
+	return em.persistAndSendEvent(ctx, ev)
 }
 
 func (em *EventManager) Subscribe(ctx context.Context, ident string, filter func(*stream.XRPCStreamEvent) bool, since *int64) (<-chan *stream.XRPCStreamEvent, func(), error) {

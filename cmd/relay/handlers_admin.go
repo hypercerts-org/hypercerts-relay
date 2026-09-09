@@ -316,8 +316,12 @@ func (s *Service) handleAdminKillUpstreamConn(c echo.Context) error {
 
 	banHost := strings.ToLower(c.QueryParam("block")) == "true"
 
-	// TODO: move this method to relay (for updating the database)
-	if err := s.relay.Slurper.KillUpstreamConnection(ctx, hostname, banHost); err != nil {
+	// hypercerts: A block updates durable source policy even without a socket.
+	if banHost {
+		if err := s.relay.SetSourceBlocked(ctx, hostname, true); err != nil {
+			return err
+		}
+	} else if err := s.relay.Slurper.KillUpstreamConnection(ctx, hostname, false); err != nil {
 		if errors.Is(err, relay.ErrHostInactive) {
 			return &echo.HTTPError{
 				Code:    http.StatusBadRequest,
@@ -347,19 +351,10 @@ func (s *Service) handleBlockHost(c echo.Context) error {
 		}
 	}
 
-	host, err := s.relay.GetHost(ctx, hostname)
-	if err != nil {
+	// hypercerts: Persist source blocks separately from runtime socket state.
+	if err := s.relay.SetSourceBlocked(ctx, hostname, true); err != nil {
 		return err
 	}
-
-	if host.Status != models.HostStatusBanned {
-		if err := s.relay.UpdateHostStatus(ctx, host.ID, models.HostStatusBanned); err != nil {
-			return err
-		}
-	}
-
-	// kill any active connection (there may not be one, so ignore error)
-	_ = s.relay.Slurper.KillUpstreamConnection(ctx, host.Hostname, false)
 
 	// forward on to any sibling instances
 	go s.ForwardSiblingRequest(c, nil)
@@ -381,15 +376,8 @@ func (s *Service) handleUnblockHost(c echo.Context) error {
 		}
 	}
 
-	host, err := s.relay.GetHost(ctx, hostname)
-	if err != nil {
+	if err := s.relay.SetSourceBlocked(ctx, hostname, false); err != nil {
 		return err
-	}
-
-	if host.Status != models.HostStatusActive {
-		if err := s.relay.UpdateHostStatus(ctx, host.ID, models.HostStatusActive); err != nil {
-			return err
-		}
 	}
 
 	// forward on to any sibling instances

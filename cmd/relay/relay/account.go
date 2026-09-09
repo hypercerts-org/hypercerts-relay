@@ -14,6 +14,12 @@ import (
 	"gorm.io/gorm"
 )
 
+// hypercerts: Separate confirmed inactivity from status lookup and storage failures.
+var ErrAccountInactive = errors.New("account is inactive")
+
+// hypercerts: Keep account updates consistent across source migration and status changes.
+const accountUIDPredicate = "uid = ?"
+
 func (r *Relay) GetAccount(ctx context.Context, did syntax.DID) (*models.Account, error) {
 	ctx, span := tracer.Start(ctx, "GetAccount")
 	defer span.End()
@@ -21,7 +27,9 @@ func (r *Relay) GetAccount(ctx context.Context, did syntax.DID) (*models.Account
 	// first try cache
 	a, ok := r.accountCache.Get(did.String())
 	if ok {
-		return a, nil
+		// hypercerts: Keep cached snapshots separate from mutable caller state.
+		copy := *a
+		return &copy, nil
 	}
 
 	var acc models.Account
@@ -37,7 +45,8 @@ func (r *Relay) GetAccount(ctx context.Context, did syntax.DID) (*models.Account
 		return nil, ErrAccountNotFound
 	}
 
-	r.accountCache.Add(did.String(), &acc)
+	cached := acc
+	r.accountCache.Add(did.String(), &cached)
 
 	return &acc, nil
 }
@@ -93,18 +102,18 @@ func (r *Relay) CreateAccountHost(ctx context.Context, did syntax.DID, hostID ui
 		UpstreamStatus: models.AccountStatusActive,
 	}
 
-	host, err := r.GetHostByID(ctx, hostID)
-	if err != nil {
-		return nil, err
-	}
-	if host.AccountCount >= host.AccountLimit {
-		acc.Status = models.AccountStatusHostThrottled
-	}
-
 	// create Account row and increment host count in the same transaction
 	err = r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Model(&models.Host{}).Where("id = ?", hostID).Update("account_count", gorm.Expr("account_count + 1")).Error; err != nil {
 			return fmt.Errorf("failed to increment account count for host (%s): %w", hostname, err)
+		}
+		// hypercerts: Decide admission after the host increment holds the transaction lock.
+		var host models.Host
+		if err := tx.First(&host, hostID).Error; err != nil {
+			return err
+		}
+		if host.AccountCount > host.AccountLimit {
+			acc.Status = models.AccountStatusHostThrottled
 		}
 		if err := tx.Create(&acc).Error; err != nil {
 			return fmt.Errorf("failed to create account: %w", err)
@@ -115,7 +124,8 @@ func (r *Relay) CreateAccountHost(ctx context.Context, did syntax.DID, hostID ui
 		return nil, err
 	}
 
-	r.accountCache.Add(did.String(), &acc)
+	cached := acc
+	r.accountCache.Add(did.String(), &cached)
 
 	//newUserDiscoveryDuration.Observe(time.Since(start).Seconds())
 	return &acc, nil
@@ -170,14 +180,25 @@ func (r *Relay) EnsureAccountHost(ctx context.Context, acc *models.Account, host
 	// create Account row and increment host count in the same transaction
 	err = r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// decrement old host count
-		if err := tx.Model(&models.Host{}).Where("id = ?", acc.HostID).Update("account_count", gorm.Expr("account_count - 1")).Error; err != nil {
+		if err := tx.Model(&models.Host{}).Where("id = ? AND account_count > 0", acc.HostID).Update("account_count", gorm.Expr("account_count - 1")).Error; err != nil {
 			return fmt.Errorf("failed to decrement account count for former host (%d): %w", acc.HostID, err)
 		}
 		// increment new host count
 		if err := tx.Model(&models.Host{}).Where("id = ?", hostID).Update("account_count", gorm.Expr("account_count + 1")).Error; err != nil {
 			return fmt.Errorf("failed to increment account count for host (%s): %w", hostname, err)
 		}
-		if err := tx.Model(models.Account{}).Where("uid = ?", acc.UID).Update("host_id", hostID).Error; err != nil {
+		var host models.Host
+		if err := tx.First(&host, hostID).Error; err != nil {
+			return err
+		}
+		// hypercerts: Apply the target quota without clearing unrelated account restrictions.
+		if acc.Status == models.AccountStatusActive || acc.Status == models.AccountStatusHostThrottled {
+			acc.Status = models.AccountStatusActive
+			if host.AccountCount > host.AccountLimit {
+				acc.Status = models.AccountStatusHostThrottled
+			}
+		}
+		if err := tx.Model(models.Account{}).Where(accountUIDPredicate, acc.UID).Updates(map[string]any{"host_id": hostID, "status": acc.Status}).Error; err != nil {
 			return fmt.Errorf("failed update account HostID: %w", err)
 		}
 		return nil
@@ -202,7 +223,7 @@ func (r *Relay) EnsureAccountActive(ctx context.Context, acc *models.Account) er
 	}
 	// NOTE: this is checking local takedown
 	if acc.Status != models.AccountStatusActive {
-		return fmt.Errorf("account %s has non-active local status: %s", acc.DID, acc.Status)
+		return fmt.Errorf("%w: local status %s", ErrAccountInactive, acc.Status)
 	}
 
 	did := syntax.DID(acc.DID)
@@ -228,7 +249,7 @@ func (r *Relay) EnsureAccountActive(ctx context.Context, acc *models.Account) er
 	if acc.IsActive() {
 		return nil
 	}
-	return fmt.Errorf("account is not active (%s): %s", acc.DID, acc.UpstreamStatus)
+	return fmt.Errorf("%w: upstream status %s", ErrAccountInactive, acc.UpstreamStatus)
 }
 
 // This updates the account's "upstream" status (eg, at the account's PDS). Usually this is called in response to an `#account` event.
@@ -236,7 +257,7 @@ func (r *Relay) EnsureAccountActive(ctx context.Context, acc *models.Account) er
 // The DID and UID are both required, and *must* match; it is assumed that calling code has already done an account lookup.
 func (r *Relay) UpdateAccountUpstreamStatus(ctx context.Context, did syntax.DID, uid uint64, status models.AccountStatus) error {
 
-	if err := r.db.WithContext(ctx).Model(models.Account{}).Where("uid = ?", uid).Update("upstream_status", status).Error; err != nil {
+	if err := r.db.WithContext(ctx).Model(models.Account{}).Where(accountUIDPredicate, uid).Update("upstream_status", status).Error; err != nil {
 		return fmt.Errorf("failed to update account upstream status: %w", err)
 	}
 
@@ -255,7 +276,7 @@ func (r *Relay) UpdateAccountLocalStatus(ctx context.Context, did syntax.DID, st
 		return err
 	}
 
-	if err := r.db.WithContext(ctx).Model(models.Account{}).Where("uid = ?", acc.UID).Update("status", status).Error; err != nil {
+	if err := r.db.WithContext(ctx).Model(models.Account{}).Where(accountUIDPredicate, acc.UID).Update("status", status).Error; err != nil {
 		return err
 	}
 

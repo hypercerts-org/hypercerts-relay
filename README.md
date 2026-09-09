@@ -10,7 +10,36 @@ The administration control plane will manage PDS sources, record collections, ra
 
 ## Status
 
-This repository establishes the maintained Relay and Rainbow base and its delivery process. It does not yet contain the Hypercerts PDS policy, Jetstream integration, collection retention, backfill behavior, or the new administration control plane. Those changes are tracked as component work before deployment.
+This repository contains the maintained Relay and Rainbow base, durable Relay processing and rejections, and a managed PDS registry. Jetstream integration, collection retention, backfill behavior, and the new administration control plane remain separate component work before deployment.
+
+## Event durability
+
+Relay saves output before advancing account revisions or source cursors. Processing and storage failures stop acknowledgment and reconnect from successful progress. Source cursor transactions preserve administrative status and never reduce saved progress. Shutdown waits for source processing before closing output persistence.
+
+An unavailable identity remains retryable. Permanent verification failures create a durable rejection containing source metadata and a fixed reason, without record contents. Signature failures require identity refresh before rejection. Startup adds the rejection table; back up Relay state before upgrading. Stored output can repeat after a failed revision update, so downstream consumers must tolerate duplicates.
+
+An ambiguous disk write or sync failure stops further persistence until restart. Startup discards only an incomplete trailing write before resuming; complete retained events remain replayable. Per-event file synchronization replaces buffered acknowledgments and can reduce throughput.
+
+## Managed PDS sources
+
+The Go adapter on `relay.Relay` separates durable desired state from connection state. It does not expose a new HTTP API or OAuth UI.
+
+| Operation | Behavior |
+| --- | --- |
+| `AddSource(ctx, origin)` | Register an origin with pending validation. Do not connect until validation passes. Repeated registration preserves disabled state and the stored TLS scheme. |
+| `ValidateSource(ctx, hostID, revision)` | Check the stored origin, persist a bounded result, then reconcile its connection. No insecure fallback. |
+| `SetSourceState(ctx, hostID, revision, state)` | Enable, disable, or remove acquisition. Stop waits for processing and cursor persistence. Removal retains host, account, rejection, and replay data. |
+| `ListSources(ctx, afterHostID, limit)` | Page through all sources, including quiet sources. Report desired/runtime state, validation, revision, durable cursor, and account quota. |
+| `ListSourceAccounts(ctx, hostID, afterDID, limit)` | Page through source observations, current resolved hosts, account placement, quota exclusions, and incomplete/unknown target coverage. |
+| `ListRejectedEvents(ctx, afterID, limit)` | Page through non-payload rejection outcomes and their verification policy revisions. |
+
+Pages default to 100 entries and cap at 1,000. State and validation changes require the current revision; an immediate identical retry is idempotent. A stale conflicting request must refresh its revision.
+
+Startup creates `source` and `account_source_observation` tables. Existing host rows become admitted sources; existing bans become disabled sources. Subsequent migrations preserve managed policy. Back up the database and event store together before upgrading. Restart reconnects only enabled, validated, non-banned sources from their saved cursors, including quiet or previously unavailable sources.
+
+Public `requestCrawl` can reconnect only an already admitted, enabled source; it cannot add, validate, or re-enable a source. The existing authenticated block/unblock handlers delegate to the same durable policy. They remain legacy administration, not the planned control plane.
+
+DID migration never admits or connects the resolved target automatically. Each observed source remains separately recorded while current resolution is refreshed. An explicitly admitted target remains incomplete until a separately owned Jetstream v2 recovery job reaches its durable boundary. This Relay adapter cannot claim complete coverage or reconstruct deleted historical state. Account quota exclusions use `host-account-limit`; they are distinct from stream throughput limits.
 
 ## Included components
 

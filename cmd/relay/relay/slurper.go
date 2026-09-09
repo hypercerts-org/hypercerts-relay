@@ -35,8 +35,11 @@ type Slurper struct {
 	processCallback ProcessMessageFunc
 	Config          *SlurperConfig
 
-	subsLk sync.Mutex
-	subs   map[string]*Subscription
+	subsLk       sync.Mutex
+	subs         map[string]*Subscription
+	closed       bool
+	shutdownOnce sync.Once
+	shutdownErr  error
 
 	shutdownChan   chan bool
 	shutdownResult chan error
@@ -94,17 +97,26 @@ type Subscription struct {
 	lk        sync.RWMutex
 	ctx       context.Context
 	cancel    func()
+	// hypercerts: Track connection completion separately from subscription registration.
+	done      chan struct{}
+	state     string
+	finishErr error
 }
 
 // pulls lastSeq from underlying scheduler in to this Subscription
 func (sub *Subscription) UpdateSeq() {
+	// hypercerts: Protect the scheduler while connections restart and cursors are saved.
+	sub.lk.RLock()
+	defer sub.lk.RUnlock()
 	// possible for this to get called before a connection has fully been set up
 	if sub.scheduler == nil {
 		return
 	}
 	seq := sub.scheduler.LastSeq()
-	if seq > 0 {
-		sub.LastSeq.Store(seq)
+	for current := sub.LastSeq.Load(); seq > 0 && seq > current; current = sub.LastSeq.Load() {
+		if sub.LastSeq.CompareAndSwap(current, seq) {
+			break
+		}
 	}
 }
 
@@ -224,14 +236,24 @@ func (s *Slurper) GetLimits(hostname string) (*StreamLimiterCounts, error) {
 
 // Shutdown shuts down the entire Slurper (all subscriptions)
 func (s *Slurper) Shutdown() error {
-	s.shutdownChan <- true
-	s.logger.Info("waiting for slurper shutdown")
-	err := <-s.shutdownResult
-	if err != nil {
-		s.logger.Error("shutdown error", "err", err)
-	}
-	s.logger.Info("slurper shutdown complete")
-	return err
+	// hypercerts: Finish source processing before shutting down output persistence.
+	s.shutdownOnce.Do(func() {
+		s.subsLk.Lock()
+		s.closed = true
+		subs := make([]*Subscription, 0, len(s.subs))
+		for _, sub := range s.subs {
+			subs = append(subs, sub)
+			sub.cancel()
+		}
+		s.subsLk.Unlock()
+		for _, sub := range subs {
+			<-sub.done
+			s.shutdownErr = errors.Join(s.shutdownErr, sub.finishErr)
+		}
+		s.shutdownChan <- true
+		s.shutdownErr = errors.Join(s.shutdownErr, <-s.shutdownResult)
+	})
+	return s.shutdownErr
 }
 
 func (s *Slurper) CheckIfSubscribed(hostname string) bool {
@@ -248,6 +270,9 @@ func (s *Slurper) CheckIfSubscribed(hostname string) bool {
 func (s *Slurper) Subscribe(host *models.Host) error {
 	s.subsLk.Lock()
 	defer s.subsLk.Unlock()
+	if s.closed {
+		return fmt.Errorf("slurper is shut down")
+	}
 
 	_, ok := s.subs[host.Hostname]
 	if ok {
@@ -271,6 +296,8 @@ func (s *Slurper) Subscribe(host *models.Host) error {
 		Limiters: limiters,
 		ctx:      ctx,
 		cancel:   cancel,
+		done:     make(chan struct{}),
+		state:    "configured",
 	}
 	sub.LastSeq.Store(host.LastSeq)
 	s.subs[host.Hostname] = &sub
@@ -287,10 +314,20 @@ func (s *Slurper) subscribeWithRedialer(ctx context.Context, host *models.Host, 
 
 	logger := s.logger.With("host", host.Hostname)
 	defer func() {
+		// hypercerts: Save completed work even when source cancellation ends the connection.
+		sub.UpdateSeq()
+		if s.Config.PersistCursorCallback != nil {
+			flushCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			batch := []HostCursor{sub.HostCursor()}
+			sub.finishErr = s.Config.PersistCursorCallback(flushCtx, &batch)
+			cancel()
+		}
 		s.subsLk.Lock()
-		defer s.subsLk.Unlock()
-
-		delete(s.subs, host.Hostname)
+		if s.subs[host.Hostname] == sub {
+			delete(s.subs, host.Hostname)
+		}
+		s.subsLk.Unlock()
+		close(sub.done)
 	}()
 
 	d := websocket.Dialer{
@@ -304,10 +341,6 @@ func (s *Slurper) subscribeWithRedialer(ctx context.Context, host *models.Host, 
 	}
 
 	cursor := host.LastSeq
-
-	connectedInbound.Inc()
-	defer connectedInbound.Dec()
-	// TODO: add a metric for number of subscriptions which are attempting to reconnect
 
 	var backoff int
 	for {
@@ -323,16 +356,27 @@ func (s *Slurper) subscribeWithRedialer(ctx context.Context, host *models.Host, 
 		}
 		hdr := make(http.Header)
 		hdr.Add("User-Agent", s.Config.UserAgent)
+		sub.setState("connecting")
 		conn, resp, err := d.DialContext(ctx, u, hdr)
 		if err != nil {
-			logger.Warn("dialing failed", "err", err, "backoff", backoff)
-			time.Sleep(sleepForBackoff(backoff))
+			sub.setState("failing")
+			// hypercerts: Preserve the connection failure reason for operator diagnosis.
+			logger.Warn("dialing failed", "backoff", backoff, "err", err)
+			timer := time.NewTimer(sleepForBackoff(backoff))
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
 			backoff++
 
 			if backoff > 15 {
 				logger.Warn("host does not appear to be online, disabling for now")
-				if err := s.Config.PersistHostStatusCallback(ctx, sub.HostID, models.HostStatusOffline); err != nil {
-					logger.Error("failed to update host status", "err", err)
+				if s.Config.PersistHostStatusCallback != nil {
+					if err := s.Config.PersistHostStatusCallback(ctx, sub.HostID, models.HostStatusOffline); err != nil {
+						logger.Error("failed to update host status", "err", err)
+					}
 				}
 				return
 			}
@@ -343,6 +387,8 @@ func (s *Slurper) subscribeWithRedialer(ctx context.Context, host *models.Host, 
 		// check if we connected to a relay (eg, this indigo relay, or rainbow) and drop if so
 		serverHdr := resp.Header.Get("Server")
 		if strings.Contains(serverHdr, "atproto-relay") {
+			_ = conn.Close()
+			sub.setState("failing")
 			logger.Warn("subscribed host is atproto relay of some kind, banning", "header", "Server", "value", serverHdr, "url", u)
 			if err := s.Config.PersistHostStatusCallback(ctx, sub.HostID, models.HostStatusBanned); err != nil {
 				logger.Error("failed to update host status", "err", err)
@@ -351,14 +397,19 @@ func (s *Slurper) subscribeWithRedialer(ctx context.Context, host *models.Host, 
 		}
 
 		logger.Debug("event subscription response", "code", resp.StatusCode, "url", u)
-
+		sub.setState("connected")
+		connectedInbound.Inc()
 		if err := s.handleConnection(ctx, conn, sub); err != nil {
 
 			// TODO: measure the last N connection error times and if they're coming too fast reconnect slower or don't reconnect and wait for requestCrawl
-			logger.Warn("host connection failed", "err", err, "backoff", backoff)
+			// hypercerts: Preserve stream-processing errors as well as retry context.
+			logger.Warn("host connection failed", "backoff", backoff, "err", err)
 
 			// for all other errors, keep retrying / reconnecting
 		}
+		connectedInbound.Dec()
+		_ = conn.Close()
+		sub.setState("failing")
 
 		updatedCursor := sub.LastSeq.Load()
 		if updatedCursor > cursor {
@@ -366,11 +417,16 @@ func (s *Slurper) subscribeWithRedialer(ctx context.Context, host *models.Host, 
 			cursor = updatedCursor
 			backoff = 0
 
+			// hypercerts: The deferred bounded flush owns cursor persistence after cancellation.
+			if ctx.Err() != nil {
+				return
+			}
+
 			// persist updated cursor
 			if s.Config.PersistCursorCallback != nil {
 				batch := []HostCursor{sub.HostCursor()}
 				if err := s.Config.PersistCursorCallback(ctx, &batch); err != nil {
-					logger.Warn("failed to persist cursor")
+					logger.Warn("failed to persist cursor", "err", err)
 				}
 			}
 		}
@@ -383,7 +439,7 @@ func sleepForBackoff(b int) time.Duration {
 	}
 
 	if b < 10 {
-		return (time.Duration(b) * 2) + (time.Millisecond * time.Duration(rand.Intn(1000)))
+		return (time.Duration(b) * 2 * time.Second) + (time.Millisecond * time.Duration(rand.Intn(1000)))
 	}
 
 	return time.Second * 30
@@ -398,42 +454,23 @@ func (s *Slurper) handleConnection(ctx context.Context, conn *websocket.Conn, su
 		RepoCommit: func(evt *comatproto.SyncSubscribeRepos_Commit) error {
 			logger := s.logger.With("host", sub.Hostname, "did", evt.Repo, "seq", evt.Seq, "eventType", "commit")
 			logger.Debug("got remote repo event")
-			if err := s.processCallback(context.Background(), &stream.XRPCStreamEvent{RepoCommit: evt}, sub.Hostname, sub.HostID); err != nil {
-				logger.Error("failed handling event", "err", err)
-			}
-			sub.UpdateSeq()
-
-			return nil
+			// hypercerts: Return processing failures before the scheduler acknowledges the source event.
+			return s.processCallback(ctx, &stream.XRPCStreamEvent{RepoCommit: evt}, sub.Hostname, sub.HostID)
 		},
 		RepoSync: func(evt *comatproto.SyncSubscribeRepos_Sync) error {
 			logger := s.logger.With("host", sub.Hostname, "did", evt.Did, "seq", evt.Seq, "eventType", "sync")
 			logger.Debug("commit event")
-			if err := s.processCallback(context.Background(), &stream.XRPCStreamEvent{RepoSync: evt}, sub.Hostname, sub.HostID); err != nil {
-				logger.Error("failed handling event", "err", err)
-			}
-			sub.UpdateSeq()
-
-			return nil
+			return s.processCallback(ctx, &stream.XRPCStreamEvent{RepoSync: evt}, sub.Hostname, sub.HostID)
 		},
 		RepoIdentity: func(evt *comatproto.SyncSubscribeRepos_Identity) error {
 			logger := s.logger.With("host", sub.Hostname, "did", evt.Did, "seq", evt.Seq, "eventType", "identity")
 			logger.Debug("identity event")
-			if err := s.processCallback(context.Background(), &stream.XRPCStreamEvent{RepoIdentity: evt}, sub.Hostname, sub.HostID); err != nil {
-				logger.Error("failed handling event", "err", err)
-			}
-			sub.UpdateSeq()
-
-			return nil
+			return s.processCallback(ctx, &stream.XRPCStreamEvent{RepoIdentity: evt}, sub.Hostname, sub.HostID)
 		},
 		RepoAccount: func(evt *comatproto.SyncSubscribeRepos_Account) error {
 			logger := s.logger.With("host", sub.Hostname, "did", evt.Did, "seq", evt.Seq, "eventType", "account")
-			s.logger.Debug("account event")
-			if err := s.processCallback(context.Background(), &stream.XRPCStreamEvent{RepoAccount: evt}, sub.Hostname, sub.HostID); err != nil {
-				logger.Error("failed handling event", "err", err)
-			}
-			sub.UpdateSeq()
-
-			return nil
+			logger.Debug("account event")
+			return s.processCallback(ctx, &stream.XRPCStreamEvent{RepoAccount: evt}, sub.Hostname, sub.HostID)
 		},
 		Error: func(evt *stream.ErrorFrame) error {
 			logger := s.logger.With("host", sub.Hostname)
@@ -465,14 +502,38 @@ func (s *Slurper) handleConnection(ctx context.Context, conn *websocket.Conn, su
 	// NOTE: `InstrumentedRepoStreamCallbacks` is where event limiters get called/enforced
 	instrumentedRSC := stream.NewInstrumentedRepoStreamCallbacks(limiters, rsc.EventHandler)
 
-	sub.scheduler = parallel.NewScheduler(
+	scheduler := parallel.NewScheduler(
 		s.Config.ConcurrencyPerHost,
 		s.Config.QueueDepthPerHost,
 		conn.RemoteAddr().String(),
-		instrumentedRSC.EventHandler,
+		func(_ context.Context, evt *stream.XRPCStreamEvent) error {
+			return instrumentedRSC.EventHandler(ctx, evt)
+		},
 	)
+	sub.lk.Lock()
+	sub.scheduler = scheduler
+	sub.lk.Unlock()
+	defer func() {
+		sub.UpdateSeq()
+		sub.lk.Lock()
+		sub.scheduler = nil
+		sub.lk.Unlock()
+	}()
+	// hypercerts: Stop socket reads when asynchronous processing fails.
+	go func() {
+		select {
+		case <-scheduler.Done():
+			cancel()
+		case <-ctx.Done():
+		}
+		_ = conn.Close()
+	}()
 	connLogger := s.logger.With("host", sub.Hostname)
-	return stream.HandleRepoStream(ctx, conn, sub.scheduler, connLogger)
+	err := stream.HandleRepoStream(ctx, conn, scheduler, connLogger)
+	if processErr := scheduler.Err(); processErr != nil {
+		return processErr
+	}
+	return err
 }
 
 type HostCursor struct {
@@ -518,19 +579,16 @@ func (s *Slurper) GetActiveSubHostnames() []string {
 
 func (s *Slurper) KillUpstreamConnection(ctx context.Context, hostname string, ban bool) error {
 	s.subsLk.Lock()
-	defer s.subsLk.Unlock()
-
 	sub, ok := s.subs[hostname]
+	s.subsLk.Unlock()
 	if !ok {
 		return fmt.Errorf("killing connection %q: %w", hostname, ErrHostInactive)
 	}
-	sub.cancel()
-
 	if ban && s.Config.PersistHostStatusCallback != nil {
 		if err := s.Config.PersistHostStatusCallback(ctx, sub.HostID, models.HostStatusBanned); err != nil {
 			return fmt.Errorf("failed to set host as banned: %w", err)
 		}
 	}
-
-	return nil
+	// hypercerts: Persist the ban before cancellation and wait without holding the subscription lock.
+	return s.StopSource(ctx, hostname)
 }
