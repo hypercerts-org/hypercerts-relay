@@ -4,6 +4,9 @@ TECH-588 introduces a separate Svelte/Tailwind application and Node management
 service. It talks only to versioned private Relay and Jetstream APIs. It never
 opens their databases, inherits their Basic-auth UI, or implements ingestion.
 
+For Railway containers, volumes, networking and administrator bootstrap, see
+[the Railway runbook](../docs/railway.md).
+
 ## Run locally
 
 Use Node 24.18 or later, Go versions required by each module, and npm. From this directory:

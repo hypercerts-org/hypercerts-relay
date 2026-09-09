@@ -21,6 +21,9 @@ RUN go build \
     -o /rainbow-bin \
     ./cmd/rainbow
 
+# hypercerts: Share the opt-in Railway bootstrap with the other images.
+RUN CGO_ENABLED=0 go build -trimpath -o /container-entrypoint ./jetstream/cmd/container-entrypoint/main.go
+
 FROM debian:bookworm-slim
 
 ENV DEBIAN_FRONTEND="noninteractive"
@@ -34,8 +37,9 @@ RUN apt-get update && apt-get install --yes \
 
 WORKDIR /rainbow
 COPY --from=build-env /rainbow-bin /usr/bin/rainbow
+COPY --from=build-env /container-entrypoint /container-entrypoint
 
-ENTRYPOINT ["/usr/bin/dumb-init", "--"]
+ENTRYPOINT ["/usr/bin/dumb-init", "--", "/container-entrypoint", "rainbow"]
 CMD ["/usr/bin/rainbow"]
 
 LABEL org.opencontainers.image.source=https://github.com/bluesky-social/indigo

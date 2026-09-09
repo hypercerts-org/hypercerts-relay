@@ -14,14 +14,16 @@ archive and metadata under `JETSTREAM_DATA_DIR`. Each stateful component needs i
 own persistent data directory. Rainbow is the optional raw-stream fan-out path;
 consumers of retained collections connect to Jetstream's archive/live interfaces.
 
-The intended deployment target is Vercel, with this repository as the deployment
-source. The entry points above are Go daemons, not Vercel request handlers. Platform
-qualification must establish persistent storage, process lifetime, networking, and
-restart behavior before deployment. TECH-593 documents source/build ownership;
-it does not provision infrastructure or claim a qualified Vercel deployment.
+The deployment target is **Railway**. Public container and runtime
+contracts are documented in [the Railway runbook](railway.md). Infrastructure as
+Code and real project/environment configuration belong in a private infrastructure
+repository. Railway uses the canonical
+Dockerfiles and build contexts listed above. Administration uses
+`docker build -f administration/Dockerfile .`; Jetstream retains its nested module
+context.
 
-The separate `administration/` application added by TECH-588 builds with
-`npm ci && npm run build` in that directory and runs with `npm run server`.
-It requires Node 24.18+, durable local SQLite storage, mounted secrets, private
-service connectivity and an HTTPS origin. It does not extend the inherited Relay
-web UI or establish a qualified Vercel deployment. See `administration/README.md`.
+The separate `administration/` application builds with `npm ci --ignore-scripts &&
+npm run build` in that directory and runs with `npm run server`. It requires Node
+24.18+, durable local SQLite storage, file-based runtime secrets, private service
+connectivity and an HTTPS origin. See `administration/README.md`. Adding deployment
+files does not provision or qualify a running deployment.

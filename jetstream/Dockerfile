@@ -49,6 +49,10 @@ RUN --mount=type=cache,target=/go/pkg/mod \
       -o /out/jetstream \
       ./cmd/jetstream
 
+# hypercerts: Static bootstrap preserves the distroless runtime and module context.
+RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -buildvcs=false \
+    -o /out/container-entrypoint ./cmd/container-entrypoint
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Runtime stage
 #
@@ -75,6 +79,7 @@ LABEL org.opencontainers.image.title="jetstream" \
 # Bring the binary across. /usr/local/bin is on $PATH and is the conventional
 # location even though distroless has no PATH-based shell to care.
 COPY --from=build /out/jetstream /usr/local/bin/jetstream
+COPY --from=build /out/container-entrypoint /usr/local/bin/container-entrypoint
 
 # Document the listeners. EXPOSE is metadata only; it does not publish ports.
 EXPOSE 8080 6060
@@ -84,7 +89,6 @@ EXPOSE 8080 6060
 # security posture obvious from `docker inspect`.
 USER 65532:65532
 
-# Use the binary as PID 1 directly. No tini/dumb-init: Go's runtime handles
-# signals and reaps no children of its own.
-ENTRYPOINT ["/usr/local/bin/jetstream"]
+# hypercerts: The bootstrap execs Jetstream, preserving signals and CLI arguments.
+ENTRYPOINT ["/usr/local/bin/container-entrypoint", "jetstream", "/usr/local/bin/jetstream"]
 CMD ["serve"]
