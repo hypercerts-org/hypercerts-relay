@@ -93,6 +93,7 @@ test("existing database and WAL files become private without chmod of a shared p
 test("proxy login limiting isolates clients only when the immediate proxy is trusted", async (t) => {
   for (const trusted of [false, true]) {
     const app = express();
+    app.disable("x-powered-by");
     app.set("trust proxy", trusted ? ["loopback"] : false);
     app.use(railwayClientIP({ railway: true }));
     app.use(loginLimit(2));
@@ -123,6 +124,7 @@ test("proxy login limiting isolates clients only when the immediate proxy is tru
 });
 test("control URLs reject malformed origins and retain encrypted private-network HTTP support", () => {
   const config = {
+    // Never fetched: this fixture checks the encrypted private-network contract.
     url: "http://relay.railway.internal:2472",
     token: "fixture",
   };

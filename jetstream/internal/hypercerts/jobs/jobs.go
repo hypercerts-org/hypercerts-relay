@@ -322,12 +322,18 @@ func (m *Manager) TransitionOnce(id string, state State, requestID string) error
 	if !m.canTransition(j, state, requestID != "") {
 		return ErrConflict
 	}
+	return m.commitTransition(j, state, requestID)
+}
+
+// commitTransition persists the receipt with the resulting state before stopping
+// acquisition. The caller holds mu and has already validated the transition.
+func (m *Manager) commitTransition(j Job, state State, requestID string) error {
 	next := clone(m.data)
 	if requestID != "" {
 		if next.Actions == nil {
 			next.Actions = map[string]string{}
 		}
-		next.Actions[requestID] = string(state) + ":" + id
+		next.Actions[requestID] = string(state) + ":" + j.ID
 	}
 	if requestID != "" && (j.State == state || (state == Pending && j.State == Running)) {
 		return m.commit(next)
@@ -338,11 +344,11 @@ func (m *Manager) TransitionOnce(id string, state State, requestID string) error
 	if state == Canceled {
 		j.FinishedAt = time.Now().UTC()
 	}
-	next.Jobs[id] = j
+	next.Jobs[j.ID] = j
 	if err := m.commit(next); err != nil {
 		return err
 	}
-	if state == Canceled && m.cancel != nil && m.runningID == id {
+	if state == Canceled && m.cancel != nil && m.runningID == j.ID {
 		m.cancel()
 	}
 	return nil
