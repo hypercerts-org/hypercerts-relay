@@ -37,33 +37,7 @@ func (s *Service) controlHandler(token string) (http.Handler, error) {
 		view, err := s.relay.InspectSource(r.Context(), r.URL.Query().Get("pds"))
 		controlResult(w, view, err)
 	})
-	mux.HandleFunc("PUT /hypercerts/v1/source", func(w http.ResponseWriter, r *http.Request) {
-		var input struct {
-			PDS   string             `json:"pds"`
-			State models.SourceState `json:"state"`
-		}
-		if !controlDecode(w, r, &input) {
-			return
-		}
-		if input.State != models.SourceStateEnabled && input.State != models.SourceStateDisabled && input.State != models.SourceStateRemoved {
-			controlReply(w, 400, map[string]string{"error": "invalid_source_state"})
-			return
-		}
-		var view *relay.SourceView
-		var err error
-		if input.State == models.SourceStateEnabled {
-			view, err = s.relay.AddSource(r.Context(), input.PDS)
-			if err == nil && view.Validation.Status != models.SourceValidationPassed {
-				view, err = s.relay.ValidateSource(r.Context(), view.HostID, view.Revision)
-			}
-		} else {
-			view, err = s.relay.InspectSource(r.Context(), input.PDS)
-		}
-		if err == nil {
-			view, err = s.relay.SetSourceState(r.Context(), view.HostID, view.Revision, input.State)
-		}
-		controlResult(w, view, err)
-	})
+	mux.HandleFunc("PUT /hypercerts/v1/source", s.controlSetSource)
 	mux.HandleFunc("PUT /hypercerts/v1/source/quota", func(w http.ResponseWriter, r *http.Request) {
 		var input struct {
 			PDS           string `json:"pds"`
@@ -106,6 +80,34 @@ func (s *Service) controlHandler(token string) (http.Handler, error) {
 		mux.ServeHTTP(w, r)
 	}), nil
 }
+func (s *Service) controlSetSource(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		PDS   string             `json:"pds"`
+		State models.SourceState `json:"state"`
+	}
+	if !controlDecode(w, r, &input) {
+		return
+	}
+	if input.State != models.SourceStateEnabled && input.State != models.SourceStateDisabled && input.State != models.SourceStateRemoved {
+		controlReply(w, 400, map[string]string{"error": "invalid_source_state"})
+		return
+	}
+	var view *relay.SourceView
+	var err error
+	if input.State == models.SourceStateEnabled {
+		view, err = s.relay.AddSource(r.Context(), input.PDS)
+		if err == nil && view.Validation.Status != models.SourceValidationPassed {
+			view, err = s.relay.ValidateSource(r.Context(), view.HostID, view.Revision)
+		}
+	} else {
+		view, err = s.relay.InspectSource(r.Context(), input.PDS)
+	}
+	if err == nil {
+		view, err = s.relay.SetSourceState(r.Context(), view.HostID, view.Revision, input.State)
+	}
+	controlResult(w, view, err)
+}
+
 func controlReply(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -148,7 +150,7 @@ func controlDecode(w http.ResponseWriter, r *http.Request, v any) bool {
 }
 func (s *Service) startControl(ctx context.Context, addr, tokenFile string) (func(), error) {
 	if addr == "" && tokenFile == "" {
-		return func() {}, nil
+		return func() { /* No listener was started. */ }, nil
 	}
 	if addr == "" || tokenFile == "" {
 		return nil, errors.New("RELAY_CONTROL_ADDR and RELAY_CONTROL_TOKEN_FILE must be configured together")

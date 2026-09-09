@@ -95,13 +95,10 @@ test("session exposes only the signed-in profile and keeps authorization bound t
   });
   response = await request("/api/v1/session");
   session = await response.json();
-  assert.deepEqual(Object.keys(session).sort(), [
-    "csrf",
-    "did",
-    "displayName",
-    "expires",
-    "handle",
-  ]);
+  assert.deepEqual(
+    Object.keys(session).sort((a, b) => a.localeCompare(b)),
+    ["csrf", "did", "displayName", "expires", "handle"],
+  );
   assert.equal(session.did, did);
   assert.equal(session.csrf, "x".repeat(43));
   assert.equal(session.displayName, "Test Operator");

@@ -53,6 +53,7 @@ type Job struct {
 	HistoryComplete bool              `json:"historyComplete"`
 }
 type data struct {
+	Actions     map[string]string `json:"actions,omitempty"`
 	Requests    map[string]string `json:"requests,omitempty"`
 	Initialized bool              `json:"initialized"`
 	Sources     map[string]bool   `json:"sources"`
@@ -100,6 +101,7 @@ func Open(db *store.Store, policy *selection.Manager) (*Manager, error) {
 			return nil, errors.New("invalid job status")
 		}
 	}
+	m.data.migrateActionReceipts()
 	if err := m.save(m.data); err != nil {
 		return nil, err
 	}
@@ -274,35 +276,27 @@ func (m *Manager) RequestOnce(raw, reason, requestID string) (Job, error) {
 		return Job{}, ErrConflict
 	}
 	next := clone(m.data)
-	remember := func(job Job) (Job, error) {
-		if requestID != "" {
-			if next.Requests == nil {
-				next.Requests = map[string]string{}
-			}
-			next.Requests[requestID] = job.ID
-		}
-		if err := m.commit(next); err != nil {
-			return Job{}, err
-		}
-		return clone(job), nil
-	}
-	policy := m.policy.Current()
+	j := requestJob(next, pds, reason, m.policy.Current())
+	return m.rememberRequest(next, j, requestID)
+}
+
+func requestJob(next data, pds, reason string, policy selection.Policy) Job {
 	for _, existing := range next.Jobs {
 		if existing.PDS == pds && existing.Policy.Revision == policy.Revision && existing.Reason == reason && (existing.State == Pending || existing.State == Running) {
-			return remember(existing)
+			return existing
 		}
 	}
 	j := newJob(pds, policy, reason)
 	if existing, ok := next.Jobs[j.ID]; ok {
 		if existing.State == Pending || existing.State == Running {
-			return remember(existing)
+			return existing
 		}
 		// A later recovery gap is new work, preserving the previous result.
 		sum := sha256.Sum256([]byte(fmt.Sprintf("%s/%d", j.ID, len(next.Jobs))))
 		j.ID = hex.EncodeToString(sum[:16])
 	}
 	next.Jobs[j.ID] = j
-	return remember(j)
+	return j
 }
 func (m *Manager) Cancel(id string) error                  { return m.transition(id, Canceled) }
 func (m *Manager) Retry(id string) error                   { return m.transition(id, Pending) }
@@ -315,8 +309,7 @@ func (m *Manager) TransitionOnce(id string, state State, requestID string) error
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	receipt := "action/" + requestID
-	if existing, ok := m.data.Requests[receipt]; requestID != "" && ok {
+	if existing, ok := m.data.Actions[requestID]; requestID != "" && ok {
 		if existing != string(state)+":"+id {
 			return ErrConflict
 		}
@@ -326,18 +319,15 @@ func (m *Manager) TransitionOnce(id string, state State, requestID string) error
 	if !ok {
 		return ErrNotFound
 	}
-	if state == Pending && (!m.data.Sources[j.PDS] || j.Policy.Revision != m.policy.Current().Revision || (j.State == Running && requestID == "")) {
-		return ErrConflict
-	}
-	if state == Canceled && j.State != Pending && j.State != Running && !(requestID != "" && j.State == Canceled) {
+	if !m.canTransition(j, state, requestID != "") {
 		return ErrConflict
 	}
 	next := clone(m.data)
 	if requestID != "" {
-		if next.Requests == nil {
-			next.Requests = map[string]string{}
+		if next.Actions == nil {
+			next.Actions = map[string]string{}
 		}
-		next.Requests[receipt] = string(state) + ":" + id
+		next.Actions[requestID] = string(state) + ":" + id
 	}
 	if requestID != "" && (j.State == state || (state == Pending && j.State == Running)) {
 		return m.commit(next)
@@ -518,4 +508,42 @@ func jobOutcome(err error) (State, string, error) {
 		return Pending, "", nil
 	}
 	return "", "", err
+}
+
+// Previous versions mixed action receipts into Requests using an action/ prefix.
+// Recognize their typed value, not only their key: a job request ID may itself
+// start with action/. Keep every old receipt so journal retries remain safe.
+func (d *data) migrateActionReceipts() {
+	for key, value := range d.Requests {
+		state, id, ok := strings.Cut(value, ":")
+		if !strings.HasPrefix(key, "action/") || !ok || (State(state) != Pending && State(state) != Canceled) {
+			continue
+		}
+		if _, exists := d.Jobs[id]; !exists {
+			continue
+		}
+		if d.Actions == nil {
+			d.Actions = map[string]string{}
+		}
+		d.Actions[strings.TrimPrefix(key, "action/")] = value
+		delete(d.Requests, key)
+	}
+}
+func (m *Manager) rememberRequest(next data, job Job, requestID string) (Job, error) {
+	if requestID != "" {
+		if next.Requests == nil {
+			next.Requests = map[string]string{}
+		}
+		next.Requests[requestID] = job.ID
+	}
+	if err := m.commit(next); err != nil {
+		return Job{}, err
+	}
+	return clone(job), nil
+}
+func (m *Manager) canTransition(j Job, state State, hasReceipt bool) bool {
+	if state == Pending {
+		return m.data.Sources[j.PDS] && j.Policy.Revision == m.policy.Current().Revision && (j.State != Running || hasReceipt)
+	}
+	return j.State == Pending || j.State == Running || (hasReceipt && j.State == Canceled)
 }

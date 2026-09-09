@@ -23,7 +23,14 @@ var relaySecret = secretFile{"HC_RELAY_CONTROL_SECRET", "RELAY_CONTROL_TOKEN_FIL
 var jetstreamSecret = secretFile{"HC_JETSTREAM_CONTROL_SECRET", "JETSTREAM_CONTROL_TOKEN_FILE"}
 var administrationSecret = secretFile{"HC_ADMIN_ENCRYPTION_SECRET", "ADMIN_ENCRYPTION_KEY_FILE"}
 
+func clearRawSecrets() {
+	for _, secret := range []secretFile{relaySecret, jetstreamSecret, administrationSecret} {
+		_ = os.Unsetenv(secret.input)
+	}
+}
+
 func prepare(component string) error {
+	defer clearRawSecrets()
 	var secrets []secretFile
 	switch component {
 	case "relay":
@@ -69,9 +76,6 @@ func prepare(component string) error {
 			}
 		}
 		complete = true
-	}
-	for _, secret := range []secretFile{relaySecret, jetstreamSecret, administrationSecret} {
-		_ = os.Unsetenv(secret.input)
 	}
 	return nil
 }

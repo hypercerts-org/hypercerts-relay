@@ -6,9 +6,25 @@ export interface ServiceConfig {
 }
 export class Services {
   constructor(
-    private relay: ServiceConfig,
-    private jetstream: ServiceConfig,
-  ) {}
+    private readonly relay: ServiceConfig,
+    private readonly jetstream: ServiceConfig,
+  ) {
+    for (const config of [relay, jetstream]) {
+      const url = new URL(config.url);
+      if (
+        !["http:", "https:"].includes(url.protocol) ||
+        url.username ||
+        url.password ||
+        url.pathname !== "/" ||
+        url.search ||
+        url.hash
+      )
+        throw new Error(
+          "Control services require an HTTP(S) origin without credentials, path or query",
+        );
+      config.url = url.origin;
+    }
+  }
   async call<T>(
     service: "relay" | "jetstream",
     path: string,
@@ -83,38 +99,8 @@ export class Services {
           expectedLimit: command.expectedLimit,
           accountLimit: command.accountLimit,
         });
-      case "source": {
-        // Stop acquisition at Jetstream before disabling the raw source. Retry is safe.
-        if (command.state !== "enabled") {
-          try {
-            await this.call("jetstream", "/sources", "DELETE", {
-              pds: command.pds,
-            });
-          } catch (error) {
-            // A Relay-only source is already absent from Jetstream.
-            if (!(error instanceof ApiError && error.status === 404))
-              throw error;
-          }
-          progress({ jetstream: { enabled: false } });
-        }
-        const relay = await this.call("relay", "/source", "PUT", {
-          pds: command.pds,
-          state: command.state,
-        });
-        progress({
-          relay,
-          ...(command.state !== "enabled"
-            ? { jetstream: { enabled: false } }
-            : {}),
-        });
-        const jetstream =
-          command.state === "enabled"
-            ? await this.call("jetstream", "/sources", "POST", {
-                pds: command.pds,
-              })
-            : { enabled: false };
-        return { relay, jetstream };
-      }
+      case "source":
+        return this.applySource(command, progress);
       case "collections": {
         const policy = await this.policy();
         if (
@@ -148,5 +134,37 @@ export class Services {
           eventsPerSecond: command.eventsPerSecond,
         });
     }
+  }
+  private async applySource(
+    command: Extract<Command, { kind: "source" }>,
+    progress: (value: unknown) => void,
+  ) {
+    // Stop acquisition at Jetstream before disabling the raw source. Retry is safe.
+    if (command.state !== "enabled") {
+      try {
+        await this.call("jetstream", "/sources", "DELETE", {
+          pds: command.pds,
+        });
+      } catch (error) {
+        // A Relay-only source is already absent from Jetstream.
+        if (!(error instanceof ApiError && error.status === 404)) throw error;
+      }
+      progress({ jetstream: { enabled: false } });
+    }
+    const relay = await this.call("relay", "/source", "PUT", {
+      pds: command.pds,
+      state: command.state,
+    });
+    progress({
+      relay,
+      ...(command.state !== "enabled" ? { jetstream: { enabled: false } } : {}),
+    });
+    const jetstream =
+      command.state === "enabled"
+        ? await this.call("jetstream", "/sources", "POST", {
+            pds: command.pds,
+          })
+        : { enabled: false };
+    return { relay, jetstream };
   }
 }

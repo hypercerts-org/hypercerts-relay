@@ -157,8 +157,19 @@ test(
     const jobID = (job.result as { id: string }).id;
     const again = await services.apply(job.command, job.id);
     assert.equal((again as { id: string }).id, jobID);
-    await new Promise((r) => setTimeout(r, 300));
-    const jobs = await services.jobs();
+    let jobs = await services.jobs();
+    const deadline = Date.now() + 10_000;
+    while (
+      jobs.jobs.find((job) => job.id === jobID)?.state !== "incomplete" &&
+      Date.now() < deadline
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      jobs = await services.jobs();
+    }
+    assert.equal(
+      jobs.jobs.find((job) => job.id === jobID)?.state,
+      "incomplete",
+    );
     assert.ok(jobs.jobs.every((j) => !j.historyComplete));
     assert.ok(jobs.jobs.some((j) => j.state === "incomplete"));
     await services.call("relay", "/source", "PUT", {

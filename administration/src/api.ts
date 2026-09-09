@@ -1,5 +1,5 @@
-import type { Command, Operation, Policy, Job } from "../server/contracts";
-export type { Command, Operation, Policy, Job };
+import type { Command, Policy } from "../server/contracts";
+export type { Command, Operation, Policy, Job } from "../server/contracts";
 export interface Administrator {
   did: string;
   handle?: string | null;
@@ -58,13 +58,22 @@ export async function api<T>(
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   if (response.status === 204) return undefined as T;
-  const data = await response.json();
+  let data;
+  try {
+    data = await response.json();
+  } catch {
+    data = null;
+  }
   if (!response.ok)
     throw new Error(
-      data.details?.join(" ") ??
-        data.error?.replaceAll("_", " ") ??
-        "The request failed. Try again.",
+      (Array.isArray(data?.details) ? data.details.join(" ") : undefined) ??
+        (typeof data?.error === "string"
+          ? data.error.replaceAll("_", " ")
+          : undefined) ??
+        `The request failed (HTTP ${response.status}). Try again.`,
     );
+  if (data === null)
+    throw new Error("The service returned an invalid response. Try again.");
   return data as T;
 }
 export function target(command: Command) {

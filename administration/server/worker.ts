@@ -6,8 +6,8 @@ import { ApiError } from "./contracts.ts";
 export class Worker {
   private busy = false;
   constructor(
-    private store: Store,
-    private services: Services,
+    private readonly store: Store,
+    private readonly services: Services,
   ) {}
   recover() {
     const pending = this.store.db
@@ -19,6 +19,8 @@ export class Worker {
         "requested",
         this.store.operation(row.id as string)?.result,
         "resuming_after_restart",
+        undefined,
+        ["applying"],
       );
   }
   async tick() {
@@ -32,12 +34,21 @@ export class Worker {
         .get();
       if (!row) return;
       const op = this.store.operation(row.id as string)!;
-      this.store.transition(op.id, "applying", op.result);
+      if (
+        !this.store.transition(op.id, "applying", op.result, null, undefined, [
+          "requested",
+        ])
+      )
+        return;
       try {
-        const result = await this.services.apply(op.command, op.id, (value) =>
-          this.store.transition(op.id, "applying", value),
-        );
-        this.store.transition(op.id, "applied", result);
+        const result = await this.services.apply(op.command, op.id, (value) => {
+          this.store.transition(op.id, "applying", value, null, undefined, [
+            "applying",
+          ]);
+        });
+        this.store.transition(op.id, "applied", result, null, undefined, [
+          "applying",
+        ]);
       } catch (e) {
         this.store.transition(
           op.id,
@@ -46,6 +57,8 @@ export class Worker {
             : "failed",
           this.store.operation(op.id)?.result,
           e instanceof ApiError ? e.code : "application_failed",
+          undefined,
+          ["applying"],
         );
       }
     } finally {

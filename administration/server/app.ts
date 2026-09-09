@@ -1,3 +1,8 @@
+import {
+  loginLimit,
+  railwayClientIP,
+  type ProxyOptions,
+} from "./login-limit.ts";
 import express, { type ErrorRequestHandler } from "express";
 import { z, ZodError } from "zod";
 import { join } from "node:path";
@@ -17,9 +22,12 @@ export function createApp(
   auth: Auth,
   metadata: unknown,
   staticDir?: string,
+  proxy: ProxyOptions = {},
 ) {
   const app = express();
   app.disable("x-powered-by");
+  app.set("trust proxy", proxy.trustProxy ?? false);
+  app.use(railwayClientIP(proxy));
   app.use((_req, res, next) => {
     res.set({
       "Cache-Control": "no-store",
@@ -34,24 +42,7 @@ export function createApp(
   app.use(express.urlencoded({ extended: false, limit: "4kb" }));
   app.get("/health", (_req, res) => res.json({ status: "ok" }));
   app.get("/oauth-client-metadata.json", (_req, res) => res.json(metadata));
-  const logins = new Map<string, { count: number; until: number }>();
-  app.post(
-    "/auth/login",
-    (req, res, next) => {
-      const now = Date.now();
-      for (const [key, value] of logins)
-        if (value.until < now) logins.delete(key);
-      const key = req.ip ?? "unknown",
-        entry = logins.get(key) ?? { count: 0, until: now + 60000 };
-      if (logins.size >= 10000 || ++entry.count > 10) {
-        next(new ApiError(429, "try_sign_in_again_later"));
-        return;
-      }
-      logins.set(key, entry);
-      next();
-    },
-    (req, res) => auth.login(req, res),
-  );
+  app.post("/auth/login", loginLimit(), (req, res) => auth.login(req, res));
   app.get("/auth/callback", (req, res) => auth.callback(req, res));
   app.use("/api/v1", auth.require);
   app.get("/api/v1/session", (_req, res) => {
@@ -124,13 +115,15 @@ export function createApp(
       throw new ApiError(409, "only_requested_operations_can_be_canceled");
     if (action === "retry" && !["failed", "incomplete"].includes(op.state))
       throw new ApiError(409, "operation_not_retryable");
-    store.transition(
+    const transitioned = store.transition(
       id,
       action === "cancel" ? "canceled" : "requested",
       op.result,
       null,
       (res.locals.session as Session).did,
+      action === "cancel" ? ["requested"] : ["failed", "incomplete"],
     );
+    if (!transitioned) throw new ApiError(409, "operation_state_changed");
     res.json(store.operation(id));
   });
   app.get("/api/v1/audit", (req, res) => {

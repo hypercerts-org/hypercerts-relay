@@ -27,6 +27,7 @@ type rateBucket struct {
 	waiting int
 }
 type ratePolicies struct {
+	writeMu sync.Mutex // Serialize persistence and publication without blocking admission on disk IO.
 	mu      sync.Mutex
 	buckets map[string]*rateBucket
 	changed chan struct{}
@@ -61,11 +62,13 @@ func (r *Relay) SetRatePolicy(ctx context.Context, scope string, value int64) (*
 		scope = sourceOrigin(view)
 	}
 	p := RatePolicy{Scope: scope, EventsPerSecond: value, UpdatedAt: time.Now().UTC()}
-	r.rates.mu.Lock()
-	defer r.rates.mu.Unlock()
+	r.rates.writeMu.Lock()
+	defer r.rates.writeMu.Unlock()
 	if err := r.db.WithContext(ctx).Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "scope"}}, DoUpdates: clause.AssignmentColumns([]string{"events_per_second", "updated_at"})}).Create(&p).Error; err != nil {
 		return nil, err
 	}
+	r.rates.mu.Lock()
+	defer r.rates.mu.Unlock()
 	bucket := r.rates.buckets[scope]
 	if bucket == nil {
 		bucket = &rateBucket{tokens: float64(value)}
@@ -128,19 +131,7 @@ func (r *Relay) waitRateCapacity(ctx context.Context, hostname string) error {
 			return err
 		}
 		r.rates.mu.Lock()
-		now := time.Now()
-		delay := time.Duration(0)
-		var buckets []*rateBucket
-		for _, key := range []string{"global", "https://" + hostname, "http://" + hostname} {
-			if b := r.rates.buckets[key]; b != nil {
-				b.tokens = math.Min(float64(b.policy.EventsPerSecond), b.tokens+now.Sub(b.at).Seconds()*float64(b.policy.EventsPerSecond))
-				b.at = now
-				if b.tokens < 1 {
-					delay = max(delay, time.Duration((1-b.tokens)/float64(b.policy.EventsPerSecond)*float64(time.Second)))
-				}
-				buckets = append(buckets, b)
-			}
-		}
+		buckets, delay := r.rates.capacity(hostname, time.Now())
 		if delay <= 0 {
 			for _, b := range buckets {
 				b.tokens--
@@ -166,4 +157,24 @@ func (r *Relay) waitRateCapacity(ctx context.Context, hostname string) error {
 		}
 		r.rates.mu.Unlock()
 	}
+}
+
+// capacity refills all matching buckets under mu; callers reserve from them atomically.
+func (p *ratePolicies) capacity(hostname string, now time.Time) ([]*rateBucket, time.Duration) {
+	var buckets []*rateBucket
+	var delay time.Duration
+	for _, key := range []string{"global", "https://" + hostname, "http://" + hostname} {
+		b := p.buckets[key]
+		if b == nil {
+			continue
+		}
+		rate := float64(b.policy.EventsPerSecond)
+		b.tokens = math.Min(rate, b.tokens+now.Sub(b.at).Seconds()*rate)
+		b.at = now
+		if b.tokens < 1 {
+			delay = max(delay, time.Duration((1-b.tokens)/rate*float64(time.Second)))
+		}
+		buckets = append(buckets, b)
+	}
+	return buckets, delay
 }

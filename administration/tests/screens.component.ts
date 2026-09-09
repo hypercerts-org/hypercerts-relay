@@ -37,11 +37,25 @@ test("quota drafts survive observations and reject stale or invalid changes", as
     expectedLimit: 100,
     accountLimit: 250,
   });
+  await view.rerender({
+    source: { ...source, AccountQuota: { Count: 11, Limit: 250 } },
+  });
+  expect(
+    screen.queryByRole("button", { name: "Use current quota" }),
+  ).toBeNull();
+  await fireEvent.input(input, { target: { value: "300" } });
+  await fireEvent.submit(input.form!);
+  expect(submit).toHaveBeenLastCalledWith({
+    kind: "account_quota",
+    pds: "https://quota.example",
+    expectedLimit: 250,
+    accountLimit: 300,
+  });
   submit.mockClear();
   await view.rerender({
     source: { ...source, AccountQuota: { Count: 11, Limit: 150 } },
   });
-  expect(input.value).toBe("250");
+  expect(input.value).toBe("300");
   await fireEvent.submit(input.form!);
   expect(submit).not.toHaveBeenCalled();
   await fireEvent.click(

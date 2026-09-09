@@ -340,3 +340,34 @@ test("branded sign-in and sidebar identity work with and without profile metadat
     await page.unroute("**/api/v1/session");
   }
 });
+
+test("successful polling clears observation errors without hiding action failures", async ({
+  page,
+}) => {
+  await login(page);
+  await page.route("**/api/v1/limits?*", (route) =>
+    route.fulfill({
+      status: 502,
+      contentType: "text/html",
+      body: "Bad gateway",
+    }),
+  );
+  await page.getByRole("link", { name: "Rate limits", exact: true }).click();
+  await expect(page.getByRole("alert")).toContainText("HTTP 502");
+  await page.unroute("**/api/v1/limits?*");
+  await expect(page.getByRole("alert")).toHaveCount(0, { timeout: 12_000 });
+  await page.route("**/api/v1/operations", (route) =>
+    route.fulfill({
+      status: 409,
+      contentType: "application/json",
+      body: JSON.stringify({ error: "revision_conflict" }),
+    }),
+  );
+  await page.getByLabel("Events per second").fill("150");
+  await page.getByRole("button", { name: "Request limit change" }).click();
+  await expect(page.getByRole("alert")).toContainText("revision conflict");
+  await page.waitForResponse((response) =>
+    response.url().includes("/api/v1/limits?"),
+  );
+  await expect(page.getByRole("alert")).toContainText("revision conflict");
+});

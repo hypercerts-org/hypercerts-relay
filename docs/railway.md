@@ -136,3 +136,18 @@ volume persistence and cursor recovery still need deployment-specific validation
 - [Volume availability and ownership](https://docs.railway.com/volumes)
 - [Private networking](https://docs.railway.com/networking/private-networking/how-it-works)
 - [Project-local Railway skill](../.agents/skills/hypercerts-railway/SKILL.md)
+
+## Management transport
+
+Control URLs must be HTTP(S) origins without embedded credentials, paths, queries
+or fragments. Use HTTPS when traffic crosses an untrusted network. HTTP is supported
+on loopback and Railway's encrypted private network: Railway carries private
+service traffic through WireGuard tunnels. Bind management listeners only within
+that trust boundary and never attach public domains or public TCP proxies to them.
+A bearer token authenticates callers but does not itself encrypt HTTP traffic.
+See [Railway private networking](https://docs.railway.com/networking/private-networking).
+
+The administration bootstrap mode also enables Railway public-edge client-IP
+handling for login limits; see [proxy configuration](../administration/README.md#proxy-and-storage-boundaries).
+Raw `HC_*_SECRET` inputs are removed before process replacement in both ordinary
+container mode and Railway mode. Existing `*_FILE` configuration is preserved.

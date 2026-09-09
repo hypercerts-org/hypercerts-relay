@@ -204,3 +204,16 @@ Errors use a bounded JSON `error` code: 400 invalid input, 401 authentication,
 Mutation bodies are limited to 64 KiB and reject unknown fields/trailing JSON.
 Local persistence errors do not acknowledge a successful change or expose raw
 storage errors. Job progress and outcomes survive restart.
+
+### Backfill command receipts
+
+Job creation and retry/cancel commands have separate durable receipt namespaces.
+Existing mixed receipts are migrated when the job store opens, preserving retries
+from the administration journal across upgrades. Do not downgrade to a version
+that predates separate action receipts while journal commands can still be retried.
+
+Receipts currently have no expiry: an old journal retry must never repeat a later
+side effect. Job history and receipts share the persisted job-state document, so
+its size and rewrite cost grow with operator activity. Monitor metadata volume and
+command latency. Receipt pruning requires an agreed journal retry cutoff and an
+atomic migration to per-key storage; arbitrary age/count eviction is not safe.

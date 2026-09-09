@@ -16,7 +16,7 @@ export const origin = z
         u.hash ||
         u.pathname !== "/"
       )
-        throw new Error();
+        throw new Error("Invalid PDS origin");
       return u.origin;
     } catch {
       ctx.addIssue({
@@ -57,9 +57,7 @@ export const command = z.discriminatedUnion("kind", [
             ),
         )
         .max(1000)
-        .transform((v) =>
-          [...new Set(v)].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)),
-        ),
+        .transform((v) => [...new Set(v)].sort(compareCollections)),
     })
     .strict(),
   z
@@ -119,4 +117,9 @@ export class ApiError extends Error {
   ) {
     super(code);
   }
+}
+
+function compareCollections(a: string, b: string) {
+  if (a === b) return 0;
+  return a < b ? -1 : 1;
 }

@@ -39,6 +39,7 @@
     loading = false,
     busy = false,
     error = "",
+    loadError = "",
     notice = "";
   let administrators: Administrator[] = [];
   let policyLoaded = false;
@@ -126,8 +127,9 @@
       }
       if (operation)
         operation = await api<Operation>(`/operations/${operation.id}`);
+      loadError = "";
     } catch (e) {
-      error = (e as Error).message;
+      loadError = (e as Error).message;
     } finally {
       loading = false;
     }
@@ -304,8 +306,9 @@
           >
         </div>
       </header>
-      {#if error}<div class="error" role="alert">
-          {error}. Check the service connection or refresh to try again.
+      {#if error || loadError}<div class="error" role="alert">
+          {error || loadError}. Check the service connection or refresh to try
+          again.
         </div>{/if}
       {#if notice || operation}<div class="notice" role="status">
           {notice}{#if operation}<div>

@@ -13,7 +13,7 @@ type rateScheduler struct {
 }
 
 func (s rateScheduler) AddWork(ctx context.Context, repo string, ev *stream.XRPCStreamEvent) error {
-	if s.wait != nil && (ev.RepoCommit != nil || ev.RepoSync != nil || ev.RepoIdentity != nil || ev.RepoAccount != nil) {
+	if s.wait != nil {
 		if err := s.wait(ctx, s.host); err != nil {
 			return err
 		}

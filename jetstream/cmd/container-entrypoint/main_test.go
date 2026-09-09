@@ -42,23 +42,28 @@ func TestSecretFiles(t *testing.T) {
 					continue
 				}
 				found++
-				data, err := os.ReadFile(path)
-				if err != nil || string(data) != fixtureSecret {
-					t.Fatalf("%s did not materialize correctly", secret.output)
-				}
-				info, err := os.Stat(path)
-				if err != nil || info.Mode().Perm() != 0600 {
-					t.Fatal("secret file permissions are not 0600")
-				}
-				info, err = os.Stat(filepath.Dir(path))
-				if err != nil || info.Mode().Perm() != 0700 {
-					t.Fatal("secret directory permissions are not 0700")
-				}
+				assertSecretFile(t, path, secret.output)
 			}
 			if found != count {
 				t.Fatalf("got %d files, want %d", found, count)
 			}
 		})
+	}
+}
+
+func assertSecretFile(t *testing.T, path, name string) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil || string(data) != fixtureSecret {
+		t.Fatalf("%s did not materialize correctly", name)
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.Mode().Perm() != 0600 {
+		t.Fatal("secret file permissions are not 0600")
+	}
+	info, err = os.Stat(filepath.Dir(path))
+	if err != nil || info.Mode().Perm() != 0700 {
+		t.Fatal("secret directory permissions are not 0700")
 	}
 }
 
@@ -72,6 +77,11 @@ func TestOrdinaryContainerKeepsExistingConfiguration(t *testing.T) {
 	}
 	if os.Getenv(relaySecret.output) != "/run/secrets/existing-token" {
 		t.Fatal("existing file-secret path changed")
+	}
+	for _, secret := range []secretFile{relaySecret, jetstreamSecret, administrationSecret} {
+		if _, present := os.LookupEnv(secret.input); present {
+			t.Fatalf("raw %s remains in ordinary container", secret.input)
+		}
 	}
 	entries, err := os.ReadDir(os.Getenv("TMPDIR"))
 	if err != nil || len(entries) != 0 {

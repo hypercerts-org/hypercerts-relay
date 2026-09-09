@@ -141,8 +141,8 @@ filtered jobs and coverage; connection state and durable cursors come from Relay
 
 Global and per-PDS values are integer **events/second**, inclusive range 1–1,000,000,
 with a one-second token-bucket burst. Both constraints must admit an event before
-it enters the scheduler. They cover commit, sync, identity and account frames;
-control/error frames can still pass. Waiting pauses further socket reads and is
+it enters the scheduler. They cover every source frame, including repository,
+info, label and error frames. Waiting pauses further socket reads and is
 cancelable. Policy changes wake waiting connections; persistence precedes the
 applied acknowledgment. Buckets refill on restart; configured values persist.
 Existing host limits and account-admission quotas remain independently enforced.
@@ -175,3 +175,24 @@ required for Go service changes.
 ## Brand assets
 
 The UI uses the Hypercerts theme, logo and fonts. See [the brand source notes](src/brand/README.md) for asset provenance and licensing, and [DESIGN.md](../DESIGN.md) for the operator UI conventions. The first `npm run build` or `npm run dev` downloads a checksum-verified Switzer font from Fontshare; subsequent builds reuse the ignored cache. The built application serves its fonts locally.
+
+## Proxy and storage boundaries
+
+Direct connections ignore forwarded client-IP headers. Behind a reverse proxy,
+set `ADMIN_TRUST_PROXY` to a comma-separated list of its exact addresses or CIDRs;
+the proxy must overwrite forwarded headers. Do not trust arbitrary internet clients.
+With `HC_RAILWAY_STARTUP=1`, the application trusts loopback, link-local and private
+network peers and uses Railway's overwritten `X-Real-IP` header. That mode assumes
+all private-environment peers are trusted; use explicit CIDRs to narrow the peer
+set where available. Sign-in limits are per observed client (10 attempts/minute),
+with a bounded 10,000-client cache that evicts the oldest entry at capacity.
+
+Use a dedicated directory owned by the runtime UID for `ADMIN_DATABASE`. New
+folders are mode 0700; the database and existing WAL/SHM files are secured to 0600
+before opening. Existing parent directories are never chmod-ed because a volume
+or directory may be shared. Restrict write access to the parent through deployment
+ownership and permissions.
+
+Operation pages use creation time and UUID as a stable tie-breaker. Their `next`
+cursor is opaque; clients should pass it unchanged as `after`. Worker claims,
+cancellation and retries compare the current journal state in one transaction.

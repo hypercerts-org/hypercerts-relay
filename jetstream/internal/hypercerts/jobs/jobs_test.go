@@ -168,3 +168,31 @@ func TestNoopActionReceiptsDoNotChangeLaterJobState(t *testing.T) {
 	require.NoError(t, m.TransitionOnce(job.ID, Canceled, "cancel-current"))
 	require.Equal(t, Pending, m.List()[0].State, "a repeated receipt must not cancel a later retry")
 }
+
+func TestReceiptNamespacesAndLegacyMigration(t *testing.T) {
+	dir := t.TempDir()
+	m, db := newManager(t, dir)
+	_, err := m.AddSource("https://pds.example")
+	require.NoError(t, err)
+	job, err := m.RequestOnce("https://pds.example", "backfill", "action/shared")
+	require.NoError(t, err)
+	// These keys collided in the old combined map. Each operation keeps its receipt.
+	require.NoError(t, m.TransitionOnce(job.ID, Canceled, "shared"))
+	again, err := m.RequestOnce("https://pds.example", "backfill", "action/shared")
+	require.NoError(t, err)
+	require.Equal(t, job.ID, again.ID)
+	require.Equal(t, Canceled, again.State)
+	// Model an existing installation: typed action values live in Requests.
+	m.data.Requests["action/legacy"] = string(Canceled) + ":" + job.ID
+	require.NoError(t, m.save(m.data))
+	require.NoError(t, db.Close())
+	m, db = newManager(t, dir)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	require.Equal(t, job.ID, m.data.Requests["action/shared"])
+	require.NotContains(t, m.data.Requests, "action/legacy")
+	require.NoError(t, m.Retry(job.ID))
+	require.NoError(t, m.TransitionOnce(job.ID, Canceled, "legacy"))
+	require.NoError(t, m.TransitionOnce(job.ID, Canceled, "shared"))
+	require.Equal(t, Pending, m.data.Jobs[job.ID].State, "old cancellation receipts must not cancel a later retry")
+	require.ErrorIs(t, m.TransitionOnce(job.ID, Pending, "legacy"), ErrConflict)
+}

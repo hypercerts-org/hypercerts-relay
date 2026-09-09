@@ -48,6 +48,14 @@ const server = createApp(
   new Auth(store, base, provider),
   metadata,
   resolve("dist"),
+  {
+    railway: process.env.HC_RAILWAY_STARTUP === "1",
+    trustProxy:
+      process.env.ADMIN_TRUST_PROXY?.split(",").map((value) => value.trim()) ??
+      (process.env.HC_RAILWAY_STARTUP === "1"
+        ? ["loopback", "linklocal", "uniquelocal"]
+        : undefined),
+  },
 ).listen(
   Number(process.env.PORT ?? 3000),
   process.env.ADMIN_BIND ?? "127.0.0.1",

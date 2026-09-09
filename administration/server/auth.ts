@@ -71,7 +71,8 @@ export function oauthProvider(store: Store, base: string, key: Buffer) {
       store.set(namespace, key, {
         value: seal(value),
         expires:
-          Date.now() + (namespace === "oauth-state" ? 600_000 : 30 * 86400_000),
+          Date.now() +
+          (namespace === "oauth-state" ? 600_000 : 30 * 86_400_000),
       });
     },
     async del(key: string) {
@@ -164,7 +165,7 @@ export class Auth {
       id: hash(token),
       did,
       csrf,
-      expires: Date.now() + 8 * 3600_000,
+      expires: Date.now() + 8 * 3_600_000,
     };
     this.store.transaction(() => {
       this.store.db
@@ -182,7 +183,7 @@ export class Auth {
         });
       }
     });
-    res.cookie("relay_session", token, this.options(8 * 3600_000));
+    res.cookie("relay_session", token, this.options(8 * 3_600_000));
     return session;
   }
   require = (req: Request, res: Response, next: NextFunction) => {

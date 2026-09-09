@@ -8,6 +8,12 @@
   let draft = String(expectedLimit);
   let error = "";
   let input: HTMLInputElement;
+  $: if (
+    /^\d+$/.test(draft) &&
+    Number.isSafeInteger(Number(draft)) &&
+    Number(draft) === source.AccountQuota.Limit
+  )
+    expectedLimit = source.AccountQuota.Limit;
   $: changedElsewhere = source.AccountQuota.Limit !== expectedLimit;
   function useCurrent() {
     expectedLimit = source.AccountQuota.Limit;
