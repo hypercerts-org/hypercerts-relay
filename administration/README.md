@@ -14,13 +14,14 @@ Use Node 24.18 or later, Go versions required by each module, and npm. From this
 ```sh
 npm ci
 npm run build
-# Set the configuration below and grant an initial administrator, then:
+# Set the configuration below, including ADMIN_SEED_DID for first access, then:
 npm run server
 ```
 
 | Variable                       | Meaning                                                                                                 |
 | ------------------------------ | ------------------------------------------------------------------------------------------------------- |
 | `ADMIN_PUBLIC_ORIGIN`          | Exact externally visible HTTPS origin; local development uses `http://127.0.0.1:3000`.                  |
+| `ADMIN_SEED_DID`               | Optional full DID to grant ordinary administrator access once, on an uninitialized database.            |
 | `ADMIN_DATABASE`               | Dedicated SQLite file on durable local storage.                                                         |
 | `ADMIN_ENCRYPTION_KEY_FILE`    | File containing a random secret of at least 32 bytes, used to encrypt OAuth tokens and handshake state. |
 | `ADMIN_BIND` / `PORT`          | Listener, default `127.0.0.1:3000`. Put an HTTPS proxy in front for remote use.                         |
@@ -53,7 +54,24 @@ membership. All responses prohibit caching.
 
 ## Administrator access
 
-An operator with filesystem access to the control-plane host grants/removes DIDs:
+Set `ADMIN_SEED_DID` to the initial operator's full DID at runtime. It is not a
+handle, password, or special superadministrator. An invalid or empty configured
+value fails startup. Omit the variable when not needed.
+
+On an uninitialized database, startup atomically grants this DID, records an
+`administrator_seed` audit event and saves a durable initialization marker.
+Restarts and changes to the variable never grant it again. Existing administrator
+membership or recorded access history also prevents seeding. Removing every
+administrator does not reset initialization; retain the database across deploys.
+
+After signing in, use **Administrators** to grant access to another DID or remove
+another administrator, including the seed DID. Removal immediately invalidates
+all their local sessions and stored OAuth tokens, and records the acting admin in
+the audit history. Admins cannot remove their own access through this API or UI;
+another administrator must do that. Normal OAuth sign-in is still required.
+
+The CLI is the recovery path when administrator access is lost. An operator with
+filesystem access to the control-plane host can grant/remove DIDs:
 
 ```sh
 ADMIN_DATABASE=/data/control.db npx tsx server/access.ts grant did:plc:...
@@ -74,6 +92,8 @@ The browser-facing API is `/api/v1`; all endpoints below require authorization.
 
 | Endpoint                                 | Contract                                                                                          |
 | ---------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `GET /administrators`                 | Paginated current administrator DIDs.                                                             |
+| `POST /administrators`                | `{did, action}` with `grant` or `remove`; actor audited, CSRF protected; cannot remove oneself.            |
 | `GET /session`                           | Current DID, CSRF token, expiry.                                                                  |
 | `POST /signout`, `/revoke-sessions`      | Revoke the current or all local sessions.                                                         |
 | `POST /operations`                       | Validated command plus UUID `Idempotency-Key`; returns durable operation and HTTP 202.            |

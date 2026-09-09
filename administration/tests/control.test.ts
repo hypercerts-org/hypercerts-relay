@@ -210,3 +210,71 @@ test("OAuth callback binding rejects a different browser and non-admin identity"
     1,
   );
 });
+
+test("admins manage other administrators with CSRF, immediate revocation and actor audit", async (t) => {
+  const { request, store } = await fixture(t);
+  const other = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+  const grant = { did: other, action: "grant" };
+  for (const headers of [
+    { Cookie: "" },
+    { "X-CSRF-Token": "" },
+    { Origin: "https://evil.example" },
+  ] as Record<string, string>[])
+    assert.ok(
+      (await request("/api/v1/administrators", grant, headers)).status >= 400,
+    );
+  assert.equal(
+    (
+      await request("/api/v1/administrators", {
+        ...grant,
+        did: "a.handle.example",
+      })
+    ).status,
+    400,
+  );
+  assert.equal((await request("/api/v1/administrators", grant)).status, 204);
+  assert.equal((await request("/api/v1/administrators", grant)).status, 204);
+  assert.equal(
+    (await request("/api/v1/administrators", { did, action: "remove" })).status,
+    400,
+  );
+  const first = await (await request("/api/v1/administrators?limit=1")).json();
+  assert.deepEqual(first.items, [{ did }]);
+  assert.equal(first.next, did);
+  const second = await (
+    await request(
+      `/api/v1/administrators?after=${encodeURIComponent(first.next)}&limit=1`,
+    )
+  ).json();
+  assert.deepEqual(second.items, [{ did: other }]);
+  store.db
+    .prepare("INSERT INTO sessions VALUES(?,?,?,?)")
+    .run(
+      createHash("sha256").update("other-session").digest("hex"),
+      other,
+      "x".repeat(43),
+      Date.now() + 60000,
+    );
+  store.set("oauth-session", did, { encrypted: "test-only-value" });
+  assert.equal(
+    (
+      await request(
+        "/api/v1/administrators",
+        { did, action: "remove" },
+        { Cookie: "relay_session=other-session" },
+      )
+    ).status,
+    204,
+  );
+  assert.equal((await request("/api/v1/session")).status, 401);
+  assert.equal((await request("/api/v1/administrators", grant)).status, 401);
+  assert.equal(store.get("oauth-session", did), undefined);
+  const audit = store.page("audit", "", 50).items;
+  assert.deepEqual(
+    audit.map((row: any) => [row.actor, row.action]),
+    [
+      [did, "administrator_grant"],
+      [other, "administrator_remove"],
+    ],
+  );
+});

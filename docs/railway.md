@@ -91,8 +91,14 @@ arguments, image layers, command history or CI logs. Keep the OAuth encryption k
 stable with its database; coordinate service-token rotation with client restarts.
 The inherited Relay administrative password is a separate runtime setting.
 
-Administrator grants must run against the running administration container's
-mounted database, using `/app/node_modules/.bin/tsx server/access.ts grant DID`.
+For initial access, set `ADMIN_SEED_DID` on the administration service at runtime.
+Startup grants that DID once on an uninitialized database. The seed is an ordinary
+administrator: another admin can remove it through the Administrators screen,
+and restarting or changing the seed variable cannot restore revoked access.
+Keep the initialization marker with the durable administration database.
+
+Use the access CLI only for recovery, against the running administration
+container's mounted database: `/app/node_modules/.bin/tsx server/access.ts grant DID`.
 Do not bake an administrator into an image or grant access at build/pre-deploy time.
 `railway run` executes locally with remote variables, not against a remote volume.
 See the administration README for the full access and revocation contract.

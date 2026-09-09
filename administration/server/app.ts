@@ -57,6 +57,27 @@ export function createApp(
     const { did, csrf, expires } = res.locals.session as Session;
     res.json({ did, csrf, expires });
   });
+  app.get("/api/v1/administrators", (req, res) => {
+    const p = page
+      .extend({ after: z.string().max(2048).default("") })
+      .parse(req.query);
+    res.json(store.administrators(p.after, p.limit));
+  });
+  app.post("/api/v1/administrators", (req, res) => {
+    const input = z
+      .object({
+        did: z.string().max(2048),
+        action: z.enum(["grant", "remove"]),
+      })
+      .strict()
+      .parse(req.body);
+    store.changeAdministrator(
+      (res.locals.session as Session).did,
+      input.did,
+      input.action,
+    );
+    res.status(204).end();
+  });
   app.post("/api/v1/signout", (req, res) => auth.logout(req, res));
   app.post("/api/v1/revoke-sessions", (_req, res) => {
     const session = res.locals.session as Session;

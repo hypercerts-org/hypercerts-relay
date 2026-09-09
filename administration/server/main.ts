@@ -39,6 +39,7 @@ const services = new Services(
     token: secret("JETSTREAM_CONTROL_TOKEN_FILE"),
   },
 );
+store.seedAdministrator(process.env.ADMIN_SEED_DID);
 const worker = new Worker(store, services);
 worker.recover();
 const server = createApp(

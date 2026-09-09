@@ -13,6 +13,7 @@ if (
   );
 const store = new Store(process.env.ADMIN_DATABASE);
 store.transaction(() => {
+  store.set("bootstrap", "administrator", { initialized: true });
   if (action === "grant")
     store.db.prepare("INSERT OR IGNORE INTO administrators VALUES(?)").run(did);
   else {

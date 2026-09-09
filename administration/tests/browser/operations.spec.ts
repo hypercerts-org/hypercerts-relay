@@ -74,6 +74,7 @@ test("desktop and mobile screens have no serious accessibility violations or pag
       "/limits",
       "/changes",
       "/audit",
+      "/administrators",
     ]) {
       await page.goto(route);
       await expect(page.locator("h1")).toBeVisible();
@@ -101,4 +102,67 @@ test("desktop and mobile screens have no serious accessibility violations or pag
     path: test.info().outputPath("desktop.png"),
     fullPage: true,
   });
+});
+
+test("administrator grants and removes access through the UI", async ({
+  page,
+}) => {
+  await login(page);
+  await page.getByRole("link", { name: "Administrators", exact: true }).click();
+  const did = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+  await page
+    .getByLabel("Administrator DID", { exact: true })
+    .fill("invalid.example");
+  await page
+    .getByRole("button", { name: "Grant administrator access" })
+    .click();
+  await expect(page.getByRole("alert")).toContainText("Enter a valid DID");
+  await expect(
+    page.getByLabel("Administrator DID", { exact: true }),
+  ).toBeFocused();
+  await page.getByLabel("Administrator DID", { exact: true }).fill(did);
+  await page
+    .getByRole("button", { name: "Grant administrator access" })
+    .click();
+  await expect(
+    page
+      .getByRole("status")
+      .filter({ hasText: "Administrator access granted" }),
+  ).toBeVisible();
+  await page.reload();
+  const remove = page.getByRole("button", {
+    name: `Remove administrator ${did}`,
+    exact: true,
+  });
+  await expect(remove).toBeVisible();
+  for (const width of [1365, 390]) {
+    await page.setViewportSize({ width, height: 900 });
+    await remove.click();
+    await expect(
+      page.getByRole("heading", { name: "Remove administrator access?" }),
+    ).toBeVisible();
+    const results = await new AxeBuilder({ page }).analyze();
+    expect(
+      results.violations.filter((v) =>
+        ["serious", "critical"].includes(v.impact ?? ""),
+      ),
+    ).toEqual([]);
+    expect(
+      await page.evaluate(
+        () => document.documentElement.scrollWidth <= window.innerWidth,
+      ),
+    ).toBe(true);
+    await page.screenshot({
+      path: test.info().outputPath(`administrators-${width}.png`),
+      fullPage: true,
+    });
+    await page.getByRole("button", { name: "Cancel", exact: true }).click();
+  }
+  await remove.click();
+  await page
+    .getByRole("button", { name: "Confirm removal", exact: true })
+    .click();
+  await expect(remove).toHaveCount(0);
+  await page.reload();
+  await expect(remove).toHaveCount(0);
 });

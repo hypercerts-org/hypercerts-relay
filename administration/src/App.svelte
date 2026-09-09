@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import Administrators from "./Administrators.svelte";
   import Sources from "./Sources.svelte";
   import Collections from "./Collections.svelte";
   import Operations from "./Operations.svelte";
@@ -26,6 +27,7 @@
     ["limits", "Rate limits"],
     ["changes", "Requested changes"],
     ["audit", "Audit history"],
+    ["administrators", "Administrators"],
   ];
   const route = location.pathname.split("/")[1] || "overview";
   const screen = navigation.some(([key]) => key === route) ? route : "overview";
@@ -35,6 +37,7 @@
     busy = false,
     error = "",
     notice = "";
+  let administrators: { did: string }[] = [];
   let policyLoaded = false;
   let sources: Source[] = [],
     policy: Policy = { revision: 1, collections: [] },
@@ -54,6 +57,15 @@
     loading = true;
     try {
       switch (screen) {
+        case "administrators": {
+          const r = await api<{
+            items: { did: string }[];
+            next: string | null;
+          }>(`/administrators?after=${encodeURIComponent(cursor)}`);
+          administrators = r.items;
+          next = r.next;
+          break;
+        }
         case "sources": {
           const r = await api<{ Sources: Source[]; NextAfterHostID: number }>(
             `/sources?after=${encodeURIComponent(cursor)}`,
@@ -283,7 +295,13 @@
               ) ?? ""} <a href="/changes">View requested changes</a>
             </div>{/if}
         </div>{/if}
-      {#if screen === "sources"}<Sources rows={sources} {submit} {busy} />
+      {#if screen === "administrators"}<Administrators
+          rows={administrators}
+          currentDid={session.did}
+          csrf={session.csrf}
+          onChanged={load}
+        />
+      {:else if screen === "sources"}<Sources rows={sources} {submit} {busy} />
       {:else if screen === "collections"}{#if policyLoaded}<Collections
             {policy}
             {submit}

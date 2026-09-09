@@ -1,3 +1,4 @@
+import { isValidDid } from "@atproto/syntax";
 import { DatabaseSync } from "node:sqlite";
 import { mkdirSync, chmodSync } from "node:fs";
 import { dirname } from "node:path";
@@ -20,6 +21,65 @@ export class Store {
       CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, did TEXT NOT NULL, csrf TEXT NOT NULL, expires INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS administrators (did TEXT PRIMARY KEY);
       CREATE INDEX IF NOT EXISTS operations_state ON operations(state,createdAt,id);`);
+  }
+  seedAdministrator(did?: string) {
+    if (did !== undefined && !isValidDid(did))
+      throw new Error("ADMIN_SEED_DID must be a valid DID");
+    this.transaction(() => {
+      if (this.get("bootstrap", "administrator")) return;
+      // Existing membership or its audit history must never be overwritten by
+      // first-run configuration, even if the last administrator was removed.
+      const existing =
+        this.db.prepare("SELECT did FROM administrators LIMIT 1").get() ||
+        this.db
+          .prepare(
+            "SELECT seq FROM audit WHERE action IN ('administrator_grant', 'administrator_remove', 'administrator_seed') LIMIT 1",
+          )
+          .get();
+      if (existing) {
+        this.set("bootstrap", "administrator", { initialized: true });
+      } else if (did) {
+        this.db.prepare("INSERT INTO administrators VALUES(?)").run(did);
+        this.audit("system:bootstrap", "administrator_seed", { did });
+        this.set("bootstrap", "administrator", { initialized: true });
+      }
+    });
+  }
+  administrators(after: string, limit: number) {
+    const rows = this.db
+      .prepare(
+        "SELECT did FROM administrators WHERE did>? ORDER BY did LIMIT ?",
+      )
+      .all(after, limit + 1) as { did: string }[];
+    return {
+      items: rows.slice(0, limit),
+      next: rows.length > limit ? rows[limit - 1].did : null,
+    };
+  }
+  changeAdministrator(actor: string, did: string, action: "grant" | "remove") {
+    if (!isValidDid(did)) throw new ApiError(400, "invalid_administrator_did");
+    this.transaction(() => {
+      if (
+        !this.db
+          .prepare("SELECT did FROM administrators WHERE did=?")
+          .get(actor)
+      )
+        throw new ApiError(403, "administrator_required");
+      if (action === "remove" && did === actor)
+        throw new ApiError(
+          400,
+          "ask_another_administrator_to_remove_your_access",
+        );
+      const result =
+        action === "grant"
+          ? this.db
+              .prepare("INSERT OR IGNORE INTO administrators VALUES(?)")
+              .run(did)
+          : this.db.prepare("DELETE FROM administrators WHERE did=?").run(did);
+      if (action === "remove") this.revokeSessions(did);
+      this.set("bootstrap", "administrator", { initialized: true });
+      if (result.changes) this.audit(actor, `administrator_${action}`, { did });
+    });
   }
   transaction<T>(f: () => T): T {
     this.db.exec("BEGIN IMMEDIATE");

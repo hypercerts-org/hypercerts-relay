@@ -9,7 +9,7 @@ import { resolve } from "node:path";
 const base = "http://127.0.0.1:3188",
   did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
 const store = new Store(":memory:");
-store.db.prepare("INSERT INTO administrators VALUES(?)").run(did);
+store.seedAdministrator(did);
 const oauth: OAuthProvider = {
   async authorize(input, options) {
     return new URL(
