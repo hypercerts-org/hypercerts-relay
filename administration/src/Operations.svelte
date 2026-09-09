@@ -23,7 +23,7 @@
 {#if screen === "jobs"}
   <div class="intro">
     <p class="eyebrow">Historical recovery</p>
-    <h1>Backfill <em>jobs</em></h1>
+    <h1>Backfill jobs</h1>
     <p>
       Acquire selected current records directly from a PDS. Job states come from
       Jetstream.
@@ -115,7 +115,7 @@
 {:else if screen === "coverage"}
   <div class="intro">
     <p class="eyebrow">Retention evidence</p>
-    <h1>Collection <em>coverage</em></h1>
+    <h1>Collection coverage</h1>
     <p>
       Coverage is scoped to the named PDS and collection-policy revision. A
       complete snapshot does not prove complete history.
@@ -171,7 +171,7 @@
 {:else if screen === "audit"}
   <div class="intro">
     <p class="eyebrow">Activity record</p>
-    <h1>Audit <em>history</em></h1>
+    <h1>Audit history</h1>
     <p>
       Actor-attributed changes and their recorded outcomes. Entries are ordered
       by durable sequence.
@@ -209,7 +209,7 @@
 {:else}
   <div class="intro">
     <p class="eyebrow">Change tracking</p>
-    <h1>Requested <em>changes</em></h1>
+    <h1>Requested changes</h1>
     <p>
       Requested configuration is recorded before application. “Applied” means
       the owning service acknowledged the change; backfill completion is

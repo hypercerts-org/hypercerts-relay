@@ -44,7 +44,7 @@
 
 <div class="intro">
   <p class="eyebrow">Source admission</p>
-  <h1>PDS <em>sources</em></h1>
+  <h1>PDS sources</h1>
   <p>
     Manage approved sources and inspect their actual Relay connection state.
   </p>

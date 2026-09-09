@@ -235,7 +235,7 @@
       <img src={logo} alt="Hypercerts" width="170" height="30" />
     </div>
     <p class="eyebrow">Operator access</p>
-    <h1>Relay <em>administration</em></h1>
+    <h1>Relay administration</h1>
     <p>
       Sign in with your AT Protocol account. Access is limited to authorized
       administrators.
@@ -343,14 +343,14 @@
         />
       {:else}<div class="intro">
           <p class="eyebrow">Service health</p>
-          <h1>Relay <em>operations</em></h1>
+          <h1>Relay operations</h1>
           <p>
             Manage acquisition across Relay and Jetstream. Start with source
             health, then inspect backfills and coverage.
           </p>
         </div>
         <section class="overview">
-          <h2>Service <em>connections</em></h2>
+          <h2>Service connections</h2>
           <dl>
             <div>
               <dt>Indigo Relay</dt>
@@ -368,7 +368,7 @@
           </p>
         </section>
         <section class="overview">
-          <h2>Operate <em>the relay</em></h2>
+          <h2>Operate the relay</h2>
           <a class="workflow" href="/sources"
             ><strong>Inspect PDS sources</strong><span
               >Connection state, validation, account quota and the last durable
