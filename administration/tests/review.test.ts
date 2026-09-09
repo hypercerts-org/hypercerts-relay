@@ -128,7 +128,30 @@ test("control URLs reject malformed origins and retain encrypted private-network
     url: "http://relay.railway.internal:2472",
     token: "fixture",
   };
-  assert.doesNotThrow(() => new Services({ ...config }, { ...config }));
+  const railway = { railwayPrivateNetwork: true };
+  assert.doesNotThrow(
+    () => new Services({ ...config }, { ...config }, railway),
+  );
+  assert.throws(() => new Services({ ...config }, { ...config }));
+  for (const hostname of [
+    "untrusted.example",
+    "relay.railway.internal.example",
+    "railway.internal",
+  ]) {
+    const url = new URL(config.url);
+    url.hostname = hostname;
+    assert.throws(
+      () =>
+        new Services({ ...config, url: url.origin }, { ...config }, railway),
+    );
+  }
+  assert.doesNotThrow(
+    () =>
+      new Services(
+        { ...config, url: "https://relay.example" },
+        { ...config, url: "http://127.0.0.1:2472" },
+      ),
+  );
   for (const url of [
     "ftp://example.com",
     "https://user:pass@example.com",

@@ -8,11 +8,12 @@ export class Services {
   constructor(
     private readonly relay: ServiceConfig,
     private readonly jetstream: ServiceConfig,
+    options: { railwayPrivateNetwork?: boolean } = {},
   ) {
     for (const config of [relay, jetstream]) {
       const url = new URL(config.url);
       if (
-        !["http:", "https:"].includes(url.protocol) ||
+        !allowedControlTransport(url, options.railwayPrivateNetwork ?? false) ||
         url.username ||
         url.password ||
         url.pathname !== "/" ||
@@ -20,7 +21,7 @@ export class Services {
         url.hash
       )
         throw new Error(
-          "Control services require an HTTP(S) origin without credentials, path or query",
+          "Control services require HTTPS (or loopback / Railway private HTTP) without credentials, path or query",
         );
       config.url = url.origin;
     }
@@ -167,4 +168,14 @@ export class Services {
         : { enabled: false };
     return { relay, jetstream };
   }
+}
+
+function allowedControlTransport(url: URL, railwayPrivateNetwork: boolean) {
+  if (url.protocol === "https:") return true;
+  if (url.protocol !== "http:") return false;
+  if (["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)) return true;
+  return (
+    railwayPrivateNetwork &&
+    /^[a-z0-9-]+\.railway\.internal$/.test(url.hostname)
+  );
 }

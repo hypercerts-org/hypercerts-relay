@@ -141,7 +141,9 @@ volume persistence and cursor recovery still need deployment-specific validation
 
 Control URLs must be HTTP(S) origins without embedded credentials, paths, queries
 or fragments. Use HTTPS when traffic crosses an untrusted network. HTTP is supported
-on loopback and Railway's encrypted private network: Railway carries private
+on loopback and, with `HC_RAILWAY_STARTUP=1`, single-service
+`*.railway.internal` origins. Other HTTP origins fail administration startup.
+Railway carries private
 service traffic through WireGuard tunnels. Bind management listeners only within
 that trust boundary and never attach public domains or public TCP proxies to them.
 A bearer token authenticates callers but does not itself encrypt HTTP traffic.

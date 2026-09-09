@@ -10,7 +10,9 @@ opaque `next` cursor unchanged.
 
 Correct applied-quota feedback and recovered polling errors. Secure SQLite sidecar
 files, clear raw container secret inputs before starting services, and validate
-control-service origins. Railway startup now honors the edge's client IP for login
+control-service origins. HTTP control origins must be loopback, or single-service
+`*.railway.internal` hosts with `HC_RAILWAY_STARTUP=1`; other hosts require HTTPS.
+Railway startup now honors the edge's client IP for login
 limits; other proxies can configure `ADMIN_TRUST_PROXY` with trusted peer CIDRs.
 
 Keep Relay event admission responsive during policy persistence, apply rate limits

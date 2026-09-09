@@ -41,7 +41,9 @@ In Relay, set `RELAY_CONTROL_ADDR` and `RELAY_CONTROL_TOKEN_FILE` together. This
 starts a separate bearer-authenticated listener. It is never mounted on the public
 API. In Jetstream, configure `JETSTREAM_DEBUG_ADDR` and
 `JETSTREAM_CONTROL_TOKEN_FILE` as documented in `../jetstream/README.md`. Use
-private transport or TLS between services. No component is deployed by this change.
+TLS between services, or Railway private service origins with `HC_RAILWAY_STARTUP=1`.
+Control URLs reject plaintext HTTP except loopback and single-service
+`*.railway.internal` origins in Railway startup mode. No component is deployed by this change.
 
 `/oauth-client-metadata.json` must be reachable by authorization servers at the
 public origin. OAuth uses the maintained AT Protocol Node client for discovery,

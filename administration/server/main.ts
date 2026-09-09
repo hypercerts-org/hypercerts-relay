@@ -38,6 +38,7 @@ const services = new Services(
     url: required("JETSTREAM_CONTROL_URL"),
     token: secret("JETSTREAM_CONTROL_TOKEN_FILE"),
   },
+  { railwayPrivateNetwork: process.env.HC_RAILWAY_STARTUP === "1" },
 );
 store.seedAdministrator(process.env.ADMIN_SEED_DID);
 const worker = new Worker(store, services);
