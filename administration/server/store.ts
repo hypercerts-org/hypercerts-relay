@@ -52,7 +52,13 @@ export class Store {
       )
       .all(after, limit + 1) as { did: string }[];
     return {
-      items: rows.slice(0, limit),
+      items: rows.slice(0, limit).map((row) => ({
+        ...this.get<{ handle?: string | null; displayName?: string | null }>(
+          "administrator-profile",
+          row.did,
+        ),
+        did: row.did,
+      })),
       next: rows.length > limit ? rows[limit - 1].did : null,
     };
   }
@@ -75,8 +81,7 @@ export class Store {
           ? this.db
               .prepare("INSERT OR IGNORE INTO administrators VALUES(?)")
               .run(did)
-          : this.db.prepare("DELETE FROM administrators WHERE did=?").run(did);
-      if (action === "remove") this.revokeSessions(did);
+          : this.removeAdministrator(did);
       this.set("bootstrap", "administrator", { initialized: true });
       if (result.changes) this.audit(actor, `administrator_${action}`, { did });
     });
@@ -91,6 +96,15 @@ export class Store {
       this.db.exec("ROLLBACK");
       throw e;
     }
+  }
+  // API and local recovery callers provide their own authorization, audit and transaction.
+  removeAdministrator(did: string) {
+    const result = this.db
+      .prepare("DELETE FROM administrators WHERE did=?")
+      .run(did);
+    this.revokeSessions(did);
+    this.del("administrator-profile", did);
+    return result;
   }
   audit(
     actor: string,

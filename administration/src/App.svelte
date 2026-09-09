@@ -17,6 +17,7 @@
     type Coverage,
     type Audit,
     type Limit,
+    type Administrator,
   } from "./api";
   const navigation = [
     ["overview", "Overview"],
@@ -37,7 +38,7 @@
     busy = false,
     error = "",
     notice = "";
-  let administrators: { did: string }[] = [];
+  let administrators: Administrator[] = [];
   let policyLoaded = false;
   let sources: Source[] = [],
     policy: Policy = { revision: 1, collections: [] },
@@ -59,7 +60,7 @@
       switch (screen) {
         case "administrators": {
           const r = await api<{
-            items: { did: string }[];
+            items: Administrator[];
             next: string | null;
           }>(`/administrators?after=${encodeURIComponent(cursor)}`);
           administrators = r.items;

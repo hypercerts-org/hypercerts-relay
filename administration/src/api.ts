@@ -1,5 +1,10 @@
 import type { Command, Operation, Policy, Job } from "../server/contracts";
 export type { Command, Operation, Policy, Job };
+export interface Administrator {
+  did: string;
+  handle?: string | null;
+  displayName?: string | null;
+}
 export interface Source {
   HostID: number;
   Hostname: string;

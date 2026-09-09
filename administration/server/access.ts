@@ -17,9 +17,8 @@ store.transaction(() => {
   if (action === "grant")
     store.db.prepare("INSERT OR IGNORE INTO administrators VALUES(?)").run(did);
   else {
-    if (action === "remove")
-      store.db.prepare("DELETE FROM administrators WHERE did=?").run(did);
-    store.revokeSessions(did);
+    if (action === "remove") store.removeAdministrator(did);
+    else store.revokeSessions(did);
   }
   store.audit(`local:${userInfo().username}`, `administrator_${action}`, {
     did,

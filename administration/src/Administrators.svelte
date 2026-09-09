@@ -1,8 +1,8 @@
 <script lang="ts">
   import { tick } from "svelte";
   import { isValidDid } from "@atproto/syntax";
-  import { api } from "./api";
-  export let rows: { did: string }[] = [];
+  import { api, type Administrator } from "./api";
+  export let rows: Administrator[] = [];
   export let currentDid: string;
   export let csrf: string;
   export let onChanged: () => Promise<void>;
@@ -114,7 +114,11 @@
 <ul class="administrators">
   {#each rows as row (row.did)}
     <li>
-      <code>{row.did}</code>
+      <div class="identity">
+        {#if row.displayName}<strong>{row.displayName}</strong>{/if}
+        {#if row.handle}<span>@{row.handle}</span>{/if}
+        <code>{row.did}</code>
+      </div>
       {#if row.did === currentDid}<span>You</span>
       {:else}<button
           disabled={busy}
@@ -143,7 +147,9 @@
     padding: 1rem 0;
     border-bottom: 1px solid var(--border, #d8ddd9);
   }
-  li code {
+  .identity {
+    display: grid;
+    gap: 0.2rem;
     flex: 1;
     min-width: 0;
     overflow-wrap: anywhere;

@@ -14,6 +14,11 @@ import {
 import type { Request, Response, NextFunction } from "express";
 import { Store } from "./store.ts";
 import { ApiError } from "./contracts.ts";
+import {
+  administratorProfile,
+  type AdministratorProfile,
+  type IdentitySession,
+} from "./profile.ts";
 
 const hash = (v: string) => createHash("sha256").update(v).digest("hex");
 const random = () => randomBytes(32).toString("base64url");
@@ -30,8 +35,9 @@ export interface OAuthProvider {
   ): Promise<URL>;
   callback(
     params: URLSearchParams,
-  ): Promise<{ session: { did: string }; state?: string | null }>;
+  ): Promise<{ session: IdentitySession; state?: string | null }>;
   revoke(did: string): Promise<void>;
+  profile?(session: IdentitySession): Promise<AdministratorProfile>;
 }
 export function oauthProvider(store: Store, base: string, key: Buffer) {
   const seal = (value: unknown) => {
@@ -91,13 +97,20 @@ export function oauthProvider(store: Store, base: string, key: Buffer) {
     application_type: "web" as const,
     dpop_bound_access_tokens: true,
   };
+  const client = new NodeOAuthClient({
+    requestLock: requestLocalLock,
+    clientMetadata: metadata,
+    stateStore: storage<NodeSavedState>("oauth-state"),
+    sessionStore: storage<NodeSavedSession>("oauth-session"),
+  });
   return {
-    provider: new NodeOAuthClient({
-      requestLock: requestLocalLock,
-      clientMetadata: metadata,
-      stateStore: storage<NodeSavedState>("oauth-state"),
-      sessionStore: storage<NodeSavedSession>("oauth-session"),
-    }),
+    provider: {
+      authorize: client.authorize.bind(client),
+      callback: client.callback.bind(client),
+      revoke: client.revoke.bind(client),
+      profile: (session: IdentitySession) =>
+        administratorProfile(client.oauthResolver, session),
+    },
     metadata,
   };
 }
@@ -138,7 +151,7 @@ export class Auth {
       return;
     return row;
   }
-  create(did: string, res: Response) {
+  create(did: string, res: Response, profile?: AdministratorProfile) {
     if (
       !this.store.db
         .prepare("SELECT did FROM administrators WHERE did=?")
@@ -161,6 +174,13 @@ export class Auth {
         .prepare("INSERT INTO sessions VALUES(?,?,?,?)")
         .run(session.id, did, csrf, session.expires);
       this.store.audit(did, "signed_in", {});
+      if (profile && Object.keys(profile).length) {
+        this.store.set("administrator-profile", did, {
+          ...this.store.get<AdministratorProfile>("administrator-profile", did),
+          ...profile,
+          updatedAt: new Date().toISOString(),
+        });
+      }
     });
     res.cookie("relay_session", token, this.options(8 * 3600_000));
     return session;
@@ -207,7 +227,19 @@ export class Auth {
     res.clearCookie("relay_oauth", this.options(0));
     if (!state || state !== hash(binding))
       throw new ApiError(403, "oauth_browser_binding_invalid");
-    this.create(session.did, res);
+    if (
+      !this.store.db
+        .prepare("SELECT did FROM administrators WHERE did=?")
+        .get(session.did)
+    )
+      throw new ApiError(403, "administrator_required");
+    let profile: AdministratorProfile | undefined;
+    try {
+      profile = await this.provider.profile?.(session);
+    } catch {
+      /* Keep sign-in available without profile metadata. */
+    }
+    this.create(session.did, res, profile);
     res.redirect(303, "/");
   }
   logout(req: Request, res: Response) {

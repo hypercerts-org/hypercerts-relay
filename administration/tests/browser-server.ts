@@ -25,6 +25,9 @@ const oauth: OAuthProvider = {
     };
   },
   async revoke() {},
+  async profile() {
+    return { handle: "operator.example", displayName: "Test Operator" };
+  },
 };
 let policy = { revision: 1, collections: ["app.bsky.feed.post"] };
 let sources: any[] = [];

@@ -152,6 +152,12 @@ test("administrator grants and removes access through the UI", async ({
 }) => {
   await login(page);
   await page.getByRole("link", { name: "Administrators", exact: true }).click();
+  await expect(page.getByText("Test Operator", { exact: true })).toBeVisible();
+  await expect(
+    page.getByText("@operator.example", { exact: true }),
+  ).toBeVisible();
+  await page.reload();
+  await expect(page.getByText("Test Operator", { exact: true })).toBeVisible();
   const did = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
   await page
     .getByLabel("Administrator DID", { exact: true })
