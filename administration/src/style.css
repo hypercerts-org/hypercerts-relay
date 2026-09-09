@@ -1,0 +1,502 @@
+@import "tailwindcss";
+@theme {
+  --color-ink: #203d39;
+  --color-paper: #f5f5ef;
+  --color-action: #245b4b;
+}
+:root {
+  font-family: "Source Sans 3 Variable", sans-serif;
+  color: #203d39;
+  background: #f5f5ef;
+  font-size: 16px;
+  line-height: 1.5;
+  font-synthesis: none;
+  font-variant-numeric: tabular-nums;
+  scrollbar-color: #809b8c #eef0e8;
+  caret-color: #245b4b;
+}
+* {
+  box-sizing: border-box;
+}
+::selection {
+  background: #c8dfcf;
+  color: #173c30;
+}
+body {
+  margin: 0;
+}
+a {
+  color: #245b4b;
+  text-underline-offset: 0.2em;
+}
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+button,
+a,
+input,
+textarea,
+select {
+  -webkit-tap-highlight-color: transparent;
+}
+:focus-visible {
+  outline: 3px solid #a46520;
+  outline-offset: 3px;
+}
+button {
+  border: 1px solid #819389;
+  border-radius: 5px;
+  background: #fff;
+  padding: 0.5rem 0.9rem;
+  color: #203d39;
+  cursor: pointer;
+  min-height: 42px;
+}
+button:hover:not(:disabled) {
+  background: #e8eee4;
+  border-color: #245b4b;
+}
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.primary {
+  background: #245b4b;
+  color: white;
+  border-color: #245b4b;
+}
+.primary:hover:not(:disabled) {
+  background: #173f33;
+  color: white;
+}
+.text-button {
+  border: 0;
+  background: transparent;
+  color: #245b4b;
+  text-decoration: underline;
+  padding: 0.25rem 0;
+  text-align: left;
+}
+.text-button:hover:not(:disabled) {
+  background: transparent;
+}
+input,
+select,
+textarea {
+  display: block;
+  width: 100%;
+  border: 1px solid #819389;
+  border-radius: 4px;
+  background: #fff;
+  color: #203d39;
+  padding: 0.65rem 0.7rem;
+}
+input::placeholder {
+  color: #65796f;
+}
+label {
+  display: block;
+  font-weight: 600;
+  margin-bottom: 0.35rem;
+}
+small {
+  display: block;
+  color: #4f665a;
+  font-size: 0.875rem;
+  overflow-wrap: anywhere;
+}
+h1 {
+  font-size: 2.25rem;
+  letter-spacing: -0.025em;
+  line-height: 1.15;
+  font-weight: 650;
+  margin: 0 0 0.85rem;
+  text-wrap: balance;
+}
+h2 {
+  font-size: 1.35rem;
+  font-weight: 650;
+  margin: 0 0 1rem;
+}
+p {
+  max-width: 72ch;
+  margin: 0.5rem 0 1rem;
+}
+strong {
+  font-weight: 650;
+}
+.shell {
+  display: grid;
+  grid-template-columns: 245px minmax(0, 1fr);
+  min-height: 100vh;
+}
+.shell > aside {
+  background: #e8eee4;
+  border-right: 1px solid #c0cdbd;
+  padding: 2rem 1.25rem;
+  display: flex;
+  flex-direction: column;
+}
+.brand {
+  font-size: 1.3rem;
+  font-weight: 700;
+  color: #183e30;
+  text-decoration: none;
+  display: block;
+  white-space: nowrap;
+}
+.brand span {
+  font-weight: 400;
+}
+.shell > aside nav {
+  display: grid;
+  gap: 0.2rem;
+  margin: 2.5rem 0;
+}
+.shell > aside nav a {
+  padding: 0.6rem 0.8rem;
+  text-decoration: none;
+  border-radius: 4px;
+  color: #324b3e;
+}
+.shell > aside nav a:hover {
+  background: #dce6d5;
+}
+.shell > aside nav a[aria-current] {
+  background: #245b4b;
+  color: #fff;
+}
+.account {
+  margin-top: auto;
+  padding-top: 3rem;
+  font-size: 0.85rem;
+}
+.account p {
+  overflow-wrap: anywhere;
+}
+.account button {
+  display: block;
+  margin: 0.5rem 0;
+}
+.shell main {
+  padding: 0 3rem;
+  min-width: 0;
+  max-width: 1500px;
+  width: 100%;
+}
+.toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 1.5rem 0;
+  border-bottom: 1px solid #c0cdbd;
+  color: #4f665a;
+  margin-bottom: 2.75rem;
+}
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  flex-wrap: wrap;
+}
+.intro {
+  margin-bottom: 2rem;
+}
+.intro p {
+  font-size: 1.075rem;
+  color: #4f665a;
+}
+.inline-form {
+  display: flex;
+  gap: 1rem;
+  align-items: flex-end;
+  margin: 2rem 0;
+  flex-wrap: wrap;
+}
+.inline-form button {
+  margin-bottom: 0;
+}
+.grow {
+  flex: 1;
+  min-width: 240px;
+}
+.field small {
+  margin-top: 0.5rem;
+}
+.compact {
+  border-top: 1px solid #c0cdbd;
+  padding-top: 1.5rem;
+}
+.table-wrap {
+  overflow: auto;
+  margin: 1.5rem 0;
+}
+table {
+  min-width: 720px;
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.94rem;
+}
+caption {
+  text-align: left;
+  font-weight: 650;
+  margin-bottom: 0.9rem;
+  font-size: 1.1rem;
+}
+th {
+  text-align: left;
+  font-size: 0.85rem;
+  color: #4f665a;
+  border-block: 1px solid #c0cdbd;
+  padding: 0.75rem;
+  white-space: nowrap;
+  background: #eef0e8;
+}
+td {
+  padding: 1rem 0.75rem;
+  border-bottom: 1px solid #d2d9cd;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+  max-width: 36rem;
+}
+td small {
+  margin-top: 0.3rem;
+}
+.state {
+  display: inline-block;
+  font-size: 0.82rem;
+  font-weight: 650;
+  padding: 0.18rem 0.5rem;
+  margin: 0.1rem 0.35rem 0.1rem 0;
+  background: #e5e9df;
+  color: #3b5142;
+  border-radius: 3px;
+  white-space: nowrap;
+}
+.state.good {
+  background: #d9e8d8;
+  color: #17442e;
+}
+.state.warning {
+  background: #fae4c7;
+  color: #744010;
+}
+.empty {
+  padding: 2.5rem 1rem;
+  color: #4f665a;
+}
+.notice,
+.error {
+  padding: 1rem 1.2rem;
+  margin: 1rem 0 1.5rem;
+  border: 1px solid #c0cdbd;
+  background: #e8eee4;
+  border-radius: 4px;
+}
+.error {
+  background: #fff0e0;
+  border-color: #cda87a;
+  color: #753e18;
+}
+.note {
+  font-size: 0.9rem;
+  color: #4f665a;
+  margin-top: 1rem;
+}
+.editor {
+  max-width: 780px;
+}
+.editor textarea {
+  line-height: 1.8;
+}
+.policy-line {
+  padding: 0.8rem 0;
+  border-block: 1px solid #c0cdbd;
+}
+.detail {
+  background: #fff;
+  border: 1px solid #c0cdbd;
+  padding: 1.5rem;
+  margin: 1.5rem 0;
+}
+.section-heading {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: center;
+}
+.section-heading h2 {
+  overflow-wrap: anywhere;
+}
+dl {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1.5rem 3rem;
+  margin: 1rem 0;
+}
+dt {
+  font-size: 0.9rem;
+  color: #4f665a;
+}
+dd {
+  margin: 0.3rem 0;
+  font-weight: 600;
+}
+.pagination {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 1rem;
+  margin: 2rem 0;
+}
+footer {
+  margin-top: 4rem;
+  padding: 1.5rem 0;
+  border-top: 1px solid #c0cdbd;
+  color: #4f665a;
+  font-size: 0.85rem;
+}
+.overview {
+  padding: 1.5rem 0;
+  border-top: 1px solid #c0cdbd;
+  margin-top: 2rem;
+}
+.workflow {
+  display: grid;
+  grid-template-columns: 230px 1fr;
+  gap: 1.5rem;
+  padding: 1.2rem 0;
+  text-decoration: none;
+  border-bottom: 1px solid #d2d9cd;
+}
+.workflow:hover strong {
+  text-decoration: underline;
+}
+.workflow span {
+  color: #4f665a;
+}
+.login {
+  max-width: 510px;
+  margin: 10vh auto;
+  padding: 2rem;
+}
+.login .brand {
+  margin-bottom: 3rem;
+}
+.login form {
+  margin: 2rem 0;
+}
+.login button {
+  margin-top: 1rem;
+  width: 100%;
+}
+.skip {
+  position: absolute;
+  top: 0;
+  left: -1000px;
+  padding: 1rem;
+  background: white;
+  z-index: 10;
+}
+.skip:focus {
+  left: 0;
+}
+.refresh-status {
+  font-size: 0.8rem;
+}
+@media (max-width: 900px) {
+  .shell {
+    grid-template-columns: 190px minmax(0, 1fr);
+  }
+  .shell main {
+    padding: 0 1.5rem;
+  }
+  .shell > aside {
+    padding: 1.5rem 0.8rem;
+  }
+  .workflow {
+    grid-template-columns: 1fr;
+    gap: 0.35rem;
+  }
+  .refresh-status {
+    display: none;
+  }
+}
+@media (max-width: 640px) {
+  .shell {
+    display: block;
+  }
+  .shell > aside {
+    padding: 1rem;
+    border-right: 0;
+    border-bottom: 1px solid #c0cdbd;
+  }
+  .shell > aside nav {
+    display: flex;
+    overflow: auto;
+    margin: 1rem 0 0;
+    gap: 0.25rem;
+  }
+  .shell > aside nav a {
+    white-space: nowrap;
+  }
+  .account {
+    padding: 0;
+    margin-top: 1rem;
+    display: flex;
+    gap: 0.8rem;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .account small,
+  .account p {
+    display: none;
+  }
+  .account button {
+    margin: 0;
+    min-height: 36px;
+    font-size: 0.85rem;
+  }
+  .shell main {
+    padding: 0 1rem;
+  }
+  .toolbar {
+    margin-bottom: 2rem;
+    padding: 1rem 0;
+  }
+  h1 {
+    font-size: 1.9rem;
+  }
+  .inline-form {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+  .grow {
+    min-width: 0;
+  }
+  .section-heading {
+    align-items: flex-start;
+  }
+  .pagination {
+    justify-content: space-between;
+    gap: 0.35rem;
+  }
+  .pagination button {
+    padding: 0.5rem;
+  }
+  .login {
+    margin: 4vh auto;
+  }
+  .table-wrap {
+    margin-inline: 0;
+  }
+}
+
+@media (min-width: 641px) {
+  .inline-form:has(.field small) > button {
+    margin-bottom: 1.65rem;
+  }
+}

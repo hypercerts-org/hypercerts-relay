@@ -19,3 +19,9 @@ source. The entry points above are Go daemons, not Vercel request handlers. Plat
 qualification must establish persistent storage, process lifetime, networking, and
 restart behavior before deployment. TECH-593 documents source/build ownership;
 it does not provision infrastructure or claim a qualified Vercel deployment.
+
+The separate `administration/` application added by TECH-588 builds with
+`npm ci && npm run build` in that directory and runs with `npm run server`.
+It requires Node 24.18+, durable local SQLite storage, mounted secrets, private
+service connectivity and an HTTPS origin. It does not extend the inherited Relay
+web UI or establish a qualified Vercel deployment. See `administration/README.md`.

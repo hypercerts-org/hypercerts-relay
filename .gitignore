@@ -55,3 +55,8 @@ netsync-out/
 # Relay dash output
 /public/
 /cmd/relay/public
+
+# Separate administration application artifacts
+/administration/dist/
+/administration/test-results/
+/administration/playwright-report/

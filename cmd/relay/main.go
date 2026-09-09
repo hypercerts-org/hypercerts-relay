@@ -399,6 +399,12 @@ func runRelay(ctx context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
+	// hypercerts: Management uses a separate private listener, never the Basic-auth UI.
+	stopControl, err := svc.startControl(ctx, os.Getenv("RELAY_CONTROL_ADDR"), os.Getenv("RELAY_CONTROL_TOKEN_FILE"))
+	if err != nil {
+		return err
+	}
+	defer stopControl()
 	persister.SetUidSource(r)
 
 	alertMonitor, err := configureAccountLimitAlertMonitor(cmd, logger, r, func(ctx context.Context, state AccountLimitAlertSentState) {

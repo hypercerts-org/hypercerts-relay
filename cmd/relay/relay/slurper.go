@@ -48,6 +48,8 @@ type Slurper struct {
 }
 
 type SlurperConfig struct {
+	// hypercerts: Apply explicit policy before queueing a raw source event.
+	WaitRateCapacity    func(context.Context, string) error
 	UserAgent           string
 	ConcurrencyPerHost  int
 	QueueDepthPerHost   int
@@ -529,7 +531,7 @@ func (s *Slurper) handleConnection(ctx context.Context, conn *websocket.Conn, su
 		_ = conn.Close()
 	}()
 	connLogger := s.logger.With("host", sub.Hostname)
-	err := stream.HandleRepoStream(ctx, conn, scheduler, connLogger)
+	err := stream.HandleRepoStream(ctx, conn, rateScheduler{Scheduler: scheduler, wait: s.Config.WaitRateCapacity, host: sub.Hostname}, connLogger)
 	if processErr := scheduler.Err(); processErr != nil {
 		return processErr
 	}

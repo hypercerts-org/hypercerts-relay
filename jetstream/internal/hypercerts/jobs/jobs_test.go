@@ -128,3 +128,43 @@ func TestJobsRepeatedQuotaRecoveryStartsFreshWork(t *testing.T) {
 	require.Equal(t, Pending, second.State)
 	require.Empty(t, second.CompletedRepos)
 }
+
+func TestRequestReceiptSurvivesCompletionAndRestart(t *testing.T) {
+	dir := t.TempDir()
+	m, db := newManager(t, dir)
+	_, err := m.AddSource("https://pds.example")
+	require.NoError(t, err)
+	first, err := m.RequestOnce("https://pds.example", "backfill", "request-1")
+	require.NoError(t, err)
+	m.mu.Lock()
+	next := clone(m.data)
+	j := next.Jobs[first.ID]
+	j.State = Complete
+	next.Jobs[j.ID] = j
+	require.NoError(t, m.commit(next))
+	m.mu.Unlock()
+	require.NoError(t, db.Close())
+	m, db = newManager(t, dir)
+	defer db.Close()
+	again, err := m.RequestOnce("https://pds.example", "backfill", "request-1")
+	require.NoError(t, err)
+	require.Equal(t, first.ID, again.ID)
+	require.Equal(t, Complete, again.State)
+	_, err = m.RequestOnce("https://different.example", "backfill", "request-1")
+	require.ErrorIs(t, err, ErrConflict)
+}
+
+func TestNoopActionReceiptsDoNotChangeLaterJobState(t *testing.T) {
+	m, db := newManager(t, t.TempDir())
+	defer db.Close()
+	job, err := m.AddSource("https://pds.example")
+	require.NoError(t, err)
+	require.NoError(t, m.TransitionOnce(job.ID, Pending, "retry-current"))
+	require.NoError(t, m.Cancel(job.ID))
+	require.NoError(t, m.TransitionOnce(job.ID, Pending, "retry-current"))
+	require.Equal(t, Canceled, m.List()[0].State, "a repeated receipt must not restart later work")
+	require.NoError(t, m.TransitionOnce(job.ID, Canceled, "cancel-current"))
+	require.NoError(t, m.Retry(job.ID))
+	require.NoError(t, m.TransitionOnce(job.ID, Canceled, "cancel-current"))
+	require.Equal(t, Pending, m.List()[0].State, "a repeated receipt must not cancel a later retry")
+}

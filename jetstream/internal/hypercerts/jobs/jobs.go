@@ -53,9 +53,10 @@ type Job struct {
 	HistoryComplete bool              `json:"historyComplete"`
 }
 type data struct {
-	Initialized bool            `json:"initialized"`
-	Sources     map[string]bool `json:"sources"`
-	Jobs        map[string]Job  `json:"jobs"`
+	Requests    map[string]string `json:"requests,omitempty"`
+	Initialized bool              `json:"initialized"`
+	Sources     map[string]bool   `json:"sources"`
+	Jobs        map[string]Job    `json:"jobs"`
 }
 type Manager struct {
 	mu        sync.Mutex
@@ -246,7 +247,13 @@ func (m *Manager) SetPolicy(expected uint64, collections []string) (selection.Po
 	}
 	return policy, nil
 }
-func (m *Manager) Request(raw, reason string) (Job, error) {
+func (m *Manager) Request(raw, reason string) (Job, error) { return m.RequestOnce(raw, reason, "") }
+
+// RequestOnce durably deduplicates control-plane retries, including terminal jobs.
+func (m *Manager) RequestOnce(raw, reason, requestID string) (Job, error) {
+	if len(requestID) > 128 {
+		return Job{}, ErrInvalidInput
+	}
 	if reason != "quota_recovery" && reason != "backfill" {
 		return Job{}, fmt.Errorf("%w: unsupported job reason", ErrInvalidInput)
 	}
@@ -256,47 +263,85 @@ func (m *Manager) Request(raw, reason string) (Job, error) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if id, ok := m.data.Requests[requestID]; requestID != "" && ok {
+		existing := m.data.Jobs[id]
+		if existing.PDS != pds || existing.Reason != reason {
+			return Job{}, ErrConflict
+		}
+		return clone(existing), nil
+	}
 	if !m.data.Sources[pds] {
 		return Job{}, ErrConflict
 	}
 	next := clone(m.data)
+	remember := func(job Job) (Job, error) {
+		if requestID != "" {
+			if next.Requests == nil {
+				next.Requests = map[string]string{}
+			}
+			next.Requests[requestID] = job.ID
+		}
+		if err := m.commit(next); err != nil {
+			return Job{}, err
+		}
+		return clone(job), nil
+	}
 	policy := m.policy.Current()
 	for _, existing := range next.Jobs {
 		if existing.PDS == pds && existing.Policy.Revision == policy.Revision && existing.Reason == reason && (existing.State == Pending || existing.State == Running) {
-			return clone(existing), nil
+			return remember(existing)
 		}
 	}
 	j := newJob(pds, policy, reason)
 	if existing, ok := next.Jobs[j.ID]; ok {
 		if existing.State == Pending || existing.State == Running {
-			return clone(existing), nil
+			return remember(existing)
 		}
 		// A later recovery gap is new work, preserving the previous result.
 		sum := sha256.Sum256([]byte(fmt.Sprintf("%s/%d", j.ID, len(next.Jobs))))
 		j.ID = hex.EncodeToString(sum[:16])
 	}
 	next.Jobs[j.ID] = j
-	if err := m.commit(next); err != nil {
-		return Job{}, err
-	}
-	return clone(j), nil
+	return remember(j)
 }
-func (m *Manager) Cancel(id string) error { return m.transition(id, Canceled) }
-func (m *Manager) Retry(id string) error  { return m.transition(id, Pending) }
-func (m *Manager) transition(id string, state State) error {
+func (m *Manager) Cancel(id string) error                  { return m.transition(id, Canceled) }
+func (m *Manager) Retry(id string) error                   { return m.transition(id, Pending) }
+func (m *Manager) transition(id string, state State) error { return m.TransitionOnce(id, state, "") }
+
+// TransitionOnce records command receipts atomically with cancellation/retry.
+func (m *Manager) TransitionOnce(id string, state State, requestID string) error {
+	if len(requestID) > 128 || (state != Pending && state != Canceled) {
+		return ErrInvalidInput
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	receipt := "action/" + requestID
+	if existing, ok := m.data.Requests[receipt]; requestID != "" && ok {
+		if existing != string(state)+":"+id {
+			return ErrConflict
+		}
+		return nil
+	}
 	j, ok := m.data.Jobs[id]
 	if !ok {
 		return ErrNotFound
 	}
-	if state == Pending && (!m.data.Sources[j.PDS] || j.Policy.Revision != m.policy.Current().Revision || j.State == Running) {
+	if state == Pending && (!m.data.Sources[j.PDS] || j.Policy.Revision != m.policy.Current().Revision || (j.State == Running && requestID == "")) {
 		return ErrConflict
 	}
-	if state == Canceled && j.State != Pending && j.State != Running {
+	if state == Canceled && j.State != Pending && j.State != Running && !(requestID != "" && j.State == Canceled) {
 		return ErrConflict
 	}
 	next := clone(m.data)
+	if requestID != "" {
+		if next.Requests == nil {
+			next.Requests = map[string]string{}
+		}
+		next.Requests[receipt] = string(state) + ":" + id
+	}
+	if requestID != "" && (j.State == state || (state == Pending && j.State == Running)) {
+		return m.commit(next)
+	}
 	j.State = state
 	j.ErrorCode = ""
 	j.FinishedAt = time.Time{}
