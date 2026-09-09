@@ -167,8 +167,8 @@
   <table>
     <caption>Configured sources</caption><thead
       ><tr
-        ><th>Source</th><th>Desired / connection</th><th>Last durable cursor</th
-        ><th>Actions</th></tr
+        ><th>Source</th><th>Desired / connection</th><th>Admission check</th
+        ><th>Account quota</th><th>Last durable cursor</th><th>Actions</th></tr
       ></thead
     ><tbody>
       {#each rows as source (source.HostID)}<tr
@@ -188,6 +188,8 @@
             ><State value={source.DesiredState} /><State
               value={source.RuntimeState}
             /></td
+          ><td>{source.Validation.Status} {source.Validation.Reason}</td
+          ><td>{source.AccountQuota.Count} / {source.AccountQuota.Limit} accounts</td
           ><td
             >{source.LastDurableCursor < 0
               ? "Not recorded"
@@ -221,7 +223,7 @@
           ></tr
         >
       {:else}<tr
-          ><td colspan="4" class="empty"
+          ><td colspan="6" class="empty"
             >No sources on this page. Add a PDS origin to begin acquisition.</td
           ></tr
         >{/each}
@@ -231,4 +233,8 @@
 <p class="note">
   Disabling or removing a source stops acquisition. Archived records remain
   available.
+</p>
+<p class="note">
+  Per-PDS historical collection counts are unavailable because archived events
+  do not retain historical PDS attribution.
 </p>

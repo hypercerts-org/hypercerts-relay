@@ -1,6 +1,7 @@
 <script lang="ts">
   import { isValidNsid } from "@atproto/syntax";
   import type { Policy, Command } from "./api";
+  import { collectionSuggestions } from "./collectionSuggestions";
   export let policy: Policy;
   export let submit: (command: Command) => Promise<void>;
   export let busy = false;
@@ -84,15 +85,22 @@
     id="collection"
     bind:this={input}
     bind:value={collection}
+    list="collection-suggestions"
     disabled={busy}
     spellcheck="false"
     aria-describedby="collection-help collection-error"
     aria-invalid={!!error}
   />
+  <datalist id="collection-suggestions">
+    {#each collectionSuggestions as nsid (nsid)}
+      <option value={nsid}></option>
+    {/each}
+  </datalist>
   <button type="button" disabled={busy} onclick={addCollection}>Add collection</button>
   <p id="collection-help" class="note">
-    Enter an exact NSID, such as org.hypercerts.claim.activity. Wildcards are
-    not supported. An empty list stops new record acquisition; previously archived rows remain.
+    Pinned Hypercerts and Certified suggestions are available as you type. Enter
+    any exact NSID; wildcards are not supported. An empty list stops new record
+    acquisition; previously archived rows remain.
   </p>
   <div id="collection-error" role="alert">
     {#if error}<p class="error">{error}</p>{/if}

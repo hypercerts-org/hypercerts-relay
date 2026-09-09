@@ -77,15 +77,13 @@ test("source form submits a backend command without inventing an applied state",
   });
   expect(screen.queryByText("applied")).toBeNull();
 });
-test("empty collection selection remains an explicit editable policy", async () => {
+test("collection drafts support removal and an explicit empty policy", async () => {
   const submit = vi.fn().mockResolvedValue(undefined);
   render(Collections, {
     policy: { revision: 4, collections: ["app.bsky.feed.post"] },
     submit,
   });
-  await fireEvent.input(screen.getByLabelText("Enabled collection NSIDs"), {
-    target: { value: "" },
-  });
+  await fireEvent.click(screen.getByRole("button", { name: "Remove app.bsky.feed.post" }));
   await fireEvent.click(
     screen.getByRole("button", { name: "Request policy change" }),
   );
@@ -93,6 +91,59 @@ test("empty collection selection remains an explicit editable policy", async () 
     kind: "collections",
     expectedRevision: 4,
     collections: [],
+  });
+});
+test("collection drafts reject invalid and duplicate NSIDs", async () => {
+  render(Collections, {
+    policy: { revision: 4, collections: ["app.bsky.feed.post"] },
+    submit: vi.fn(),
+  });
+  const input = screen.getByLabelText("Collection NSID");
+  await fireEvent.input(input, { target: { value: "not an nsid" } });
+  await fireEvent.click(screen.getByRole("button", { name: "Add collection" }));
+  expect(screen.getByRole("alert").textContent).toContain("Enter a valid exact collection NSID.");
+  await fireEvent.input(input, { target: { value: "app.bsky.feed.like" } });
+  await fireEvent.click(screen.getByRole("button", { name: "Add collection" }));
+  expect(screen.getByText("app.bsky.feed.like")).toBeTruthy();
+  await fireEvent.input(input, { target: { value: "app.bsky.feed.like" } });
+  await fireEvent.click(screen.getByRole("button", { name: "Add collection" }));
+  expect(screen.getByRole("alert").textContent).toContain("already in this policy");
+});
+test("collection suggestions use the pinned seed without restricting exact NSIDs", async () => {
+  render(Collections, {
+    policy: { revision: 4, collections: [] },
+    submit: vi.fn(),
+  });
+  const input = screen.getByLabelText("Collection NSID") as HTMLInputElement;
+  expect(input.getAttribute("list")).toBe("collection-suggestions");
+  expect(
+    document.querySelector('option[value="org.hypercerts.claim.activity"]'),
+  ).toBeTruthy();
+  await fireEvent.input(input, { target: { value: "app.bsky.feed.post" } });
+  await fireEvent.click(screen.getByRole("button", { name: "Add collection" }));
+  expect(screen.getByText("app.bsky.feed.post")).toBeTruthy();
+});
+test("collection drafts survive polling and require reset after a stale revision", async () => {
+  const submit = vi.fn().mockResolvedValue(undefined);
+  const policy = { revision: 4, collections: ["app.bsky.feed.post"] };
+  const view = render(Collections, { policy, submit });
+  await fireEvent.input(screen.getByLabelText("Collection NSID"), {
+    target: { value: "app.bsky.feed.like" },
+  });
+  await fireEvent.click(screen.getByRole("button", { name: "Add collection" }));
+  await view.rerender({ policy: { revision: 4, collections: ["app.bsky.feed.repost"] } });
+  expect(screen.getByText("app.bsky.feed.like")).toBeTruthy();
+  await view.rerender({ policy: { revision: 5, collections: ["app.bsky.feed.repost"] } });
+  expect(screen.getByRole("status").textContent).toContain("draft is preserved");
+  await fireEvent.click(screen.getByRole("button", { name: "Request policy change" }));
+  expect(submit).not.toHaveBeenCalled();
+  await fireEvent.click(screen.getByRole("button", { name: "Use current policy" }));
+  expect(screen.getByText("app.bsky.feed.repost")).toBeTruthy();
+  await fireEvent.click(screen.getByRole("button", { name: "Request policy change" }));
+  expect(submit).toHaveBeenCalledWith({
+    kind: "collections",
+    expectedRevision: 5,
+    collections: ["app.bsky.feed.repost"],
   });
 });
 test("complete current-state coverage still discloses unknown history", () => {
@@ -162,4 +213,26 @@ test("selected source detail refreshes even when found outside the current page"
     vi.useRealTimers();
     vi.unstubAllGlobals();
   }
+});
+test("source overview shows admission and account quota metadata", () => {
+  render(Sources, {
+    rows: [
+      {
+        HostID: 1,
+        Hostname: "overview.example",
+        NoSSL: false,
+        DesiredState: "enabled",
+        RuntimeState: "connected",
+        Revision: 1,
+        RecoveryRequired: false,
+        LastDurableCursor: 12,
+        Validation: { Status: "passed", Reason: "reachable" },
+        AccountQuota: { Count: 4, Limit: 25 },
+      },
+    ],
+    submit: vi.fn(),
+  });
+  expect(screen.getByText("passed reachable")).toBeTruthy();
+  expect(screen.getByText("4 / 25 accounts")).toBeTruthy();
+  expect(screen.getByText(/historical collection counts are unavailable/)).toBeTruthy();
 });
