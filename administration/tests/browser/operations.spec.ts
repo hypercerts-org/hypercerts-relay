@@ -63,9 +63,11 @@ test("administrator operates sources, collections, jobs, rates and revokes the s
   await page
     .getByRole("button", { name: "Request account quota change" })
     .click();
-  await expect(page.getByText("0 / 250 accounts")).toBeVisible({
-    timeout: 12000,
-  });
+  await expect(
+    page
+      .getByRole("region", { name: "Source detail" })
+      .getByText("0 / 250 accounts"),
+  ).toBeVisible({ timeout: 12000 });
   await page.reload();
   await page
     .getByRole("button", { name: "quiet.example", exact: true })
@@ -74,9 +76,11 @@ test("administrator operates sources, collections, jobs, rates and revokes the s
     "250",
   );
   await page.getByRole("link", { name: "Collections", exact: true }).click();
-  await page
-    .getByLabel("Enabled collection NSIDs")
-    .fill("app.bsky.feed.post\napp.bsky.feed.like");
+  const collection = page.getByLabel("Collection NSID");
+  await collection.fill("app.bsky.feed.post");
+  await page.getByRole("button", { name: "Add collection" }).click();
+  await collection.fill("app.bsky.feed.like");
+  await page.getByRole("button", { name: "Add collection" }).click();
   await page.getByRole("button", { name: "Request policy change" }).click();
   await expect(page.getByText("2 enabled collections")).toBeVisible({
     timeout: 12000,
