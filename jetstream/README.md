@@ -64,10 +64,11 @@ JETSTREAM_COLLECTIONS=org.hypercerts.claim.activity \
 go run ./cmd/jetstream serve
 ```
 
-Do not point `JETSTREAM_RELAY_URL` at Rainbow when direct Relay access is
-available. Rainbow is optional raw-stream connection pooling; Jetstream owns
-archive materialization, retention, replay, direct-PDS backfill, and its own
-durable state. Back up the Jetstream data directory as one unit. It is not
+For the Relay → Rainbow → Jetstream topology, set `JETSTREAM_RELAY_URL` to
+Rainbow's HTTP base URL. Rainbow serves the raw subscription and proxies the
+Relay sync APIs. Direct Relay access remains supported when Rainbow is omitted.
+Jetstream owns archive materialization, retention, replay, direct-PDS backfill,
+and its own durable state. Back up the Jetstream data directory as one unit. It is not
 safe to combine it with Relay's database or event-store backup.
 
 `Dockerfile` builds this module with `docker build -f jetstream/Dockerfile

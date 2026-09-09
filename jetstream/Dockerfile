@@ -21,9 +21,8 @@ WORKDIR /src
 # Copy go.{mod,sum} first so the dependency-download layer caches independently
 # of source changes. Module downloads are the slowest step in a clean build.
 COPY go.mod go.sum ./
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    go mod download
+# hypercerts: Use portable layer caching; Railway cache mounts require private service IDs.
+RUN go mod download
 
 # Now copy the rest of the source. Anything in .dockerignore stays out.
 COPY . .
@@ -35,9 +34,7 @@ COPY . .
 #     (and avoids surprising failures when /src isn't a git checkout).
 #   - -extldflags=-static is belt-and-suspenders for fully static linking.
 ENV CGO_ENABLED=0
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build \
       -trimpath \
       -buildvcs=false \
