@@ -16,7 +16,7 @@ export const origin = z
         u.hash ||
         u.pathname !== "/"
       )
-        throw Error();
+        throw new Error();
       return u.origin;
     } catch {
       ctx.addIssue({
@@ -49,7 +49,9 @@ export const command = z.discriminatedUnion("kind", [
             ),
         )
         .max(1000)
-        .transform((v) => [...new Set(v)].sort()),
+        .transform((v) =>
+          [...new Set(v)].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)),
+        ),
     })
     .strict(),
   z

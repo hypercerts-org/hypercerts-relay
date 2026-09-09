@@ -92,7 +92,13 @@ test("desktop and mobile screens have no serious accessibility violations or pag
     }
   }
   await page.goto("/sources");
-  await page.screenshot({ path: "/tmp/tech588-mobile.png", fullPage: true });
+  await page.screenshot({
+    path: test.info().outputPath("mobile.png"),
+    fullPage: true,
+  });
   await page.setViewportSize({ width: 1365, height: 900 });
-  await page.screenshot({ path: "/tmp/tech588-desktop.png", fullPage: true });
+  await page.screenshot({
+    path: test.info().outputPath("desktop.png"),
+    fullPage: true,
+  });
 });

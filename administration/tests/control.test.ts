@@ -146,8 +146,8 @@ test("idempotency and invalid rate policies cannot create extra work", async (t)
 
 test("a source absent from Jetstream can still be disabled in Relay", async () => {
   const services = new Services(
-    { url: "http://unused", token: "unused" },
-    { url: "http://unused", token: "unused" },
+    { url: "https://unused.example", token: "unused" },
+    { url: "https://unused.example", token: "unused" },
   );
   const calls: string[] = [];
   services.call = async <T>(service: "relay" | "jetstream") => {
@@ -169,8 +169,8 @@ test("a source absent from Jetstream can still be disabled in Relay", async () =
 
 test("job actions always pass a durable receipt key even when the target already matches", async () => {
   const services = new Services(
-    { url: "http://unused", token: "unused" },
-    { url: "http://unused", token: "unused" },
+    { url: "https://unused.example", token: "unused" },
+    { url: "https://unused.example", token: "unused" },
   );
   let seen: unknown[] = [];
   services.call = async <T>(...args: Parameters<Services["call"]>) => {

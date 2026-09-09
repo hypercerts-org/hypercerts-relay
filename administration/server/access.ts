@@ -8,7 +8,7 @@ if (
   !isValidDid(did ?? "") ||
   !process.env.ADMIN_DATABASE
 )
-  throw Error(
+  throw new Error(
     "Usage: ADMIN_DATABASE=/path/control.db npx tsx server/access.ts grant|remove|revoke did:...",
   );
 const store = new Store(process.env.ADMIN_DATABASE);

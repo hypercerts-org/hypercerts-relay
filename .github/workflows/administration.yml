@@ -23,11 +23,11 @@ jobs:
           node-version: '24'
           cache: npm
           cache-dependency-path: administration/package-lock.json
-      - run: npm ci
+      - run: npm ci --ignore-scripts
         working-directory: administration
       - run: npm run check && npm test && npm run test:components && npm run build
         working-directory: administration
-      - run: npx playwright install --with-deps chromium
+      - run: ./node_modules/.bin/playwright install --with-deps chromium
         working-directory: administration
       - run: npm run test:browser
         working-directory: administration

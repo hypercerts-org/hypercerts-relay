@@ -48,7 +48,7 @@ const services = {
       if (!source) throw new ApiError(404, "source_not_found");
       return source;
     }
-    throw Error("Unexpected fixture route");
+    throw new Error("Unexpected fixture route");
   },
   async apply(command: Command, id: string) {
     switch (command.kind) {

@@ -1,9 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
+import { promisify } from "node:util";
 import { mkdtempSync, readFileSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { resolve, join } from "node:path";
+import { resolve, join, isAbsolute } from "node:path";
 import { Store } from "../server/store.ts";
 import { Services } from "../server/services.ts";
 import { Worker } from "../server/worker.ts";
@@ -11,49 +12,78 @@ import { command } from "../server/contracts.ts";
 
 test(
   "real Relay and Jetstream APIs apply durable requests and preserve incomplete coverage",
-  { timeout: 120000 },
+  { timeout: 360000 },
   async (t) => {
+    const goBinary = process.env.CONTROL_GO_BINARY;
+    if (!goBinary || !isAbsolute(goBinary))
+      throw new Error(
+        "CONTROL_GO_BINARY must identify an absolute Go executable path",
+      );
     const temp = mkdtempSync(join(tmpdir(), "management-acceptance-"));
-    async function fixture(name: string, cwd: string, pkg: string) {
+    const compile = promisify(execFile);
+    const fixtures = [
+      { name: "relay", cwd: resolve(".."), pkg: "./cmd/relay" },
+      {
+        name: "jetstream",
+        cwd: resolve("../jetstream"),
+        pkg: "./internal/hypercerts/control",
+      },
+    ];
+    // Finish cold dependency downloads and compilation before starting either
+    // bounded fixture server. Compilation is not part of its startup deadline.
+    await Promise.all(
+      fixtures.map(({ name, cwd, pkg }) =>
+        compile(
+          goBinary,
+          ["test", "-c", "-o", join(temp, name + ".test"), pkg],
+          {
+            cwd,
+            timeout: 300000,
+            signal: t.signal,
+            maxBuffer: 2 * 1024 * 1024,
+          },
+        ),
+      ),
+    );
+    async function fixture(name: string, cwd: string) {
       const ready = join(temp, name);
       let output = "";
       const child = spawn(
-        "go",
-        [
-          "test",
-          pkg,
-          "-run",
-          "^TestControlPlaneAcceptanceFixture$",
-          "-count=1",
-        ],
+        join(temp, name + ".test"),
+        ["-test.run=^TestControlPlaneAcceptanceFixture$", "-test.count=1"],
         { cwd, env: { ...process.env, CONTROL_ACCEPTANCE_READY: ready } },
       );
       child.stdout.on("data", (b) => (output += b));
       child.stderr.on("data", (b) => (output += b));
-      const done = new Promise<number | null>((resolve) =>
-        child.on("exit", resolve),
+      const done = new Promise<{ code: number | null; error?: Error }>(
+        (resolve) => {
+          child.on("error", (error) => resolve({ code: null, error }));
+          child.on("exit", (code) => resolve({ code }));
+        },
       );
       t.after(async () => {
         writeFileSync(ready + ".stop", "");
-        const code = await done;
-        assert.equal(code, 0, output);
+        const deadline = setTimeout(() => child.kill("SIGKILL"), 5000);
+        try {
+          const result = await done;
+          assert.ifError(result.error);
+          assert.equal(result.code, 0, output);
+        } finally {
+          clearTimeout(deadline);
+        }
       });
       const start = Date.now();
       while (!existsSync(ready)) {
-        if (child.exitCode !== null || Date.now() - start > 90000)
-          throw Error(output || "Service fixture did not start");
+        if (child.exitCode !== null || Date.now() - start > 15000)
+          throw new Error(output || "Service fixture did not start");
+        t.signal.throwIfAborted();
         await new Promise((r) => setTimeout(r, 50));
       }
       return readFileSync(ready, "utf8");
     }
-    const [relay, jetstream] = await Promise.all([
-      fixture("relay", resolve(".."), "./cmd/relay"),
-      fixture(
-        "jetstream",
-        resolve("../jetstream"),
-        "./internal/hypercerts/control",
-      ),
-    ]);
+    const [relay, jetstream] = await Promise.all(
+      fixtures.map(({ name, cwd }) => fixture(name, cwd)),
+    );
     const token = "fixture-service-credential-32-bytes-minimum";
     const services = new Services(
       { url: relay, token },

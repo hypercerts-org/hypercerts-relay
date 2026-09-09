@@ -95,7 +95,7 @@ test("selected source detail refreshes even when found outside the current page"
     await vi.advanceTimersByTimeAsync(5000);
     expect(screen.getByText("disabled")).toBeTruthy();
     expect(screen.getByText("50")).toBeTruthy();
-    fetcher.mockRejectedValue(Error("offline"));
+    fetcher.mockRejectedValue(new Error("offline"));
     await vi.advanceTimersByTimeAsync(5000);
     expect(screen.getByText(/Latest observation unavailable/)).toBeTruthy();
   } finally {
