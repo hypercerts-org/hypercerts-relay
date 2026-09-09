@@ -52,6 +52,19 @@ const services = {
   },
   async apply(command: Command, id: string) {
     switch (command.kind) {
+      case "account_quota": {
+        const source = sources.find(
+          (s) => s.Hostname === new URL(command.pds).host,
+        );
+        if (!source) throw new ApiError(404, "source_not_found");
+        if (
+          source.AccountQuota.Limit !== command.expectedLimit &&
+          source.AccountQuota.Limit !== command.accountLimit
+        )
+          throw new ApiError(409, "revision_conflict");
+        source.AccountQuota.Limit = command.accountLimit;
+        return source;
+      }
       case "source": {
         let source = sources.find(
           (s) => s.Hostname === new URL(command.pds).host,

@@ -29,6 +29,49 @@ test("administrator operates sources, collections, jobs, rates and revokes the s
       }),
     ).toBeVisible({ timeout: 12000 });
   }
+  await page
+    .getByRole("button", { name: "quiet.example", exact: true })
+    .click();
+  const quota = page.getByLabel("Account quota", { exact: true });
+  await quota.fill("-1");
+  await page
+    .getByRole("button", { name: "Request account quota change" })
+    .click();
+  await expect(quota).toBeFocused();
+  await expect(page.getByRole("alert")).toContainText("Enter a whole number");
+  await quota.fill("250");
+  for (const width of [1365, 390]) {
+    await page.setViewportSize({ width, height: 900 });
+    await quota.focus();
+    const results = await new AxeBuilder({ page }).analyze();
+    expect(
+      results.violations.filter((v) =>
+        ["serious", "critical"].includes(v.impact ?? ""),
+      ),
+    ).toEqual([]);
+    expect(
+      await page.evaluate(
+        () => document.documentElement.scrollWidth <= window.innerWidth,
+      ),
+    ).toBe(true);
+    await page.screenshot({
+      path: test.info().outputPath(`quota-${width}.png`),
+      fullPage: true,
+    });
+  }
+  await page
+    .getByRole("button", { name: "Request account quota change" })
+    .click();
+  await expect(page.getByText("0 / 250 accounts")).toBeVisible({
+    timeout: 12000,
+  });
+  await page.reload();
+  await page
+    .getByRole("button", { name: "quiet.example", exact: true })
+    .click();
+  await expect(page.getByLabel("Account quota", { exact: true })).toHaveValue(
+    "250",
+  );
   await page.getByRole("link", { name: "Collections", exact: true }).click();
   await page
     .getByLabel("Enabled collection NSIDs")

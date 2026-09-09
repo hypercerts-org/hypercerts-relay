@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import State from "./State.svelte";
+  import AccountQuota from "./AccountQuota.svelte";
   import { api, sourceOrigin, type Source, type Command } from "./api";
   export let rows: Source[] = [];
   export let submit: (command: Command) => Promise<void>;
@@ -125,6 +126,14 @@
         </dd>
       </div>
     </dl>
+    {#key sourceOrigin(selected)}
+      <AccountQuota
+        source={selected}
+        {submit}
+        {busy}
+        unavailable={detailUnavailable}
+      />
+    {/key}
     <p>
       {selected.RecoveryRequired
         ? "Recovery remains required. Inspect backfill jobs and coverage before claiming completeness."

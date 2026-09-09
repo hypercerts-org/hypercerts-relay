@@ -64,6 +64,22 @@ func (s *Service) controlHandler(token string) (http.Handler, error) {
 		}
 		controlResult(w, view, err)
 	})
+	mux.HandleFunc("PUT /hypercerts/v1/source/quota", func(w http.ResponseWriter, r *http.Request) {
+		var input struct {
+			PDS           string `json:"pds"`
+			ExpectedLimit *int64 `json:"expectedLimit"`
+			AccountLimit  *int64 `json:"accountLimit"`
+		}
+		if !controlDecode(w, r, &input) {
+			return
+		}
+		if input.ExpectedLimit == nil || input.AccountLimit == nil {
+			controlReply(w, 400, map[string]string{"error": "account_quota_required"})
+			return
+		}
+		view, err := s.relay.SetSourceAccountQuota(r.Context(), input.PDS, *input.ExpectedLimit, *input.AccountLimit)
+		controlResult(w, view, err)
+	})
 	mux.HandleFunc("GET /hypercerts/v1/limits", func(w http.ResponseWriter, r *http.Request) {
 		rows, next, err := s.relay.ListRatePolicies(r.Context(), r.URL.Query().Get("after"))
 		controlResult(w, map[string]any{"items": rows, "next": next}, err)
@@ -102,6 +118,8 @@ func controlResult(w http.ResponseWriter, value any, err error) {
 	}
 	status, code := 500, "service_error"
 	switch {
+	case errors.Is(err, relay.ErrInvalidAccountQuota):
+		status, code = 400, "account_quota_must_be_a_nonnegative_safe_integer"
 	case errors.Is(err, relay.ErrInvalidRatePolicy):
 		status, code = 400, "events_per_second_must_be_1_to_1000000"
 	case errors.Is(err, relay.ErrSourceNotFound):

@@ -84,6 +84,33 @@ test("signout and revocation invalidate server-side sessions", async (t) => {
   assert.equal((await request("/api/v1/signout", {})).status, 204);
   assert.equal((await request("/api/v1/session")).status, 401);
 });
+test("quota requests require administrator CSRF and validated integer values", async (t) => {
+  const { request, store } = await fixture(t);
+  const body = {
+    kind: "account_quota",
+    pds: "https://pds.example",
+    expectedLimit: 100,
+    accountLimit: 250,
+  };
+  assert.equal(
+    (await request("/api/v1/operations", body, { Cookie: "" })).status,
+    401,
+  );
+  assert.equal(
+    (await request("/api/v1/operations", body, { "X-CSRF-Token": "" })).status,
+    403,
+  );
+  for (const invalid of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1, "250", null]) {
+    assert.equal(
+      (await request("/api/v1/operations", { ...body, accountLimit: invalid }))
+        .status,
+      400,
+    );
+  }
+  assert.equal(store.page("operations", "", 50).items.length, 0);
+  assert.equal((await request("/api/v1/operations", body)).status, 202);
+  assert.equal(store.page("operations", "", 50).items.length, 1);
+});
 test("durable operations recover after restart and retain actor and failure states", async () => {
   const path = join(mkdtempSync(join(tmpdir(), "control-test-")), "state.db");
   let store = new Store(path);

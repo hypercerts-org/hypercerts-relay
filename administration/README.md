@@ -106,7 +106,8 @@ The browser-facing API is `/api/v1`; all endpoints below require authorization.
 
 Commands are discriminated by `kind`: `source` (`pds`, `state`), `collections`
 (`expectedRevision`, exact `collections`), `job` (`pds`, `reason`), `job_action`
-(`id`, `action`), and `limit` (`scope`, `eventsPerSecond`). Bodies are limited to
+(`id`, `action`), `account_quota` (`pds`, `expectedLimit`, `accountLimit`), and
+`limit` (`scope`, `eventsPerSecond`). Bodies are limited to
 64 KiB. Lists use bounded pages and opaque `after` cursors; restart pagination to
 include newly added items that sort before the current cursor. Collection lists
 are limited to 1,000 exact NSIDs per request.

@@ -106,6 +106,32 @@ test(
     });
     const sources = await services.sources();
     assert.equal((sources.Sources as unknown[]).length, 1);
+    const source = (
+      sources.Sources as { AccountQuota: { Limit: number } }[]
+    )[0];
+    const quota = await apply({
+      kind: "account_quota",
+      pds: "https://pds.example",
+      expectedLimit: source.AccountQuota.Limit,
+      accountLimit: 250,
+    });
+    assert.equal(
+      (quota.result as { AccountQuota: { Limit: number } }).AccountQuota.Limit,
+      250,
+    );
+    assert.equal(
+      (
+        (await services.apply(quota.command, quota.id)) as {
+          AccountQuota: { Limit: number };
+        }
+      ).AccountQuota.Limit,
+      250,
+    );
+    const observed = await services.call<{ AccountQuota: { Limit: number } }>(
+      "relay",
+      "/source?pds=https%3A%2F%2Fpds.example",
+    );
+    assert.equal(observed.AccountQuota.Limit, 250);
     await apply({
       kind: "collections",
       expectedRevision: 1,

@@ -64,6 +64,8 @@ export async function api<T>(
 }
 export function target(command: Command) {
   switch (command.kind) {
+    case "account_quota":
+      return `${command.pds} · account quota ${command.expectedLimit} → ${command.accountLimit}`;
     case "source":
       return `${command.state} · ${command.pds}`;
     case "collections":

@@ -30,6 +30,14 @@ export const rate = z.number().int().min(1).max(1_000_000);
 export const command = z.discriminatedUnion("kind", [
   z
     .object({
+      kind: z.literal("account_quota"),
+      pds: origin,
+      expectedLimit: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+      accountLimit: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+    })
+    .strict(),
+  z
+    .object({
       kind: z.literal("source"),
       pds: origin,
       state: z.enum(["enabled", "disabled", "removed"]),

@@ -3,7 +3,52 @@ import { render, screen, fireEvent, cleanup } from "@testing-library/svelte";
 import Sources from "../src/Sources.svelte";
 import Collections from "../src/Collections.svelte";
 import Operations from "../src/Operations.svelte";
+import AccountQuota from "../src/AccountQuota.svelte";
 afterEach(cleanup);
+test("quota drafts survive observations and reject stale or invalid changes", async () => {
+  const source = {
+    HostID: 1,
+    Hostname: "quota.example",
+    NoSSL: false,
+    DesiredState: "enabled",
+    RuntimeState: "connected",
+    Revision: 1,
+    RecoveryRequired: true,
+    LastDurableCursor: 12,
+    Validation: { Status: "passed", Reason: "" },
+    AccountQuota: { Count: 10, Limit: 100 },
+  };
+  const submit = vi.fn().mockResolvedValue(undefined);
+  const view = render(AccountQuota, { source, submit });
+  const input = screen.getByLabelText("Account quota") as HTMLInputElement;
+  await fireEvent.input(input, { target: { value: "-1" } });
+  await fireEvent.submit(input.form!);
+  expect(submit).not.toHaveBeenCalled();
+  expect(document.activeElement).toBe(input);
+  await fireEvent.input(input, { target: { value: "250" } });
+  await view.rerender({
+    source: { ...source, AccountQuota: { Count: 11, Limit: 100 } },
+  });
+  expect(input.value).toBe("250");
+  await fireEvent.submit(input.form!);
+  expect(submit).toHaveBeenCalledWith({
+    kind: "account_quota",
+    pds: "https://quota.example",
+    expectedLimit: 100,
+    accountLimit: 250,
+  });
+  submit.mockClear();
+  await view.rerender({
+    source: { ...source, AccountQuota: { Count: 11, Limit: 150 } },
+  });
+  expect(input.value).toBe("250");
+  await fireEvent.submit(input.form!);
+  expect(submit).not.toHaveBeenCalled();
+  await fireEvent.click(
+    screen.getByRole("button", { name: "Use current quota" }),
+  );
+  expect(input.value).toBe("150");
+});
 test("source form submits a backend command without inventing an applied state", async () => {
   const submit = vi.fn().mockResolvedValue(undefined);
   render(Sources, { rows: [], submit });

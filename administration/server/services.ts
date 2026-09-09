@@ -77,6 +77,12 @@ export class Services {
     progress: (value: unknown) => void = () => {},
   ): Promise<unknown> {
     switch (command.kind) {
+      case "account_quota":
+        return this.call("relay", "/source/quota", "PUT", {
+          pds: command.pds,
+          expectedLimit: command.expectedLimit,
+          accountLimit: command.accountLimit,
+        });
       case "source": {
         // Stop acquisition at Jetstream before disabling the raw source. Retry is safe.
         if (command.state !== "enabled") {

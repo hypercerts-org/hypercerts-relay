@@ -2,6 +2,7 @@ package main
 
 import (
 	"github.com/stretchr/testify/require"
+	"log/slog"
 	"net/http/httptest"
 	"os"
 	"strings"
@@ -40,6 +41,7 @@ func TestControlPlaneAcceptanceFixture(t *testing.T) {
 		t.Skip("cross-language fixture")
 	}
 	svc, r, _ := newSourceHandlerService(t)
+	r.Logger = slog.Default()
 	r.HostChecker = &countingHostChecker{}
 	h, err := svc.controlHandler("fixture-service-credential-32-bytes-minimum")
 	require.NoError(t, err)
