@@ -3,6 +3,7 @@ package relay
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -210,6 +211,14 @@ func TestListSourceAccountsBoundsThrottledAdmissions(t *testing.T) {
 	require.Len(t, page.Accounts, maxSourcePageLimit)
 	require.NotEmpty(t, page.NextAfterDID)
 	require.Equal(t, admissionReasonHostAccountLimit, page.Accounts[0].AdmissionReason)
+
+	var plan []struct{ Detail string }
+	require.NoError(t, db.Raw("EXPLAIN QUERY PLAN SELECT * FROM account_source_observation WHERE observed_host_id = ? AND did > ? ORDER BY did ASC LIMIT ?", host.ID, page.NextAfterDID, maxSourcePageLimit+1).Scan(&plan).Error)
+	var details []string
+	for _, step := range plan {
+		details = append(details, step.Detail)
+	}
+	require.Contains(t, strings.Join(details, "\n"), "idx_observation_host_did (observed_host_id=? AND did>?)")
 }
 
 func timeNow() time.Time {

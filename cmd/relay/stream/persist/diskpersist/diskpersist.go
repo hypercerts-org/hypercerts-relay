@@ -322,25 +322,26 @@ func (dp *DiskPersistence) swapLog(ctx context.Context) error {
 	return nil
 }
 
+// hypercerts: Recover incomplete trailing writes only during startup, never playback.
+func recoverIncompleteTail(fi *os.File, end, offset, lastSeq int64) (int64, error) {
+	if end != -1 {
+		return 0, io.ErrUnexpectedEOF
+	}
+	if err := fi.Truncate(offset); err != nil {
+		return 0, err
+	}
+	if err := fi.Sync(); err != nil {
+		return 0, err
+	}
+	_, err := fi.Seek(offset, io.SeekStart)
+	return lastSeq, err
+}
+
 func scanForLastSeq(fi *os.File, end int64) (int64, error) {
 	scratch := make([]byte, headerSize)
 	info, err := fi.Stat()
 	if err != nil {
 		return 0, err
-	}
-	// hypercerts: Recover only incomplete trailing writes during startup, never during playback.
-	recoverTail := func(offset int64, lastSeq int64) (int64, error) {
-		if end != -1 {
-			return 0, io.ErrUnexpectedEOF
-		}
-		if err := fi.Truncate(offset); err != nil {
-			return 0, err
-		}
-		if err := fi.Sync(); err != nil {
-			return 0, err
-		}
-		_, err := fi.Seek(offset, io.SeekStart)
-		return lastSeq, err
 	}
 
 	var lastSeq int64 = -1
@@ -352,12 +353,12 @@ func scanForLastSeq(fi *os.File, end int64) (int64, error) {
 				return lastSeq, nil
 			}
 			if errors.Is(err, io.ErrUnexpectedEOF) {
-				return recoverTail(offset, lastSeq)
+				return recoverIncompleteTail(fi, end, offset, lastSeq)
 			}
 			return 0, err
 		}
 		if offset+headerSize+int64(eh.Len) > info.Size() {
-			return recoverTail(offset, lastSeq)
+			return recoverIncompleteTail(fi, end, offset, lastSeq)
 		}
 
 		if end > 0 && eh.Seq > end {

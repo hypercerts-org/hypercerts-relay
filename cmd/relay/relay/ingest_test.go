@@ -97,7 +97,7 @@ func newIngestTestRelay(t *testing.T, directory identity.Directory, did syntax.D
 		require.NoError(t, db.AutoMigrate(&models.RejectedEvent{}))
 	}
 	require.NoError(t, db.Create(&models.Host{ID: ingestTestHostID, Hostname: "source.example", AccountLimit: 100, AccountCount: 1}).Error)
-	require.NoError(t, db.Create(&models.Source{HostID: ingestTestHostID, State: models.SourceStateEnabled, ValidationStatus: models.SourceValidationPassed}).Error)
+	require.NoError(t, db.Create(&models.Source{HostID: ingestTestHostID, State: models.SourceStateEnabled, ValidationStatus: models.SourceValidationPassed, RecoveryRequired: true}).Error)
 	t.Cleanup(func() { require.NoError(t, relay.Slurper.Shutdown()) })
 	require.NoError(t, db.Create(&models.Account{
 		UID:            1,
@@ -225,11 +225,12 @@ func TestSyncOutputFailureLeavesRevisionReplayable(t *testing.T) {
 }
 
 type rotatingDirectory struct {
-	stale      identity.Identity
-	fresh      identity.Identity
-	purgeErr   error
-	purged     bool
-	purgeCalls int
+	stale       identity.Identity
+	fresh       identity.Identity
+	purgeErr    error
+	purged      bool
+	purgeCalls  int
+	lookupCalls int
 }
 
 func (d *rotatingDirectory) LookupHandle(context.Context, syntax.Handle) (*identity.Identity, error) {
@@ -237,6 +238,7 @@ func (d *rotatingDirectory) LookupHandle(context.Context, syntax.Handle) (*ident
 }
 
 func (d *rotatingDirectory) LookupDID(context.Context, syntax.DID) (*identity.Identity, error) {
+	d.lookupCalls++
 	if d.purged {
 		ident := d.fresh
 		return &ident, nil

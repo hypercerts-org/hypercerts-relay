@@ -360,7 +360,8 @@ func (s *Slurper) subscribeWithRedialer(ctx context.Context, host *models.Host, 
 		conn, resp, err := d.DialContext(ctx, u, hdr)
 		if err != nil {
 			sub.setState("failing")
-			logger.Warn("dialing failed", "backoff", backoff)
+			// hypercerts: Preserve the connection failure reason for operator diagnosis.
+			logger.Warn("dialing failed", "backoff", backoff, "err", err)
 			timer := time.NewTimer(sleepForBackoff(backoff))
 			select {
 			case <-ctx.Done():
@@ -401,7 +402,8 @@ func (s *Slurper) subscribeWithRedialer(ctx context.Context, host *models.Host, 
 		if err := s.handleConnection(ctx, conn, sub); err != nil {
 
 			// TODO: measure the last N connection error times and if they're coming too fast reconnect slower or don't reconnect and wait for requestCrawl
-			logger.Warn("host connection failed", "backoff", backoff)
+			// hypercerts: Preserve stream-processing errors as well as retry context.
+			logger.Warn("host connection failed", "backoff", backoff, "err", err)
 
 			// for all other errors, keep retrying / reconnecting
 		}

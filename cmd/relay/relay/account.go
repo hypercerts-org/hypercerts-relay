@@ -17,6 +17,9 @@ import (
 // hypercerts: Separate confirmed inactivity from status lookup and storage failures.
 var ErrAccountInactive = errors.New("account is inactive")
 
+// hypercerts: Keep account updates consistent across source migration and status changes.
+const accountUIDPredicate = "uid = ?"
+
 func (r *Relay) GetAccount(ctx context.Context, did syntax.DID) (*models.Account, error) {
 	ctx, span := tracer.Start(ctx, "GetAccount")
 	defer span.End()
@@ -195,7 +198,7 @@ func (r *Relay) EnsureAccountHost(ctx context.Context, acc *models.Account, host
 				acc.Status = models.AccountStatusHostThrottled
 			}
 		}
-		if err := tx.Model(models.Account{}).Where("uid = ?", acc.UID).Updates(map[string]any{"host_id": hostID, "status": acc.Status}).Error; err != nil {
+		if err := tx.Model(models.Account{}).Where(accountUIDPredicate, acc.UID).Updates(map[string]any{"host_id": hostID, "status": acc.Status}).Error; err != nil {
 			return fmt.Errorf("failed update account HostID: %w", err)
 		}
 		return nil
@@ -254,7 +257,7 @@ func (r *Relay) EnsureAccountActive(ctx context.Context, acc *models.Account) er
 // The DID and UID are both required, and *must* match; it is assumed that calling code has already done an account lookup.
 func (r *Relay) UpdateAccountUpstreamStatus(ctx context.Context, did syntax.DID, uid uint64, status models.AccountStatus) error {
 
-	if err := r.db.WithContext(ctx).Model(models.Account{}).Where("uid = ?", uid).Update("upstream_status", status).Error; err != nil {
+	if err := r.db.WithContext(ctx).Model(models.Account{}).Where(accountUIDPredicate, uid).Update("upstream_status", status).Error; err != nil {
 		return fmt.Errorf("failed to update account upstream status: %w", err)
 	}
 
@@ -273,7 +276,7 @@ func (r *Relay) UpdateAccountLocalStatus(ctx context.Context, did syntax.DID, st
 		return err
 	}
 
-	if err := r.db.WithContext(ctx).Model(models.Account{}).Where("uid = ?", acc.UID).Update("status", status).Error; err != nil {
+	if err := r.db.WithContext(ctx).Model(models.Account{}).Where(accountUIDPredicate, acc.UID).Update("status", status).Error; err != nil {
 		return err
 	}
 

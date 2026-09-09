@@ -24,6 +24,8 @@ var (
 )
 
 const (
+	sourceHostIDPredicate = "host_id = ?"
+
 	defaultSourcePageLimit = 100
 	maxSourcePageLimit     = 1_000
 
@@ -116,28 +118,11 @@ func (r *Relay) AddSource(ctx context.Context, rawURL string) (*SourceView, erro
 	var host models.Host
 	var source models.Source
 	err = r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		err := tx.Where("hostname = ?", hostname).First(&host).Error
-		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-			return fmt.Errorf("loading source host: %w", err)
+		if err := r.ensureSourceHost(tx, &host, hostname, noSSL); err != nil {
+			return err
 		}
 
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			host = models.Host{
-				Hostname:     hostname,
-				NoSSL:        noSSL,
-				Status:       models.HostStatusActive,
-				Trusted:      IsTrustedHostname(hostname, r.Config.TrustedDomains),
-				AccountLimit: r.Config.DefaultRepoLimit,
-			}
-			if host.Trusted {
-				host.AccountLimit = r.Config.TrustedRepoLimit
-			}
-			if err := tx.Create(&host).Error; err != nil {
-				return fmt.Errorf("creating source host: %w", err)
-			}
-		}
-
-		err = tx.Where("host_id = ?", host.ID).First(&source).Error
+		err := tx.Where(sourceHostIDPredicate, host.ID).First(&source).Error
 		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 			return fmt.Errorf("loading source: %w", err)
 		}
@@ -173,6 +158,31 @@ func (r *Relay) AddSource(ctx context.Context, rawURL string) (*SourceView, erro
 		return view, err
 	}
 	return r.sourceViewLocked(ctx, &source, &host)
+}
+
+// ensureSourceHost loads or creates the host within the caller's source transaction.
+func (r *Relay) ensureSourceHost(tx *gorm.DB, host *models.Host, hostname string, noSSL bool) error {
+	err := tx.Where("hostname = ?", hostname).First(host).Error
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return fmt.Errorf("loading source host: %w", err)
+	}
+
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		*host = models.Host{
+			Hostname:     hostname,
+			NoSSL:        noSSL,
+			Status:       models.HostStatusActive,
+			Trusted:      IsTrustedHostname(hostname, r.Config.TrustedDomains),
+			AccountLimit: r.Config.DefaultRepoLimit,
+		}
+		if host.Trusted {
+			host.AccountLimit = r.Config.TrustedRepoLimit
+		}
+		if err := tx.Create(host).Error; err != nil {
+			return fmt.Errorf("creating source host: %w", err)
+		}
+	}
+	return nil
 }
 
 // ValidateSource performs one explicit host check against the stored scheme and
@@ -271,15 +281,8 @@ func (r *Relay) SetSourceState(ctx context.Context, hostID, expectedRevision uin
 		return nil, ErrSourceRevisionConflict
 	}
 	if state == models.SourceStateEnabled {
-		if source.ValidationStatus != models.SourceValidationPassed {
-			return nil, ErrSourceValidationFailed
-		}
-		banned, err := r.sourceDomainIsBanned(ctx, host.Hostname)
-		if err != nil {
+		if err := r.checkSourceEnablement(ctx, source, host); err != nil {
 			return nil, err
-		}
-		if banned || host.Status == models.HostStatusBanned {
-			return nil, ErrSourceDomainBanned
 		}
 	}
 	if source.State != state {
@@ -320,6 +323,21 @@ func (r *Relay) SetSourceState(ctx context.Context, hostID, expectedRevision uin
 		return nil, err
 	}
 	return r.sourceViewLocked(ctx, source, host)
+}
+
+// checkSourceEnablement enforces validation and bans before acquisition is enabled.
+func (r *Relay) checkSourceEnablement(ctx context.Context, source *models.Source, host *models.Host) error {
+	if source.ValidationStatus != models.SourceValidationPassed {
+		return ErrSourceValidationFailed
+	}
+	banned, err := r.sourceDomainIsBanned(ctx, host.Hostname)
+	if err != nil {
+		return err
+	}
+	if banned || host.Status == models.HostStatusBanned {
+		return ErrSourceDomainBanned
+	}
+	return nil
 }
 
 // ListSources returns a deterministic, bounded page including quiet sources.
@@ -374,7 +392,7 @@ func (r *Relay) ObserveAccountSource(ctx context.Context, didStr string, sourceH
 	}
 
 	var source models.Source
-	if err := r.db.WithContext(ctx).First(&source, "host_id = ?", sourceHostID).Error; err != nil {
+	if err := r.db.WithContext(ctx).First(&source, sourceHostIDPredicate, sourceHostID).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return ErrSourceNotFound
 		}
@@ -429,7 +447,7 @@ func (r *Relay) ListSourceAccounts(ctx context.Context, sourceHostID uint64, aft
 	defer r.sourcesLk.Unlock()
 
 	var source models.Source
-	if err := r.db.WithContext(ctx).First(&source, "host_id = ?", sourceHostID).Error; err != nil {
+	if err := r.db.WithContext(ctx).First(&source, sourceHostIDPredicate, sourceHostID).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, ErrSourceNotFound
 		}
@@ -483,41 +501,47 @@ func (r *Relay) ListSourceAccounts(ctx context.Context, sourceHostID uint64, aft
 	}
 
 	for _, observation := range observations {
-		view := &SourceAccountView{
-			DID:                  observation.DID,
-			ObservedSourceHostID: observation.ObservedHostID,
-			ResolvedHostname:     observation.ResolvedHostname,
-			ObservedAt:           observation.ObservedAt,
-			ResolvedAt:           observation.ResolvedAt,
-			TargetCoverage:       "unknown",
-			AdmissionReason:      observation.AdmissionReason,
-			RecoveryRequired:     source.RecoveryRequired,
-		}
-		if admitted[observation.ResolvedHostname] {
-			view.TargetCoverage = "incomplete"
-		}
-		if observedHost := hosts[observation.ObservedHostID]; observedHost != nil {
-			view.ObservedSourceHostname = observedHost.Hostname
-		}
-		if account := accounts[observation.DID]; account != nil {
-			view.CurrentHostID = account.HostID
-			view.CurrentStatus = account.Status
-			view.CurrentUpstreamStatus = account.UpstreamStatus
-			if currentHost := hosts[account.HostID]; currentHost != nil {
-				view.CurrentHostname = currentHost.Hostname
-			}
-			if account.Status == models.AccountStatusHostThrottled {
-				view.AdmissionReason = admissionReasonHostAccountLimit
-			}
-		}
+		view := sourceAccountView(observation, accounts[observation.DID], hosts, admitted[observation.ResolvedHostname], source.RecoveryRequired)
 		page.Accounts = append(page.Accounts, view)
 	}
 	return page, nil
 }
 
+// sourceAccountView keeps historical observation and current placement separate.
+func sourceAccountView(observation *models.AccountSourceObservation, account *models.Account, hosts map[uint64]*models.Host, targetAdmitted, recoveryRequired bool) *SourceAccountView {
+	view := &SourceAccountView{
+		DID:                  observation.DID,
+		ObservedSourceHostID: observation.ObservedHostID,
+		ResolvedHostname:     observation.ResolvedHostname,
+		ObservedAt:           observation.ObservedAt,
+		ResolvedAt:           observation.ResolvedAt,
+		TargetCoverage:       "unknown",
+		AdmissionReason:      observation.AdmissionReason,
+		RecoveryRequired:     recoveryRequired,
+	}
+	if targetAdmitted {
+		view.TargetCoverage = "incomplete"
+	}
+	if observedHost := hosts[observation.ObservedHostID]; observedHost != nil {
+		view.ObservedSourceHostname = observedHost.Hostname
+	}
+	if account != nil {
+		view.CurrentHostID = account.HostID
+		view.CurrentStatus = account.Status
+		view.CurrentUpstreamStatus = account.UpstreamStatus
+		if currentHost := hosts[account.HostID]; currentHost != nil {
+			view.CurrentHostname = currentHost.Hostname
+		}
+		if account.Status == models.AccountStatusHostThrottled {
+			view.AdmissionReason = admissionReasonHostAccountLimit
+		}
+	}
+	return view
+}
+
 func (r *Relay) sourceAndHostLocked(ctx context.Context, hostID uint64) (*models.Source, *models.Host, error) {
 	var source models.Source
-	if err := r.db.WithContext(ctx).First(&source, "host_id = ?", hostID).Error; err != nil {
+	if err := r.db.WithContext(ctx).First(&source, sourceHostIDPredicate, hostID).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, nil, ErrSourceNotFound
 		}
@@ -673,7 +697,7 @@ func (r *Relay) SetSourceBlocked(ctx context.Context, hostname string, blocked b
 		if err := tx.Model(&models.Host{}).Where("id = ?", host.ID).Update("status", status).Error; err != nil {
 			return err
 		}
-		return tx.Model(&models.Source{}).Where("host_id = ?", host.ID).Updates(map[string]any{
+		return tx.Model(&models.Source{}).Where(sourceHostIDPredicate, host.ID).Updates(map[string]any{
 			"state": state, "revision": gorm.Expr("revision + 1"), "last_operation": "block", "recovery_required": true,
 		}).Error
 	})

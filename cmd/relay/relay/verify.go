@@ -128,6 +128,10 @@ func (r *Relay) VerifyCommitObject(ctx context.Context, commit *repo.Commit, ide
 // verifyCommitObjectWithRefresh gives a rotated signing key one fresh DID lookup
 // before classifying its signature as permanently invalid.
 func (r *Relay) verifyCommitObjectWithRefresh(ctx context.Context, commit *repo.Commit, ident *identity.Identity, expectedDID syntax.DID, hostname string) error {
+	// hypercerts: A different repository cannot justify refreshing the claimed DID's key.
+	if commit != nil && commit.DID != expectedDID.String() {
+		return newPermanentEventError(rejectionReasonInvalidCommit, errors.New("mismatched inner commit DID field"))
+	}
 	err := r.VerifyCommitObject(ctx, commit, ident, hostname)
 	if err == nil || (!errors.Is(err, ErrCommitSignature) && !errors.Is(err, ErrIdentityUnavailable)) {
 		return err

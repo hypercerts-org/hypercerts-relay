@@ -45,7 +45,8 @@ type Source struct {
 
 	// RecoveryRequired remains true until the Plan 006 recovery owner records a
 	// durable boundary. Relay lifecycle changes never clear it.
-	RecoveryRequired bool `gorm:"column:recovery_required;not null;default:true" json:"recoveryRequired"`
+	// Creation paths explicitly require recovery; preserve a completed boundary's false value.
+	RecoveryRequired bool `gorm:"column:recovery_required;not null" json:"recoveryRequired"`
 }
 
 func (Source) TableName() string {
@@ -55,8 +56,8 @@ func (Source) TableName() string {
 // AccountSourceObservation preserves source attribution independently from an
 // account's current HostID. One row is maintained for each DID/source pair.
 type AccountSourceObservation struct {
-	DID            string `gorm:"column:did;primaryKey" json:"did"`
-	ObservedHostID uint64 `gorm:"column:observed_host_id;primaryKey" json:"observedHostID"`
+	DID            string `gorm:"column:did;primaryKey;index:idx_observation_host_did,priority:2" json:"did"`
+	ObservedHostID uint64 `gorm:"column:observed_host_id;primaryKey;index:idx_observation_host_did,priority:1" json:"observedHostID"`
 
 	ResolvedHostname string    `gorm:"column:resolved_hostname;not null" json:"resolvedHostname"`
 	ObservedAt       time.Time `gorm:"column:observed_at;not null" json:"observedAt"`

@@ -219,6 +219,7 @@ func TestNewRelayMigratesSourcePolicyWithoutOverwritingExistingState(t *testing.
 		RecoveryRequired: false,
 	}
 	require.NoError(t, db.Create(existingSource).Error)
+	require.False(t, existingSource.RecoveryRequired, "inserting a completed recovery must preserve false")
 
 	events := eventmgr.NewEventManager(&testEventPersistence{})
 	r, err := NewRelay(db, events, identity.NewMockDirectory(), nil)
@@ -248,6 +249,7 @@ func TestNewRelayMigratesSourcePolicyWithoutOverwritingExistingState(t *testing.
 	var preserved models.Source
 	require.NoError(t, db.Where("host_id = ?", existing.ID).First(&preserved).Error)
 	require.Equal(t, *existingSource, preserved)
+	require.False(t, preserved.RecoveryRequired)
 }
 
 func TestSourceRemovalRetainsRawReplay(t *testing.T) {
@@ -265,6 +267,10 @@ func TestSourceRemovalRetainsRawReplay(t *testing.T) {
 	root := t.TempDir()
 	db, err := gorm.Open(sqlite.Open(filepath.Join(root, "relay.db")), &gorm.Config{})
 	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
 	persistence, err := diskpersist.NewDiskPersistence(filepath.Join(root, "events"), "", db, nil)
 	require.NoError(t, err)
 	events := eventmgr.NewEventManager(persistence)
@@ -334,7 +340,7 @@ func TestPublicSubscribeCannotCreateOrReviveManagedSources(t *testing.T) {
 	require.NoError(t, err)
 	select {
 	case <-connection.closed:
-	default:
+	case <-time.After(5 * time.Second):
 		t.Fatal("disabled source connection did not close")
 	}
 	require.Error(t, r.SubscribeToHost(ctx, disabledFixture.host, true, false))

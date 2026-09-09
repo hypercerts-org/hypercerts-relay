@@ -25,6 +25,7 @@ type Scheduler struct {
 	feeder chan *consumerTask
 	done   chan struct{}
 
+	// hypercerts: Workers share this owned lifetime; stop cancels it before Shutdown joins.
 	ctx    context.Context
 	cancel context.CancelFunc
 
