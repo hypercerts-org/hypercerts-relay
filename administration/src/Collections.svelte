@@ -12,7 +12,8 @@
 </script>
 
 <div class="intro">
-  <h1>Record collections</h1>
+  <p class="eyebrow">Archive policy</p>
+  <h1>Record <em>collections</em></h1>
   <p>
     Choose the exact collections Jetstream acquires. Each change creates a
     durable policy revision and schedules source backfills.

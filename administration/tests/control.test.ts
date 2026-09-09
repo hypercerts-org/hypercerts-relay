@@ -79,6 +79,41 @@ test("authentication, CSRF and immediate administrator removal guard durable mut
   assert.equal((await request("/api/v1/operations", body)).status, 401);
   assert.equal(store.page("operations", "", 50).items.length, 1);
 });
+test("session exposes only the signed-in profile and keeps authorization bound to the DID", async (t) => {
+  const { store, request } = await fixture(t);
+  let response = await request("/api/v1/session");
+  let session = await response.json();
+  assert.equal(session.did, did);
+  assert.equal(session.displayName, null);
+  assert.equal(session.handle, null);
+  store.set("administrator-profile", did, {
+    displayName: "Test Operator",
+    handle: "operator.example",
+    did: "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb",
+    csrf: "profile-must-not-override-session",
+    unexpected: "must-not-be-exposed",
+  });
+  response = await request("/api/v1/session");
+  session = await response.json();
+  assert.deepEqual(Object.keys(session).sort(), [
+    "csrf",
+    "did",
+    "displayName",
+    "expires",
+    "handle",
+  ]);
+  assert.equal(session.did, did);
+  assert.equal(session.csrf, "x".repeat(43));
+  assert.equal(session.displayName, "Test Operator");
+  assert.equal(session.handle, "operator.example");
+  assert.match(response.headers.get("Cache-Control")!, /no-store/);
+  assert.equal(
+    (await request("/api/v1/session", undefined, { Cookie: "" })).status,
+    401,
+  );
+  store.removeAdministrator(did);
+  assert.equal((await request("/api/v1/session")).status, 401);
+});
 test("signout and revocation invalidate server-side sessions", async (t) => {
   const { request } = await fixture(t);
   assert.equal((await request("/api/v1/signout", {})).status, 204);

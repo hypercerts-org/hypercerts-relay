@@ -6,6 +6,7 @@
   import Operations from "./Operations.svelte";
   import Limits from "./Limits.svelte";
   import State from "./State.svelte";
+  import logo from "./brand/assets/logo/hypercerts.svg";
   import {
     api,
     target,
@@ -32,7 +33,8 @@
   ];
   const route = location.pathname.split("/")[1] || "overview";
   const screen = navigation.some(([key]) => key === route) ? route : "overview";
-  let session: { did: string; csrf: string; expires: number } | null = null,
+  let session: (Administrator & { csrf: string; expires: number }) | null =
+      null,
     ready = false,
     loading = false,
     busy = false,
@@ -227,8 +229,11 @@
     <p role="status">Checking your session…</p>
   </main>
 {:else if !session}<main id="main" class="login">
-    <div class="brand">Hypercerts <span>Relay</span></div>
-    <h1>Administration</h1>
+    <div class="brand">
+      <img src={logo} alt="Hypercerts" width="170" height="30" />
+    </div>
+    <p class="eyebrow">Operator access</p>
+    <h1>Relay <em>administration</em></h1>
     <p>
       Sign in with your AT Protocol account. Access is limited to authorized
       administrators.
@@ -254,20 +259,34 @@
 {:else}
   <div class="shell">
     <aside>
-      <a class="brand" href="/">Hypercerts <span>Relay</span></a>
+      <a class="brand" href="/" aria-label="Hypercerts Relay overview"
+        ><img src={logo} alt="Hypercerts" width="170" height="30" /></a
+      >
+      <p class="product-label">Relay administration</p>
       <nav aria-label="Administration">
         {#each navigation as [key, label]}<a
             href={key === "overview" ? "/" : `/${key}`}
             aria-current={screen === key ? "page" : undefined}>{label}</a
           >{/each}
       </nav>
-      <div class="account">
-        <small>Signed in as</small>
-        <p>{session.did}</p>
-        <button onclick={() => signout()}>Sign out</button><button
-          class="text-button"
-          onclick={() => signout(true)}>Revoke my sessions</button
-        >
+      <div class="account" aria-label="Signed-in account">
+        <div class="account-identity">
+          <small>Signed in as</small>
+          <strong
+            >{session.displayName ||
+              (session.handle ? `@${session.handle}` : session.did)}</strong
+          >
+          {#if session.displayName && session.handle}<span
+              >@{session.handle}</span
+            >
+          {:else if session.displayName}<span>{session.did}</span>{/if}
+        </div>
+        <div class="account-actions">
+          <button onclick={() => signout()}>Sign out</button><button
+            class="text-button"
+            onclick={() => signout(true)}>Revoke my sessions</button
+          >
+        </div>
       </div>
     </aside>
     <main id="main">
@@ -320,14 +339,15 @@
           {busy}
         />
       {:else}<div class="intro">
-          <h1>Relay operations</h1>
+          <p class="eyebrow">Service health</p>
+          <h1>Relay <em>operations</em></h1>
           <p>
             Manage acquisition across Relay and Jetstream. Start with source
             health, then inspect backfills and coverage.
           </p>
         </div>
         <section class="overview">
-          <h2>Service connections</h2>
+          <h2>Service <em>connections</em></h2>
           <dl>
             <div>
               <dt>Indigo Relay</dt>
@@ -345,7 +365,7 @@
           </p>
         </section>
         <section class="overview">
-          <h2>Operate the relay</h2>
+          <h2>Operate <em>the relay</em></h2>
           <a class="workflow" href="/sources"
             ><strong>Inspect PDS sources</strong><span
               >Connection state, validation, account quota and the last durable

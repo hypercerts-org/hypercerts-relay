@@ -30,3 +30,6 @@
 **/railway.ts
 **/railway.py
 **/railway.go
+
+# Obtain a verified Switzer copy directly from Fontshare inside the build.
+/administration/src/brand/assets/fonts/Switzer-Variable.woff2

@@ -9,7 +9,8 @@
 </script>
 
 <div class="intro">
-  <h1>Rate limits</h1>
+  <p class="eyebrow">Traffic policy</p>
+  <h1>Rate <em>limits</em></h1>
   <p>
     Limit Relay ingestion in events per second. Global and source policies apply
     together; account admission quotas remain separate.

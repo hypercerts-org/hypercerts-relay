@@ -52,7 +52,8 @@
 </script>
 
 <div class="intro">
-  <h1>Administrators</h1>
+  <p class="eyebrow">Access control</p>
+  <h1>Manage <em>administrators</em></h1>
   <p>
     Administrators can manage access and change Relay and Jetstream policies.
     The initial administrator has the same access as everyone else.
@@ -89,8 +90,11 @@
   {#if notice}<p class="notice" role="status">{notice}</p>{/if}
 </div>
 {#if removing}
-  <section class="editor" aria-label="Confirm administrator removal">
-    <h2>Remove administrator access?</h2>
+  <section
+    class="editor removal-confirmation"
+    aria-label="Confirm administrator removal"
+  >
+    <h2>Remove <em>administrator access?</em></h2>
     <p>
       <code>{removing}</code> will lose access immediately, including all current
       sessions.
@@ -135,6 +139,11 @@
 </p>
 
 <style>
+  .removal-confirmation {
+    margin-top: 2rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--color-ui-separator);
+  }
   .administrators {
     list-style: none;
     padding: 0;
@@ -145,7 +154,7 @@
     gap: 1rem;
     flex-wrap: wrap;
     padding: 1rem 0;
-    border-bottom: 1px solid var(--border, #d8ddd9);
+    border-bottom: 1px solid var(--color-ui-separator);
   }
   .identity {
     display: grid;

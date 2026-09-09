@@ -43,7 +43,8 @@
 </script>
 
 <div class="intro">
-  <h1>PDS sources</h1>
+  <p class="eyebrow">Source admission</p>
+  <h1>PDS <em>sources</em></h1>
   <p>
     Manage approved sources and inspect their actual Relay connection state.
   </p>
@@ -95,7 +96,7 @@
         successful observation.
       </p>{/if}
     <div class="section-heading">
-      <h2>{selected.Hostname}</h2>
+      <h2>Source: <em>{selected.Hostname}</em></h2>
       <button onclick={() => (selected = null)}>Close detail</button>
     </div>
     <dl>

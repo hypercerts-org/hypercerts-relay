@@ -20,4 +20,4 @@ AT Protocol OAuth with explicit administrator authorization. The control plane d
 Keyboard-operable screens with accessible names, validation, errors and visible operational states; component and browser acceptance checks.
 
 ## Open Decisions
-No existing visual reference was supplied. A compact operations interface is the provisional direction offered to the user while backend work proceeds.
+The user supplied the Hypercerts design repository and authorized its application to the administration UI. DESIGN.md records the operator-facing adaptation.

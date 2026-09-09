@@ -5,6 +5,7 @@ import { Auth, type Session } from "./auth.ts";
 import { ApiError, command, origin } from "./contracts.ts";
 import { Store } from "./store.ts";
 import { Services } from "./services.ts";
+import type { AdministratorProfile } from "./profile.ts";
 
 const page = z.object({
   after: z.string().max(200).default(""),
@@ -55,7 +56,17 @@ export function createApp(
   app.use("/api/v1", auth.require);
   app.get("/api/v1/session", (_req, res) => {
     const { did, csrf, expires } = res.locals.session as Session;
-    res.json({ did, csrf, expires });
+    const profile = store.get<AdministratorProfile>(
+      "administrator-profile",
+      did,
+    );
+    res.json({
+      did,
+      csrf,
+      expires,
+      displayName: profile?.displayName ?? null,
+      handle: profile?.handle ?? null,
+    });
   });
   app.get("/api/v1/administrators", (req, res) => {
     const p = page

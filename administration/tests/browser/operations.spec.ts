@@ -54,6 +54,7 @@ test("administrator operates sources, collections, jobs, rates and revokes the s
         () => document.documentElement.scrollWidth <= window.innerWidth,
       ),
     ).toBe(true);
+    await page.evaluate(() => window.scrollTo(0, 0));
     await page.screenshot({
       path: test.info().outputPath(`quota-${width}.png`),
       fullPage: true,
@@ -106,7 +107,7 @@ test("desktop and mobile screens have no serious accessibility violations or pag
   page,
 }) => {
   await login(page);
-  for (const width of [1365, 390]) {
+  for (const width of [1365, 768, 390]) {
     await page.setViewportSize({ width, height: 900 });
     for (const route of [
       "/",
@@ -152,12 +153,16 @@ test("administrator grants and removes access through the UI", async ({
 }) => {
   await login(page);
   await page.getByRole("link", { name: "Administrators", exact: true }).click();
-  await expect(page.getByText("Test Operator", { exact: true })).toBeVisible();
   await expect(
-    page.getByText("@operator.example", { exact: true }),
+    page.locator("main").getByText("Test Operator", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.locator("main").getByText("@operator.example", { exact: true }),
   ).toBeVisible();
   await page.reload();
-  await expect(page.getByText("Test Operator", { exact: true })).toBeVisible();
+  await expect(
+    page.locator("main").getByText("Test Operator", { exact: true }),
+  ).toBeVisible();
   const did = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
   await page
     .getByLabel("Administrator DID", { exact: true })
@@ -214,4 +219,124 @@ test("administrator grants and removes access through the UI", async ({
   await expect(remove).toHaveCount(0);
   await page.reload();
   await expect(remove).toHaveCount(0);
+});
+
+test("branded sign-in and sidebar identity work with and without profile metadata", async ({
+  page,
+}) => {
+  await page.goto("/");
+  for (const width of [1365, 390]) {
+    await page.setViewportSize({ width, height: 900 });
+    await expect(
+      page.getByRole("heading", { name: "Relay administration" }),
+    ).toBeVisible();
+    const fonts = await page.evaluate(async () => {
+      await Promise.all([
+        document.fonts.load('400 48px "Instrument Serif"'),
+        document.fonts.load('italic 400 48px "Instrument Serif"'),
+        document.fonts.load('700 16px "Switzer Variable"'),
+      ]);
+      return [...document.fonts].map(({ family, status }) => ({
+        family,
+        status,
+      }));
+    });
+    expect(fonts.filter((font) => font.status === "loaded")).toHaveLength(3);
+    const results = await new AxeBuilder({ page }).analyze();
+    expect(
+      results.violations.filter((v) =>
+        ["serious", "critical"].includes(v.impact ?? ""),
+      ),
+    ).toEqual([]);
+    await page.screenshot({
+      path: test.info().outputPath(`login-${width}.png`),
+      fullPage: true,
+    });
+  }
+  await login(page);
+  for (const width of [1365, 390]) {
+    await page.setViewportSize({ width, height: 900 });
+    const account = page.getByLabel("Signed-in account");
+    await expect(
+      account.getByText("Test Operator", { exact: true }),
+    ).toBeVisible();
+    await expect(
+      account.getByText("@operator.example", { exact: true }),
+    ).toBeVisible();
+    await expect(account.locator("strong")).toHaveCSS("font-weight", "700");
+    await expect(account.locator(".account-identity > span")).toHaveCSS(
+      "color",
+      "rgb(83, 83, 83)",
+    );
+    if (width === 1365) {
+      const box = await account.boundingBox();
+      expect(box!.x).toBeLessThan(264);
+      expect(box!.y).toBeGreaterThan(600);
+      expect(box!.y + box!.height).toBeLessThanOrEqual(900);
+    }
+    await page.screenshot({
+      path: test.info().outputPath(`overview-${width}.png`),
+      fullPage: true,
+    });
+  }
+  await page.setViewportSize({ width: 1365, height: 768 });
+  const shortAccount = page.getByLabel("Signed-in account");
+  await page.screenshot({
+    path: test.info().outputPath("overview-short-desktop.png"),
+    fullPage: true,
+  });
+  const shortBox = await shortAccount.boundingBox();
+  expect(shortBox!.y + shortBox!.height).toBeLessThanOrEqual(768);
+  await page.getByRole("link", { name: "Administrators", exact: true }).focus();
+  await expect(
+    page.getByRole("link", { name: "Administrators", exact: true }),
+  ).toBeInViewport();
+  await expect(
+    shortAccount.getByText("Test Operator", { exact: true }),
+  ).toBeInViewport();
+  await expect(
+    shortAccount.getByRole("button", { name: "Revoke my sessions" }),
+  ).toBeInViewport();
+  await page.setViewportSize({ width: 390, height: 900 });
+  for (const profile of [
+    {
+      displayName: null,
+      handle: "operator.example",
+      label: "@operator.example",
+    },
+    {
+      displayName: null,
+      handle: null,
+      label: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+    },
+    {
+      displayName:
+        "Operator with a very long display name that must wrap without overflowing the sidebar",
+      handle: "very.long.operator.handle.example",
+      label:
+        "Operator with a very long display name that must wrap without overflowing the sidebar",
+    },
+  ]) {
+    await page.route("**/api/v1/session", async (route) => {
+      const response = await route.fetch();
+      const session = await response.json();
+      await route.fulfill({
+        response,
+        json: {
+          ...session,
+          displayName: profile.displayName,
+          handle: profile.handle,
+        },
+      });
+    });
+    await page.reload();
+    const account = page.getByLabel("Signed-in account");
+    await expect(account.locator("strong")).toHaveText(profile.label);
+    expect(
+      await page.evaluate(
+        () => document.documentElement.scrollWidth <= window.innerWidth,
+      ),
+    ).toBe(true);
+    await page.unroute("**/api/v1/session");
+  }
 });
