@@ -66,6 +66,16 @@ Use `gofmt` on changed Go files. Validate workflow changes with the repository's
 
 For Jetstream changes, run `go test ./...` from `jetstream/` and `git diff --check`. Build its image from the module context with `docker build -f jetstream/Dockerfile jetstream` when daemon access is available.
 
+## Railway packaging
+
+Railway is the deployment target. Read `docs/railway.md` and use the project-local
+`.agents/skills/hypercerts-railway` skill for Railway configuration and container
+work. This repository is public: keep Railway IaC, project/environment bindings,
+service graphs, private domains and credentials in a private infrastructure
+repository. Do not commit `.railway/` or Railway configuration files here. Local
+checks and image builds do not require Railway access. Repository preparation
+does not authorize provisioning or deployment.
+
 ## Releases
 
 The repository uses Changesets, consistent with other Hypercerts services. Add a named `.changeset/` file for an operator-visible change; the `Release` workflow opens a version pull request from `main`, and its merge creates the tag and GitHub Release. Do not hand-edit `CHANGELOG.md` or tag a release. The workflow does not deploy a service, publish a container, or alter a running relay.

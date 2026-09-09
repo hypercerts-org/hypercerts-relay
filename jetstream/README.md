@@ -60,14 +60,14 @@ Run it behind the owned Relay using a persistent, Jetstream-owned data path:
 ```bash
 JETSTREAM_RELAY_URL=http://relay:2470 \
 JETSTREAM_DATA_DIR=/data/jetstream \
-JETSTREAM_COLLECTIONS=org.hypercerts.claim.activity \
 go run ./cmd/jetstream serve
 ```
 
-Do not point `JETSTREAM_RELAY_URL` at Rainbow when direct Relay access is
-available. Rainbow is optional raw-stream connection pooling; Jetstream owns
-archive materialization, retention, replay, direct-PDS backfill, and its own
-durable state. Back up the Jetstream data directory as one unit. It is not
+For the Relay → Rainbow → Jetstream topology, set `JETSTREAM_RELAY_URL` to
+Rainbow's HTTP base URL. Rainbow serves the raw subscription and proxies the
+Relay sync APIs. Direct Relay access remains supported when Rainbow is omitted.
+Jetstream owns archive materialization, retention, replay, direct-PDS backfill,
+and its own durable state. Back up the Jetstream data directory as one unit. It is not
 safe to combine it with Relay's database or event-store backup.
 
 `Dockerfile` builds this module with `docker build -f jetstream/Dockerfile
@@ -76,11 +76,31 @@ jetstream`. It does not publish a service or make a deployment decision.
 ## Hypercerts policy work
 
 `serve` opens a durable global exact-NSID policy before ingestion. On a new data
-directory, `JETSTREAM_COLLECTIONS` (or `--collections`) initializes revision 1.
-The example NSID above is illustrative: configure your actual enabled collections.
-An empty list stores no record payloads; prefixes and malformed NSIDs are rejected.
+directory, revision 1 defaults to the bundled Hypercerts/Certified record collections
+from `hypercerts-org/hypercerts-lexicon`. Only `record` lexicons under
+`org.hypercerts.*` and `app.certified.*` are included; shared definitions, permission
+sets and object types are excluded. This is an exact list, not a wildcard policy.
+
+Set `JETSTREAM_DISABLE_COLLECTION_SEED=true` (or `--disable-collection-seed`) to
+start with no collections. An explicitly supplied `JETSTREAM_COLLECTIONS` (or
+`--collections`) replaces the seed, even when seeding is disabled. An explicitly
+empty list stores no record payloads; prefixes and malformed NSIDs are rejected.
 Restart restores the persisted revision, including an intentionally empty list.
-Startup environment changes do not overwrite the persisted policy.
+Startup environment changes and updated bundled seeds do not overwrite saved
+policy. Existing deployments must use the administration Collections screen to
+change their saved policy; changes schedule backfills for enabled sources.
+
+The seed is compiled into the image; startup does not need a checkout, GitHub
+access or schema downloads. Its exact list and source commit are recorded in
+`internal/hypercerts/selection/defaults.go`. To update it from a clean lexicon
+checkout, run from the repository root:
+
+```sh
+python3 scripts/update-collection-seed.py /path/to/hypercerts-lexicon
+```
+
+Review the generated record-NSID diff and source revision, then run the Jetstream
+tests. Updating the bundle affects only newly initialized policies.
 
 `go test ./internal/jetstreamd -run '^TestHypercertsIndigoArchiveRestartAndLive$'`
 checks the owned Indigo Relay's disk event manager and real `subscribeRepos`
@@ -184,3 +204,16 @@ Errors use a bounded JSON `error` code: 400 invalid input, 401 authentication,
 Mutation bodies are limited to 64 KiB and reject unknown fields/trailing JSON.
 Local persistence errors do not acknowledge a successful change or expose raw
 storage errors. Job progress and outcomes survive restart.
+
+### Backfill command receipts
+
+Job creation and retry/cancel commands have separate durable receipt namespaces.
+Existing mixed receipts are migrated when the job store opens, preserving retries
+from the administration journal across upgrades. Do not downgrade to a version
+that predates separate action receipts while journal commands can still be retried.
+
+Receipts currently have no expiry: an old journal retry must never repeat a later
+side effect. Job history and receipts share the persisted job-state document, so
+its size and rewrite cost grow with operator activity. Monitor metadata volume and
+command latency. Receipt pruning requires an agreed journal retry cutoff and an
+atomic migration to per-key storage; arbitrary age/count eviction is not safe.

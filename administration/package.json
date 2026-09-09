@@ -1,0 +1,44 @@
+{
+  "name": "@hypercerts/relay-administration",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "server": "tsx server/main.ts",
+    "build": "vite build",
+    "check": "svelte-check --tsconfig ./tsconfig.json && tsc --noEmit",
+    "test": "CONTROL_GO_BINARY=\"$(command -v go)\" tsx --test tests/*.test.ts",
+    "test:components": "vitest run",
+    "test:browser": "playwright test",
+    "prebuild": "node scripts/prepare-fonts.mjs",
+    "predev": "node scripts/prepare-fonts.mjs"
+  },
+  "engines": {
+    "node": ">=24.18.0"
+  },
+  "dependencies": {
+    "@atproto/oauth-client-node": "0.5.4",
+    "@atproto/syntax": "0.7.5",
+    "express": "5.2.1",
+    "tsx": "4.23.13",
+    "zod": "4.5.4"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "4.13.0",
+    "@playwright/test": "1.63.0",
+    "@sveltejs/vite-plugin-svelte": "7.3.0",
+    "@tailwindcss/vite": "4.3.3",
+    "@testing-library/svelte": "5.4.2",
+    "@types/express": "5.0.6",
+    "@types/node": "26.5.0",
+    "jsdom": "30.0.1",
+    "prettier": "3.9.6",
+    "prettier-plugin-svelte": "4.1.1",
+    "svelte": "5.57.0",
+    "svelte-check": "4.7.6",
+    "tailwindcss": "4.3.3",
+    "typescript": "6.0.3",
+    "vite": "8.2.2",
+    "vitest": "5.0.0"
+  }
+}

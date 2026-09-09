@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -186,4 +187,38 @@ func TestPrivatePolicyAndJobsRemainAtomicOnWriteFailure(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, policy.Current(), restored.Current())
 	require.Equal(t, 200, request(h, "PUT", "/policy", `{"expectedRevision":1,"collections":[]}`, testToken).Code)
+}
+
+// Exposes the real persistent management contract to the Node acceptance harness.
+func TestControlPlaneAcceptanceFixture(t *testing.T) {
+	ready := os.Getenv("CONTROL_ACCEPTANCE_READY")
+	if ready == "" {
+		t.Skip("cross-language fixture")
+	}
+	handler, manager := setup(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- manager.Run(ctx, func(context.Context, jobs.Job) error {
+			return &jobs.InputError{Code: "source_unavailable", Unavailable: true}
+		})
+	}()
+	defer func() { cancel(); <-done }()
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	require.NoError(t, os.WriteFile(ready, []byte(server.URL), 0600))
+	deadline := time.NewTimer(2 * time.Minute)
+	defer deadline.Stop()
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-deadline.C:
+			t.Fatal("acceptance harness did not shut down")
+		case <-ticker.C:
+			if _, err := os.Stat(ready + ".stop"); err == nil {
+				return
+			}
+		}
+	}
 }

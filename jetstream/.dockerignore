@@ -26,3 +26,11 @@ profile.cov
 # Docker bookkeeping
 Dockerfile
 .dockerignore
+
+# hypercerts: Never send local private infrastructure definitions in build contexts.
+**/.railway
+**/railway.json
+**/railway.toml
+**/railway.ts
+**/railway.py
+**/railway.go

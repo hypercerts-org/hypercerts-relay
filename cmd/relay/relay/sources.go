@@ -749,3 +749,25 @@ func min(a, b int) int {
 	}
 	return b
 }
+
+// InspectSource returns current durable and runtime state without reconciling it.
+func (r *Relay) InspectSource(ctx context.Context, rawURL string) (*SourceView, error) {
+	hostname, _, err := ParseHostname(rawURL)
+	if err != nil {
+		return nil, ErrInvalidSourceURL
+	}
+	r.sourcesLk.Lock()
+	defer r.sourcesLk.Unlock()
+	var host models.Host
+	if err := r.db.WithContext(ctx).Where("hostname = ?", hostname).First(&host).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrSourceNotFound
+		}
+		return nil, err
+	}
+	source, storedHost, err := r.sourceAndHostLocked(ctx, host.ID)
+	if err != nil {
+		return nil, err
+	}
+	return r.sourceViewLocked(ctx, source, storedHost)
+}

@@ -55,3 +55,19 @@ netsync-out/
 # Relay dash output
 /public/
 /cmd/relay/public
+
+# Separate administration application artifacts
+/administration/dist/
+/administration/test-results/
+/administration/playwright-report/
+
+# Railway infrastructure belongs in a private repository.
+.railway/
+railway.json
+railway.toml
+railway.ts
+railway.py
+railway.go
+
+# Proprietary font fetched directly from Fontshare during administration builds.
+/administration/src/brand/assets/fonts/Switzer-Variable.woff2

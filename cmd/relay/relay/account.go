@@ -271,6 +271,10 @@ func (r *Relay) UpdateAccountUpstreamStatus(ctx context.Context, did syntax.DID,
 //
 // If the `emitEvent` flag is set true, a `#account` event is broadcast. This should be used for account-level takedowns.
 func (r *Relay) UpdateAccountLocalStatus(ctx context.Context, did syntax.DID, status models.AccountStatus, emitEvent bool) error {
+	// hypercerts: Serialize administrative status changes with ingestion and quota recovery.
+	lock := r.accountEventLock(did.String())
+	lock.Lock()
+	defer lock.Unlock()
 	acc, err := r.GetAccount(ctx, did)
 	if err != nil {
 		return err

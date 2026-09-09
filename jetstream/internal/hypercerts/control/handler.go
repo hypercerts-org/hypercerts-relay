@@ -151,13 +151,14 @@ func (h *Handler) removeSource(w http.ResponseWriter, r *http.Request) {
 }
 func (h *Handler) requestJob(w http.ResponseWriter, r *http.Request) {
 	var input struct {
-		PDS    string `json:"pds"`
-		Reason string `json:"reason"`
+		PDS       string `json:"pds"`
+		Reason    string `json:"reason"`
+		RequestID string `json:"requestId,omitempty"`
 	}
 	if !decode(w, r, &input) {
 		return
 	}
-	j, err := h.jobs.Request(input.PDS, input.Reason)
+	j, err := h.jobs.RequestOnce(input.PDS, input.Reason, input.RequestID)
 	if err != nil {
 		failure(w, err)
 		return
@@ -165,14 +166,14 @@ func (h *Handler) requestJob(w http.ResponseWriter, r *http.Request) {
 	reply(w, 202, view(j))
 }
 func (h *Handler) cancelJob(w http.ResponseWriter, r *http.Request) {
-	if err := h.jobs.Cancel(r.PathValue("id")); err != nil {
+	if err := h.jobs.TransitionOnce(r.PathValue("id"), jobs.Canceled, r.Header.Get("Idempotency-Key")); err != nil {
 		failure(w, err)
 		return
 	}
 	h.getJob(w, r)
 }
 func (h *Handler) retryJob(w http.ResponseWriter, r *http.Request) {
-	if err := h.jobs.Retry(r.PathValue("id")); err != nil {
+	if err := h.jobs.TransitionOnce(r.PathValue("id"), jobs.Pending, r.Header.Get("Idempotency-Key")); err != nil {
 		failure(w, err)
 		return
 	}
@@ -201,6 +202,9 @@ func (h *Handler) listJobs(w http.ResponseWriter, r *http.Request) {
 	out := make([]jobView, 0, limit)
 	next := ""
 	for _, j := range h.jobs.List() {
+		if pds := r.URL.Query().Get("pds"); pds != "" && j.PDS != pds {
+			continue
+		}
 		if j.ID <= after {
 			continue
 		}

@@ -36,3 +36,9 @@ Only a human may merge a pull request. Never push, fast-forward, reset, or force
 Run `./scripts/verify.sh` and `git diff --check` for Relay or Rainbow changes. The script excludes one documented local baseline test failure, while CI runs it separately as a visible non-blocking signal. Do not suppress additional tests without a documented observed behavior and removal condition.
 
 A release is a reviewed version tag and GitHub Release, created only through the manual workflow from `main` after `CHANGELOG.md` is updated. It is not authority to deploy or change a running relay.
+
+## Railway packaging
+
+For Railway images, volumes, private networking and runtime secret handling, read
+`docs/railway.md` and `.agents/skills/hypercerts-railway/SKILL.md`. Keep repository
+preparation separate from an authorized platform deployment.
