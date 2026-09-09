@@ -60,7 +60,6 @@ Run it behind the owned Relay using a persistent, Jetstream-owned data path:
 ```bash
 JETSTREAM_RELAY_URL=http://relay:2470 \
 JETSTREAM_DATA_DIR=/data/jetstream \
-JETSTREAM_COLLECTIONS=org.hypercerts.claim.activity \
 go run ./cmd/jetstream serve
 ```
 
@@ -77,11 +76,31 @@ jetstream`. It does not publish a service or make a deployment decision.
 ## Hypercerts policy work
 
 `serve` opens a durable global exact-NSID policy before ingestion. On a new data
-directory, `JETSTREAM_COLLECTIONS` (or `--collections`) initializes revision 1.
-The example NSID above is illustrative: configure your actual enabled collections.
-An empty list stores no record payloads; prefixes and malformed NSIDs are rejected.
+directory, revision 1 defaults to the bundled Hypercerts/Certified record collections
+from `hypercerts-org/hypercerts-lexicon`. Only `record` lexicons under
+`org.hypercerts.*` and `app.certified.*` are included; shared definitions, permission
+sets and object types are excluded. This is an exact list, not a wildcard policy.
+
+Set `JETSTREAM_DISABLE_COLLECTION_SEED=true` (or `--disable-collection-seed`) to
+start with no collections. An explicitly supplied `JETSTREAM_COLLECTIONS` (or
+`--collections`) replaces the seed, even when seeding is disabled. An explicitly
+empty list stores no record payloads; prefixes and malformed NSIDs are rejected.
 Restart restores the persisted revision, including an intentionally empty list.
-Startup environment changes do not overwrite the persisted policy.
+Startup environment changes and updated bundled seeds do not overwrite saved
+policy. Existing deployments must use the administration Collections screen to
+change their saved policy; changes schedule backfills for enabled sources.
+
+The seed is compiled into the image; startup does not need a checkout, GitHub
+access or schema downloads. Its exact list and source commit are recorded in
+`internal/hypercerts/selection/defaults.go`. To update it from a clean lexicon
+checkout, run from the repository root:
+
+```sh
+python3 scripts/update-collection-seed.py /path/to/hypercerts-lexicon
+```
+
+Review the generated record-NSID diff and source revision, then run the Jetstream
+tests. Updating the bundle affects only newly initialized policies.
 
 `go test ./internal/jetstreamd -run '^TestHypercertsIndigoArchiveRestartAndLive$'`
 checks the owned Indigo Relay's disk event manager and real `subscribeRepos`

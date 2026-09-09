@@ -97,6 +97,14 @@ administrator: another admin can remove it through the Administrators screen,
 and restarting or changing the seed variable cannot restore revoked access.
 Keep the initialization marker with the durable administration database.
 
+New Jetstream data directories seed the bundled Hypercerts/Certified record
+collections automatically. Set `JETSTREAM_DISABLE_COLLECTION_SEED=true` on
+Jetstream to opt out, or `JETSTREAM_COLLECTIONS` to supply an explicit initial
+list. Saved collection policy always wins, including an empty policy. Use the
+administration Collections screen to update an existing deployment; changing
+startup variables cannot overwrite its policy. The seed is bundled into the
+canonical image and requires no build-time credentials or external checkout.
+
 Use the access CLI only for recovery, against the running administration
 container's mounted database: `/app/node_modules/.bin/tsx server/access.ts grant DID`.
 Do not bake an administrator into an image or grant access at build/pre-deploy time.
