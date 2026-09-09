@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+concurrency: ${{ github.workflow }}-main
+
+jobs:
+  release:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.merged == true &&
+       github.event.pull_request.head.ref == 'changeset-release/main')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Generate release bot token
+        id: generate-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_APP_PRIVATE_KEY }}
+      - name: Check out main
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: main
+          token: ${{ steps.generate-token.outputs.token }}
+          persist-credentials: true
+          fetch-depth: 0
+      - name: Validate branch
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if [ "${{ github.ref }}" != 'refs/heads/main' ]; then
+            echo "::error::Release workflow can only be dispatched from main."
+            exit 1
+          fi
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install release tooling
+        run: npm ci --ignore-scripts
+      - name: Verify Relay and Rainbow
+        run: ./scripts/verify.sh
+      - name: Create release pull request or tag release
+        id: changesets
+        uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d # v1.9.0
+        with:
+          publish: npm run release
+          version: npm run version-packages
+          title: 'prepare for release'
+          commit: 'chore: release'
+          createGithubReleases: true
+        env:
+          GITHUB_TOKEN: ${{ steps.generate-token.outputs.token }}
+      - name: Rename release pull request with version
+        if: steps.changesets.outputs.pullRequestNumber != ''
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+          PR_NUMBER: ${{ steps.changesets.outputs.pullRequestNumber }}
+        run: |
+          set -euo pipefail
+          version=$(gh api \
+            "repos/${{ github.repository }}/contents/package.json?ref=changeset-release/main" \
+            -H 'Accept: application/vnd.github.raw' \
+            | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).version")
+          gh pr edit "$PR_NUMBER" --title "prepare for release v$version"

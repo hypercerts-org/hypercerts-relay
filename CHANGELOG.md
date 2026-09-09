@@ -1,22 +1,7 @@
+<!-- hypercerts: project-owned release history; review this file during every Indigo upstream sync. -->
 
-# CHANGELOG
+# Changelog
 
-All notable changes to this project will be documented in this file. The format
-is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
+All notable Hypercerts Relay changes are documented here. [Changesets](https://github.com/changesets/changesets) maintains version sections from approved release notes. Releases use [Semantic Versioning](https://semver.org/).
 
-
-## [d0ea072] - 2023-03-31
-
-Large Lexicon refactor, and updates to streaming event wire schemas. The
-relevant typescript repo pull request, with more details, is
-<https://github.com/bluesky-social/atproto/pull/658>.
-
-
-## [61fc4c0] - 2023-03-10
-
-MST and repo metadata schema refactor, resulting in repo binary format v2.
-
-
-## [init] - 2023-01-19
-
-Forked this repo from [whyrusleeping/gosky](https://github.com/whyrusleeping/gosky).
+Hypercerts release history starts after the Indigo baseline `41278964ec8e3253e70d4e919dfb8e34211c543d` (2026-09-03). Historical Indigo changelog entries are not Hypercerts Relay releases.

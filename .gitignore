@@ -8,6 +8,7 @@
 *.tmp
 *.old
 *.profile
+node_modules/
 *.bkp
 *.bak
 [Tt]humbs.db

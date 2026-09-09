@@ -1,0 +1,17 @@
+{
+  "name": "hypercerts-relay",
+  "version": "0.0.0",
+  "description": "Hypercerts-maintained Indigo Relay and Rainbow fork",
+  "private": true,
+  "packageManager": "npm@11.8.0",
+  "scripts": {
+    "changeset": "changeset",
+    "changeset:check": "changeset status",
+    "version-packages": "changeset version",
+    "release": "changeset tag"
+  },
+  "devDependencies": {
+    "@changesets/changelog-github": "1.0.1",
+    "@changesets/cli": "3.0.2"
+  }
+}
