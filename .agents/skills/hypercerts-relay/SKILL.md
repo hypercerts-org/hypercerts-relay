@@ -1,6 +1,6 @@
 ---
 name: hypercerts-relay
-description: Build, review, or operate the Hypercerts Indigo Relay and Rainbow fork. Use when work involves approved PDS sources, raw Relay events, Rainbow fan-out, upstream Indigo synchronization, or the service boundary with Hypercerts Jetstream v2.
+description: Build, review, or operate the Hypercerts Indigo Relay, Rainbow, and copied Jetstream v2 runtime. Use when work involves approved PDS sources, raw Relay events, Rainbow fan-out, Jetstream archive/backfill policy, or upstream synchronization.
 ---
 
 # Hypercerts Relay
@@ -11,10 +11,18 @@ Keep the component boundary explicit:
 
 - Indigo Relay connects approved PDS instances and publishes raw `com.atproto.sync.subscribeRepos` events.
 - Rainbow pools and fans out raw Relay connections.
-- Jetstream v2 owns selected-collection retention and PDS/collection backfill in its separate repository.
+- The `jetstream/` module owns selected-collection retention, archive replay/live APIs, and PDS/collection backfill. It is a copied Jetstream v2 runtime with its own Go module, not part of the Indigo fork closure.
 - The administration control plane owns operator access, PDS and collection policy, rate limits, jobs, and telemetry.
 
-Do not implement Jetstream filtering/backfill or the planned OAuth administration UI in Relay or Rainbow merely because the components connect to each other.
+Do not implement Jetstream filtering/backfill in Relay or Rainbow merely because the components connect to each other. Do not implement the planned OAuth administration UI in any inherited Relay admin surface.
+
+## Jetstream v2 work
+
+Read `jetstream/README.md` before changing the copied runtime. It records the exact source commit, the included closure, its license, and the update procedure. The Indigo upstream script and `.hypercerts/upstream-paths` do not govern this directory.
+
+Keep the Hypercerts policy boundary explicit: a versioned collection policy must be applied before durable record payload materialization on bootstrap, live, retry, sync-replacement, and restart paths. Preserve identity, account, sync, delete, verification, archive cursor, and progress behavior even where a commit has no selected record. Backfill jobs must be durable and idempotent, identify the PDS and policy revision they cover, and surface unavailable input as incomplete.
+
+For Jetstream changes, run the module-local suite from `jetstream/` with `go test ./...`, plus `git diff --check`. Build images from the module context with `docker build -f jetstream/Dockerfile jetstream` when Docker daemon access is available.
 
 ## Fork work
 

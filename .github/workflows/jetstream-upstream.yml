@@ -1,0 +1,71 @@
+name: Check Jetstream upstream
+on:
+  schedule:
+    - cron: '43 8 * * 1'
+  workflow_dispatch:
+permissions:
+  contents: write
+  pull-requests: write
+concurrency:
+  group: jetstream-upstream-sync
+  cancel-in-progress: false
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: jetstream/go.mod
+          cache-dependency-path: jetstream/go.sum
+      - name: Check existing review
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          count=$(gh pr list --base main --state open --search 'Jetstream upstream sync in:title' --json number --jq 'length')
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+      - name: Prepare scoped update
+        if: steps.existing.outputs.count == '0'
+        id: update
+        run: |
+          set -euo pipefail
+          git fetch https://github.com/bluesky-social/jetstream.git main
+          target=$(git rev-parse FETCH_HEAD)
+          branch="jetstream-upstream/$(date -u +%Y-%m-%d)-${GITHUB_RUN_ID}"
+          git switch -c "$branch"
+          python3 scripts/jetstream-upstream.py "$target" --apply | tee "$RUNNER_TEMP/jetstream-review.md"
+          cat "$RUNNER_TEMP/jetstream-review.md" >> "$GITHUB_STEP_SUMMARY"
+          if ! git diff --cached --quiet; then
+            echo 'needed=true' >> "$GITHUB_OUTPUT"
+            echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Verify update
+        if: steps.update.outputs.needed == 'true'
+        run: |
+          set -euo pipefail
+          ./scripts/verify-jetstream.sh 2>&1 | tee "$RUNNER_TEMP/jetstream-verification.log"
+          git diff --cached --check
+          echo 'Passed: module tests, vet, build, stress lifecycle oracle, restart oracle checks, whitespace.' >> "$RUNNER_TEMP/jetstream-review.md"
+      - name: Open review pull request
+        if: steps.update.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.update.outputs.branch }}
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'chore: Jetstream upstream sync'
+          git push origin "$BRANCH"
+          gh pr create --base main --head "$BRANCH" --title 'chore: Jetstream upstream sync' --body-file "$RUNNER_TEMP/jetstream-review.md"
+      - name: Preserve failure report
+        if: failure()
+        run: |
+          test ! -f "$RUNNER_TEMP/jetstream-review.md" || cat "$RUNNER_TEMP/jetstream-review.md" >> "$GITHUB_STEP_SUMMARY"
+          echo 'Update stopped. A maintainer must inspect conflicts or failed verification; no pull request was pushed by the failed step.' >> "$GITHUB_STEP_SUMMARY"
