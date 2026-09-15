@@ -10,6 +10,12 @@
     selected: Source | null = null,
     error = "";
   let detailUnavailable = false;
+  $: filter = search.trim().toLowerCase().replace(/^https?:\/\//, "");
+  $: displayedRows = filter
+    ? rows.filter((source) =>
+        source.Hostname.toLowerCase().includes(filter),
+      )
+    : rows;
   async function refreshSelected() {
     if (!selected) return;
     const origin = sourceOrigin(selected);
@@ -40,9 +46,7 @@
 <div class="intro">
   <p class="eyebrow">Source admission</p>
   <h1>PDS sources</h1>
-  <p>
-    Manage approved sources and inspect their actual Relay connection state.
-  </p>
+  <p>Manage PDS instances.</p>
 </div>
 <form
   class="inline-form"
@@ -54,13 +58,14 @@
   <div class="field grow">
     <label for="new-source">PDS origin</label><input
       id="new-source"
-      type="url"
-      placeholder="https://pds.example"
+      type="text"
+      inputmode="url"
+      placeholder="pds.example"
       bind:value={pds}
       required
     /><small
-      >HTTPS origin only. Adding a source also schedules selected-collection
-      acquisition.</small
+      >HTTPS is assumed when no scheme is provided. Adding a source also schedules
+      selected-collection acquisition.</small
     >
   </div>
   <button class="primary" disabled={busy}>Add source</button>
@@ -73,15 +78,16 @@
   }}
 >
   <div class="field grow">
-    <label for="find-source">Find a source by origin</label><input
+    <label for="find-source">Filter to PDS</label><input
       id="find-source"
-      type="url"
+      type="text"
+      inputmode="url"
       bind:value={search}
-      placeholder="https://pds.example"
+      placeholder="pds.example"
       required
-    />
+    /><small>Typing filters the current page. Use the button to load an exact PDS.</small>
   </div>
-  <button>Find source</button>
+  <button>Filter</button>
 </form>
 {#if error}<p role="alert" class="error">{error}</p>{/if}
 {#if selected}
@@ -90,21 +96,21 @@
         Latest observation unavailable. The values below are from the last
         successful observation.
       </p>{/if}
-    <div class="section-heading">
+    <div class="section-heading detail-heading">
+      <button onclick={() => (selected = null)}>Close</button>
       <h2>Source: <em>{selected.Hostname}</em></h2>
-      <button onclick={() => (selected = null)}>Close detail</button>
     </div>
     <dl>
       <div>
-        <dt>Desired state</dt>
+        <dt>State</dt>
         <dd><State value={selected.DesiredState} /></dd>
       </div>
       <div>
-        <dt>Connection</dt>
-        <dd><State value={selected.RuntimeState} /></dd>
+        <dt>Runtime connection</dt>
+        <dd><State value={selected.RuntimeState} /><small>Live Relay connectivity for this PDS; administrative state above controls whether it should connect.</small></dd>
       </div>
       <div>
-        <dt>Last durable cursor</dt>
+        <dt>Cursor</dt>
         <dd>
           {selected.LastDurableCursor < 0
             ? "Not recorded"
@@ -113,10 +119,10 @@
       </div>
       <div>
         <dt>Admission check</dt>
-        <dd>{selected.Validation.Status} {selected.Validation.Reason}</dd>
+        <dd>{selected.Validation.Status} {selected.Validation.Reason}<small>Validates that the configured PDS can be safely reached and admitted before Relay acquisition starts.</small></dd>
       </div>
       <div>
-        <dt>Account quota</dt>
+        <dt>Quota</dt>
         <dd>
           {selected.AccountQuota.Count} / {selected.AccountQuota.Limit} accounts
         </dd>
@@ -162,11 +168,11 @@
   <table>
     <caption>Configured sources</caption><thead
       ><tr
-        ><th>Source</th><th>Desired / connection</th><th>Admission check</th
-        ><th>Account quota</th><th>Last durable cursor</th><th>Actions</th></tr
+        ><th>Source</th><th>State / runtime connection</th><th>Admission check</th
+        ><th>Quota</th><th>Cursor</th><th>Actions</th></tr
       ></thead
     ><tbody>
-      {#each rows as source (source.HostID)}<tr
+      {#each displayedRows as source (source.HostID)}<tr
           ><td
             ><button
               class="text-button"

@@ -6,7 +6,8 @@ export const origin = z
   .max(300)
   .transform((raw, ctx) => {
     try {
-      const u = new URL(raw);
+      const trimmed = raw.trim();
+      const u = new URL(trimmed.includes("://") ? trimmed : `https://${trimmed}`);
       const local = ["localhost", "127.0.0.1", "[::1]"].includes(u.hostname);
       if (
         (u.protocol !== "https:" && !(local && u.protocol === "http:")) ||
@@ -21,7 +22,7 @@ export const origin = z
     } catch {
       ctx.addIssue({
         code: "custom",
-        message: "Use an HTTPS PDS origin without a path or credentials.",
+        message: "Use a PDS hostname or HTTPS origin without a path or credentials.",
       });
       return z.NEVER;
     }

@@ -46,7 +46,7 @@
     void save();
   }}
 >
-  <label for="account-quota">Account quota</label>
+  <label for="account-quota">Quota</label>
   <input
     id="account-quota"
     bind:this={input}
@@ -79,6 +79,6 @@
       changedElsewhere ||
       draft === String(expectedLimit)}
   >
-    Request account quota change
+    Update quota
   </button>
 </form>

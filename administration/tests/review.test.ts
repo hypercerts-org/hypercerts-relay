@@ -7,6 +7,7 @@ import express, { type ErrorRequestHandler } from "express";
 import { Store } from "../server/store.ts";
 import { Worker } from "../server/worker.ts";
 import { Services } from "../server/services.ts";
+import { origin } from "../server/contracts.ts";
 import { loginLimit, railwayClientIP } from "../server/login-limit.ts";
 import { api } from "../src/api.ts";
 const actor = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
@@ -122,6 +123,12 @@ test("proxy login limiting isolates clients only when the immediate proxy is tru
     }
   }
 });
+test("PDS origins accept bare hostnames by assuming HTTPS", () => {
+  assert.equal(origin.parse("pds.example"), "https://pds.example");
+  assert.equal(origin.parse("https://pds.example"), "https://pds.example");
+  assert.throws(() => origin.parse("pds.example/path"), /PDS hostname or HTTPS origin/);
+});
+
 test("control URLs reject malformed origins and retain encrypted private-network HTTP support", () => {
   const config = {
     // Never fetched: this fixture checks the encrypted private-network contract.

@@ -20,7 +20,7 @@ test("quota drafts survive observations and reject stale or invalid changes", as
   };
   const submit = vi.fn().mockResolvedValue(undefined);
   const view = render(AccountQuota, { source, submit });
-  const input = screen.getByLabelText("Account quota") as HTMLInputElement;
+  const input = screen.getByLabelText("Quota") as HTMLInputElement;
   await fireEvent.input(input, { target: { value: "-1" } });
   await fireEvent.submit(input.form!);
   expect(submit).not.toHaveBeenCalled();
@@ -67,12 +67,12 @@ test("source form submits a backend command without inventing an applied state",
   const submit = vi.fn().mockResolvedValue(undefined);
   render(Sources, { rows: [], submit });
   await fireEvent.input(screen.getByLabelText("PDS origin"), {
-    target: { value: "https://pds.example" },
+    target: { value: "pds.example" },
   });
   await fireEvent.click(screen.getByRole("button", { name: "Add source" }));
   expect(submit).toHaveBeenCalledWith({
     kind: "source",
-    pds: "https://pds.example",
+    pds: "pds.example",
     state: "enabled",
   });
   expect(screen.queryByText("applied")).toBeNull();
@@ -217,10 +217,10 @@ test("selected source detail is loaded on demand without background polling", as
   vi.stubGlobal("fetch", fetcher);
   try {
     render(Sources, { rows: [], submit: vi.fn() });
-    await fireEvent.input(screen.getByLabelText("Find a source by origin"), {
+    await fireEvent.input(screen.getByLabelText("Filter to PDS"), {
       target: { value: "https://outside.example" },
     });
-    await fireEvent.click(screen.getByRole("button", { name: "Find source" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Filter" }));
     expect(screen.getByText("connected")).toBeTruthy();
     expect(fetcher).toHaveBeenCalledTimes(1);
   } finally {
@@ -248,5 +248,6 @@ test("source overview shows admission and account quota metadata", () => {
   });
   expect(screen.getByText("passed reachable")).toBeTruthy();
   expect(screen.getByText("4 / 25 accounts")).toBeTruthy();
+  expect(screen.getByText("State / runtime connection")).toBeTruthy();
   expect(screen.getByText(/historical collection counts are unavailable/)).toBeTruthy();
 });
