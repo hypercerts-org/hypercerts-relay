@@ -176,7 +176,7 @@ test("collection drafts survive polling and require reset after a stale revision
     collections: ["app.bsky.feed.repost"],
   });
 });
-test("complete current-state coverage still discloses unknown history", () => {
+test("coverage groups collections by collapsed PDS and explains unknown history", () => {
   render(Operations, {
     screen: "coverage",
     submit: vi.fn(),
@@ -194,8 +194,12 @@ test("complete current-state coverage still discloses unknown history", () => {
       },
     ],
   });
-  expect(screen.getByText("Historical coverage: incomplete")).toBeTruthy();
-  expect(screen.getByText("unknown")).toBeTruthy();
+  const group = screen.getByText("https://pds.example").closest("details");
+  expect(group?.hasAttribute("open")).toBe(false);
+  expect(document.body.textContent).toContain("do not preserve which PDS supplied older records");
+  expect(screen.getByText("app.bsky.feed.post")).toBeTruthy();
+  expect(screen.queryByText("Policy revision")).toBeNull();
+  expect(screen.getByRole("link", { name: "Manage PDS instances" })).toBeTruthy();
 });
 
 test("selected source detail is loaded on demand without background polling", async () => {

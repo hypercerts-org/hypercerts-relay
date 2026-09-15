@@ -18,6 +18,11 @@
   export let busy = false;
   let pds = "",
     reason: "backfill" | "quota_recovery" = "backfill";
+  function coverageGroups(items: Coverage[]) {
+    const groups = new Map<string, Coverage[]>();
+    for (const item of items) groups.set(item.pds, [...(groups.get(item.pds) ?? []), item]);
+    return [...groups.entries()].map(([pds, rows]) => ({ pds, rows }));
+  }
 </script>
 
 {#if screen === "jobs"}
@@ -117,57 +122,62 @@
     <p class="eyebrow">Retention evidence</p>
     <h1>Collection coverage</h1>
     <p>
-      Coverage is scoped to the named PDS and collection-policy revision. A
-      complete snapshot does not prove complete history.
+      Coverage is grouped by PDS. Expand a PDS to see each selected collection and
+      the latest current-state backfill result known for it.
     </p>
   </div>
   <div class="notice">
-    Historical PDS attribution is <strong>unknown</strong>. Current snapshot
-    provenance is explicit below.
+    Historical PDS attribution is shown as <strong>unknown</strong> when archived
+    events do not preserve which PDS supplied older records. That does not change
+    the current PDS coverage shown below; it means the UI must not claim complete
+    historical provenance.
   </div>
-  <!-- svelte-ignore a11y_no_noninteractive_tabindex (Scrollable tables need keyboard access; verified with axe and Chromium.) -->
-  <div
-    class="table-wrap"
-    role="region"
-    aria-label="Scrollable results"
-    tabindex="0"
-  >
-    <table>
-      <caption>Backfill coverage by source and collection policy</caption><thead
-        ><tr
-          ><th>PDS / collections</th><th>Policy revision</th><th
-            >Current-state coverage</th
-          ><th>Progress / limitations</th></tr
-        ></thead
-      ><tbody
-        >{#each coverage as item}<tr
-            ><td
-              >{item.pds}<small
-                >{item.policy.collections.join(", ") ||
-                  "No collections selected"}</small
-              ></td
-            ><td>{item.policy.revision}</td><td
-              ><State value={item.state} /><small
-                >Historical coverage: incomplete</small
-              ></td
-            ><td
-              >{item.completedRepos} repositories<small
-                >{item.reason?.replaceAll("_", " ") ||
-                  "Current state only; historical events are not guaranteed."}</small
-              ><small>Job {item.jobId}</small></td
-            ></tr
-          >{:else}<tr
-            ><td colspan="4" class="empty"
-              >No coverage results on this page. Configured sources without a
-              backfill result have unknown coverage.</td
-            ></tr
-          >{/each}</tbody
-      >
-    </table>
-  </div>
-  <a href="/sources"
-    >Inspect configured sources, connections and durable cursors</a
-  >
+  <section class="coverage-groups" aria-label="Coverage by PDS">
+    {#each coverageGroups(coverage) as group}
+      <details class="coverage-group">
+        <summary>{group.pds}</summary>
+        <!-- svelte-ignore a11y_no_noninteractive_tabindex (Scrollable tables need keyboard access; verified with axe and Chromium.) -->
+        <div
+          class="table-wrap"
+          role="region"
+          aria-label={`Collections for ${group.pds}`}
+          tabindex="0"
+        >
+          <table>
+            <caption>Collections retained for {group.pds}</caption><thead
+              ><tr
+                ><th>Collection</th><th>Current-state coverage</th><th
+                  >Progress / limitations</th></tr
+              ></thead
+            ><tbody
+              >{#each group.rows as item}
+                {#each item.policy.collections.length ? item.policy.collections : ["No collections selected"] as collection}
+                  <tr
+                    ><td>{collection}</td><td
+                      ><State value={item.state} /><small
+                        >Historical PDS attribution: {item.historicalPDSAttribution}</small
+                      ></td
+                    ><td
+                      >{item.completedRepos} repositories<small
+                        >{item.reason?.replaceAll("_", " ") ||
+                          "Current state only; historical events are not guaranteed."}</small
+                      ><small>Job {item.jobId}</small></td
+                    ></tr
+                  >
+                {/each}
+              {/each}</tbody
+            >
+          </table>
+        </div>
+      </details>
+    {:else}
+      <p class="empty">
+        No coverage results on this page. Configured sources without a backfill
+        result have unknown coverage.
+      </p>
+    {/each}
+  </section>
+  <a href="/sources">Manage PDS instances</a>
 {:else if screen === "audit"}
   <div class="intro">
     <p class="eyebrow">Activity record</p>
