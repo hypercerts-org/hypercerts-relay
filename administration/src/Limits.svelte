@@ -1,16 +1,14 @@
 <script lang="ts">
-  import type { Limit, Command } from "./api";
+  import { sourceOrigin, type Limit, type Source, type Command } from "./api";
   export let rows: Limit[] = [];
+  export let sources: Source[] = [];
   export let submit: (command: Command) => Promise<void>;
   export let busy = false;
   let kind = "global",
     pds = "",
     value = 100;
   $: globalLimits = rows.filter((row) => row.scope === "global");
-  $: pdsSuggestions = rows
-    .map((row) => row.scope)
-    .filter((scope) => scope !== "global")
-    .slice(0, 10);
+  $: pdsSuggestions = sources.map(sourceOrigin).slice(0, 10);
 </script>
 
 <div class="intro">
@@ -52,7 +50,7 @@
       <datalist id="limit-pds-suggestions">
         {#each pdsSuggestions as suggestion}<option value={suggestion}></option>{/each}
       </datalist>
-      <small>Start typing to choose from the first matching PDS policies on this page, or enter another configured PDS.</small>
+      <small>Start typing to choose from the first 10 configured PDS instances. Rate Limit policy pagination does not limit these suggestions.</small>
     </div>{/if}
   <div class="field">
     <label for="limit-value">Events per second</label><input

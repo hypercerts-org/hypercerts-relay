@@ -19,12 +19,17 @@ export class Store {
     this.db
       .exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;
       CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, actor TEXT NOT NULL, command TEXT NOT NULL, state TEXT NOT NULL, createdAt TEXT NOT NULL, updatedAt TEXT NOT NULL, result TEXT, error TEXT);
-      CREATE TABLE IF NOT EXISTS audit (seq INTEGER PRIMARY KEY, operation TEXT, actor TEXT NOT NULL, action TEXT NOT NULL, time TEXT NOT NULL, detail TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS audit (seq INTEGER PRIMARY KEY, operation TEXT, actor TEXT NOT NULL, actorHandle TEXT, action TEXT NOT NULL, time TEXT NOT NULL, detail TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS kv (namespace TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(namespace,key));
       CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, did TEXT NOT NULL, csrf TEXT NOT NULL, expires INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS administrators (did TEXT PRIMARY KEY);
       CREATE INDEX IF NOT EXISTS operations_state ON operations(state,createdAt,id);
       CREATE INDEX IF NOT EXISTS operations_created ON operations(createdAt,id);`);
+    const auditColumns = this.db.prepare("PRAGMA table_info(audit)").all() as {
+      name: string;
+    }[];
+    if (!auditColumns.some((column) => column.name === "actorHandle"))
+      this.db.exec("ALTER TABLE audit ADD COLUMN actorHandle TEXT");
     if (path !== ":memory:") secureDatabaseFiles(path);
   }
   seedAdministrator(did?: string) {
@@ -120,11 +125,13 @@ export class Store {
   ) {
     this.db
       .prepare(
-        "INSERT INTO audit(operation,actor,action,time,detail) VALUES(?,?,?,?,?)",
+        "INSERT INTO audit(operation,actor,actorHandle,action,time,detail) VALUES(?,?,?,?,?,?)",
       )
       .run(
         operation,
         actor,
+        this.get<{ handle?: string | null }>("administrator-profile", actor)
+          ?.handle ?? null,
         action,
         new Date().toISOString(),
         JSON.stringify(detail),
@@ -176,7 +183,13 @@ export class Store {
             this.get<{ handle?: string | null }>(
               "administrator-profile",
               r.actor as string,
-            )?.handle ?? null,
+            )?.handle ??
+            ((this.db
+              .prepare(
+                "SELECT actorHandle FROM audit WHERE operation=? AND actorHandle IS NOT NULL ORDER BY seq LIMIT 1",
+              )
+              .get(r.id) as { actorHandle?: string | null } | undefined)
+              ?.actorHandle ?? null),
           command: JSON.parse(r.command as string),
           result: r.result ? JSON.parse(r.result as string) : null,
         } as unknown as Operation)
@@ -232,6 +245,7 @@ export class Store {
       items: rows.slice(0, limit).map((r) => ({
         ...r,
         actorHandle:
+          (r.actorHandle as string | null | undefined) ??
           this.get<{ handle?: string | null }>(
             "administrator-profile",
             r.actor as string,

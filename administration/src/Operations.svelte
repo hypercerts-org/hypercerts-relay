@@ -15,26 +15,47 @@
   export let audit: Audit[] = [];
   export let submit: (command: Command) => Promise<void>;
   export let action: (id: string, action: "retry" | "cancel") => Promise<void>;
+  export let moreChanges: () => Promise<void> = async () => {};
+  export let moreAudit: () => Promise<void> = async () => {};
+  export let hasMoreChanges = false;
+  export let hasMoreAudit = false;
   export let busy = false;
   let pds = "",
     reason: "backfill" | "quota_recovery" = "backfill";
   function coverageGroups(items: Coverage[]) {
-    const groups = new Map<string, Coverage[]>();
-    for (const item of items) groups.set(item.pds, [...(groups.get(item.pds) ?? []), item]);
-    return [...groups.entries()].map(([pds, rows]) => ({ pds, rows }));
+    const latest = new Map<string, Coverage>();
+    for (const item of items) {
+      const previous = latest.get(item.pds);
+      if (!previous || item.createdAt > previous.createdAt) latest.set(item.pds, item);
+    }
+    return [...latest.values()].map((item) => ({
+      pds: item.pds,
+      item,
+      collections: item.policy.collections.length
+        ? item.policy.collections
+        : ["No collections selected"],
+    }));
   }
   function jobProgress(job: Job) {
     if (["running", "in_progress"].includes(job.state)) {
-      const total = job.totalRepos ?? "unknown total";
-      return `${job.completedRepos} of ${total} repositories processed`;
+      return job.totalReposKnown
+        ? `${job.completedRepos} of ${job.totalRepos} repositories processed`
+        : "Counting repositories before backfill starts";
     }
     return `${job.completedRepos} repositories processed`;
   }
   function actorLabel(actor: { actor: string; actorHandle?: string | null }) {
     return actor.actorHandle ? `@${actor.actorHandle}` : actor.actor;
   }
-  async function copy(value: string) {
-    await navigator.clipboard?.writeText(value);
+  let copyStatus = "";
+  async function copy(actor: { actor: string; actorHandle?: string | null }) {
+    try {
+      if (!navigator.clipboard) throw new Error("clipboard unavailable");
+      await navigator.clipboard.writeText(actor.actor);
+      copyStatus = `Copied DID for ${actorLabel(actor)}.`;
+    } catch {
+      copyStatus = `Could not copy the DID for ${actorLabel(actor)}.`;
+    }
   }
 </script>
 
@@ -161,21 +182,19 @@
                   >Progress / limitations</th></tr
               ></thead
             ><tbody
-              >{#each group.rows as item}
-                {#each item.policy.collections.length ? item.policy.collections : ["No collections selected"] as collection}
-                  <tr
-                    ><td>{collection}</td><td
-                      ><State value={item.state} /><small
-                        >Historical PDS attribution: {item.historicalPDSAttribution}</small
-                      ></td
-                    ><td
-                      >{item.completedRepos} repositories<small
-                        >{item.reason?.replaceAll("_", " ") ||
-                          "Current state only; historical events are not guaranteed."}</small
-                      ><small>Job {item.jobId}</small></td
-                    ></tr
-                  >
-                {/each}
+              >{#each group.collections as collection}
+                <tr
+                  ><td>{collection}</td><td
+                    ><State value={group.item.state} /><small
+                      >Historical PDS attribution: {group.item.historicalPDSAttribution}</small
+                    ></td
+                  ><td
+                    >{group.item.completedRepos} repositories<small
+                      >{group.item.reason?.replaceAll("_", " ") ||
+                        "Current state only; historical events are not guaranteed."}</small
+                    ><small>Job {group.item.jobId}</small></td
+                  ></tr
+                >
               {/each}</tbody
             >
           </table>
@@ -198,6 +217,7 @@
       handles are shown first; hover or focus the handle to see the DID.
     </p>
   </div>
+  <p class="sr-only" role="status">{copyStatus}</p>
   <!-- svelte-ignore a11y_no_noninteractive_tabindex (Scrollable tables need keyboard access; verified with axe and Chromium.) -->
   <div
     class="table-wrap"
@@ -216,7 +236,7 @@
         >{#each changes as change}<tr
             ><td>{target(change.command)}<small>{change.id}</small></td><td
               ><span title={change.actor} tabindex="0">{actorLabel(change)}</span>
-              <button class="text-button" onclick={() => copy(change.actor)}>Copy DID</button><small
+              <button class="text-button" aria-label={`Copy DID for ${actorLabel(change)}`} onclick={() => copy(change)}>Copy DID</button><small
                 >{new Date(change.createdAt).toLocaleString()}</small
               ></td
             ><td
@@ -242,6 +262,7 @@
       >
     </table>
   </div>
+  {#if hasMoreChanges}<button disabled={busy} onclick={moreChanges}>Load more requested changes</button>{/if}
   <!-- svelte-ignore a11y_no_noninteractive_tabindex (Scrollable tables need keyboard access; verified with axe and Chromium.) -->
   <div
     class="table-wrap"
@@ -259,7 +280,7 @@
         >{#each audit as event}<tr
             ><td>{new Date(event.time).toLocaleString()}</td><td
               ><span title={event.actor} tabindex="0">{actorLabel(event)}</span>
-              <button class="text-button" onclick={() => copy(event.actor)}>Copy DID</button></td
+              <button class="text-button" aria-label={`Copy DID for ${actorLabel(event)}`} onclick={() => copy(event)}>Copy DID</button></td
             ><td><State value={event.action} /></td><td
               >{event.operation ?? "Access change"}<small
                 >{String(event.detail.error ?? event.detail.did ?? "")}</small
@@ -272,57 +293,19 @@
       >
     </table>
   </div>
-{:else}
-  <div class="intro">
-    <p class="eyebrow">Change tracking</p>
-    <h1>Requested changes</h1>
-    <p>
-      Requested configuration is recorded before application. “Applied” means
-      the owning service acknowledged the change; backfill completion is
-      reported separately.
-    </p>
-  </div>
-  <!-- svelte-ignore a11y_no_noninteractive_tabindex (Scrollable tables need keyboard access; verified with axe and Chromium.) -->
-  <div
-    class="table-wrap"
-    role="region"
-    aria-label="Scrollable results"
-    tabindex="0"
-  >
-    <table>
-      <caption>Durable management operations</caption><thead
-        ><tr
-          ><th>Requested change</th><th>Actor / time</th><th>State</th><th
-            >Actions</th
-          ></tr
-        ></thead
-      ><tbody
-        >{#each changes as change}<tr
-            ><td>{target(change.command)}<small>{change.id}</small></td><td
-              >{change.actor}<small
-                >{new Date(change.createdAt).toLocaleString()}</small
-              ></td
-            ><td
-              ><State value={change.state} /><small
-                >{change.error?.replaceAll("_", " ") ?? ""}</small
-              ></td
-            ><td
-              >{#if change.state === "requested"}<button
-                  disabled={busy}
-                  onclick={() => action(change.id, "cancel")}
-                  >Cancel change</button
-                >{:else if ["failed", "incomplete"].includes(change.state)}<button
-                  disabled={busy}
-                  onclick={() => action(change.id, "retry")}
-                  >Retry change</button
-                >{:else}—{/if}</td
-            ></tr
-          >{:else}<tr
-            ><td colspan="4" class="empty"
-              >No requested changes on this page.</td
-            ></tr
-          >{/each}</tbody
-      >
-    </table>
-  </div>
+  {#if hasMoreAudit}<button disabled={busy} onclick={moreAudit}>Load more audit history</button>{/if}
 {/if}
+
+<style>
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+</style>

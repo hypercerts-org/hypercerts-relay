@@ -56,6 +56,8 @@
     coverage: Coverage[] = [],
     audit: Audit[] = [],
     limits: Limit[] = [];
+  let nextOperationAudit: string | null = null,
+    nextHistoryAudit: string | null = null;
   let status: { relay: string; jetstream: string; observedAt: string } | null =
       null,
     operation: Operation | null = null;
@@ -105,11 +107,15 @@
           break;
         }
         case "limits": {
-          const r = await api<{ items: Limit[]; next: string | null }>(
-            `/limits?after=${encodeURIComponent(cursor)}`,
-          );
-          limits = r.items;
-          next = r.next;
+          const [limitPage, sourcePage] = await Promise.all([
+            api<{ items: Limit[]; next: string | null }>(
+              `/limits?after=${encodeURIComponent(cursor)}`,
+            ),
+            api<{ Sources: Source[] }>("/sources"),
+          ]);
+          limits = limitPage.items;
+          sources = sourcePage.Sources;
+          next = limitPage.next;
           break;
         }
         case "audit": {
@@ -119,6 +125,8 @@
           ]);
           changes = operationPage.items;
           audit = auditPage.items;
+          nextOperationAudit = operationPage.next;
+          nextHistoryAudit = auditPage.next;
           next = null;
           break;
         }
@@ -152,6 +160,31 @@
       error = (e as Error).message;
     } finally {
       busy = false;
+    }
+  }
+  async function loadMoreAudit(kind: "operations" | "history") {
+    const after = kind === "operations" ? nextOperationAudit : nextHistoryAudit;
+    if (!after) return;
+    loading = true;
+    try {
+      if (kind === "operations") {
+        const page = await api<{ items: Operation[]; next: string | null }>(
+          `/operations?after=${encodeURIComponent(after)}`,
+        );
+        changes = [...changes, ...page.items];
+        nextOperationAudit = page.next;
+      } else {
+        const page = await api<{ items: Audit[]; next: string | null }>(
+          `/audit?after=${encodeURIComponent(after)}`,
+        );
+        audit = [...audit, ...page.items];
+        nextHistoryAudit = page.next;
+      }
+      loadError = "";
+    } catch (e) {
+      loadError = (e as Error).message;
+    } finally {
+      loading = false;
     }
   }
   async function action(id: string, action: "retry" | "cancel") {
@@ -325,7 +358,7 @@
             {submit}
             {busy}
           />{/if}
-      {:else if screen === "limits"}<Limits rows={limits} {submit} {busy} />
+      {:else if screen === "limits"}<Limits rows={limits} {sources} {submit} {busy} />
       {:else if ["jobs", "coverage", "audit"].includes(screen)}<Operations
           {screen}
           {jobs}
@@ -334,6 +367,10 @@
           {audit}
           {submit}
           {action}
+          moreChanges={() => loadMoreAudit("operations")}
+          moreAudit={() => loadMoreAudit("history")}
+          hasMoreChanges={!!nextOperationAudit}
+          hasMoreAudit={!!nextHistoryAudit}
           {busy}
         />
       {:else}<div class="intro">

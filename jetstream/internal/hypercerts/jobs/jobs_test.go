@@ -50,6 +50,31 @@ func TestJobsPolicyAtomicSchedulingAndCancellation(t *testing.T) {
 	}
 }
 
+func TestJobsPersistRepositoryTotalBeforeProgress(t *testing.T) {
+	m, db := newManager(t, t.TempDir())
+	defer db.Close()
+	j, err := m.AddSource("https://pds.example")
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- m.Run(ctx, func(ctx context.Context, running Job) error {
+			if err := m.SetTotalRepos(running.ID, 12); err != nil {
+				return err
+			}
+			return ctx.Err()
+		})
+	}()
+	require.Eventually(t, func() bool {
+		job := m.List()[0]
+		return job.TotalReposKnown && job.TotalRepos == 12
+	}, time.Second, time.Millisecond)
+	cancel()
+	<-done
+	require.Equal(t, j.ID, m.List()[0].ID)
+}
+
 func TestJobsCrashResumeAndUnavailableCoverage(t *testing.T) {
 	dir := t.TempDir()
 	m, db := newManager(t, dir)

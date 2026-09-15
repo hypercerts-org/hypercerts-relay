@@ -191,7 +191,8 @@ All paths below start with `/hypercerts/v1`:
 | `POST /jobs/{id}/retry` | Resumes current-policy work from durable progress; a removed source or obsolete revision returns conflict. |
 
 Each job reports `id`, `pds`, `policy.revision`, `policy.collections`, `reason`,
-`state`, `attempts`, `completedRepos` (count), page `cursor`, bounded `errorCode`,
+`state`, `attempts`, `completedRepos` (count), `totalRepos` with
+`totalReposKnown`, page `cursor`, bounded `errorCode`,
 creation/start/finish times, `coverage`, and `historyComplete`. Job states are
 `pending`, `running`, `failed`, `canceled`, `incomplete`, and `complete`. A completed
 job identifies the exact PDS origin and policy revision whose **current state** it

@@ -195,6 +195,8 @@ test("audit log combines requested changes and handle-first actor display", () =
         error: null,
       },
     ],
+    hasMoreChanges: true,
+    hasMoreAudit: true,
     audit: [
       {
         seq: 1,
@@ -212,12 +214,30 @@ test("audit log combines requested changes and handle-first actor display", () =
   expect(screen.getByText("Audit history")).toBeTruthy();
   const handles = screen.getAllByText("@operator.example");
   expect(handles[0].getAttribute("title")).toBe("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa");
-  expect(screen.getAllByRole("button", { name: "Copy DID" }).length).toBe(2);
+  expect(
+    screen.getAllByRole("button", { name: "Copy DID for @operator.example" }).length,
+  ).toBe(2);
+  expect(screen.getByRole("button", { name: "Load more requested changes" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Load more audit history" })).toBeTruthy();
 });
 
 test("rate limits show current globals and PDS typeahead suggestions", async () => {
   render(Limits, {
     submit: vi.fn(),
+    sources: [
+      {
+        HostID: 1,
+        Hostname: "pds.example",
+        NoSSL: false,
+        DesiredState: "enabled",
+        RuntimeState: "connected",
+        Revision: 1,
+        RecoveryRequired: false,
+        LastDurableCursor: 1,
+        Validation: { Status: "passed", Reason: "" },
+        AccountQuota: { Count: 0, Limit: 100 },
+      },
+    ],
     rows: [
       {
         scope: "global",
@@ -255,7 +275,9 @@ test("jobs explain recovery types and use operator-facing progress labels", () =
         state: "running",
         completedRepos: 3,
         totalRepos: 10,
+        totalReposKnown: true,
         attempts: 1,
+        createdAt: "2026-09-09T00:00:00.000Z",
         historyComplete: false,
         coverage: "partial",
       },
@@ -277,10 +299,26 @@ test("coverage groups collections by collapsed PDS and explains unknown history"
     coverage: [
       {
         pds: "https://pds.example",
+        policy: { revision: 1, collections: ["app.bsky.feed.post"] },
+        jobId: "older",
+        state: "incomplete",
+        completedRepos: 1,
+        totalRepos: 3,
+        totalReposKnown: true,
+        createdAt: "2026-09-08T00:00:00.000Z",
+        reason: "source_unavailable",
+        historyComplete: false,
+        historicalPDSAttribution: "unknown",
+      },
+      {
+        pds: "https://pds.example",
         policy: { revision: 2, collections: ["app.bsky.feed.post"] },
         jobId: "abc",
         state: "complete",
         completedRepos: 3,
+        totalRepos: 3,
+        totalReposKnown: true,
+        createdAt: "2026-09-09T00:00:00.000Z",
         reason: null,
         historyComplete: false,
         historicalPDSAttribution: "unknown",
@@ -290,7 +328,7 @@ test("coverage groups collections by collapsed PDS and explains unknown history"
   const group = screen.getByText("https://pds.example").closest("details");
   expect(group?.hasAttribute("open")).toBe(false);
   expect(document.body.textContent).toContain("do not preserve which PDS supplied older records");
-  expect(screen.getByText("app.bsky.feed.post")).toBeTruthy();
+  expect(screen.getAllByText("app.bsky.feed.post")).toHaveLength(1);
   expect(screen.queryByText("Policy revision")).toBeNull();
   expect(screen.getByRole("link", { name: "Manage PDS instances" })).toBeTruthy();
 });

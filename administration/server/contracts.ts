@@ -107,9 +107,11 @@ export interface Job {
   policy: Policy;
   state: string;
   completedRepos: number;
-  totalRepos?: number | null;
+  totalRepos: number;
+  totalReposKnown: boolean;
   attempts: number;
   errorCode?: string;
+  createdAt: string;
   historyComplete: boolean;
   coverage: string;
 }

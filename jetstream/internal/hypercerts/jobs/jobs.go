@@ -44,6 +44,8 @@ type Job struct {
 	State           State             `json:"state"`
 	Attempts        int               `json:"attempts"`
 	CompletedRepos  map[string]string `json:"completedRepos"`
+	TotalRepos      int               `json:"totalRepos"`
+	TotalReposKnown bool              `json:"totalReposKnown"`
 	Cursor          string            `json:"cursor"`
 	ErrorCode       string            `json:"errorCode,omitempty"`
 	CreatedAt       time.Time         `json:"createdAt"`
@@ -382,6 +384,27 @@ func (m *Manager) Apply(id string, write func() error) error {
 	}
 	return write()
 }
+
+// SetTotalRepos records the active PDS snapshot size before repository work
+// begins. It is deliberately separate from completed repositories: a retry can
+// resume progress against the same observed source snapshot.
+func (m *Manager) SetTotalRepos(id string, total int) error {
+	if total < 0 {
+		return ErrInvalidInput
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.active(id) {
+		return ErrConflict
+	}
+	next := clone(m.data)
+	job := next.Jobs[id]
+	job.TotalRepos = total
+	job.TotalReposKnown = true
+	next.Jobs[id] = job
+	return m.commit(next)
+}
+
 func (m *Manager) Checkpoint(id, did, rev, cursor string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

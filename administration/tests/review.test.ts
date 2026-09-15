@@ -43,11 +43,12 @@ test("journal pages follow time with UUID tie-breaking and reject invalid cursor
   assert.deepEqual(seen, ids);
   assert.throws(() => store.page("operations", "bad", 50), /invalid_cursor/);
 });
-test("journal entries include actor handles when profile metadata is known", (t) => {
+test("journal entries retain actor handles after profile removal", (t) => {
   const store = new Store(":memory:");
   t.after(() => store.close());
   store.set("administrator-profile", actor, { handle: "operator.example" });
   const op = store.request(actor, command);
+  store.del("administrator-profile", actor);
   assert.equal(store.operation(op.id)?.actorHandle, "operator.example");
   assert.equal(
     (store.page("audit", "", 1).items[0] as { actorHandle?: string | null })

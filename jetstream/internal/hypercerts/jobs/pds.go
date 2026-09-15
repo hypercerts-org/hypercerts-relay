@@ -32,6 +32,17 @@ func (p PDSProcessor) Run(ctx context.Context, job Job) error {
 	httpClient := *p.HTTPClient
 	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	client := atmossync.NewClient(atmossync.Options{Client: &xrpc.Client{Host: job.PDS, HTTPClient: gt.Some(&httpClient), Retry: gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(1)})}, Directory: gt.Some(p.Directory)})
+	if !job.TotalReposKnown {
+		total, err := countActiveRepositories(ctx, client)
+		if err != nil {
+			return inputFailure(ctx, "source_unavailable")
+		}
+		if err := p.Manager.SetTotalRepos(job.ID, total); err != nil {
+			return err
+		}
+		job.TotalRepos = total
+		job.TotalReposKnown = true
+	}
 	for page, err := range client.ListRepos(ctx, 100, job.Cursor) {
 		if err != nil {
 			return inputFailure(ctx, "source_unavailable")
@@ -53,6 +64,24 @@ func (p PDSProcessor) Run(ctx context.Context, job Job) error {
 		job.Cursor = page.NextCursor
 	}
 	return nil
+}
+
+// countActiveRepositories establishes the bounded operator-facing total before
+// processing begins. The subsequent scan still validates and snapshots every
+// repository against the admitted PDS.
+func countActiveRepositories(ctx context.Context, client *atmossync.Client) (int, error) {
+	total := 0
+	for page, err := range client.ListRepos(ctx, 100, "") {
+		if err != nil {
+			return 0, err
+		}
+		for _, entry := range page.Entries {
+			if entry.Active {
+				total++
+			}
+		}
+	}
+	return total, nil
 }
 
 func inputFailure(ctx context.Context, code string) error {

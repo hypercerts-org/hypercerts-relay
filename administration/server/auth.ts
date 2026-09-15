@@ -175,13 +175,13 @@ export class Auth {
         .prepare("INSERT INTO sessions VALUES(?,?,?,?)")
         .run(session.id, did, csrf, session.expires);
       const now = new Date().toISOString();
-      this.store.audit(did, "signed_in", {});
       this.store.set("administrator-profile", did, {
         ...this.store.get<AdministratorProfile>("administrator-profile", did),
         ...(profile ?? {}),
         lastLoggedIn: now,
         updatedAt: now,
       });
+      this.store.audit(did, "signed_in", {});
     });
     res.cookie("relay_session", token, this.options(8 * 3_600_000));
     return session;

@@ -230,6 +230,8 @@ type jobView struct {
 	State           jobs.State       `json:"state"`
 	Attempts        int              `json:"attempts"`
 	CompletedRepos  int              `json:"completedRepos"`
+	TotalRepos      int              `json:"totalRepos"`
+	TotalReposKnown bool             `json:"totalReposKnown"`
 	Cursor          string           `json:"cursor"`
 	ErrorCode       string           `json:"errorCode,omitempty"`
 	CreatedAt       time.Time        `json:"createdAt"`
@@ -240,5 +242,5 @@ type jobView struct {
 }
 
 func view(j jobs.Job) jobView {
-	return jobView{ID: j.ID, PDS: j.PDS, Policy: j.Policy, Reason: j.Reason, State: j.State, Attempts: j.Attempts, CompletedRepos: len(j.CompletedRepos), Cursor: j.Cursor, ErrorCode: j.ErrorCode, CreatedAt: j.CreatedAt, StartedAt: j.StartedAt, FinishedAt: j.FinishedAt, Coverage: j.Coverage, HistoryComplete: j.HistoryComplete}
+	return jobView{ID: j.ID, PDS: j.PDS, Policy: j.Policy, Reason: j.Reason, State: j.State, Attempts: j.Attempts, CompletedRepos: len(j.CompletedRepos), TotalRepos: j.TotalRepos, TotalReposKnown: j.TotalReposKnown, Cursor: j.Cursor, ErrorCode: j.ErrorCode, CreatedAt: j.CreatedAt, StartedAt: j.StartedAt, FinishedAt: j.FinishedAt, Coverage: j.Coverage, HistoryComplete: j.HistoryComplete}
 }
