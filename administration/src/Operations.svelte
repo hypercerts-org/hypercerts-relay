@@ -23,6 +23,13 @@
     for (const item of items) groups.set(item.pds, [...(groups.get(item.pds) ?? []), item]);
     return [...groups.entries()].map(([pds, rows]) => ({ pds, rows }));
   }
+  function jobProgress(job: Job) {
+    if (["running", "in_progress"].includes(job.state)) {
+      const total = job.totalRepos ?? "unknown total";
+      return `${job.completedRepos} of ${total} repositories processed`;
+    }
+    return `${job.completedRepos} repositories processed`;
+  }
 </script>
 
 {#if screen === "jobs"}
@@ -30,8 +37,10 @@
     <p class="eyebrow">Historical recovery</p>
     <h1>Backfill jobs</h1>
     <p>
-      Acquire selected current records directly from a PDS. Job states come from
-      Jetstream.
+      Acquire selected current records directly from a PDS. Selected-collection
+      backfill fills the enabled collections for a source; quota recovery catches
+      up accounts that become admitted after a quota increase. Job status comes
+      from Jetstream.
     </p>
   </div>
   <form
@@ -71,19 +80,15 @@
     <table>
       <caption>Jetstream jobs</caption><thead
         ><tr
-          ><th>Source / job</th><th>Policy</th><th>Progress</th><th>State</th
+          ><th>PDS / Job id</th><th>Collections</th><th>Progress</th><th>Status</th
           ><th>Actions</th></tr
         ></thead
       ><tbody
         >{#each jobs as job}<tr
             ><td>{job.pds}<small>{job.id}</small></td><td
-              >Revision {job.policy.revision}<small
-                >{job.policy.collections.join(", ") || "No collections"}</small
-              ></td
+              >{job.policy.collections.join(", ") || "No collections"}</td
             ><td
-              >{job.completedRepos} repositories<small
-                >{job.attempts} attempts</small
-              ></td
+              >{jobProgress(job)}<small>{job.attempts} attempts</small></td
             ><td
               ><State value={job.state} /><small
                 >{job.errorCode?.replaceAll("_", " ") ?? ""}</small

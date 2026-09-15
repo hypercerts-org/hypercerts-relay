@@ -176,6 +176,33 @@ test("collection drafts survive polling and require reset after a stale revision
     collections: ["app.bsky.feed.repost"],
   });
 });
+test("jobs explain recovery types and use operator-facing progress labels", () => {
+  render(Operations, {
+    screen: "jobs",
+    submit: vi.fn(),
+    action: vi.fn(),
+    jobs: [
+      {
+        id: "abc",
+        pds: "https://pds.example",
+        policy: { revision: 2, collections: ["app.bsky.feed.post"] },
+        state: "running",
+        completedRepos: 3,
+        totalRepos: 10,
+        attempts: 1,
+        historyComplete: false,
+        coverage: "partial",
+      },
+    ],
+  });
+  expect(screen.getByText(/Selected-collection backfill fills/)).toBeTruthy();
+  expect(screen.getByText("PDS / Job id")).toBeTruthy();
+  expect(screen.getByText("Collections")).toBeTruthy();
+  expect(screen.getByText("Status")).toBeTruthy();
+  expect(screen.getByText("3 of 10 repositories processed")).toBeTruthy();
+  expect(screen.queryByText(/Revision/)).toBeNull();
+});
+
 test("coverage groups collections by collapsed PDS and explains unknown history", () => {
   render(Operations, {
     screen: "coverage",

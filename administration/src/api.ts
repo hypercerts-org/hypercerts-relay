@@ -30,6 +30,7 @@ export interface Coverage {
   jobId: string;
   state: string;
   completedRepos: number;
+  totalRepos?: number | null;
   reason: string | null;
   historyComplete: boolean;
   historicalPDSAttribution: string;
