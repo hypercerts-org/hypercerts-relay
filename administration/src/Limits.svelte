@@ -6,6 +6,11 @@
   let kind = "global",
     pds = "",
     value = 100;
+  $: globalLimits = rows.filter((row) => row.scope === "global");
+  $: pdsSuggestions = rows
+    .map((row) => row.scope)
+    .filter((scope) => scope !== "global")
+    .slice(0, 10);
 </script>
 
 <div class="intro">
@@ -38,10 +43,16 @@
   {#if kind === "pds"}<div class="field grow">
       <label for="limit-pds">Configured PDS origin</label><input
         id="limit-pds"
-        type="url"
+        type="text"
+        inputmode="url"
+        list="limit-pds-suggestions"
         bind:value={pds}
         required
       />
+      <datalist id="limit-pds-suggestions">
+        {#each pdsSuggestions as suggestion}<option value={suggestion}></option>{/each}
+      </datalist>
+      <small>Start typing to choose from the first matching PDS policies on this page, or enter another configured PDS.</small>
     </div>{/if}
   <div class="field">
     <label for="limit-value">Events per second</label><input
@@ -61,6 +72,18 @@
   Whole numbers from 1 to 1,000,000. Burst allowance is one second of the
   configured rate. Values persist across Relay restarts.
 </p>
+<section class="overview">
+  <h2>Current global rate limits</h2>
+  {#if globalLimits.length}
+    <ul>
+      {#each globalLimits as row}
+        <li>{row.eventsPerSecond.toLocaleString()} events/second · {row.waitingConnections} waiting connections · {row.recovery}</li>
+      {/each}
+    </ul>
+  {:else}
+    <p class="empty">No explicit global limit is configured.</p>
+  {/if}
+</section>
 <!-- svelte-ignore a11y_no_noninteractive_tabindex (Scrollable tables need keyboard access; verified with axe and Chromium.) -->
 <div
   class="table-wrap"
@@ -69,7 +92,7 @@
   tabindex="0"
 >
   <table>
-    <caption>Applied Relay rate policies</caption><thead
+    <caption>Rate Limit policies</caption><thead
       ><tr
         ><th>Scope</th><th>Applied value</th><th>Backpressure</th><th
           >Recovery consequence</th

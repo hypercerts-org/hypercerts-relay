@@ -3,6 +3,7 @@ import { render, screen, fireEvent, cleanup } from "@testing-library/svelte";
 import Sources from "../src/Sources.svelte";
 import Collections from "../src/Collections.svelte";
 import Operations from "../src/Operations.svelte";
+import Limits from "../src/Limits.svelte";
 import AccountQuota from "../src/AccountQuota.svelte";
 afterEach(cleanup);
 test("quota drafts survive observations and reject stale or invalid changes", async () => {
@@ -176,6 +177,33 @@ test("collection drafts survive polling and require reset after a stale revision
     collections: ["app.bsky.feed.repost"],
   });
 });
+test("rate limits show current globals and PDS typeahead suggestions", async () => {
+  render(Limits, {
+    submit: vi.fn(),
+    rows: [
+      {
+        scope: "global",
+        eventsPerSecond: 100,
+        waitingConnections: 2,
+        unit: "events_per_second",
+        recovery: "none",
+      },
+      {
+        scope: "https://pds.example",
+        eventsPerSecond: 10,
+        waitingConnections: 0,
+        unit: "events_per_second",
+        recovery: "quota recovery required",
+      },
+    ],
+  });
+  expect(screen.getByText("Current global rate limits")).toBeTruthy();
+  expect(screen.getAllByText(/100 events\/second/).length).toBeGreaterThan(0);
+  expect(screen.getByText("Rate Limit policies")).toBeTruthy();
+  await fireEvent.change(screen.getByLabelText("Scope"), { target: { value: "pds" } });
+  expect(document.querySelector('option[value="https://pds.example"]')).toBeTruthy();
+});
+
 test("jobs explain recovery types and use operator-facing progress labels", () => {
   render(Operations, {
     screen: "jobs",
