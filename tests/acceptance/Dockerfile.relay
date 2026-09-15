@@ -8,8 +8,8 @@ RUN go build -tags acceptance -o /relay ./cmd/relay
 
 FROM alpine:3.24
 RUN apk add --no-cache ca-certificates dumb-init \
-    && addgroup -S relay \
-    && adduser -S -G relay relay \
+    && addgroup -S -g 10001 relay \
+    && adduser -S -D -H -u 10001 -G relay relay \
     && mkdir -p /data/relay \
     && chown -R relay:relay /data/relay
 ENTRYPOINT ["dumb-init", "--"]
