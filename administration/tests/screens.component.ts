@@ -198,8 +198,7 @@ test("complete current-state coverage still discloses unknown history", () => {
   expect(screen.getByText("unknown")).toBeTruthy();
 });
 
-test("selected source detail refreshes even when found outside the current page", async () => {
-  vi.useFakeTimers();
+test("selected source detail is loaded on demand without background polling", async () => {
   const source = {
     HostID: 1,
     Hostname: "outside.example",
@@ -223,24 +222,9 @@ test("selected source detail refreshes even when found outside the current page"
     });
     await fireEvent.click(screen.getByRole("button", { name: "Find source" }));
     expect(screen.getByText("connected")).toBeTruthy();
-    fetcher.mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: async () => ({
-        ...source,
-        RuntimeState: "disabled",
-        LastDurableCursor: 50,
-      }),
-    });
-    await vi.advanceTimersByTimeAsync(5000);
-    expect(screen.getByText("disabled")).toBeTruthy();
-    expect(screen.getByText("50")).toBeTruthy();
-    fetcher.mockRejectedValue(new Error("offline"));
-    await vi.advanceTimersByTimeAsync(5000);
-    expect(screen.getByText(/Latest observation unavailable/)).toBeTruthy();
+    expect(fetcher).toHaveBeenCalledTimes(1);
   } finally {
     cleanup();
-    vi.useRealTimers();
     vi.unstubAllGlobals();
   }
 });

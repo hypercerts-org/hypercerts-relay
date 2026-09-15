@@ -211,12 +211,8 @@
       .catch(() => {
         if (active) ready = true;
       });
-    const timer = setInterval(() => {
-      if (session && !loading && !busy) void load();
-    }, 5000);
     return () => {
       active = false;
-      clearInterval(timer);
     };
   });
 </script>
@@ -295,9 +291,7 @@
       <header class="toolbar">
         <span>Administration</span>
         <div class="actions">
-          <span class="refresh-status" role="status"
-            >{loading ? "Refreshing…" : "Refreshes every 5 seconds"}</span
-          ><button
+          {#if loading}<span class="refresh-status" role="status">Refreshing…</span>{/if}<button
             disabled={loading}
             onclick={() => {
               error = "";

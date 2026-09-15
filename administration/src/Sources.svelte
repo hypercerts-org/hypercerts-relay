@@ -1,5 +1,4 @@
 <script lang="ts">
-  import { onMount } from "svelte";
   import State from "./State.svelte";
   import AccountQuota from "./AccountQuota.svelte";
   import { api, sourceOrigin, type Source, type Command } from "./api";
@@ -27,10 +26,6 @@
         detailUnavailable = true;
     }
   }
-  onMount(() => {
-    const timer = setInterval(() => void refreshSelected(), 5000);
-    return () => clearInterval(timer);
-  });
   async function find() {
     error = "";
     try {
