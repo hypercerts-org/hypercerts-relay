@@ -37,6 +37,7 @@ export interface Coverage {
   reason: string | null;
   historyComplete: boolean;
   historicalPDSAttribution: string;
+  coverage: string;
 }
 export interface Audit {
   seq: number;

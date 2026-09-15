@@ -2,7 +2,13 @@
   import { afterUpdate } from "svelte";
   import State from "./State.svelte";
   import AccountQuota from "./AccountQuota.svelte";
-  import { api, sourceOrigin, type Source, type Command } from "./api";
+  import {
+    api,
+    sourceOrigin,
+    type Source,
+    type Coverage,
+    type Command,
+  } from "./api";
   export let rows: Source[] = [];
   export let submit: (command: Command) => Promise<void>;
   export let busy = false;
@@ -10,7 +16,11 @@
     search = "",
     selected: Source | null = null,
     error = "";
-  let detailUnavailable = false;
+  let detailUnavailable = false,
+    coverage: Coverage | null = null,
+    coverageUnavailable = false,
+    detailRequest = 0,
+    lookupRequest = 0;
   $: filter = search.trim().toLowerCase().replace(/^https?:\/\//, "");
   $: displayedRows = filter
     ? rows.filter((source) =>
@@ -26,6 +36,7 @@
       (source) => source.HostID === previous.HostID || sourceOrigin(source) === sourceOrigin(previous),
     );
     if (current && JSON.stringify(current) !== JSON.stringify(previous)) {
+      detailRequest++;
       selected = { ...current };
       detailUnavailable = false;
     }
@@ -33,30 +44,93 @@
   export async function refreshDetails() {
     await refreshSelected();
   }
-  async function refreshSelected() {
-    if (!selected) return;
-    const origin = sourceOrigin(selected);
+  function resetCoverage() {
+    detailRequest++;
+    coverage = null;
+    coverageUnavailable = false;
+  }
+  async function refreshCoverage(origin: string, request: number) {
     try {
-      const current = await api<Source>(
-        `/source?pds=${encodeURIComponent(origin)}`,
+      const result = await api<{ items: Coverage[] }>(
+        `/coverage?pds=${encodeURIComponent(origin)}`,
       );
-      if (selected && sourceOrigin(selected) === origin) {
-        selected = current;
-        detailUnavailable = false;
+      if (
+        request === detailRequest &&
+        selected &&
+        sourceOrigin(selected) === origin
+      ) {
+        coverage = result.items[0] ?? null;
+        coverageUnavailable = false;
       }
     } catch {
-      if (selected && sourceOrigin(selected) === origin)
-        detailUnavailable = true;
+      if (
+        request === detailRequest &&
+        selected &&
+        sourceOrigin(selected) === origin
+      )
+        coverageUnavailable = true;
     }
   }
+  async function refreshSelected() {
+    if (!selected) return;
+    const origin = sourceOrigin(selected),
+      request = ++detailRequest;
+    await Promise.all([
+      (async () => {
+        try {
+          const current = await api<Source>(
+            `/source?pds=${encodeURIComponent(origin)}`,
+          );
+          if (
+            request === detailRequest &&
+            selected &&
+            sourceOrigin(selected) === origin
+          ) {
+            selected = current;
+            detailUnavailable = false;
+          }
+        } catch {
+          if (
+            request === detailRequest &&
+            selected &&
+            sourceOrigin(selected) === origin
+          )
+            detailUnavailable = true;
+        }
+      })(),
+      refreshCoverage(origin, request),
+    ]);
+  }
+  function select(source: Source) {
+    lookupRequest++;
+    error = "";
+    selected = source;
+    detailUnavailable = false;
+    resetCoverage();
+    void refreshSelected();
+  }
   async function find() {
+    const query = search,
+      request = ++lookupRequest;
     error = "";
     try {
-      selected = await api<Source>(`/source?pds=${encodeURIComponent(search)}`);
+      const found = await api<Source>(
+        `/source?pds=${encodeURIComponent(query)}`,
+      );
+      if (request !== lookupRequest) return;
+      selected = found;
       detailUnavailable = false;
+      resetCoverage();
+      const detail = ++detailRequest;
+      await refreshCoverage(sourceOrigin(found), detail);
     } catch (e) {
-      error = (e as Error).message;
+      if (request === lookupRequest) error = (e as Error).message;
     }
+  }
+  function coverageProgress(item: Coverage) {
+    return item.totalReposKnown
+      ? `${item.completedRepos} of ${item.totalRepos} active repositories scanned`
+      : `${item.completedRepos} repositories scanned; inventory is still being counted`;
   }
 </script>
 
@@ -114,7 +188,13 @@
         successful observation.
       </p>{/if}
     <div class="section-heading detail-heading">
-      <button onclick={() => (selected = null)}>Close</button>
+      <button
+        onclick={() => {
+          lookupRequest++;
+          selected = null;
+          resetCoverage();
+        }}>Close</button
+      >
       <h2>Source: <em>{selected.Hostname}</em></h2>
     </div>
     <dl>
@@ -139,9 +219,23 @@
         <dd>{selected.Validation.Status} {selected.Validation.Reason}<small>Validates that the configured PDS can be safely reached and admitted before Relay acquisition starts.</small></dd>
       </div>
       <div>
-        <dt>Quota</dt>
+        <dt>Admission quota</dt>
+        <dd>{selected.AccountQuota.Limit} accounts<small>Maximum accounts Relay may admit from this PDS. This is not the PDS account total.</small></dd>
+      </div>
+      <div>
+        <dt>Relay-observed accounts</dt>
+        <dd>{selected.AccountQuota.Count}<small>Accounts currently known to Relay for this source, not a census of the PDS.</small></dd>
+      </div>
+      <div>
+        <dt>Jetstream current-state coverage</dt>
         <dd>
-          {selected.AccountQuota.Count} / {selected.AccountQuota.Limit} accounts
+          {#if coverageUnavailable}
+            Unavailable<small>Jetstream did not return coverage for this source.</small>
+          {:else if coverage}
+            <State value={coverage.state} /><small>{coverageProgress(coverage)}</small><small>Policy revision {coverage.policy.revision}: {coverage.policy.collections.join(", ") || "No collections selected"}</small><small>{coverage.historyComplete ? "Historical coverage complete" : "Current snapshot only; historical coverage is not complete."}</small>{#if coverage.reason}<small>{coverage.reason.replaceAll("_", " ")}</small>{/if}
+          {:else}
+            Unknown<small>No Jetstream backfill result exists for this source.</small>
+          {/if}
         </dd>
       </div>
     </dl>
@@ -186,17 +280,14 @@
     <caption>Configured sources</caption><thead
       ><tr
         ><th>Source</th><th>State / runtime connection</th><th>Admission check</th
-        ><th>Quota</th><th>Cursor</th><th>Actions</th></tr
+        ><th>Admission quota</th><th>Relay-observed accounts</th><th>Cursor</th><th>Actions</th></tr
       ></thead
     ><tbody>
       {#each displayedRows as source (source.HostID)}<tr
           ><td
             ><button
               class="text-button"
-              onclick={() => {
-                selected = source;
-                detailUnavailable = false;
-              }}>{source.Hostname}</button
+              onclick={() => select(source)}>{source.Hostname}</button
             ><small
               >{source.RecoveryRequired
                 ? "Recovery required"
@@ -207,7 +298,8 @@
               value={source.RuntimeState}
             /></td
           ><td>{source.Validation.Status} {source.Validation.Reason}</td
-          ><td>{source.AccountQuota.Count} / {source.AccountQuota.Limit} accounts</td
+          ><td>{source.AccountQuota.Limit} accounts</td
+          ><td>{source.AccountQuota.Count}</td
           ><td
             >{source.LastDurableCursor < 0
               ? "Not recorded"
@@ -241,7 +333,7 @@
           ></tr
         >
       {:else}<tr
-          ><td colspan="6" class="empty"
+          ><td colspan="7" class="empty"
             >No sources on this page. Add a PDS origin to begin acquisition.</td
           ></tr
         >{/each}

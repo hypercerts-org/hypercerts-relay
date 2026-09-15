@@ -38,7 +38,7 @@ test("administrator operates sources, collections, jobs, rates and revokes the s
   await page
     .getByRole("button", { name: "quiet.example", exact: true })
     .click();
-  const quota = page.getByLabel("Quota", { exact: true });
+  const quota = page.getByLabel("Admission quota", { exact: true });
   await quota.fill("-1");
   await page
     .getByRole("button", { name: "Update quota" })
@@ -76,13 +76,13 @@ test("administrator operates sources, collections, jobs, rates and revokes the s
   await expect(
     page
       .getByRole("region", { name: "Source detail" })
-      .getByText("0 / 250 accounts"),
+      .getByText("250 accounts"),
   ).toBeVisible({ timeout: 12000 });
   await page.reload();
   await page
     .getByRole("button", { name: "quiet.example", exact: true })
     .click();
-  await expect(page.getByLabel("Quota", { exact: true })).toHaveValue(
+  await expect(page.getByLabel("Admission quota", { exact: true })).toHaveValue(
     "250",
   );
   await page.getByRole("link", { name: "Collections", exact: true }).click();
@@ -103,6 +103,15 @@ test("administrator operates sources, collections, jobs, rates and revokes the s
   await expect(page.getByText("source unavailable")).toBeVisible({
     timeout: 12000,
   });
+  await page.getByRole("link", { name: "PDS sources", exact: true }).click();
+  await page
+    .getByRole("button", { name: "quiet.example", exact: true })
+    .click();
+  await expect(
+    page
+      .getByRole("region", { name: "Source detail" })
+      .getByText("0 repositories scanned; inventory is still being counted"),
+  ).toBeVisible({ timeout: 12000 });
   await page.getByRole("link", { name: "Rate limits", exact: true }).click();
   await page.getByLabel("Events per second").fill("12");
   await page.getByRole("button", { name: "Request limit change" }).click();

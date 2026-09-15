@@ -46,7 +46,7 @@
     void save();
   }}
 >
-  <label for="account-quota">Quota</label>
+  <label for="account-quota">Admission quota</label>
   <input
     id="account-quota"
     bind:this={input}

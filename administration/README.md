@@ -111,7 +111,7 @@ The browser-facing API is `/api/v1`; all endpoints below require authorization.
 | `POST /operations`                       | Validated command plus UUID `Idempotency-Key`; returns durable operation and HTTP 202.            |
 | `GET /operations`, `/operations/{id}`    | Requested command, actor, state, observed result and bounded failure code.                        |
 | `POST /operations/{id}/retry`, `/cancel` | Retry failed/incomplete work or cancel work not yet applying; actor audited.                      |
-| `GET /sources`, `/source?pds=…`          | Relay's desired, validation, connection, account-quota and durable-cursor state.                  |
+| `GET /sources`, `/source?pds=…`          | Relay's desired, validation, connection, admission-quota, Relay-observed-account and durable-cursor state. |
 | `GET /policy`                            | Jetstream's applied collection-policy revision.                                                   |
 | `GET /jobs`, `/coverage`                 | Jetstream job state and source/policy-scoped current-state coverage; optional exact `pds` filter. |
 | `GET /limits`, `/status`, `/audit`       | Applied policies, bounded service health, durable actor-attributed history.                       |
@@ -137,8 +137,10 @@ stops acquisition without deleting archives. Job progress remains owned by Jetst
 Coverage is a page of PDS/policy results with the exact selected collections, job
 ID, progress and incomplete reason. A completed current snapshot has
 `historyComplete: false`; historical PDS attribution is explicitly unknown.
-Sources without jobs have unknown coverage. Source detail links directly to its
-filtered jobs and coverage; connection state and durable cursors come from Relay.
+Sources without jobs have unknown coverage. Source detail presents the latest
+Jetstream current-state coverage alongside Relay connection state and durable
+cursors. Its admission quota is a limit only: Relay-observed accounts are shown
+separately and are not a census of the PDS or a limit on Jetstream backfill.
 
 ## Rate policy
 

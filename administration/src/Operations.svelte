@@ -44,10 +44,18 @@
   function jobProgress(job: Job) {
     if (["running", "in_progress"].includes(job.state)) {
       return job.totalReposKnown
-        ? `${job.completedRepos} of ${job.totalRepos} repositories processed`
-        : "Counting repositories before backfill starts";
+        ? `${job.completedRepos} of ${job.totalRepos} active repositories processed`
+        : "Counting active repositories before backfill starts";
     }
-    return `${job.completedRepos} repositories processed`;
+    return job.totalReposKnown
+      ? `${job.completedRepos} of ${job.totalRepos} active repositories processed`
+      : `${job.completedRepos} repositories processed`;
+  }
+  function currentStateScope(item: { coverage: string; historyComplete: boolean }) {
+    const scope = item.coverage.replaceAll("_", " ");
+    return item.historyComplete
+      ? `${scope}; historical coverage complete`
+      : `${scope}; historical coverage is not complete`;
   }
   function actorLabel(actor: { actor: string; actorHandle?: string | null }) {
     return actor.actorHandle ? `@${actor.actorHandle}` : actor.actor;
@@ -71,8 +79,9 @@
     <p>
       Acquire selected current records directly from a PDS. Selected-collection
       backfill fills the enabled collections for a source; quota recovery catches
-      up accounts that become admitted after a quota increase. Job status comes
-      from Jetstream.
+      up accounts that become admitted after a quota increase. Each PDS backfill
+      inventories active repositories directly from that PDS; Relay-observed
+      account counts do not limit it. Job status comes from Jetstream.
     </p>
   </div>
   <form
@@ -120,7 +129,7 @@
             ><td>{job.pds}<small>{job.id}</small></td><td
               >{job.policy.collections.join(", ") || "No collections"}</td
             ><td>{jobPurpose(job)}</td><td
-              >{jobProgress(job)}<small>{job.attempts} attempts</small></td
+              >{jobProgress(job)}<small>{currentStateScope(job)}</small><small>{job.attempts} attempts</small></td
             ><td
               ><State value={job.state} /><small
                 >{job.errorCode?.replaceAll("_", " ") ?? ""}</small
@@ -194,9 +203,13 @@
                       >Historical PDS attribution: {group.item.historicalPDSAttribution}</small
                     ></td
                   ><td
-                    >{group.item.completedRepos} repositories<small
+                    >{group.item.totalReposKnown
+                      ? `${group.item.completedRepos} of ${group.item.totalRepos} active repositories processed`
+                      : `${group.item.completedRepos} repositories processed; inventory is still being counted`}<small
+                      >Policy revision {group.item.policy.revision}; {currentStateScope(group.item)}</small
+                    ><small
                       >{group.item.reason?.replaceAll("_", " ") ||
-                        "Current state only; historical events are not guaranteed."}</small
+                        "No incomplete-input reason reported."}</small
                     ><small>Job {group.item.jobId}</small></td
                   ></tr
                 >

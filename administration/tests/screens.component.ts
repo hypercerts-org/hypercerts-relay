@@ -21,7 +21,7 @@ test("quota drafts survive observations and reject stale or invalid changes", as
   };
   const submit = vi.fn().mockResolvedValue(undefined);
   const view = render(AccountQuota, { source, submit });
-  const input = screen.getByLabelText("Quota") as HTMLInputElement;
+  const input = screen.getByLabelText("Admission quota") as HTMLInputElement;
   await fireEvent.input(input, { target: { value: "-1" } });
   await fireEvent.submit(input.form!);
   expect(submit).not.toHaveBeenCalled();
@@ -299,7 +299,7 @@ test("jobs explain recovery types and use operator-facing progress labels", () =
   expect(screen.getAllByText("Purpose")).toHaveLength(2);
   expect(screen.getAllByText("Quota recovery")).toHaveLength(2);
   expect(screen.getByText("Status")).toBeTruthy();
-  expect(screen.getByText("3 of 10 repositories processed")).toBeTruthy();
+  expect(screen.getByText("3 of 10 active repositories processed")).toBeTruthy();
   expect(screen.queryByText(/Revision/)).toBeNull();
 });
 
@@ -321,6 +321,7 @@ test("coverage groups collections by collapsed PDS and explains unknown history"
         reason: "source_unavailable",
         historyComplete: false,
         historicalPDSAttribution: "unknown",
+        coverage: "current_state",
       },
       {
         pds: "https://pds.example",
@@ -334,6 +335,7 @@ test("coverage groups collections by collapsed PDS and explains unknown history"
         reason: null,
         historyComplete: false,
         historicalPDSAttribution: "unknown",
+        coverage: "current_state",
       },
     ],
   });
@@ -341,7 +343,7 @@ test("coverage groups collections by collapsed PDS and explains unknown history"
   expect(group?.hasAttribute("open")).toBe(false);
   expect(document.body.textContent).toContain("do not preserve which PDS supplied older records");
   expect(screen.getAllByText("app.bsky.feed.post")).toHaveLength(1);
-  expect(screen.queryByText("Policy revision")).toBeNull();
+  expect(screen.getByText(/Policy revision 2; current state/)).toBeTruthy();
   expect(screen.getByRole("link", { name: "Manage PDS instances" })).toBeTruthy();
 });
 
@@ -358,9 +360,32 @@ test("selected source detail is loaded on demand without background polling", as
     Validation: { Status: "passed", Reason: "" },
     AccountQuota: { Count: 0, Limit: 100 },
   };
-  const fetcher = vi
-    .fn()
-    .mockResolvedValue({ ok: true, status: 200, json: async () => source });
+  const fetcher = vi.fn().mockImplementation(async (url: string) =>
+    url.includes("/coverage")
+      ? {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            items: [
+              {
+                pds: "https://outside.example",
+                policy: { revision: 2, collections: ["app.bsky.feed.post"] },
+                jobId: "job-1",
+                state: "complete",
+                completedRepos: 43,
+                totalRepos: 13895,
+                totalReposKnown: true,
+                createdAt: "2026-09-09T00:00:00.000Z",
+                reason: null,
+                historyComplete: false,
+                historicalPDSAttribution: "unknown",
+                coverage: "current_state",
+              },
+            ],
+          }),
+        }
+      : { ok: true, status: 200, json: async () => source },
+  );
   vi.stubGlobal("fetch", fetcher);
   try {
     render(Sources, { rows: [], submit: vi.fn() });
@@ -368,14 +393,88 @@ test("selected source detail is loaded on demand without background polling", as
       target: { value: "https://outside.example" },
     });
     await fireEvent.click(screen.getByRole("button", { name: "Filter" }));
-    expect(screen.getByText("connected")).toBeTruthy();
-    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(await screen.findByText("connected")).toBeTruthy();
+    expect(await screen.findByText("43 of 13895 active repositories scanned")).toBeTruthy();
+    expect(document.body.textContent).toContain("Current snapshot only; historical coverage is not complete.");
+    expect(fetcher).toHaveBeenCalledTimes(2);
   } finally {
     cleanup();
     vi.unstubAllGlobals();
   }
 });
-test("source overview shows admission and account quota metadata", () => {
+test("latest same-source detail refresh wins over an older response", async () => {
+  const source = {
+    HostID: 1,
+    Hostname: "race.example",
+    NoSSL: false,
+    DesiredState: "enabled",
+    RuntimeState: "connected",
+    Revision: 1,
+    RecoveryRequired: false,
+    LastDurableCursor: 1,
+    Validation: { Status: "passed", Reason: "" },
+    AccountQuota: { Count: 4, Limit: 25 },
+  };
+  const deferred = <T,>() => {
+    let resolve!: (value: T) => void;
+    let reject!: (reason?: unknown) => void;
+    const promise = new Promise<T>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  };
+  const oldSource = deferred<Response>();
+  const oldCoverage = deferred<Response>();
+  const newSource = deferred<Response>();
+  const newCoverage = deferred<Response>();
+  const sourceResponses = [oldSource, newSource];
+  const coverageResponses = [oldCoverage, newCoverage];
+  const fetcher = vi.fn().mockImplementation((url: string) =>
+    url.includes("/coverage")
+      ? coverageResponses.shift()!.promise
+      : sourceResponses.shift()!.promise,
+  );
+  vi.stubGlobal("fetch", fetcher);
+  try {
+    render(Sources, { rows: [source], submit: vi.fn() });
+    const select = screen.getByRole("button", { name: "race.example" });
+    await fireEvent.click(select);
+    await fireEvent.click(select);
+    expect(fetcher).toHaveBeenCalledTimes(4);
+    newSource.resolve(Response.json(source));
+    newCoverage.resolve(
+      Response.json({
+        items: [
+          {
+            pds: "https://race.example",
+            policy: { revision: 1, collections: ["app.bsky.feed.post"] },
+            jobId: "new",
+            state: "complete",
+            completedRepos: 20,
+            totalRepos: 20,
+            totalReposKnown: true,
+            createdAt: "2026-09-09T00:00:00.000Z",
+            reason: null,
+            historyComplete: false,
+            historicalPDSAttribution: "unknown",
+            coverage: "current_state",
+          },
+        ],
+      }),
+    );
+    expect(await screen.findByText("20 of 20 active repositories scanned")).toBeTruthy();
+    oldSource.reject(new Error("stale source failure"));
+    oldCoverage.reject(new Error("stale coverage failure"));
+    await Promise.resolve();
+    expect(screen.getByText("20 of 20 active repositories scanned")).toBeTruthy();
+    expect(screen.queryByText("Jetstream did not return coverage for this source.")).toBeNull();
+  } finally {
+    cleanup();
+    vi.unstubAllGlobals();
+  }
+});
+test("source overview separates admission quota from Relay-observed accounts", () => {
   render(Sources, {
     rows: [
       {
@@ -394,7 +493,10 @@ test("source overview shows admission and account quota metadata", () => {
     submit: vi.fn(),
   });
   expect(screen.getByText("passed reachable")).toBeTruthy();
-  expect(screen.getByText("4 / 25 accounts")).toBeTruthy();
+  expect(screen.getByText("25 accounts")).toBeTruthy();
+  expect(screen.getByText("4")).toBeTruthy();
+  expect(screen.getByText("Admission quota")).toBeTruthy();
+  expect(screen.getByText("Relay-observed accounts")).toBeTruthy();
   expect(screen.getByText("State / runtime connection")).toBeTruthy();
   expect(screen.getByText(/historical collection counts are unavailable/)).toBeTruthy();
 });
