@@ -55,7 +55,10 @@ type Options struct {
 	DebugAddr           string
 	// hypercerts: Explicitly opt in to profiling on the private listener.
 	EnablePprof bool
-	DataDir     string
+	// AcceptancePrivateHosts activates disposable fixture behavior only when the
+	// binary was built with the acceptance tag. Production builds ignore it.
+	AcceptancePrivateHosts bool
+	DataDir                string
 	// StorageFS is the filesystem for Jetstream-owned durable storage under
 	// DataDir (segments + Pebble). Nil uses the host OS filesystem.
 	StorageFS          vfs.FS

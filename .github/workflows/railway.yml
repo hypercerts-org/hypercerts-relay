@@ -1,0 +1,68 @@
+name: Verify container packaging
+on:
+  pull_request:
+    branches: [main]
+    paths: ['.railway/**', '**/.railway/**', '**/railway.*', '.dockerignore', '**/*.go', '**/go.mod', '**/go.sum', 'administration/**', '**/Dockerfile', 'jetstream/.dockerignore', '.github/workflows/railway.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  repository-boundary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - name: Keep Railway infrastructure configuration private
+        run: |
+          if [ -n "$(git ls-files -- .railway ':(glob)**/.railway/**' ':(glob)**/railway.json' ':(glob)**/railway.toml' ':(glob)**/railway.ts' ':(glob)**/railway.py' ':(glob)**/railway.go')" ]; then
+            echo 'Railway infrastructure configuration belongs in the private infrastructure repository.' >&2
+            exit 1
+          fi
+      - run: git diff --check
+  images:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: relay
+            dockerfile: cmd/relay/Dockerfile
+            context: .
+            binary: /relay
+          - component: rainbow
+            dockerfile: cmd/rainbow/Dockerfile
+            context: .
+            binary: /usr/bin/rainbow
+          - component: jetstream
+            dockerfile: jetstream/Dockerfile
+            context: jetstream
+            binary: /usr/local/bin/jetstream
+          - component: administration
+            dockerfile: administration/Dockerfile
+            context: .
+            binary: /app/node_modules/.bin/tsx
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - name: Build canonical image without publishing
+        env:
+          COMPONENT: ${{ matrix.component }}
+          DOCKERFILE: ${{ matrix.dockerfile }}
+          BUILD_CONTEXT: ${{ matrix.context }}
+        run: docker build -f "$DOCKERFILE" -t "hypercerts-${COMPONENT}:check" "$BUILD_CONTEXT"
+      - name: Check ordinary and Railway startup without starting services
+        env:
+          COMPONENT: ${{ matrix.component }}
+          SERVICE_BINARY: ${{ matrix.binary }}
+        run: |
+          case "$COMPONENT" in
+            jetstream) set -- --help ;;
+            administration) set -- "$SERVICE_BINARY" -e "import('./server/app.ts')" ;;
+            *) set -- "$SERVICE_BINARY" --help ;;
+          esac
+          docker run --rm "hypercerts-${COMPONENT}:check" "$@"
+          docker run --rm \
+            -e HC_RAILWAY_STARTUP=1 -e RAILWAY_VOLUME_MOUNT_PATH=/data \
+            -e HC_RELAY_CONTROL_SECRET=deployment-fixture-credential-32-bytes \
+            -e HC_JETSTREAM_CONTROL_SECRET=deployment-fixture-credential-32-bytes \
+            -e HC_ADMIN_ENCRYPTION_SECRET=deployment-fixture-credential-32-bytes \
+            "hypercerts-${COMPONENT}:check" "$@"

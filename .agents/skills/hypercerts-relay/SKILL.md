@@ -16,6 +16,21 @@ Keep the component boundary explicit:
 
 Do not implement Jetstream filtering/backfill in Relay or Rainbow merely because the components connect to each other. Do not implement the planned OAuth administration UI in any inherited Relay admin surface.
 
+## Disposable acceptance fixtures
+
+Use the Plan 001 Docker fixture only for local, disposable acceptance work. It is
+not a deployment recipe. Private Docker PDS access requires both an acceptance-tag
+build and an explicit component opt-in:
+
+- Relay: `-tags acceptance` and `RELAY_ACCEPTANCE_PRIVATE_HOSTS=true`.
+- Jetstream: Docker build arg `GO_BUILD_TAGS=acceptance` and
+  `JETSTREAM_ACCEPTANCE_PRIVATE_HOSTS=true` (or
+  `--acceptance-private-hosts`).
+
+Normal builds ignore those opt-ins and retain their SSRF protections. Never add
+these settings to Railway or other production configuration. The Jetstream
+acceptance seal endpoint is present only under the same Jetstream two-part gate.
+
 ## Jetstream v2 work
 
 Read `jetstream/README.md` before changing the copied runtime. It records the exact source commit, the included closure, its license, and the update procedure. The Indigo upstream script and `.hypercerts/upstream-paths` do not govern this directory.
@@ -36,3 +51,9 @@ Only a human may merge a pull request. Never push, fast-forward, reset, or force
 Run `./scripts/verify.sh` and `git diff --check` for Relay or Rainbow changes. The script excludes one documented local baseline test failure, while CI runs it separately as a visible non-blocking signal. Do not suppress additional tests without a documented observed behavior and removal condition.
 
 A release is a reviewed version tag and GitHub Release, created only through the manual workflow from `main` after `CHANGELOG.md` is updated. It is not authority to deploy or change a running relay.
+
+## Railway packaging
+
+For Railway images, volumes, private networking and runtime secret handling, read
+`docs/railway.md`. Keep repository preparation separate from an authorized platform
+deployment.

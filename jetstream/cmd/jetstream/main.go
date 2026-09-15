@@ -64,6 +64,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 	"github.com/bluesky-social/jetstream/internal/jetstreamd"
 	"github.com/bluesky-social/jetstream/internal/version"
 	"github.com/bluesky-social/jetstream/internal/xrpcapi"
@@ -213,8 +214,12 @@ func serveCommand() *cli.Command {
 			// hypercerts: Credentials come from mounted files, never command-line values.
 			&cli.StringFlag{Name: "control-token-file", Usage: "Mounted secret file for the private service API; requires debug-addr", Sources: cli.EnvVars("JETSTREAM_CONTROL_TOKEN_FILE")},
 			&cli.StringSliceFlag{Name: "pds-sources", Usage: "Initial admitted direct-PDS HTTPS origins to backfill; comma-separated", Sources: cli.EnvVars("JETSTREAM_PDS_SOURCES")},
-			// hypercerts: A new archive starts fail-closed unless exact collections are supplied.
-			&cli.StringSliceFlag{Name: "collections", Usage: "Initial exact collection NSIDs for a new data directory; empty stores no records. Existing persisted policy wins.", Sources: cli.EnvVars("JETSTREAM_COLLECTIONS")},
+			// hypercerts: Seed new archives with bundled record NSIDs unless explicitly overridden.
+			&cli.StringSliceFlag{Name: "collections", Usage: "Initial exact collection NSIDs, overriding the bundled seed; empty stores no records. Existing persisted policy wins.", Sources: cli.EnvVars("JETSTREAM_COLLECTIONS")},
+			&cli.BoolFlag{Name: "disable-collection-seed", Usage: "Disable bundled Hypercerts/Certified collection seeding for a new data directory; explicit collections still apply", Sources: cli.EnvVars("JETSTREAM_DISABLE_COLLECTION_SEED")},
+			// This is inert in production builds. Acceptance builds use it with fixed
+			// fixture origins that resolve inside a Docker network.
+			&cli.BoolFlag{Name: "acceptance-private-hosts", Usage: "Allow acceptance-only private fixture hosts when built with the acceptance tag", Sources: cli.EnvVars("JETSTREAM_ACCEPTANCE_PRIVATE_HOSTS")},
 			&cli.StringFlag{
 				Name:    "relay-url",
 				Usage:   "Base URL of the upstream relay",
@@ -455,17 +460,25 @@ func serveOptionsFromCommand(cmd *cli.Command) (jetstreamd.Options, error) {
 	if maxBackfillRepos > 0 || len(backfillRepos) > 0 {
 		skipMergeDiscovery = true
 	}
+	// hypercerts: Only initial policy defaults are seeded; durable policy always wins.
+	initialCollections := cmd.StringSlice("collections")
+	if !cmd.IsSet("collections") && !cmd.Bool("disable-collection-seed") {
+		initialCollections = selection.DefaultCollections()
+	} else if len(initialCollections) == 1 && initialCollections[0] == "" {
+		initialCollections = nil // Explicit --collections= opts out without an invalid empty NSID.
+	}
 
 	return jetstreamd.Options{
-		ControlToken: controlToken,
-		PublicAddr:   cmd.String("addr"),
-		DebugAddr:    cmd.String("debug-addr"),
-		EnablePprof:  cmd.Bool("enable-pprof"),
-		DataDir:      cmd.String("data-dir"),
+		ControlToken:           controlToken,
+		PublicAddr:             cmd.String("addr"),
+		DebugAddr:              cmd.String("debug-addr"),
+		EnablePprof:            cmd.Bool("enable-pprof"),
+		AcceptancePrivateHosts: cmd.Bool("acceptance-private-hosts"),
+		DataDir:                cmd.String("data-dir"),
 		// hypercerts: Production serve always enforces the durable collection policy.
 		CollectionSelection:            true,
 		InitialPDSSources:              cmd.StringSlice("pds-sources"),
-		InitialCollections:             cmd.StringSlice("collections"),
+		InitialCollections:             initialCollections,
 		RelayURL:                       cmd.String("relay-url"),
 		PLCURL:                         cmd.String("plc-url"),
 		OTelServiceName:                cmd.String("otel-service-name"),

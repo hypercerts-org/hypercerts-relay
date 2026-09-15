@@ -3,6 +3,7 @@ package relay
 import (
 	"bytes"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/bluesky-social/indigo/atproto/identity"
@@ -17,6 +18,19 @@ func TestVerifyCommitObjectRejectsMissingIdentity(t *testing.T) {
 
 	relay := &Relay{}
 	require.ErrorIs(t, relay.VerifyCommitObject(t.Context(), commit, nil, "source.example"), ErrIdentityUnavailable)
+}
+
+func TestVerifyCommitObjectReportsInvalidIdentityKey(t *testing.T) {
+	_, event := loadIngestFixture(t)
+	commit, _, err := repo.LoadCommitFromCAR(t.Context(), bytes.NewReader(event.Blocks))
+	require.NoError(t, err)
+
+	relay := &Relay{}
+	err = relay.VerifyCommitObject(t.Context(), commit, &identity.Identity{Keys: map[string]identity.VerificationMethod{
+		"atproto": {Type: "Multikey", PublicKeyMultibase: "znot-a-valid-key"},
+	}}, "source.example")
+	require.ErrorIs(t, err, ErrIdentityUnavailable)
+	require.True(t, strings.Contains(err.Error(), "parse atproto public key"), err)
 }
 
 func TestVerifyCommitDIDMismatchDoesNotRefreshIdentity(t *testing.T) {

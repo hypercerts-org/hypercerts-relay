@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# Plan 001 disposable acceptance entry point. It owns only tests/acceptance/results.
+set -euo pipefail
+
+case_id=${1:-}
+if [[ $# -ne 1 || "$case_id" != "T01" ]]; then
+  printf '%s\n' 'usage: ./tests/acceptance/run T01' >&2
+  printf '%s\n' 'T15-core is intentionally not implemented by Plan 001 and must fail.' >&2
+  exit 64
+fi
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+mkdir -p "$root/tests/acceptance/results"
+run_dir=$(mktemp -d "$root/tests/acceptance/results/T01.XXXXXX")
+project="hc-t01-$(basename "$run_dir" | tr -cd '[:alnum:]' | tr '[:upper:]' '[:lower:]')"
+env_file="$run_dir/.env"
+compose=(docker compose --project-name "$project" --env-file "$env_file" -f "$root/docker-compose.acceptance.yml")
+consumer_pid=''
+
+cleanup() {
+  status=$?
+  if [[ -n "$consumer_pid" ]]; then kill "$consumer_pid" 2>/dev/null || true; fi
+  "${compose[@]}" logs --no-color >"$run_dir/compose.log" 2>&1 || true
+  "${compose[@]}" down --volumes --remove-orphans >>"$run_dir/compose.log" 2>&1 || true
+  # The runner's generated file contains all ephemeral credentials. Keep only
+  # sanitized evidence and source revisions in the retained result directory.
+  rm -f "$env_file"
+  exit "$status"
+}
+trap cleanup EXIT INT TERM
+
+random_hex() { openssl rand -hex "$1"; }
+rotation_key() {
+  openssl ecparam --name secp256k1 --genkey --noout --outform DER \
+    | tail --bytes=+8 | head --bytes=32 | xxd --plain --cols 32
+}
+free_port() {
+  python3 - <<'PY'
+import socket
+sock = socket.socket()
+sock.bind(('127.0.0.1', 0))
+print(sock.getsockname()[1])
+sock.close()
+PY
+}
+wait_for_http() {
+  local url=$1 label=$2 code='000'
+  for _ in $(seq 1 90); do
+    code=$(curl --silent --output /dev/null --write-out '%{http_code}' "$url" || true)
+    [[ "$code" != 000 ]] && return
+    sleep 1
+  done
+  printf '%s did not bind its public listener\n' "$label" >&2
+  return 1
+}
+wait_for_assertion() {
+  local label=$1
+  shift
+  for _ in $(seq 1 90); do
+    if node "$root/tests/acceptance/assert.mjs" "$@" >/dev/null 2>&1; then return; fi
+    if [[ -n "$consumer_pid" ]] && ! kill -0 "$consumer_pid" 2>/dev/null; then
+      printf '%s consumer exited before its assertion succeeded\n' "$label" >&2
+      return 1
+    fi
+    sleep 1
+  done
+  printf '%s did not satisfy its assertion within 90 seconds\n' "$label" >&2
+  return 1
+}
+
+cat >"$env_file" <<EOF
+ACCEPTANCE_STATE_DIR=$run_dir
+JETSTREAM_HOST_PORT=$(free_port)
+RELAY_CONTROL_TOKEN=$(random_hex 32)
+RELAY_ADMIN_PASSWORD=$(random_hex 24)
+PDS_A_JWT_SECRET=$(random_hex 32)
+PDS_A_ADMIN_PASSWORD=$(random_hex 24)
+PDS_A_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX=$(rotation_key)
+PDS_B_JWT_SECRET=$(random_hex 32)
+PDS_B_ADMIN_PASSWORD=$(random_hex 24)
+PDS_B_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX=$(rotation_key)
+EOF
+chmod 600 "$env_file"
+printf '%s\n' "run directory: $run_dir"
+git -C "$root" rev-parse HEAD >"$run_dir/relay-revision"
+git -C "$root/jetstream" rev-parse HEAD >"$run_dir/jetstream-revision"
+
+"${compose[@]}" config --quiet
+"${compose[@]}" up --build --detach
+
+jetstream_port=$(awk -F= '$1 == "JETSTREAM_HOST_PORT" { print $2 }' "$env_file")
+jetstream_url="http://127.0.0.1:$jetstream_port"
+wait_for_http "$jetstream_url/" Jetstream
+
+"${compose[@]}" exec --no-TTY driver node /app/driver.mjs bootstrap | tee "$run_dir/bootstrap.json"
+
+# The acceptance-tag Jetstream binary exposes this route only when private
+# fixture hosts are explicitly enabled. Retrying the rotation accounts for the real
+# Relay→Jetstream asynchronous boundary; the public archive assertion proves the
+# resulting sealed boundary contains the complete seed phase.
+sealed=0
+for _ in $(seq 1 90); do
+  curl --fail --silent --show-error --request POST "$jetstream_url/hypercerts/acceptance/seal"
+  curl --fail --silent --show-error --request POST \
+    --header 'content-type: application/json' \
+    --data '{}' \
+    "$jetstream_url/xrpc/network.bsky.jetstream.planSnapshot" >"$run_dir/archive-snapshot.json" || true
+  sealed=$(node -e 'const fs = require("fs"); const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8")).sealedTipSeq; process.stdout.write(Number.isSafeInteger(value) ? String(value) : "0")' "$run_dir/archive-snapshot.json" 2>/dev/null || printf 0)
+  if (( sealed > 0 )); then
+    (
+      cd "$root/jetstream"
+      go run ./cmd/client \
+        --host "127.0.0.1:$jetstream_port" \
+        --after-seq 0 \
+        --before-seq "$sealed" \
+        --backfill-only \
+        --collection app.bsky.feed.post \
+        --batch-size 1 \
+        --zstd=false \
+        --print
+    ) >"$run_dir/archive.ndjson" 2>"$run_dir/archive.stderr" || true
+    if node "$root/tests/acceptance/assert.mjs" archive "$run_dir/bootstrap.json" "$run_dir/archive.ndjson" "$run_dir/archive-snapshot.json" >/dev/null 2>&1; then
+      break
+    fi
+  fi
+  sleep 1
+done
+if (( sealed == 0 )) || ! node "$root/tests/acceptance/assert.mjs" archive "$run_dir/bootstrap.json" "$run_dir/archive.ndjson" "$run_dir/archive-snapshot.json"; then
+  printf '%s\n' 'seed events were not proven in the sealed archive' >&2
+  exit 1
+fi
+
+(
+  cd "$root/jetstream"
+  go build -o "$run_dir/jetstream-client" ./cmd/client
+)
+"$run_dir/jetstream-client" \
+  --host "127.0.0.1:$jetstream_port" \
+  --after-seq 0 \
+  --collection app.bsky.feed.post \
+  --batch-size 1 \
+  --zstd=false \
+  --print >"$run_dir/consumer.ndjson" 2>"$run_dir/consumer.stderr" &
+consumer_pid=$!
+
+# Seeing every expected seed event through archive replay proves the combined
+# client is at its live cutover before the driver introduces the live phase.
+wait_for_assertion 'archive-to-live consumer readiness' \
+  seed-ready "$run_dir/bootstrap.json" "$run_dir/consumer.ndjson"
+"${compose[@]}" exec --no-TTY driver node /app/driver.mjs live | tee "$run_dir/live.json"
+wait_for_assertion 'archive-to-live consumer result' \
+  combined "$run_dir/bootstrap.json" "$run_dir/consumer.ndjson" \
+  "$run_dir/archive-snapshot.json" "$run_dir/live.json"
+
+kill "$consumer_pid" 2>/dev/null || true
+wait "$consumer_pid" 2>/dev/null || true
+consumer_pid=''
+printf '%s\n' 'T01 passed: two independent PDS sources produced lifecycle and create/update/delete events across a sealed archive-to-live cutover.'

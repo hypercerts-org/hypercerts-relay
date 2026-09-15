@@ -76,7 +76,9 @@ func TestClaimDueAccountLimitAlertsPersistsWarningState(t *testing.T) {
 func TestClaimDueAccountLimitAlertsRepeatsAfterInterval(t *testing.T) {
 	ctx := context.Background()
 	r, db := testRelayWithHostDB(t)
-	oldSentAt := time.Now().Add(-2 * time.Hour)
+	// hypercerts: ClaimDueAccountLimitAlerts persists UTC timestamps; use the
+	// same representation so SQLite does not compare zone-offset text lexically.
+	oldSentAt := time.Now().UTC().Add(-2 * time.Hour)
 	require.NoError(t, db.Create(&models.Host{
 		Hostname:                "over.example.com",
 		AccountCount:            85,

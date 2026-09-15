@@ -37,25 +37,32 @@ var ErrNotFound = errors.New("job not found")
 var ErrInvalidInput = errors.New("invalid job input")
 
 type Job struct {
-	ID              string            `json:"id"`
-	PDS             string            `json:"pds"`
-	Policy          selection.Policy  `json:"policy"`
-	Reason          string            `json:"reason"`
-	State           State             `json:"state"`
-	Attempts        int               `json:"attempts"`
-	CompletedRepos  map[string]string `json:"completedRepos"`
-	Cursor          string            `json:"cursor"`
-	ErrorCode       string            `json:"errorCode,omitempty"`
-	CreatedAt       time.Time         `json:"createdAt"`
-	StartedAt       time.Time         `json:"startedAt,omitempty"`
-	FinishedAt      time.Time         `json:"finishedAt,omitempty"`
-	Coverage        string            `json:"coverage"`
-	HistoryComplete bool              `json:"historyComplete"`
+	ID             string            `json:"id"`
+	PDS            string            `json:"pds"`
+	Policy         selection.Policy  `json:"policy"`
+	Reason         string            `json:"reason"`
+	State          State             `json:"state"`
+	Attempts       int               `json:"attempts"`
+	CompletedRepos map[string]string `json:"completedRepos"`
+	// EnumeratedRepos is the durable, non-public subtotal used to resume a
+	// single PDS inventory scan without re-counting earlier pages.
+	EnumeratedRepos int       `json:"enumeratedRepos"`
+	TotalRepos      int       `json:"totalRepos"`
+	TotalReposKnown bool      `json:"totalReposKnown"`
+	Cursor          string    `json:"cursor"`
+	ErrorCode       string    `json:"errorCode,omitempty"`
+	CreatedAt       time.Time `json:"createdAt"`
+	StartedAt       time.Time `json:"startedAt,omitempty"`
+	FinishedAt      time.Time `json:"finishedAt,omitempty"`
+	Coverage        string    `json:"coverage"`
+	HistoryComplete bool      `json:"historyComplete"`
 }
 type data struct {
-	Initialized bool            `json:"initialized"`
-	Sources     map[string]bool `json:"sources"`
-	Jobs        map[string]Job  `json:"jobs"`
+	Actions     map[string]string `json:"actions,omitempty"`
+	Requests    map[string]string `json:"requests,omitempty"`
+	Initialized bool              `json:"initialized"`
+	Sources     map[string]bool   `json:"sources"`
+	Jobs        map[string]Job    `json:"jobs"`
 }
 type Manager struct {
 	mu        sync.Mutex
@@ -99,6 +106,7 @@ func Open(db *store.Store, policy *selection.Manager) (*Manager, error) {
 			return nil, errors.New("invalid job status")
 		}
 	}
+	m.data.migrateActionReceipts()
 	if err := m.save(m.data); err != nil {
 		return nil, err
 	}
@@ -246,7 +254,13 @@ func (m *Manager) SetPolicy(expected uint64, collections []string) (selection.Po
 	}
 	return policy, nil
 }
-func (m *Manager) Request(raw, reason string) (Job, error) {
+func (m *Manager) Request(raw, reason string) (Job, error) { return m.RequestOnce(raw, reason, "") }
+
+// RequestOnce durably deduplicates control-plane retries, including terminal jobs.
+func (m *Manager) RequestOnce(raw, reason, requestID string) (Job, error) {
+	if len(requestID) > 128 {
+		return Job{}, ErrInvalidInput
+	}
 	if reason != "quota_recovery" && reason != "backfill" {
 		return Job{}, fmt.Errorf("%w: unsupported job reason", ErrInvalidInput)
 	}
@@ -256,58 +270,90 @@ func (m *Manager) Request(raw, reason string) (Job, error) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if id, ok := m.data.Requests[requestID]; requestID != "" && ok {
+		existing := m.data.Jobs[id]
+		if existing.PDS != pds || existing.Reason != reason {
+			return Job{}, ErrConflict
+		}
+		return clone(existing), nil
+	}
 	if !m.data.Sources[pds] {
 		return Job{}, ErrConflict
 	}
 	next := clone(m.data)
-	policy := m.policy.Current()
+	j := requestJob(next, pds, reason, m.policy.Current())
+	return m.rememberRequest(next, j, requestID)
+}
+
+func requestJob(next data, pds, reason string, policy selection.Policy) Job {
 	for _, existing := range next.Jobs {
 		if existing.PDS == pds && existing.Policy.Revision == policy.Revision && existing.Reason == reason && (existing.State == Pending || existing.State == Running) {
-			return clone(existing), nil
+			return existing
 		}
 	}
 	j := newJob(pds, policy, reason)
 	if existing, ok := next.Jobs[j.ID]; ok {
 		if existing.State == Pending || existing.State == Running {
-			return clone(existing), nil
+			return existing
 		}
 		// A later recovery gap is new work, preserving the previous result.
 		sum := sha256.Sum256([]byte(fmt.Sprintf("%s/%d", j.ID, len(next.Jobs))))
 		j.ID = hex.EncodeToString(sum[:16])
 	}
 	next.Jobs[j.ID] = j
-	if err := m.commit(next); err != nil {
-		return Job{}, err
-	}
-	return clone(j), nil
+	return j
 }
-func (m *Manager) Cancel(id string) error { return m.transition(id, Canceled) }
-func (m *Manager) Retry(id string) error  { return m.transition(id, Pending) }
-func (m *Manager) transition(id string, state State) error {
+func (m *Manager) Cancel(id string) error                  { return m.transition(id, Canceled) }
+func (m *Manager) Retry(id string) error                   { return m.transition(id, Pending) }
+func (m *Manager) transition(id string, state State) error { return m.TransitionOnce(id, state, "") }
+
+// TransitionOnce records command receipts atomically with cancellation/retry.
+func (m *Manager) TransitionOnce(id string, state State, requestID string) error {
+	if len(requestID) > 128 || (state != Pending && state != Canceled) {
+		return ErrInvalidInput
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if existing, ok := m.data.Actions[requestID]; requestID != "" && ok {
+		if existing != string(state)+":"+id {
+			return ErrConflict
+		}
+		return nil
+	}
 	j, ok := m.data.Jobs[id]
 	if !ok {
 		return ErrNotFound
 	}
-	if state == Pending && (!m.data.Sources[j.PDS] || j.Policy.Revision != m.policy.Current().Revision || j.State == Running) {
+	if !m.canTransition(j, state, requestID != "") {
 		return ErrConflict
 	}
-	if state == Canceled && j.State != Pending && j.State != Running {
-		return ErrConflict
-	}
+	return m.commitTransition(j, state, requestID)
+}
+
+// commitTransition persists the receipt with the resulting state before stopping
+// acquisition. The caller holds mu and has already validated the transition.
+func (m *Manager) commitTransition(j Job, state State, requestID string) error {
 	next := clone(m.data)
+	if requestID != "" {
+		if next.Actions == nil {
+			next.Actions = map[string]string{}
+		}
+		next.Actions[requestID] = string(state) + ":" + j.ID
+	}
+	if requestID != "" && (j.State == state || (state == Pending && j.State == Running)) {
+		return m.commit(next)
+	}
 	j.State = state
 	j.ErrorCode = ""
 	j.FinishedAt = time.Time{}
 	if state == Canceled {
 		j.FinishedAt = time.Now().UTC()
 	}
-	next.Jobs[id] = j
+	next.Jobs[j.ID] = j
 	if err := m.commit(next); err != nil {
 		return err
 	}
-	if state == Canceled && m.cancel != nil && m.runningID == id {
+	if state == Canceled && m.cancel != nil && m.runningID == j.ID {
 		m.cancel()
 	}
 	return nil
@@ -341,6 +387,50 @@ func (m *Manager) Apply(id string, write func() error) error {
 	}
 	return write()
 }
+
+// SetTotalRepos records a known PDS snapshot size. PDSProcessor normally uses
+// CheckpointEnumeration so retries never need to re-count earlier pages.
+func (m *Manager) SetTotalRepos(id string, total int) error {
+	if total < 0 {
+		return ErrInvalidInput
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.active(id) {
+		return ErrConflict
+	}
+	next := clone(m.data)
+	job := next.Jobs[id]
+	job.TotalRepos = total
+	job.TotalReposKnown = true
+	next.Jobs[id] = job
+	return m.commit(next)
+}
+
+// CheckpointEnumeration atomically advances a completed inventory page and its
+// active-repository subtotal. A retry begins at the saved cursor, so each page
+// contributes to the eventual total at most once.
+func (m *Manager) CheckpointEnumeration(id, cursor string, active int, complete bool) error {
+	if active < 0 {
+		return ErrInvalidInput
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.active(id) {
+		return ErrConflict
+	}
+	next := clone(m.data)
+	job := next.Jobs[id]
+	job.Cursor = cursor
+	job.EnumeratedRepos += active
+	if complete {
+		job.TotalRepos = job.EnumeratedRepos
+		job.TotalReposKnown = true
+	}
+	next.Jobs[id] = job
+	return m.commit(next)
+}
+
 func (m *Manager) Checkpoint(id, did, rev, cursor string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -473,4 +563,42 @@ func jobOutcome(err error) (State, string, error) {
 		return Pending, "", nil
 	}
 	return "", "", err
+}
+
+// Previous versions mixed action receipts into Requests using an action/ prefix.
+// Recognize their typed value, not only their key: a job request ID may itself
+// start with action/. Keep every old receipt so journal retries remain safe.
+func (d *data) migrateActionReceipts() {
+	for key, value := range d.Requests {
+		state, id, ok := strings.Cut(value, ":")
+		if !strings.HasPrefix(key, "action/") || !ok || (State(state) != Pending && State(state) != Canceled) {
+			continue
+		}
+		if _, exists := d.Jobs[id]; !exists {
+			continue
+		}
+		if d.Actions == nil {
+			d.Actions = map[string]string{}
+		}
+		d.Actions[strings.TrimPrefix(key, "action/")] = value
+		delete(d.Requests, key)
+	}
+}
+func (m *Manager) rememberRequest(next data, job Job, requestID string) (Job, error) {
+	if requestID != "" {
+		if next.Requests == nil {
+			next.Requests = map[string]string{}
+		}
+		next.Requests[requestID] = job.ID
+	}
+	if err := m.commit(next); err != nil {
+		return Job{}, err
+	}
+	return clone(job), nil
+}
+func (m *Manager) canTransition(j Job, state State, hasReceipt bool) bool {
+	if state == Pending {
+		return m.data.Sources[j.PDS] && j.Policy.Revision == m.policy.Current().Revision && (j.State != Running || hasReceipt)
+	}
+	return j.State == Pending || j.State == Running || (hasReceipt && j.State == Canceled)
 }

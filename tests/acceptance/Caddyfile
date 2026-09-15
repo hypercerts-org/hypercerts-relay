@@ -1,0 +1,18 @@
+{
+	auto_https disable_redirects
+}
+
+https://plc.test {
+	tls internal
+	reverse_proxy plc:2582
+}
+
+https://pds-a.test {
+	tls internal
+	reverse_proxy pds-a:3000
+}
+
+https://pds-b.test {
+	tls internal
+	reverse_proxy pds-b:3000
+}

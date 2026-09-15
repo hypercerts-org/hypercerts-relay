@@ -28,6 +28,7 @@ type Relay struct {
 	// hypercerts: Serialize each account across source connections during migration.
 	eventLocks [256]sync.Mutex
 	sourcesLk  sync.Mutex
+	rates      *ratePolicies // hypercerts: Durable source/global event admission policy.
 
 	// Management of Socket Consumers
 	consumersLk    sync.RWMutex
@@ -95,7 +96,12 @@ func NewRelay(db *gorm.DB, evtman *eventmgr.EventManager, dir identity.Directory
 		return nil, err
 	}
 
+	// hypercerts: Restore applied policies before any source socket starts.
+	if err := r.loadRatePolicies(); err != nil {
+		return nil, err
+	}
 	slurpConfig := DefaultSlurperConfig()
+	slurpConfig.WaitRateCapacity = r.waitRateCapacity
 	slurpConfig.ConcurrencyPerHost = config.ConcurrencyPerHost
 
 	// register callbacks to persist cursors and host state in database

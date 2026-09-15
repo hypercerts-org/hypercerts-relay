@@ -1,0 +1,35 @@
+.git
+**/node_modules
+**/dist
+**/test-results
+**/playwright-report
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+**/*.db
+**/*.db-shm
+**/*.db-wal
+**/*.sqlite
+**/*.sqlite-shm
+**/*.sqlite-wal
+**/*.log
+**/*.test
+/data
+/jetstream/data
+/out
+/build
+/relay
+/rainbow
+/jetstream/bin
+
+# hypercerts: Never send local private infrastructure definitions in build contexts.
+**/.railway
+**/railway.json
+**/railway.toml
+**/railway.ts
+**/railway.py
+**/railway.go
+
+# Obtain a verified Switzer copy directly from Fontshare inside the build.
+/administration/src/brand/assets/fonts/Switzer-Variable.woff2

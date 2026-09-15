@@ -1,0 +1,128 @@
+/* Hypercerts design system — Tailwind v4 theme.
+ *
+ *   @import "tailwindcss";
+ *   @import "@hypercerts/design/theme/hypercerts.css";
+ *
+ * That is the whole setup. It registers the brand faces and replaces
+ * Tailwind's default colour palette with the Hypercerts one, so `bg-blue-500`
+ * stops existing and `bg-surface-cream` starts.
+ *
+ * Font files are resolved relative to this file — keep `assets/fonts/` next to
+ * `theme/` when you vendor it, or rewrite the four `src:` URLs.
+ */
+
+@font-face {
+  font-family: "Instrument Serif";
+  src: url("../assets/fonts/InstrumentSerif-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Instrument Serif";
+  src: url("../assets/fonts/InstrumentSerif-Italic.woff2") format("woff2");
+  font-weight: 400;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Switzer Variable";
+  src: url("../assets/fonts/Switzer-Variable.woff2") format("woff2");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+@theme {
+  /* Tailwind's default palette is cleared deliberately. The brand is a small
+   * closed set of colours, and an agent reaching for `bg-slate-100` is the
+   * most common way output stops looking like Hypercerts. */
+  --color-*: initial;
+  --color-transparent: transparent;
+  --color-current: currentColor;
+  --color-inherit: inherit;
+
+  /* THE TEXT LAYER — the only three colours type is ever set in. */
+  --color-brand-black: #000000;   /* headings, rules, ink */
+  --color-brand-accent: #af2901;  /* the italic clause, eyebrows, one figure row */
+  --color-ui-grey-dark: #535353;  /* body copy — never black */
+
+  /* GROUNDS */
+  --color-brand-white: #ffffff;
+  --color-ui-bg: #f1f1f1;
+  --color-surface-cream: #f9f6ef;
+
+  /* LINES AND SUPPORTING GREYS */
+  --color-ui-separator: #d2d2d2;  /* hairlines */
+  --color-ui-grey: #999999;       /* notes, captions */
+  --color-ui-grey-light: #d7d7d7;
+  --color-ui-grey-tag: #ececec;
+
+  /* PANEL TINTS — one per document or page. Never behind body copy. */
+  --color-surface-sage: #e1edda;
+  --color-surface-green-light: #f2f9ec;
+  --color-surface-teal-light: #e7f2f2;
+  --color-surface-blue-light: #e7eff3;
+  --color-surface-lavender: #efeff9;
+
+  /* ORNAMENT ONLY — the guilloche palette. These must not appear in the text
+   * layer or as a panel ground. The namespace is the rule: if you have typed
+   * `bg-ornament-`, you have made a mistake. */
+  --color-ornament-teal: #33b899;
+  --color-ornament-teal-light: #a1e6da;
+  --color-ornament-navy: #14334c;
+  --color-ornament-deep-navy: #121047;
+  --color-ornament-forest: #426a5a;
+  --color-ornament-orange: #ff4b00;
+  --color-ornament-orange-light: #ffd099;
+  --color-ornament-green: #b6e6a1;
+  --color-ornament-green-light: #edffb8;
+
+  /* TYPE */
+  --font-display: "Instrument Serif", Georgia, serif;
+  --font-body: "Switzer Variable", system-ui, sans-serif;
+
+  --text-display-1: 160px;
+  --text-display-1--line-height: 0.81;
+  --text-display-1--letter-spacing: -0.03em;
+  --text-display-2: 72px;
+  --text-display-2--line-height: 1;
+  --text-display-2--letter-spacing: -0.02em;
+  --text-display-3: 48px;
+  --text-display-3--line-height: 1.1;
+  --text-display-3--letter-spacing: -0.02em;
+  --text-heading-4: 24px;
+  --text-heading-4--line-height: 1.17;
+  --text-heading-4--letter-spacing: -0.02em;
+  --text-body-lg: 18px;
+  --text-body-lg--line-height: 1.2;
+  --text-body-lg--letter-spacing: -0.2px;
+  --text-body-sm: 14px;
+  --text-body-sm--line-height: 1.2;
+
+  /* The only radius the brand uses. It keeps panels soft rather than technical. */
+  --radius-brand: 12px;
+
+  /* The fixed site header height, carried over as a rhythm unit. */
+  --spacing-header: 50px;
+}
+
+/* Base defaults, mirroring the site's own `app/globals.css`.
+ *
+ * Without these, every element needs an explicit `font-body` and the most
+ * common failure is output that quietly renders in the system sans. Setting
+ * them here means a bare <p> is already correct.
+ *
+ * Body copy still needs `text-ui-grey-dark` applied — the default here is
+ * black because headings, labels and interface text outnumber running prose.
+ */
+@layer base {
+  body {
+    font-family: var(--font-body);
+    color: var(--color-brand-black);
+    background-color: var(--color-brand-white);
+  }
+  h1, h2, h3 {
+    font-family: var(--font-display);
+  }
+}

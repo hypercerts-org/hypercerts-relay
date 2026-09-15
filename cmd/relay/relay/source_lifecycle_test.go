@@ -96,6 +96,46 @@ func TestSourceAddDefersConnectionAndListsQuietSource(t *testing.T) {
 	_ = fixture.next(t)
 }
 
+func TestSourceEnableAndRetryPreserveActiveSubscription(t *testing.T) {
+	ctx := context.Background()
+	fixture := newSourceFixture(t)
+	r, _, processed := newSourceLifecycleRelay(t)
+	validated, connection := addPassedSource(t, r, fixture)
+
+	// The private control adapter enables the source after validating it, then
+	// repeats AddSource and SetSourceState when an administrator retries.
+	enabled, err := r.SetSourceState(ctx, validated.HostID, validated.Revision, models.SourceStateEnabled)
+	require.NoError(t, err)
+	require.Equal(t, validated.Revision, enabled.Revision)
+	duplicate, err := r.AddSource(ctx, "http://"+fixture.host)
+	require.NoError(t, err)
+	retried, err := r.SetSourceState(ctx, duplicate.HostID, duplicate.Revision, models.SourceStateEnabled)
+	require.NoError(t, err)
+	require.Equal(t, enabled.Revision, retried.Revision)
+	requireNoSourceConnection(t, fixture)
+
+	connection.emit(t, &stream.XRPCStreamEvent{RepoIdentity: &comatproto.SyncSubscribeRepos_Identity{
+		Seq: 7, Did: "did:plc:abcdefghijklmnopqrstuvwx", Time: "2026-09-07T12:00:00Z",
+	}})
+	select {
+	case sequence := <-processed:
+		require.Equal(t, int64(7), sequence)
+	case <-time.After(5 * time.Second):
+		t.Fatal("original source connection stopped processing events")
+	}
+}
+
+func TestSubscribeRejectsDrainingSubscription(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	host := &models.Host{Hostname: "draining.example"}
+	sub := &Subscription{Hostname: host.Hostname, ctx: ctx}
+	slurper := &Slurper{subs: map[string]*Subscription{host.Hostname: sub}}
+
+	require.ErrorContains(t, slurper.Subscribe(host), "subscription is stopping")
+	require.Same(t, sub, slurper.subs[host.Hostname])
+}
+
 func TestSourceDisableDuplicateAddAndReenableResumeDurableCursor(t *testing.T) {
 	ctx := context.Background()
 	fixture := newSourceFixture(t)

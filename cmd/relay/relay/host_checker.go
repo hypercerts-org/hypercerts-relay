@@ -33,9 +33,15 @@ func NewHostClient(userAgent string) *HostClient {
 	if userAgent == "" {
 		userAgent = "indigo-relay (atproto-relay)"
 	}
+	transport := ssrf.PublicOnlyTransport()
+	// hypercerts: acceptance-tag builds alone exercise real PDS containers on a
+	// private Docker network. Production builds always retain the SSRF transport.
+	if acceptancePrivateHostsEnabled() {
+		transport = http.DefaultTransport.(*http.Transport).Clone()
+	}
 	c := http.Client{
 		Timeout:   5 * time.Second,
-		Transport: ssrf.PublicOnlyTransport(),
+		Transport: transport,
 	}
 	return &HostClient{
 		Client:    &c,

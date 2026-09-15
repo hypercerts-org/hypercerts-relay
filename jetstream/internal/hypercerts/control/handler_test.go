@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -41,7 +42,7 @@ func request(h http.Handler, method, path, body, token string) *httptest.Respons
 }
 func TestPrivateAuthenticationAndInputValidation(t *testing.T) {
 	h, m := setup(t)
-	for _, path := range []string{"/policy", "/sources", "/jobs", "/jobs/unknown", "/jobs/unknown/cancel", "/jobs/unknown/retry"} {
+	for _, path := range []string{"/policy", "/sources", "/jobs", "/coverage", "/jobs/unknown", "/jobs/unknown/cancel", "/jobs/unknown/retry"} {
 		for _, method := range []string{"GET", "POST", "PUT", "DELETE"} {
 			w := request(h, method, path, `{}`, "")
 			require.Equal(t, 401, w.Code)
@@ -111,8 +112,57 @@ func TestPrivateLifecycleAndCoverage(t *testing.T) {
 	require.NoError(t, json.Unmarshal(page.Body.Bytes(), &result))
 	require.Len(t, result.Jobs, 1)
 	require.NotEmpty(t, result.NextCursor)
+	coverage := request(h, "GET", "/coverage", "", testToken)
+	require.Equal(t, 200, coverage.Code)
+	var coveragePage struct {
+		Items []coverageView `json:"items"`
+	}
+	require.NoError(t, json.Unmarshal(coverage.Body.Bytes(), &coveragePage))
+	require.Len(t, coveragePage.Items, 1)
+	require.Equal(t, "https://pds.example", coveragePage.Items[0].PDS)
+	require.Equal(t, uint64(2), coveragePage.Items[0].Policy.Revision)
+	require.Equal(t, "policy_changed", coveragePage.Items[0].Reason)
+	_, err := m.AddSource("https://other.example")
+	require.NoError(t, err)
+	filtered := request(h, "GET", "/coverage?summary=1&pds=https%3A%2F%2Fpds.example&pds=https%3A%2F%2Fother.example", "", testToken)
+	require.Equal(t, 200, filtered.Code)
+	var summaries struct {
+		Items []coverageSummaryView `json:"items"`
+	}
+	require.NoError(t, json.Unmarshal(filtered.Body.Bytes(), &summaries))
+	require.Len(t, summaries.Items, 2)
+	require.Equal(t, "https://other.example", summaries.Items[0].PDS)
+	require.Equal(t, "https://pds.example", summaries.Items[1].PDS)
+	require.NotContains(t, filtered.Body.String(), "policy")
 	require.Equal(t, 204, request(h, "DELETE", "/sources", `{"pds":"https://pds.example"}`, testToken).Code)
 }
+
+func TestCoverageSelectionPaginationAndSummary(t *testing.T) {
+	created := time.Date(2026, time.September, 15, 12, 0, 0, 0, time.UTC)
+	jobsList := []jobs.Job{
+		{ID: "a-old", PDS: "https://a.example", CreatedAt: created},
+		{ID: "a-new", PDS: "https://a.example", CreatedAt: created.Add(time.Second)},
+		{ID: "b-a", PDS: "https://b.example", CreatedAt: created},
+		{ID: "b-z", PDS: "https://b.example", CreatedAt: created},
+		{ID: "c-only", PDS: "https://c.example", CreatedAt: created},
+	}
+
+	options, ok := parseCoverageOptions(httptest.NewRequest("GET", Prefix+"/coverage?limit=1&pds=https%3A%2F%2Fa.example&pds=https%3A%2F%2Fb.example&summary=1", nil))
+	require.True(t, ok)
+	require.True(t, options.summary)
+	selected := latestCoverageJobs(jobsList, options.requestedPDS)
+	require.Equal(t, []string{"a-new", "b-z"}, []string{selected[0].ID, selected[1].ID})
+
+	page, next := pageCoverage(selected, options.after, options.limit)
+	require.Len(t, page, 1)
+	require.Equal(t, "https://a.example", page[0].PDS)
+	require.Equal(t, "https://a.example", next)
+	require.Equal(t, "a-new", coverageSummaryPage(page, next).Items[0].JobID)
+
+	options, ok = parseCoverageOptions(httptest.NewRequest("GET", Prefix+"/coverage?limit=0", nil))
+	require.False(t, ok)
+}
+
 func TestPrivateCompleteAndFailedResults(t *testing.T) {
 	for _, state := range []jobs.State{jobs.Complete, jobs.Failed} {
 		t.Run(string(state), func(t *testing.T) {
@@ -186,4 +236,38 @@ func TestPrivatePolicyAndJobsRemainAtomicOnWriteFailure(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, policy.Current(), restored.Current())
 	require.Equal(t, 200, request(h, "PUT", "/policy", `{"expectedRevision":1,"collections":[]}`, testToken).Code)
+}
+
+// Exposes the real persistent management contract to the Node acceptance harness.
+func TestControlPlaneAcceptanceFixture(t *testing.T) {
+	ready := os.Getenv("CONTROL_ACCEPTANCE_READY")
+	if ready == "" {
+		t.Skip("cross-language fixture")
+	}
+	handler, manager := setup(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- manager.Run(ctx, func(context.Context, jobs.Job) error {
+			return &jobs.InputError{Code: "source_unavailable", Unavailable: true}
+		})
+	}()
+	defer func() { cancel(); <-done }()
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	require.NoError(t, os.WriteFile(ready, []byte(server.URL), 0600))
+	deadline := time.NewTimer(2 * time.Minute)
+	defer deadline.Stop()
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-deadline.C:
+			t.Fatal("acceptance harness did not shut down")
+		case <-ticker.C:
+			if _, err := os.Stat(ready + ".stop"); err == nil {
+				return
+			}
+		}
+	}
 }

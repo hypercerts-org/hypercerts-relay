@@ -116,7 +116,7 @@ func (r *Relay) VerifyCommitObject(ctx context.Context, commit *repo.Commit, ide
 	// NOTE: may eventually want to cache cryptographic key parsing
 	pubkey, err := ident.PublicKey()
 	if err != nil {
-		return ErrIdentityUnavailable
+		return fmt.Errorf("%w: parse atproto public key: %v", ErrIdentityUnavailable, err)
 	}
 
 	if err := commit.VerifySignature(pubkey); err != nil {

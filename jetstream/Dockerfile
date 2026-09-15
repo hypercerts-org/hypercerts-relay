@@ -10,6 +10,9 @@ FROM --platform=$BUILDPLATFORM golang:1.26.6-bookworm AS build
 ARG VERSION=dev
 ARG COMMIT=unknown
 ARG DATE=unknown
+# Empty for canonical images. The disposable acceptance Compose build sets
+# this to acceptance, enabling only tagged local-fixture code.
+ARG GO_BUILD_TAGS=
 
 # TARGETOS/TARGETARCH are provided automatically by buildx and let us
 # cross-compile for arm64/amd64 from a single Dockerfile.
@@ -21,9 +24,8 @@ WORKDIR /src
 # Copy go.{mod,sum} first so the dependency-download layer caches independently
 # of source changes. Module downloads are the slowest step in a clean build.
 COPY go.mod go.sum ./
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    go mod download
+# hypercerts: Use portable layer caching; Railway cache mounts require private service IDs.
+RUN go mod download
 
 # Now copy the rest of the source. Anything in .dockerignore stays out.
 COPY . .
@@ -35,10 +37,9 @@ COPY . .
 #     (and avoids surprising failures when /src isn't a git checkout).
 #   - -extldflags=-static is belt-and-suspenders for fully static linking.
 ENV CGO_ENABLED=0
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build \
+      -tags "${GO_BUILD_TAGS}" \
       -trimpath \
       -buildvcs=false \
       -ldflags " \
@@ -48,6 +49,10 @@ RUN --mount=type=cache,target=/go/pkg/mod \
         -X github.com/bluesky-social/jetstream/internal/version.Date=${DATE}" \
       -o /out/jetstream \
       ./cmd/jetstream
+
+# hypercerts: Static bootstrap preserves the distroless runtime and module context.
+RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -buildvcs=false \
+    -o /out/container-entrypoint ./cmd/container-entrypoint
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Runtime stage
@@ -75,6 +80,7 @@ LABEL org.opencontainers.image.title="jetstream" \
 # Bring the binary across. /usr/local/bin is on $PATH and is the conventional
 # location even though distroless has no PATH-based shell to care.
 COPY --from=build /out/jetstream /usr/local/bin/jetstream
+COPY --from=build /out/container-entrypoint /usr/local/bin/container-entrypoint
 
 # Document the listeners. EXPOSE is metadata only; it does not publish ports.
 EXPOSE 8080 6060
@@ -84,7 +90,6 @@ EXPOSE 8080 6060
 # security posture obvious from `docker inspect`.
 USER 65532:65532
 
-# Use the binary as PID 1 directly. No tini/dumb-init: Go's runtime handles
-# signals and reaps no children of its own.
-ENTRYPOINT ["/usr/local/bin/jetstream"]
+# hypercerts: The bootstrap execs Jetstream, preserving signals and CLI arguments.
+ENTRYPOINT ["/usr/local/bin/container-entrypoint", "jetstream", "/usr/local/bin/jetstream"]
 CMD ["serve"]

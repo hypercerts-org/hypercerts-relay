@@ -454,6 +454,13 @@ func runRelay(ctx context.Context, cmd *cli.Command) error {
 		return err
 	}
 
+	// hypercerts: Management uses a separate private listener, never the Basic-auth UI.
+	stopControl, err := svc.startControl(ctx, os.Getenv("RELAY_CONTROL_ADDR"), os.Getenv("RELAY_CONTROL_TOKEN_FILE"))
+	if err != nil {
+		return err
+	}
+	defer stopControl()
+
 	svcErr := make(chan error, 1)
 	go func() {
 		err := svc.StartAPI(cmd.String("bind"))

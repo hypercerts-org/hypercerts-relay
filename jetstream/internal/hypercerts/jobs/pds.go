@@ -27,30 +27,80 @@ type PDSProcessor struct {
 }
 
 func (p PDSProcessor) Run(ctx context.Context, job Job) error {
-	// Direct snapshots stay on the explicitly admitted origin; a redirect must
-	// not silently enroll a migration target or change coverage attribution.
-	httpClient := *p.HTTPClient
-	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	client := atmossync.NewClient(atmossync.Options{Client: &xrpc.Client{Host: job.PDS, HTTPClient: gt.Some(&httpClient), Retry: gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(1)})}, Directory: gt.Some(p.Directory)})
+	client := p.client(job)
 	for page, err := range client.ListRepos(ctx, 100, job.Cursor) {
 		if err != nil {
 			return inputFailure(ctx, "source_unavailable")
 		}
-		for _, entry := range page.Entries {
-			if !entry.Active {
-				continue
-			}
-			if rev, ok := job.CompletedRepos[string(entry.DID)]; ok && rev == entry.Rev {
-				continue
-			}
-			if err := p.repository(ctx, client, job, entry); err != nil {
-				return err
-			}
-		}
-		if err := p.Manager.Checkpoint(job.ID, "", "", page.NextCursor); err != nil {
+		if err := p.processPage(ctx, client, &job, page); err != nil {
 			return err
 		}
-		job.Cursor = page.NextCursor
+	}
+	return p.completeEnumeration(job)
+}
+
+func (p PDSProcessor) client(job Job) *atmossync.Client {
+	// Direct snapshots stay on the explicitly admitted origin; a redirect must
+	// not silently enroll a migration target or change coverage attribution.
+	httpClient := *p.HTTPClient
+	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return atmossync.NewClient(atmossync.Options{Client: &xrpc.Client{Host: job.PDS, HTTPClient: gt.Some(&httpClient), Retry: gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(1)})}, Directory: gt.Some(p.Directory)})
+}
+
+func (p PDSProcessor) processPage(ctx context.Context, client *atmossync.Client, job *Job, page atmossync.ListReposPage) error {
+	active, err := p.processEntries(ctx, client, job, page.Entries)
+	if err != nil {
+		return err
+	}
+	return p.checkpointPage(job, page.NextCursor, active)
+}
+
+func (p PDSProcessor) processEntries(ctx context.Context, client *atmossync.Client, job *Job, entries []atmossync.ListReposEntry) (int, error) {
+	active := 0
+	for _, entry := range entries {
+		if !entry.Active {
+			continue
+		}
+		if !job.TotalReposKnown {
+			active++
+		}
+		if rev, ok := job.CompletedRepos[string(entry.DID)]; ok && rev == entry.Rev {
+			continue
+		}
+		if err := p.repository(ctx, client, *job, entry); err != nil {
+			return 0, err
+		}
+		// Keep this page-local snapshot current: duplicate entries must not
+		// trigger a second download before the page checkpoint commits.
+		job.CompletedRepos[string(entry.DID)] = entry.Rev
+	}
+	return active, nil
+}
+
+func (p PDSProcessor) checkpointPage(job *Job, cursor string, active int) error {
+	if job.TotalReposKnown {
+		if err := p.Manager.Checkpoint(job.ID, "", "", cursor); err != nil {
+			return err
+		}
+	} else {
+		if err := p.Manager.CheckpointEnumeration(job.ID, cursor, active, cursor == ""); err != nil {
+			return err
+		}
+		job.EnumeratedRepos += active
+		if cursor == "" {
+			job.TotalRepos = job.EnumeratedRepos
+			job.TotalReposKnown = true
+		}
+	}
+	job.Cursor = cursor
+	return nil
+}
+
+func (p PDSProcessor) completeEnumeration(job Job) error {
+	// Atmos does not yield an empty terminal page. It is still a complete,
+	// durable inventory and therefore has a total of the saved subtotal.
+	if !job.TotalReposKnown {
+		return p.Manager.CheckpointEnumeration(job.ID, job.Cursor, 0, true)
 	}
 	return nil
 }

@@ -48,6 +48,8 @@ type Slurper struct {
 }
 
 type SlurperConfig struct {
+	// hypercerts: Apply explicit policy before queueing a raw source event.
+	WaitRateCapacity    func(context.Context, string) error
 	UserAgent           string
 	ConcurrencyPerHost  int
 	QueueDepthPerHost   int
@@ -274,9 +276,14 @@ func (s *Slurper) Subscribe(host *models.Host) error {
 		return fmt.Errorf("slurper is shut down")
 	}
 
-	_, ok := s.subs[host.Hostname]
+	subscription, ok := s.subs[host.Hostname]
 	if ok {
-		return fmt.Errorf("already subscribed: %s", host.Hostname)
+		// hypercerts: Reconciliation and control-plane retries preserve an existing subscription.
+		// A canceled subscription must finish draining before a retry can replace it.
+		if subscription.ctx.Err() != nil {
+			return fmt.Errorf("subscription is stopping: %s", host.Hostname)
+		}
+		return nil
 	}
 
 	counts := s.ComputeLimiterCounts(host.AccountLimit, host.Trusted)
@@ -334,8 +341,9 @@ func (s *Slurper) subscribeWithRedialer(ctx context.Context, host *models.Host, 
 		HandshakeTimeout: time.Second * 5,
 	}
 
-	// if this isn't a localhost / private connection, then we should enable SSRF protections
-	if !host.NoSSL {
+	// hypercerts: the acceptance build alone reaches private Docker PDS hosts;
+	// all normal builds keep SSRF protection for HTTPS sources.
+	if !host.NoSSL && !acceptancePrivateHostsEnabled() {
 		netDialer := ssrf.PublicOnlyDialer()
 		d.NetDialContext = netDialer.DialContext
 	}
@@ -529,7 +537,7 @@ func (s *Slurper) handleConnection(ctx context.Context, conn *websocket.Conn, su
 		_ = conn.Close()
 	}()
 	connLogger := s.logger.With("host", sub.Hostname)
-	err := stream.HandleRepoStream(ctx, conn, scheduler, connLogger)
+	err := stream.HandleRepoStream(ctx, conn, rateScheduler{Scheduler: scheduler, wait: s.Config.WaitRateCapacity, host: sub.Hostname}, connLogger)
 	if processErr := scheduler.Err(); processErr != nil {
 		return processErr
 	}
