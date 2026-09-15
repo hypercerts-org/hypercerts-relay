@@ -217,9 +217,9 @@ func serveCommand() *cli.Command {
 			// hypercerts: Seed new archives with bundled record NSIDs unless explicitly overridden.
 			&cli.StringSliceFlag{Name: "collections", Usage: "Initial exact collection NSIDs, overriding the bundled seed; empty stores no records. Existing persisted policy wins.", Sources: cli.EnvVars("JETSTREAM_COLLECTIONS")},
 			&cli.BoolFlag{Name: "disable-collection-seed", Usage: "Disable bundled Hypercerts/Certified collection seeding for a new data directory; explicit collections still apply", Sources: cli.EnvVars("JETSTREAM_DISABLE_COLLECTION_SEED")},
-			// Development mode is inert in production builds. Acceptance builds use it
-			// with fixed fixture origins that resolve inside a Docker network.
-			&cli.BoolFlag{Name: "development-mode", Usage: "Enable acceptance-only local fixture support when built with the acceptance tag", Sources: cli.EnvVars("JETSTREAM_DEVELOPMENT_MODE")},
+			// This is inert in production builds. Acceptance builds use it with fixed
+			// fixture origins that resolve inside a Docker network.
+			&cli.BoolFlag{Name: "acceptance-private-hosts", Usage: "Allow acceptance-only private fixture hosts when built with the acceptance tag", Sources: cli.EnvVars("JETSTREAM_ACCEPTANCE_PRIVATE_HOSTS")},
 			&cli.StringFlag{
 				Name:    "relay-url",
 				Usage:   "Base URL of the upstream relay",
@@ -469,12 +469,12 @@ func serveOptionsFromCommand(cmd *cli.Command) (jetstreamd.Options, error) {
 	}
 
 	return jetstreamd.Options{
-		ControlToken:    controlToken,
-		PublicAddr:      cmd.String("addr"),
-		DebugAddr:       cmd.String("debug-addr"),
-		EnablePprof:     cmd.Bool("enable-pprof"),
-		DevelopmentMode: cmd.Bool("development-mode"),
-		DataDir:         cmd.String("data-dir"),
+		ControlToken:           controlToken,
+		PublicAddr:             cmd.String("addr"),
+		DebugAddr:              cmd.String("debug-addr"),
+		EnablePprof:            cmd.Bool("enable-pprof"),
+		AcceptancePrivateHosts: cmd.Bool("acceptance-private-hosts"),
+		DataDir:                cmd.String("data-dir"),
 		// hypercerts: Production serve always enforces the durable collection policy.
 		CollectionSelection:            true,
 		InitialPDSSources:              cmd.StringSlice("pds-sources"),

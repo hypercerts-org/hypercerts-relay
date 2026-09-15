@@ -94,8 +94,8 @@ wait_for_http "$jetstream_url/" Jetstream
 
 "${compose[@]}" exec --no-TTY driver node /app/driver.mjs bootstrap | tee "$run_dir/bootstrap.json"
 
-# The acceptance-tag Jetstream binary exposes this route only when development
-# mode is explicitly enabled. Retrying the rotation accounts for the real
+# The acceptance-tag Jetstream binary exposes this route only when private
+# fixture hosts are explicitly enabled. Retrying the rotation accounts for the real
 # Relay→Jetstream asynchronous boundary; the public archive assertion proves the
 # resulting sealed boundary contains the complete seed phase.
 sealed=0

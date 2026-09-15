@@ -278,9 +278,9 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		transportOpt = []jttp.Option{jttp.WithTransport(opts.HTTPTransport)}
 	}
 	// Private origins are accepted only by an acceptance-tag binary whose
-	// operator explicitly enabled development mode. Ordinary production and
-	// development builds retain jttp's redirect SSRF protection.
-	allowAcceptancePrivateSources := opts.DevelopmentMode && acceptancePrivateSourcesEnabled()
+	// operator explicitly opted into private fixture hosts. Ordinary production
+	// and development builds retain jttp's redirect SSRF protection.
+	allowAcceptancePrivateSources := opts.AcceptancePrivateHosts && acceptancePrivateSourcesEnabled()
 	sourceTransportOpt := transportOpt
 	if allowAcceptancePrivateSources {
 		sourceTransportOpt = append(sourceTransportOpt, jttp.WithAllowPrivateRedirects())
@@ -569,7 +569,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	}, processLogger, metrics)
 	// hypercerts: The disposable acceptance binary needs an explicit archive
 	// boundary; production builds do not register this route.
-	if opts.DevelopmentMode && acceptanceSealingEnabled() {
+	if opts.AcceptancePrivateHosts && acceptanceSealingEnabled() {
 		srv.RegisterPublicRoute("POST /hypercerts/acceptance/seal", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			writer := writerPtr.Load()
 			if writer == nil {

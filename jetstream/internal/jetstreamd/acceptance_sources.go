@@ -8,7 +8,7 @@ import (
 )
 
 // acceptancePrivateSourcesEnabled keeps Docker-network access out of ordinary
-// Jetstream binaries. DevelopmentMode must also be set by the operator.
+// Jetstream binaries. AcceptancePrivateHosts must also be set by the operator.
 func acceptancePrivateSourcesEnabled() bool { return true }
 
 // acceptanceSealingEnabled exposes a deterministic archive-boundary hook only
