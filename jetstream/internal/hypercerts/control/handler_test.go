@@ -136,6 +136,33 @@ func TestPrivateLifecycleAndCoverage(t *testing.T) {
 	require.NotContains(t, filtered.Body.String(), "policy")
 	require.Equal(t, 204, request(h, "DELETE", "/sources", `{"pds":"https://pds.example"}`, testToken).Code)
 }
+
+func TestCoverageSelectionPaginationAndSummary(t *testing.T) {
+	created := time.Date(2026, time.September, 15, 12, 0, 0, 0, time.UTC)
+	jobsList := []jobs.Job{
+		{ID: "a-old", PDS: "https://a.example", CreatedAt: created},
+		{ID: "a-new", PDS: "https://a.example", CreatedAt: created.Add(time.Second)},
+		{ID: "b-a", PDS: "https://b.example", CreatedAt: created},
+		{ID: "b-z", PDS: "https://b.example", CreatedAt: created},
+		{ID: "c-only", PDS: "https://c.example", CreatedAt: created},
+	}
+
+	options, ok := parseCoverageOptions(httptest.NewRequest("GET", Prefix+"/coverage?limit=1&pds=https%3A%2F%2Fa.example&pds=https%3A%2F%2Fb.example&summary=1", nil))
+	require.True(t, ok)
+	require.True(t, options.summary)
+	selected := latestCoverageJobs(jobsList, options.requestedPDS)
+	require.Equal(t, []string{"a-new", "b-z"}, []string{selected[0].ID, selected[1].ID})
+
+	page, next := pageCoverage(selected, options.after, options.limit)
+	require.Len(t, page, 1)
+	require.Equal(t, "https://a.example", page[0].PDS)
+	require.Equal(t, "https://a.example", next)
+	require.Equal(t, "a-new", coverageSummaryPage(page, next).Items[0].JobID)
+
+	options, ok = parseCoverageOptions(httptest.NewRequest("GET", Prefix+"/coverage?limit=0", nil))
+	require.False(t, ok)
+}
+
 func TestPrivateCompleteAndFailedResults(t *testing.T) {
 	for _, state := range []jobs.State{jobs.Complete, jobs.Failed} {
 		t.Run(string(state), func(t *testing.T) {

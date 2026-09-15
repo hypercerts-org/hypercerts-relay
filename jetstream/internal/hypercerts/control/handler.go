@@ -191,12 +191,32 @@ func (h *Handler) getJob(w http.ResponseWriter, r *http.Request) {
 	failure(w, jobs.ErrNotFound)
 }
 func (h *Handler) listCoverage(w http.ResponseWriter, r *http.Request) {
+	options, ok := parseCoverageOptions(r)
+	if !ok {
+		reply(w, 400, map[string]string{"error": "invalid_limit"})
+		return
+	}
+	items, next := pageCoverage(latestCoverageJobs(h.jobs.List(), options.requestedPDS), options.after, options.limit)
+	if options.summary {
+		reply(w, 200, coverageSummaryPage(items, next))
+		return
+	}
+	reply(w, 200, coveragePage(items, next))
+}
+
+type coverageOptions struct {
+	limit        int
+	requestedPDS map[string]struct{}
+	after        string
+	summary      bool
+}
+
+func parseCoverageOptions(r *http.Request) (coverageOptions, bool) {
 	limit := 100
 	if raw := r.URL.Query().Get("limit"); raw != "" {
 		n, err := strconv.Atoi(raw)
 		if err != nil || n < 1 || n > 200 {
-			reply(w, 400, map[string]string{"error": "invalid_limit"})
-			return
+			return coverageOptions{}, false
 		}
 		limit = n
 	}
@@ -206,8 +226,17 @@ func (h *Handler) listCoverage(w http.ResponseWriter, r *http.Request) {
 			requestedPDS[pds] = struct{}{}
 		}
 	}
+	return coverageOptions{
+		limit:        limit,
+		requestedPDS: requestedPDS,
+		after:        r.URL.Query().Get("after"),
+		summary:      r.URL.Query().Get("summary") == "1",
+	}, true
+}
+
+func latestCoverageJobs(jobsList []jobs.Job, requestedPDS map[string]struct{}) []jobs.Job {
 	latest := map[string]jobs.Job{}
-	for _, job := range h.jobs.List() {
+	for _, job := range jobsList {
 		if len(requestedPDS) > 0 {
 			if _, ok := requestedPDS[job.PDS]; !ok {
 				continue
@@ -223,34 +252,45 @@ func (h *Handler) listCoverage(w http.ResponseWriter, r *http.Request) {
 		all = append(all, job)
 	}
 	sort.Slice(all, func(i, j int) bool { return all[i].PDS < all[j].PDS })
-	after := r.URL.Query().Get("after")
+	return all
+}
+
+func pageCoverage(jobsList []jobs.Job, after string, limit int) ([]coverageView, string) {
 	out := make([]coverageView, 0, limit)
-	next := ""
-	for _, job := range all {
+	for _, job := range jobsList {
 		if job.PDS <= after {
 			continue
 		}
 		if len(out) == limit {
-			next = out[len(out)-1].PDS
-			break
+			return out, out[len(out)-1].PDS
 		}
 		out = append(out, coverage(job))
 	}
-	if r.URL.Query().Get("summary") == "1" {
-		summaries := make([]coverageSummaryView, 0, len(out))
-		for _, job := range out {
-			summaries = append(summaries, coverageSummary(job))
-		}
-		reply(w, 200, struct {
-			Items      []coverageSummaryView `json:"items"`
-			NextCursor string                `json:"nextCursor,omitempty"`
-		}{summaries, next})
-		return
-	}
-	reply(w, 200, struct {
+	return out, ""
+}
+
+func coveragePage(items []coverageView, next string) struct {
+	Items      []coverageView `json:"items"`
+	NextCursor string         `json:"nextCursor,omitempty"`
+} {
+	return struct {
 		Items      []coverageView `json:"items"`
 		NextCursor string         `json:"nextCursor,omitempty"`
-	}{out, next})
+	}{items, next}
+}
+
+func coverageSummaryPage(items []coverageView, next string) struct {
+	Items      []coverageSummaryView `json:"items"`
+	NextCursor string                `json:"nextCursor,omitempty"`
+} {
+	summaries := make([]coverageSummaryView, 0, len(items))
+	for _, item := range items {
+		summaries = append(summaries, coverageSummary(item))
+	}
+	return struct {
+		Items      []coverageSummaryView `json:"items"`
+		NextCursor string                `json:"nextCursor,omitempty"`
+	}{summaries, next}
 }
 
 func (h *Handler) listJobs(w http.ResponseWriter, r *http.Request) {
