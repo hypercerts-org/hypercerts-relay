@@ -86,6 +86,35 @@ test("status displays only configured public service origins", async (t) => {
     jetstream: "https://jetstream.example",
   });
 });
+test("coverage preserves Jetstream's reason independently of its error code", async (t) => {
+  const { request, services } = await fixture(t);
+  services.coverage = async () => ({
+    items: [
+      {
+        pds: "https://pds.example",
+        policy: { revision: 2, collections: ["app.bsky.feed.post"] },
+        jobId: "coverage-job",
+        reason: "quota_recovery",
+        state: "incomplete",
+        completedRepos: 3,
+        totalRepos: 10,
+        totalReposKnown: true,
+        errorCode: "source_unavailable",
+        createdAt: "2026-09-15T00:00:00.000Z",
+        coverage: "current_state",
+        historyComplete: false,
+      },
+    ],
+    nextCursor: "next-page",
+  });
+
+  const response = await request("/api/v1/coverage");
+  assert.equal(response.status, 200);
+  const page = await response.json();
+  assert.equal(page.items[0].reason, "quota_recovery");
+  assert.equal(page.items[0].errorCode, "source_unavailable");
+  assert.equal(page.next, "next-page");
+});
 test("authentication, CSRF and immediate administrator removal guard durable mutations", async (t) => {
   const { store, request } = await fixture(t);
   const body = { kind: "source", pds: "https://pds.example", state: "enabled" };

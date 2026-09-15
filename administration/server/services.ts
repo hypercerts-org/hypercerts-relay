@@ -219,6 +219,7 @@ interface CoveragePage {
     pds: string;
     policy: Policy;
     jobId: string;
+    reason: string;
     state: string;
     completedRepos: number;
     totalRepos: number;

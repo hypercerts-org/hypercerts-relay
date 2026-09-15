@@ -201,7 +201,7 @@ export function createApp(
     res.json({
       items: coverage.items.map((item) => ({
         ...item,
-        reason: item.errorCode ?? null,
+        reason: item.reason,
         historicalPDSAttribution: "unknown",
       })),
       next: coverage.nextCursor ?? null,

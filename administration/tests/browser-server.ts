@@ -49,6 +49,7 @@ const services = {
         pds: job.pds,
         policy: job.policy,
         jobId: job.id,
+        reason: job.reason,
         state: job.state,
         completedRepos: job.completedRepos,
         totalRepos: job.totalRepos,
