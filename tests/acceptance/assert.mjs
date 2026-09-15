@@ -54,12 +54,12 @@ function assertOperation(events, expected, collection, label) {
 }
 
 function assertLifecycle(events, expected, label) {
-  const identity = events.find((event) => event.did === expected.did && event.kind === 'identity' &&
+  const identity = events.some((event) => event.did === expected.did && event.kind === 'identity' &&
     event.identity?.did === expected.did && Number.isSafeInteger(event.identity?.seq) &&
     event.identity.seq > 0 && typeof event.identity.time === 'string' && event.identity.time)
   if (!identity) fail(`${label} lacks a well-formed identity event for ${expected.did}`)
 
-  const account = events.find((event) => event.did === expected.did && event.kind === 'account' &&
+  const account = events.some((event) => event.did === expected.did && event.kind === 'account' &&
     event.account?.did === expected.did && event.account?.active === true && !event.account.status &&
     Number.isSafeInteger(event.account.seq) && event.account.seq > 0 &&
     typeof event.account.time === 'string' && event.account.time)
@@ -111,6 +111,38 @@ function assertExpected(events, expected, label, boundary, requireLifecycle, pro
   return found
 }
 
+async function assertArchive(events, bootstrap, snapshotPath) {
+  if (!snapshotPath) fail('archive requires snapshot.json')
+  const snapshot = await readJSON(snapshotPath)
+  const boundary = snapshot.sealedTipSeq
+  if (!Number.isSafeInteger(boundary) || boundary <= 0) fail(`invalid sealedTipSeq ${boundary}`)
+  assertExpected(events, bootstrap, 'archive', boundary, true, 'seed')
+}
+
+function assertSeedReady(events, bootstrap) {
+  assertExpected(events, bootstrap, 'combined archive prefix', null, true, 'seed')
+}
+
+async function assertCombined(events, bootstrap, snapshotPath, livePath) {
+  if (!snapshotPath || !livePath) fail('combined requires snapshot.json and live.json')
+  const snapshot = await readJSON(snapshotPath)
+  const boundary = snapshot.sealedTipSeq
+  if (!Number.isSafeInteger(boundary) || boundary <= 0) fail(`invalid sealedTipSeq ${boundary}`)
+  const live = await readJSON(livePath)
+  const seedEvents = assertExpected(events, bootstrap, 'combined seed archive', boundary, true, 'seed')
+  const liveEvents = assertExpected(events, live, 'combined live', null, false, 'live')
+  for (const event of liveEvents) {
+    if (event.cursor <= boundary) fail(`live event cursor ${event.cursor} is not after sealed boundary ${boundary}`)
+  }
+  const expectedCount = seedEvents.length + liveEvents.length
+  const actualExpectedCount = events.filter((event) =>
+    [...bootstrap.operations, ...live.operations].some((operation) => matchOperation(event, operation, bootstrap.collection)),
+  ).length
+  if (actualExpectedCount !== expectedCount) {
+    fail(`combined stream has duplicate expected operations: expected ${expectedCount}, got ${actualExpectedCount}`)
+  }
+}
+
 async function main() {
   const [mode, bootstrapPath, eventPath, snapshotPath, livePath] = process.argv.slice(2)
   if (!mode || !bootstrapPath || !eventPath) {
@@ -121,37 +153,17 @@ async function main() {
   assertStrictlyIncreasing(events, mode)
 
   if (mode === 'archive') {
-    if (!snapshotPath) fail('archive requires snapshot.json')
-    const snapshot = await readJSON(snapshotPath)
-    const boundary = snapshot.sealedTipSeq
-    if (!Number.isSafeInteger(boundary) || boundary <= 0) fail(`invalid sealedTipSeq ${boundary}`)
-    assertExpected(events, bootstrap, 'archive', boundary, true, 'seed')
+    await assertArchive(events, bootstrap, snapshotPath)
     return
   }
 
   if (mode === 'seed-ready') {
-    assertExpected(events, bootstrap, 'combined archive prefix', null, true, 'seed')
+    assertSeedReady(events, bootstrap)
     return
   }
 
   if (mode === 'combined') {
-    if (!snapshotPath || !livePath) fail('combined requires snapshot.json and live.json')
-    const snapshot = await readJSON(snapshotPath)
-    const boundary = snapshot.sealedTipSeq
-    if (!Number.isSafeInteger(boundary) || boundary <= 0) fail(`invalid sealedTipSeq ${boundary}`)
-    const live = await readJSON(livePath)
-    const seedEvents = assertExpected(events, bootstrap, 'combined seed archive', boundary, true, 'seed')
-    const liveEvents = assertExpected(events, live, 'combined live', null, false, 'live')
-    for (const event of liveEvents) {
-      if (event.cursor <= boundary) fail(`live event cursor ${event.cursor} is not after sealed boundary ${boundary}`)
-    }
-    const expectedCount = seedEvents.length + liveEvents.length
-    const actualExpectedCount = events.filter((event) =>
-      [...bootstrap.operations, ...live.operations].some((operation) => matchOperation(event, operation, bootstrap.collection)),
-    ).length
-    if (actualExpectedCount !== expectedCount) {
-      fail(`combined stream has duplicate expected operations: expected ${expectedCount}, got ${actualExpectedCount}`)
-    }
+    await assertCombined(events, bootstrap, snapshotPath, livePath)
     return
   }
 

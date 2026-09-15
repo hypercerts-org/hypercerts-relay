@@ -60,9 +60,13 @@ async function source(origin) {
 
 function cursor(view) {
   if (!Number.isSafeInteger(view.LastDurableCursor)) {
-    throw new Error(`source response has no safe LastDurableCursor: ${JSON.stringify(view)}`)
+    throw new TypeError(`source response has no safe LastDurableCursor: ${JSON.stringify(view)}`)
   }
   return view.LastDurableCursor
+}
+
+function writeJSON(value) {
+  process.stdout.write(`${JSON.stringify(value)}\n`)
 }
 
 async function waitForCursorAdvance(origin, previous, label) {
@@ -186,7 +190,7 @@ async function bootstrap() {
 
   await mkdir('/state', { recursive: true })
   await writeFile(statePath, JSON.stringify({ a: accountA, b: accountB }), { mode: 0o600 })
-  console.log(JSON.stringify({
+  writeJSON({
     collection,
     lifecycle: [
       { did: accountA.did },
@@ -204,7 +208,7 @@ async function bootstrap() {
       bAfterSeed: cursor(bAfterSeed),
       aAfterBSeed: cursor(aAfterBSeed),
     },
-  }))
+  })
 }
 
 async function live() {
@@ -221,7 +225,7 @@ async function live() {
   const aAfterB = await source(origins.a)
   assertCursorUnchanged(aAfterB, cursor(aAfter), 'PDS A cursor after PDS B live mutations')
 
-  console.log(JSON.stringify({
+  writeJSON({
     collection,
     operations: [...liveA, ...liveB],
     sourceProof: {
@@ -232,7 +236,7 @@ async function live() {
       bAfter: cursor(bAfter),
       aAfterB: cursor(aAfterB),
     },
-  }))
+  })
 }
 
 const command = process.argv[2]
