@@ -155,26 +155,17 @@ export function createApp(
   });
   app.get("/api/v1/coverage", async (req, res) => {
     const p = page.parse(req.query),
-      jobs = await services.jobs(
+      coverage = await services.coverage(
         p.after,
         req.query.pds ? origin.parse(req.query.pds) : "",
       );
     res.json({
-      items: jobs.jobs.map((j) => ({
-        pds: j.pds,
-        policy: j.policy,
-        jobId: j.id,
-        state: j.state,
-        completedRepos: j.completedRepos,
-        totalRepos: j.totalRepos,
-        totalReposKnown: j.totalReposKnown,
-        createdAt: j.createdAt,
-        reason: j.errorCode ?? null,
-        coverage: j.coverage,
-        historyComplete: j.historyComplete,
+      items: coverage.items.map((item) => ({
+        ...item,
+        reason: item.errorCode ?? null,
         historicalPDSAttribution: "unknown",
       })),
-      next: jobs.nextCursor ?? null,
+      next: coverage.nextCursor ?? null,
     });
   });
   app.get("/api/v1/limits", (req, res) =>

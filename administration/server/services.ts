@@ -82,6 +82,27 @@ export class Services {
       `/jobs?limit=50&after=${encodeURIComponent(after)}&pds=${encodeURIComponent(pds)}`,
     );
   }
+  coverage(after = "", pds = "") {
+    return this.call<{
+      items: {
+        pds: string;
+        policy: Policy;
+        jobId: string;
+        state: string;
+        completedRepos: number;
+        totalRepos: number;
+        totalReposKnown: boolean;
+        errorCode?: string;
+        createdAt: string;
+        coverage: string;
+        historyComplete: boolean;
+      }[];
+      nextCursor?: string;
+    }>(
+      "jetstream",
+      `/coverage?limit=50&after=${encodeURIComponent(after)}&pds=${encodeURIComponent(pds)}`,
+    );
+  }
   sources(after = "") {
     return this.call<Record<string, unknown>>(
       "relay",

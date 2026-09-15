@@ -186,6 +186,7 @@ All paths below start with `/hypercerts/v1`:
 | `DELETE /sources` | Same body; cancels acquisition without deleting the archive. |
 | `POST /jobs` | `{"pds":"https://pds.example","reason":"backfill"}` or reason `quota_recovery`; duplicate active work is reused, a later terminal recovery creates a fresh job. |
 | `GET /jobs?limit=100&after=<cursor>` | Sorted page, maximum 200 jobs, optional `nextCursor`. Concurrent additions may require a fresh listing. |
+| `GET /coverage?limit=100&after=<pds>` | Latest current-state job per PDS, sorted and paginated by PDS with optional exact `pds` filter. |
 | `GET /jobs/{id}` | Durable state, progress, attempt count, and coverage. |
 | `POST /jobs/{id}/cancel` | Cancels pending/running work. |
 | `POST /jobs/{id}/retry` | Resumes current-policy work from durable progress; a removed source or obsolete revision returns conflict. |

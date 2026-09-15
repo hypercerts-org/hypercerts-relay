@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -45,6 +46,7 @@ func New(token string, manager *jobs.Manager, policy *selection.Manager) (*Handl
 	h.mux.HandleFunc("POST "+sourcesPath, h.addSource)
 	h.mux.HandleFunc("DELETE "+sourcesPath, h.removeSource)
 	h.mux.HandleFunc("GET "+Prefix+"/jobs", h.listJobs)
+	h.mux.HandleFunc("GET "+Prefix+"/coverage", h.listCoverage)
 	h.mux.HandleFunc("GET "+Prefix+"/jobs/{id}", h.getJob)
 	h.mux.HandleFunc("POST "+Prefix+"/jobs", h.requestJob)
 	h.mux.HandleFunc("POST "+Prefix+"/jobs/{id}/cancel", h.cancelJob)
@@ -188,6 +190,50 @@ func (h *Handler) getJob(w http.ResponseWriter, r *http.Request) {
 	}
 	failure(w, jobs.ErrNotFound)
 }
+func (h *Handler) listCoverage(w http.ResponseWriter, r *http.Request) {
+	limit := 100
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > 200 {
+			reply(w, 400, map[string]string{"error": "invalid_limit"})
+			return
+		}
+		limit = n
+	}
+	latest := map[string]jobs.Job{}
+	for _, job := range h.jobs.List() {
+		if pds := r.URL.Query().Get("pds"); pds != "" && job.PDS != pds {
+			continue
+		}
+		previous, ok := latest[job.PDS]
+		if !ok || job.CreatedAt.After(previous.CreatedAt) || (job.CreatedAt.Equal(previous.CreatedAt) && job.ID > previous.ID) {
+			latest[job.PDS] = job
+		}
+	}
+	all := make([]jobs.Job, 0, len(latest))
+	for _, job := range latest {
+		all = append(all, job)
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].PDS < all[j].PDS })
+	after := r.URL.Query().Get("after")
+	out := make([]coverageView, 0, limit)
+	next := ""
+	for _, job := range all {
+		if job.PDS <= after {
+			continue
+		}
+		if len(out) == limit {
+			next = out[len(out)-1].PDS
+			break
+		}
+		out = append(out, coverage(job))
+	}
+	reply(w, 200, struct {
+		Items      []coverageView `json:"items"`
+		NextCursor string         `json:"nextCursor,omitempty"`
+	}{out, next})
+}
+
 func (h *Handler) listJobs(w http.ResponseWriter, r *http.Request) {
 	limit := 100
 	if raw := r.URL.Query().Get("limit"); raw != "" {
@@ -243,4 +289,22 @@ type jobView struct {
 
 func view(j jobs.Job) jobView {
 	return jobView{ID: j.ID, PDS: j.PDS, Policy: j.Policy, Reason: j.Reason, State: j.State, Attempts: j.Attempts, CompletedRepos: len(j.CompletedRepos), TotalRepos: j.TotalRepos, TotalReposKnown: j.TotalReposKnown, Cursor: j.Cursor, ErrorCode: j.ErrorCode, CreatedAt: j.CreatedAt, StartedAt: j.StartedAt, FinishedAt: j.FinishedAt, Coverage: j.Coverage, HistoryComplete: j.HistoryComplete}
+}
+
+type coverageView struct {
+	PDS             string           `json:"pds"`
+	Policy          selection.Policy `json:"policy"`
+	JobID           string           `json:"jobId"`
+	State           jobs.State       `json:"state"`
+	CompletedRepos  int              `json:"completedRepos"`
+	TotalRepos      int              `json:"totalRepos"`
+	TotalReposKnown bool             `json:"totalReposKnown"`
+	ErrorCode       string           `json:"errorCode,omitempty"`
+	CreatedAt       time.Time        `json:"createdAt"`
+	Coverage        string           `json:"coverage"`
+	HistoryComplete bool             `json:"historyComplete"`
+}
+
+func coverage(j jobs.Job) coverageView {
+	return coverageView{PDS: j.PDS, Policy: j.Policy, JobID: j.ID, State: j.State, CompletedRepos: len(j.CompletedRepos), TotalRepos: j.TotalRepos, TotalReposKnown: j.TotalReposKnown, ErrorCode: j.ErrorCode, CreatedAt: j.CreatedAt, Coverage: j.Coverage, HistoryComplete: j.HistoryComplete}
 }

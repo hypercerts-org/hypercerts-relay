@@ -42,7 +42,7 @@ func request(h http.Handler, method, path, body, token string) *httptest.Respons
 }
 func TestPrivateAuthenticationAndInputValidation(t *testing.T) {
 	h, m := setup(t)
-	for _, path := range []string{"/policy", "/sources", "/jobs", "/jobs/unknown", "/jobs/unknown/cancel", "/jobs/unknown/retry"} {
+	for _, path := range []string{"/policy", "/sources", "/jobs", "/coverage", "/jobs/unknown", "/jobs/unknown/cancel", "/jobs/unknown/retry"} {
 		for _, method := range []string{"GET", "POST", "PUT", "DELETE"} {
 			w := request(h, method, path, `{}`, "")
 			require.Equal(t, 401, w.Code)
@@ -112,6 +112,15 @@ func TestPrivateLifecycleAndCoverage(t *testing.T) {
 	require.NoError(t, json.Unmarshal(page.Body.Bytes(), &result))
 	require.Len(t, result.Jobs, 1)
 	require.NotEmpty(t, result.NextCursor)
+	coverage := request(h, "GET", "/coverage", "", testToken)
+	require.Equal(t, 200, coverage.Code)
+	var coveragePage struct {
+		Items []coverageView `json:"items"`
+	}
+	require.NoError(t, json.Unmarshal(coverage.Body.Bytes(), &coveragePage))
+	require.Len(t, coveragePage.Items, 1)
+	require.Equal(t, "https://pds.example", coveragePage.Items[0].PDS)
+	require.Equal(t, uint64(2), coveragePage.Items[0].Policy.Revision)
 	require.Equal(t, 204, request(h, "DELETE", "/sources", `{"pds":"https://pds.example"}`, testToken).Code)
 }
 func TestPrivateCompleteAndFailedResults(t *testing.T) {

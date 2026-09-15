@@ -43,6 +43,23 @@ const services = {
   async jobs() {
     return { jobs };
   },
+  async coverage() {
+    return {
+      items: jobs.map((job) => ({
+        pds: job.pds,
+        policy: job.policy,
+        jobId: job.id,
+        state: job.state,
+        completedRepos: job.completedRepos,
+        totalRepos: job.totalRepos,
+        totalReposKnown: job.totalReposKnown,
+        errorCode: job.errorCode,
+        createdAt: job.createdAt,
+        coverage: job.coverage,
+        historyComplete: job.historyComplete,
+      })),
+    };
+  },
   async call(_service: string, path: string) {
     if (path.startsWith("/limits")) return { items: limits, next: null };
     if (path.startsWith("/source?")) {
