@@ -58,10 +58,11 @@ export class Store {
       .all(after, limit + 1) as { did: string }[];
     return {
       items: rows.slice(0, limit).map((row) => ({
-        ...this.get<{ handle?: string | null; displayName?: string | null }>(
-          "administrator-profile",
-          row.did,
-        ),
+        ...this.get<{
+          handle?: string | null;
+          displayName?: string | null;
+          lastLoggedIn?: string | null;
+        }>("administrator-profile", row.did),
         did: row.did,
       })),
       next: rows.length > limit ? rows[limit - 1].did : null,
