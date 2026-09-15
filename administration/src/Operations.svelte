@@ -36,6 +36,11 @@
         : ["No collections selected"],
     }));
   }
+  function jobPurpose(job: Job) {
+    return job.reason === "quota_recovery"
+      ? "Quota recovery"
+      : "Selected-collection backfill";
+  }
   function jobProgress(job: Job) {
     if (["running", "in_progress"].includes(job.state)) {
       return job.totalReposKnown
@@ -107,14 +112,14 @@
     <table>
       <caption>Jetstream jobs</caption><thead
         ><tr
-          ><th>PDS / Job id</th><th>Collections</th><th>Progress</th><th>Status</th
+          ><th>PDS / Job id</th><th>Collections</th><th>Purpose</th><th>Progress</th><th>Status</th
           ><th>Actions</th></tr
         ></thead
       ><tbody
         >{#each jobs as job}<tr
             ><td>{job.pds}<small>{job.id}</small></td><td
               >{job.policy.collections.join(", ") || "No collections"}</td
-            ><td
+            ><td>{jobPurpose(job)}</td><td
               >{jobProgress(job)}<small>{job.attempts} attempts</small></td
             ><td
               ><State value={job.state} /><small
@@ -142,7 +147,7 @@
               </div></td
             ></tr
           >{:else}<tr
-            ><td colspan="5" class="empty"
+            ><td colspan="6" class="empty"
               >No jobs on this page. Submit a backfill for an enabled source.</td
             ></tr
           >{/each}</tbody

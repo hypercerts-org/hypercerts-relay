@@ -1,13 +1,13 @@
 <script lang="ts">
   import { sourceOrigin, type Limit, type Source, type Command } from "./api";
   export let rows: Limit[] = [];
+  export let globalLimits: Limit[] = [];
   export let sources: Source[] = [];
   export let submit: (command: Command) => Promise<void>;
   export let busy = false;
   let kind = "global",
     pds = "",
     value = 100;
-  $: globalLimits = rows.filter((row) => row.scope === "global");
   $: pdsSuggestions = sources.map(sourceOrigin).slice(0, 10);
 </script>
 

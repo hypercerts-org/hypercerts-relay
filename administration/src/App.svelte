@@ -55,7 +55,8 @@
     changes: Operation[] = [],
     coverage: Coverage[] = [],
     audit: Audit[] = [],
-    limits: Limit[] = [];
+    limits: Limit[] = [],
+    globalLimits: Limit[] = [];
   let nextOperationAudit: string | null = null,
     nextHistoryAudit: string | null = null;
   let status: { relay: string; jetstream: string; observedAt: string } | null =
@@ -114,6 +115,10 @@
             api<{ Sources: Source[] }>("/sources"),
           ]);
           limits = limitPage.items;
+          const pageGlobals = limitPage.items.filter(
+            (limit) => limit.scope === "global",
+          );
+          if (!cursor || pageGlobals.length) globalLimits = pageGlobals;
           sources = sourcePage.Sources;
           next = limitPage.next;
           break;
@@ -358,7 +363,7 @@
             {submit}
             {busy}
           />{/if}
-      {:else if screen === "limits"}<Limits rows={limits} {sources} {submit} {busy} />
+      {:else if screen === "limits"}<Limits rows={limits} {globalLimits} {sources} {submit} {busy} />
       {:else if ["jobs", "coverage", "audit"].includes(screen)}<Operations
           {screen}
           {jobs}

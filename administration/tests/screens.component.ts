@@ -224,6 +224,15 @@ test("audit log combines requested changes and handle-first actor display", () =
 test("rate limits show current globals and PDS typeahead suggestions", async () => {
   render(Limits, {
     submit: vi.fn(),
+    globalLimits: [
+      {
+        scope: "global",
+        eventsPerSecond: 100,
+        waitingConnections: 2,
+        unit: "events_per_second",
+        recovery: "none",
+      },
+    ],
     sources: [
       {
         HostID: 1,
@@ -272,6 +281,7 @@ test("jobs explain recovery types and use operator-facing progress labels", () =
         id: "abc",
         pds: "https://pds.example",
         policy: { revision: 2, collections: ["app.bsky.feed.post"] },
+        reason: "quota_recovery",
         state: "running",
         completedRepos: 3,
         totalRepos: 10,
@@ -286,6 +296,8 @@ test("jobs explain recovery types and use operator-facing progress labels", () =
   expect(screen.getByText(/Selected-collection backfill fills/)).toBeTruthy();
   expect(screen.getByText("PDS / Job id")).toBeTruthy();
   expect(screen.getByText("Collections")).toBeTruthy();
+  expect(screen.getAllByText("Purpose")).toHaveLength(2);
+  expect(screen.getAllByText("Quota recovery")).toHaveLength(2);
   expect(screen.getByText("Status")).toBeTruthy();
   expect(screen.getByText("3 of 10 repositories processed")).toBeTruthy();
   expect(screen.queryByText(/Revision/)).toBeNull();

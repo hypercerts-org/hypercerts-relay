@@ -105,6 +105,7 @@ export interface Job {
   id: string;
   pds: string;
   policy: Policy;
+  reason: string;
   state: string;
   completedRepos: number;
   totalRepos: number;
