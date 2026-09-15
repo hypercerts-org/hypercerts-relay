@@ -30,6 +30,12 @@
     }
     return `${job.completedRepos} repositories processed`;
   }
+  function actorLabel(actor: { actor: string; actorHandle?: string | null }) {
+    return actor.actorHandle ? `@${actor.actorHandle}` : actor.actor;
+  }
+  async function copy(value: string) {
+    await navigator.clipboard?.writeText(value);
+  }
 </script>
 
 {#if screen === "jobs"}
@@ -186,21 +192,65 @@
 {:else if screen === "audit"}
   <div class="intro">
     <p class="eyebrow">Activity record</p>
-    <h1>Audit history</h1>
+    <h1>Audit Log</h1>
     <p>
-      Actor-attributed changes and their recorded outcomes. Entries are ordered
-      by durable sequence.
+      Requested changes and actor-attributed audit events in one place. Actor
+      handles are shown first; hover or focus the handle to see the DID.
     </p>
   </div>
   <!-- svelte-ignore a11y_no_noninteractive_tabindex (Scrollable tables need keyboard access; verified with axe and Chromium.) -->
   <div
     class="table-wrap"
     role="region"
-    aria-label="Scrollable results"
+    aria-label="Requested changes"
     tabindex="0"
   >
     <table>
-      <caption>Management audit events</caption><thead
+      <caption>Requested changes</caption><thead
+        ><tr
+          ><th>Requested change</th><th>Actor / time</th><th>Status</th><th
+            >Actions</th
+          ></tr
+        ></thead
+      ><tbody
+        >{#each changes as change}<tr
+            ><td>{target(change.command)}<small>{change.id}</small></td><td
+              ><span title={change.actor} tabindex="0">{actorLabel(change)}</span>
+              <button class="text-button" onclick={() => copy(change.actor)}>Copy DID</button><small
+                >{new Date(change.createdAt).toLocaleString()}</small
+              ></td
+            ><td
+              ><State value={change.state} /><small
+                >{change.error?.replaceAll("_", " ") ?? ""}</small
+              ></td
+            ><td
+              >{#if change.state === "requested"}<button
+                  disabled={busy}
+                  onclick={() => action(change.id, "cancel")}
+                  >Cancel change</button
+                >{:else if ["failed", "incomplete"].includes(change.state)}<button
+                  disabled={busy}
+                  onclick={() => action(change.id, "retry")}
+                  >Retry change</button
+                >{:else}—{/if}</td
+            ></tr
+          >{:else}<tr
+            ><td colspan="4" class="empty"
+              >No requested changes on this page.</td
+            ></tr
+          >{/each}</tbody
+      >
+    </table>
+  </div>
+  <!-- svelte-ignore a11y_no_noninteractive_tabindex (Scrollable tables need keyboard access; verified with axe and Chromium.) -->
+  <div
+    class="table-wrap"
+    role="region"
+    aria-label="Audit history"
+    tabindex="0"
+  >
+    <table>
+      <caption>Audit history</caption><thead
         ><tr
           ><th>Time</th><th>Actor</th><th>Event</th><th>Operation / result</th
           ></tr
@@ -208,7 +258,8 @@
       ><tbody
         >{#each audit as event}<tr
             ><td>{new Date(event.time).toLocaleString()}</td><td
-              >{event.actor}</td
+              ><span title={event.actor} tabindex="0">{actorLabel(event)}</span>
+              <button class="text-button" onclick={() => copy(event.actor)}>Copy DID</button></td
             ><td><State value={event.action} /></td><td
               >{event.operation ?? "Access change"}<small
                 >{String(event.detail.error ?? event.detail.did ?? "")}</small

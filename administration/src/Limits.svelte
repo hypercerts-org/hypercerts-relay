@@ -114,4 +114,4 @@
     >
   </table>
 </div>
-<a href="/changes">Compare requested changes and service acknowledgments</a>
+<a href="/audit">Compare requested changes and service acknowledgments</a>

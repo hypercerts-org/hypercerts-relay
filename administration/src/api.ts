@@ -38,6 +38,7 @@ export interface Coverage {
 export interface Audit {
   seq: number;
   actor: string;
+  actorHandle?: string | null;
   action: string;
   time: string;
   operation: string | null;

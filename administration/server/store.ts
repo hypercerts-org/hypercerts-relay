@@ -171,6 +171,11 @@ export class Store {
     return r
       ? ({
           ...r,
+          actorHandle:
+            this.get<{ handle?: string | null }>(
+              "administrator-profile",
+              r.actor as string,
+            )?.handle ?? null,
           command: JSON.parse(r.command as string),
           result: r.result ? JSON.parse(r.result as string) : null,
         } as unknown as Operation)
@@ -223,9 +228,15 @@ export class Store {
       .prepare("SELECT * FROM audit WHERE seq>? ORDER BY seq LIMIT ?")
       .all(Number(after || 0), limit + 1);
     return {
-      items: rows
-        .slice(0, limit)
-        .map((r) => ({ ...r, detail: JSON.parse(r.detail as string) })),
+      items: rows.slice(0, limit).map((r) => ({
+        ...r,
+        actorHandle:
+          this.get<{ handle?: string | null }>(
+            "administrator-profile",
+            r.actor as string,
+          )?.handle ?? null,
+        detail: JSON.parse(r.detail as string),
+      })),
       next: rows.length > limit ? String(rows[limit - 1].seq) : null,
     };
   }

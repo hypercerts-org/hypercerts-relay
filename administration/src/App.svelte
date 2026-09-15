@@ -27,12 +27,11 @@
     ["jobs", "Backfill jobs"],
     ["coverage", "Coverage"],
     ["limits", "Rate limits"],
-    ["changes", "Requested changes"],
-    ["audit", "Audit history"],
+    ["audit", "Audit log"],
     ["administrators", "Administrators"],
   ];
   const route = location.pathname.split("/")[1] || "overview";
-  const screen = navigation.some(([key]) => key === route) ? route : "overview";
+  const screen = route === "changes" ? "audit" : navigation.some(([key]) => key === route) ? route : "overview";
   let session: (Administrator & { csrf: string; expires: number }) | null =
       null,
     ready = false,
@@ -106,20 +105,14 @@
           next = r.next;
           break;
         }
-        case "changes": {
-          const r = await api<{ items: Operation[]; next: string | null }>(
-            `/operations?after=${encodeURIComponent(cursor)}`,
-          );
-          changes = r.items;
-          next = r.next;
-          break;
-        }
         case "audit": {
-          const r = await api<{ items: Audit[]; next: string | null }>(
-            `/audit?after=${encodeURIComponent(cursor)}`,
-          );
-          audit = r.items;
-          next = r.next;
+          const [operationPage, auditPage] = await Promise.all([
+            api<{ items: Operation[]; next: string | null }>("/operations"),
+            api<{ items: Audit[]; next: string | null }>("/audit"),
+          ]);
+          changes = operationPage.items;
+          audit = auditPage.items;
+          next = null;
           break;
         }
         default:
@@ -309,7 +302,7 @@
               <State value={operation.state} />{operation.error?.replaceAll(
                 "_",
                 " ",
-              ) ?? ""} <a href="/changes">View requested changes</a>
+              ) ?? ""} <a href="/audit">View audit log</a>
             </div>{/if}
         </div>{/if}
       {#if screen === "administrators"}<Administrators
@@ -325,7 +318,7 @@
             {busy}
           />{/if}
       {:else if screen === "limits"}<Limits rows={limits} {submit} {busy} />
-      {:else if ["jobs", "coverage", "changes", "audit"].includes(screen)}<Operations
+      {:else if ["jobs", "coverage", "audit"].includes(screen)}<Operations
           {screen}
           {jobs}
           {changes}
@@ -368,9 +361,9 @@
               >Connection state, validation, account quota and the last durable
               cursor.</span
             ></a
-          ><a class="workflow" href="/changes"
-            ><strong>Follow requested changes</strong><span
-              >Separate requested policy from acknowledged service results.</span
+          ><a class="workflow" href="/audit"
+            ><strong>Open audit log</strong><span
+              >Review requested policy and acknowledged service results.</span
             ></a
           ><a class="workflow" href="/coverage"
             ><strong>Check collection coverage</strong><span
@@ -380,7 +373,7 @@
           >
         </section>
       {/if}
-      {#if !["overview", "collections"].includes(screen)}<nav
+      {#if !["overview", "collections", "audit"].includes(screen)}<nav
           class="pagination"
           aria-label="Result pages"
         >

@@ -89,6 +89,7 @@ export type OperationState =
 export interface Operation {
   id: string;
   actor: string;
+  actorHandle?: string | null;
   command: Command;
   state: OperationState;
   createdAt: string;

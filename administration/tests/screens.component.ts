@@ -177,6 +177,44 @@ test("collection drafts survive polling and require reset after a stale revision
     collections: ["app.bsky.feed.repost"],
   });
 });
+test("audit log combines requested changes and handle-first actor display", () => {
+  render(Operations, {
+    screen: "audit",
+    submit: vi.fn(),
+    action: vi.fn(),
+    changes: [
+      {
+        id: "00000000-0000-4000-8000-000000000000",
+        actor: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+        actorHandle: "operator.example",
+        command: { kind: "limit", scope: "global", eventsPerSecond: 10 },
+        state: "requested",
+        createdAt: "2026-09-09T00:00:00.000Z",
+        updatedAt: "2026-09-09T00:00:00.000Z",
+        result: null,
+        error: null,
+      },
+    ],
+    audit: [
+      {
+        seq: 1,
+        actor: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+        actorHandle: "operator.example",
+        action: "requested",
+        time: "2026-09-09T00:00:00.000Z",
+        operation: "00000000-0000-4000-8000-000000000000",
+        detail: {},
+      },
+    ],
+  });
+  expect(screen.getByText("Audit Log")).toBeTruthy();
+  expect(screen.getByText("Requested changes")).toBeTruthy();
+  expect(screen.getByText("Audit history")).toBeTruthy();
+  const handles = screen.getAllByText("@operator.example");
+  expect(handles[0].getAttribute("title")).toBe("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa");
+  expect(screen.getAllByRole("button", { name: "Copy DID" }).length).toBe(2);
+});
+
 test("rate limits show current globals and PDS typeahead suggestions", async () => {
   render(Limits, {
     submit: vi.fn(),
