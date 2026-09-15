@@ -32,10 +32,10 @@ test("administrator operates sources, collections, jobs, rates and revokes the s
   await page
     .getByRole("button", { name: "quiet.example", exact: true })
     .click();
-  const quota = page.getByLabel("Account quota", { exact: true });
+  const quota = page.getByLabel("Quota", { exact: true });
   await quota.fill("-1");
   await page
-    .getByRole("button", { name: "Request account quota change" })
+    .getByRole("button", { name: "Update quota" })
     .click();
   await expect(quota).toBeFocused();
   await expect(page.getByRole("alert")).toContainText("Enter a whole number");
@@ -61,7 +61,7 @@ test("administrator operates sources, collections, jobs, rates and revokes the s
     });
   }
   await page
-    .getByRole("button", { name: "Request account quota change" })
+    .getByRole("button", { name: "Update quota" })
     .click();
   await expect(
     page
@@ -72,7 +72,7 @@ test("administrator operates sources, collections, jobs, rates and revokes the s
   await page
     .getByRole("button", { name: "quiet.example", exact: true })
     .click();
-  await expect(page.getByLabel("Account quota", { exact: true })).toHaveValue(
+  await expect(page.getByLabel("Quota", { exact: true })).toHaveValue(
     "250",
   );
   await page.getByRole("link", { name: "Collections", exact: true }).click();
@@ -97,7 +97,7 @@ test("administrator operates sources, collections, jobs, rates and revokes the s
   await expect(
     page.getByRole("cell", { name: "12 events/second", exact: true }),
   ).toBeVisible({ timeout: 12000 });
-  await page.getByRole("link", { name: "Audit history", exact: true }).click();
+  await page.getByRole("link", { name: "Audit log", exact: true }).click();
   await expect(page.getByRole("table")).toContainText(
     "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
   );
@@ -120,9 +120,8 @@ test("desktop and mobile screens have no serious accessibility violations or pag
       "/jobs",
       "/coverage",
       "/limits",
-      "/changes",
       "/audit",
-      "/administrators",
+      "/manage-adminis",
     ]) {
       await page.goto(route);
       await expect(page.locator("h1")).toBeVisible();

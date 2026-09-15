@@ -93,9 +93,10 @@ at the user's PDS. No administrators or credentials are shipped in the applicati
 At sign-in, administration refreshes the account's verified handle and display
 name, preferring `app.certified.actor.profile` and falling back to
 `app.bsky.actor.profile`. Presentation is stored in the administration database
-and shown beside the DID in Administrators. Lookups are bounded to four seconds;
-unavailable metadata does not block sign-in or erase the last successful values.
-Accounts without stored profiles display their DID. Removing an administrator
+and shown beside the DID in Administrators with the last recorded login time.
+Lookups are bounded to four seconds; unavailable metadata does not block sign-in
+or erase the last successful values. Accounts without stored profiles display their DID.
+Removing an administrator
 also removes their cached profile. Authorization and audit attribution always
 use the immutable DID, never a handle or display name.
 
@@ -103,7 +104,7 @@ The browser-facing API is `/api/v1`; all endpoints below require authorization.
 
 | Endpoint                                 | Contract                                                                                          |
 | ---------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| `GET /administrators`                 | Paginated current administrator DIDs.                                                             |
+| `GET /administrators`                 | Paginated current administrator DIDs with cached presentation and last login.                      |
 | `POST /administrators`                | `{did, action}` with `grant` or `remove`; actor audited, CSRF protected; cannot remove oneself.            |
 | `GET /session`                           | Current DID, CSRF token, expiry.                                                                  |
 | `POST /signout`, `/revoke-sessions`      | Revoke the current or all local sessions.                                                         |
