@@ -177,7 +177,7 @@ export class Auth {
       const now = new Date().toISOString();
       this.store.set("administrator-profile", did, {
         ...this.store.get<AdministratorProfile>("administrator-profile", did),
-        ...(profile ?? {}),
+        ...profile,
         lastLoggedIn: now,
         updatedAt: now,
       });
