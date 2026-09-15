@@ -341,8 +341,9 @@ func (s *Slurper) subscribeWithRedialer(ctx context.Context, host *models.Host, 
 		HandshakeTimeout: time.Second * 5,
 	}
 
-	// if this isn't a localhost / private connection, then we should enable SSRF protections
-	if !host.NoSSL {
+	// hypercerts: the acceptance build alone reaches private Docker PDS hosts;
+	// all normal builds keep SSRF protection for HTTPS sources.
+	if !host.NoSSL && !acceptancePrivateHostsEnabled() {
 		netDialer := ssrf.PublicOnlyDialer()
 		d.NetDialContext = netDialer.DialContext
 	}

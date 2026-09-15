@@ -10,6 +10,9 @@ FROM --platform=$BUILDPLATFORM golang:1.26.6-bookworm AS build
 ARG VERSION=dev
 ARG COMMIT=unknown
 ARG DATE=unknown
+# Empty for canonical images. The disposable acceptance Compose build sets
+# this to acceptance, enabling only tagged local-fixture code.
+ARG GO_BUILD_TAGS=
 
 # TARGETOS/TARGETARCH are provided automatically by buildx and let us
 # cross-compile for arm64/amd64 from a single Dockerfile.
@@ -36,6 +39,7 @@ COPY . .
 ENV CGO_ENABLED=0
 RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build \
+      -tags "${GO_BUILD_TAGS}" \
       -trimpath \
       -buildvcs=false \
       -ldflags " \

@@ -277,18 +277,26 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	if opts.HTTPTransport != nil {
 		transportOpt = []jttp.Option{jttp.WithTransport(opts.HTTPTransport)}
 	}
+	// Private origins are accepted only by an acceptance-tag binary whose
+	// operator explicitly enabled development mode. Ordinary production and
+	// development builds retain jttp's redirect SSRF protection.
+	allowAcceptancePrivateSources := opts.DevelopmentMode && acceptancePrivateSourcesEnabled()
+	sourceTransportOpt := transportOpt
+	if allowAcceptancePrivateSources {
+		sourceTransportOpt = append(sourceTransportOpt, jttp.WithAllowPrivateRedirects())
+	}
 
 	backfillMetrics := backfill.NewMetrics(metrics.Registry)
 	xrpcClient := &xrpc.Client{
 		Host:       relayHTTPURL,
-		HTTPClient: gt.Some(jttp.New(append(xrpc.BulkDownloadOpts(), transportOpt...)...)),
+		HTTPClient: gt.Some(jttp.New(append(xrpc.BulkDownloadOpts(), sourceTransportOpt...)...)),
 	}
 
 	resolver := &identity.DefaultResolver{}
 	if opts.PLCURL != "" {
 		resolver.PLCURL = gt.Some(opts.PLCURL)
 	}
-	if opts.PLCURL != "" || opts.HTTPTransport != nil {
+	if opts.PLCURL != "" || opts.HTTPTransport != nil || allowAcceptancePrivateSources {
 		// atmos's default resolver client enables jttp.WithStrictSSRFProtection,
 		// which refuses loopback even on the initial request. When the
 		// operator points us at a local PLC (e.g. the dev simulator at
@@ -299,7 +307,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		// Options.HTTPTransport, so identity/PLC resolution must route
 		// through it too -- otherwise a "socket-free" runtime silently
 		// dials the real network for resolution.
-		resolver.HTTPClient = gt.Some(jttp.New(append(xrpc.ATProtoOpts(10*time.Second), transportOpt...)...))
+		resolver.HTTPClient = gt.Some(jttp.New(append(xrpc.ATProtoOpts(10*time.Second), sourceTransportOpt...)...))
 	}
 	directory := &identity.Directory{
 		Resolver:               resolver,
@@ -382,6 +390,15 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	if opts.HTTPTransport != nil {
 		backfillNewHostClient = func(hostname string) (*atmossync.Client, error) {
 			xc := &xrpc.Client{Host: "http://" + hostname, HTTPClient: xrpcClient.HTTPClient, Retry: gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(1)})}
+			return atmossync.NewClient(atmossync.Options{Client: xc}), nil
+		}
+	} else if allowAcceptancePrivateSources {
+		hardened := backfill.NewHostClientBuilder(opts.RelayURL, xrpcClient.HTTPClient.Val())
+		backfillNewHostClient = func(hostname string) (*atmossync.Client, error) {
+			if !isAcceptancePrivateSource(hostname) {
+				return hardened(hostname)
+			}
+			xc := &xrpc.Client{Host: "https://" + hostname, HTTPClient: xrpcClient.HTTPClient, Retry: gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(1)})}
 			return atmossync.NewClient(atmossync.Options{Client: xc}), nil
 		}
 	}
@@ -550,6 +567,22 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		PublicListener:        opts.PublicListener,
 		DebugListener:         opts.DebugListener,
 	}, processLogger, metrics)
+	// hypercerts: The disposable acceptance binary needs an explicit archive
+	// boundary; production builds do not register this route.
+	if opts.DevelopmentMode && acceptanceSealingEnabled() {
+		srv.RegisterPublicRoute("POST /hypercerts/acceptance/seal", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			writer := writerPtr.Load()
+			if writer == nil {
+				http.Error(w, "steady-state writer is not ready", http.StatusServiceUnavailable)
+				return
+			}
+			if err := writer.ForceRotate(r.Context()); err != nil {
+				http.Error(w, "failed to seal acceptance archive", http.StatusInternalServerError)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		}))
+	}
 
 	// HandlerDeps.WriterRef is read at request time via writerPtr.Load();
 	// before steady-state, lifecycle.IsSteadyState gates with 503 so

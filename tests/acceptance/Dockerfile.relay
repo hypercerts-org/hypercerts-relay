@@ -1,0 +1,16 @@
+# Disposable Plan 001 image only. The acceptance tag is never used by the
+# production Relay Dockerfile; it permits Docker-private fixture PDS addresses.
+FROM golang:1.26-alpine3.22 AS build
+RUN apk add --no-cache build-base
+WORKDIR /src
+COPY . .
+RUN go build -tags acceptance -o /relay ./cmd/relay
+
+FROM alpine:3.24
+RUN apk add --no-cache ca-certificates dumb-init
+ENTRYPOINT ["dumb-init", "--"]
+WORKDIR /
+RUN mkdir -p /data/relay
+COPY --from=build /relay /relay
+EXPOSE 2470 2471
+CMD ["/relay", "serve"]
