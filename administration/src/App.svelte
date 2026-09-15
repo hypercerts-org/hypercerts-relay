@@ -47,6 +47,7 @@
     loadError = "",
     notice = "";
   let administrators: Administrator[] = [];
+  let sourcesComponent: { refreshDetails: () => Promise<void> } | null = null;
   let policyLoaded = false;
   let sources: Source[] = [],
     policy: Policy = { revision: 1, collections: [] },
@@ -79,7 +80,7 @@
           const r = await api<{ Sources: Source[]; NextAfterHostID: number }>(
             `/sources?after=${encodeURIComponent(cursor)}`,
           );
-          sources = r.Sources;
+          sources = r.Sources.map((source) => ({ ...source }));
           next = r.NextAfterHostID ? String(r.NextAfterHostID) : null;
           break;
         }
@@ -124,6 +125,7 @@
         default:
           status = await api("/status");
       }
+      if (screen === "sources") await sourcesComponent?.refreshDetails();
       if (operation)
         operation = await api<Operation>(`/operations/${operation.id}`);
       loadError = "";
@@ -317,7 +319,7 @@
           csrf={session.csrf}
           onChanged={load}
         />
-      {:else if screen === "sources"}<Sources rows={sources} {submit} {busy} />
+      {:else if screen === "sources"}<Sources bind:this={sourcesComponent} rows={sources} {submit} {busy} />
       {:else if screen === "collections"}{#if policyLoaded}<Collections
             {policy}
             {submit}

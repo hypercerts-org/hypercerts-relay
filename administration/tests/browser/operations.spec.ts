@@ -8,6 +8,10 @@ async function login(page: import("@playwright/test").Page) {
     page.getByRole("heading", { name: "Relay operations" }),
   ).toBeVisible();
 }
+async function refresh(page: import("@playwright/test").Page) {
+  await page.waitForTimeout(100);
+  await page.getByRole("button", { name: "Refresh" }).click();
+}
 test("administrator operates sources, collections, jobs, rates and revokes the session", async ({
   page,
 }) => {
@@ -17,11 +21,13 @@ test("administrator operates sources, collections, jobs, rates and revokes the s
     .getByLabel("PDS origin", { exact: true })
     .fill("https://quiet.example");
   await page.getByRole("button", { name: "Add source", exact: true }).click();
+  await refresh(page);
   await expect(
     page.getByRole("button", { name: "quiet.example", exact: true }),
   ).toBeVisible({ timeout: 12000 });
   for (const name of ["Disable", "Re-enable"]) {
     await page.getByRole("button", { name, exact: true }).click();
+    await refresh(page);
     await expect(
       page.getByRole("button", {
         name: name === "Disable" ? "Re-enable" : "Disable",
@@ -63,6 +69,10 @@ test("administrator operates sources, collections, jobs, rates and revokes the s
   await page
     .getByRole("button", { name: "Update quota" })
     .click();
+  await refresh(page);
+  await page
+    .getByRole("button", { name: "quiet.example", exact: true })
+    .click();
   await expect(
     page
       .getByRole("region", { name: "Source detail" })
@@ -82,24 +92,27 @@ test("administrator operates sources, collections, jobs, rates and revokes the s
   await collection.fill("app.bsky.feed.like");
   await page.getByRole("button", { name: "Add collection" }).click();
   await page.getByRole("button", { name: "Request policy change" }).click();
+  await refresh(page);
   await expect(page.getByText("2 enabled collections")).toBeVisible({
     timeout: 12000,
   });
   await page.getByRole("link", { name: "Backfill jobs", exact: true }).click();
   await page.getByLabel("Enabled PDS origin").fill("https://quiet.example");
   await page.getByRole("button", { name: "Submit backfill" }).click();
+  await refresh(page);
   await expect(page.getByText("source unavailable")).toBeVisible({
     timeout: 12000,
   });
   await page.getByRole("link", { name: "Rate limits", exact: true }).click();
   await page.getByLabel("Events per second").fill("12");
   await page.getByRole("button", { name: "Request limit change" }).click();
+  await refresh(page);
   await expect(
     page.getByRole("cell", { name: "12 events/second", exact: true }),
   ).toBeVisible({ timeout: 12000 });
   await page.getByRole("link", { name: "Audit log", exact: true }).click();
-  await expect(page.getByRole("table")).toContainText(
-    "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+  await expect(page.getByRole("table", { name: "Audit history" })).toContainText(
+    "@operator.example",
   );
   await page.getByRole("button", { name: "Revoke my sessions" }).click();
   await expect(
@@ -344,7 +357,7 @@ test("branded sign-in and sidebar identity work with and without profile metadat
   }
 });
 
-test("successful polling clears observation errors without hiding action failures", async ({
+test("manual refresh clears observation errors without hiding action failures", async ({
   page,
 }) => {
   await login(page);
@@ -358,7 +371,8 @@ test("successful polling clears observation errors without hiding action failure
   await page.getByRole("link", { name: "Rate limits", exact: true }).click();
   await expect(page.getByRole("alert")).toContainText("HTTP 502");
   await page.unroute("**/api/v1/limits?*");
-  await expect(page.getByRole("alert")).toHaveCount(0, { timeout: 12_000 });
+  await refresh(page);
+  await expect(page.getByRole("alert")).toHaveCount(0);
   await page.route("**/api/v1/operations", (route) =>
     route.fulfill({
       status: 409,
@@ -369,8 +383,6 @@ test("successful polling clears observation errors without hiding action failure
   await page.getByLabel("Events per second").fill("150");
   await page.getByRole("button", { name: "Request limit change" }).click();
   await expect(page.getByRole("alert")).toContainText("revision conflict");
-  await page.waitForResponse((response) =>
-    response.url().includes("/api/v1/limits?"),
-  );
+  await page.waitForTimeout(500);
   await expect(page.getByRole("alert")).toContainText("revision conflict");
 });

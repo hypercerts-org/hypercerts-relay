@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { afterUpdate } from "svelte";
   import State from "./State.svelte";
   import AccountQuota from "./AccountQuota.svelte";
   import { api, sourceOrigin, type Source, type Command } from "./api";
@@ -16,6 +17,22 @@
         source.Hostname.toLowerCase().includes(filter),
       )
     : rows;
+  afterUpdate(() => syncSelected(rows));
+  $: syncSelected(rows);
+  function syncSelected(currentRows: Source[]) {
+    if (!selected) return;
+    const previous = selected;
+    const current = currentRows.find(
+      (source) => source.HostID === previous.HostID || sourceOrigin(source) === sourceOrigin(previous),
+    );
+    if (current && JSON.stringify(current) !== JSON.stringify(previous)) {
+      selected = { ...current };
+      detailUnavailable = false;
+    }
+  }
+  export async function refreshDetails() {
+    await refreshSelected();
+  }
   async function refreshSelected() {
     if (!selected) return;
     const origin = sourceOrigin(selected);
