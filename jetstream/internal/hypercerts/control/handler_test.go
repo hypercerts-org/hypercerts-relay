@@ -121,6 +121,7 @@ func TestPrivateLifecycleAndCoverage(t *testing.T) {
 	require.Len(t, coveragePage.Items, 1)
 	require.Equal(t, "https://pds.example", coveragePage.Items[0].PDS)
 	require.Equal(t, uint64(2), coveragePage.Items[0].Policy.Revision)
+	require.Equal(t, "policy_changed", coveragePage.Items[0].Reason)
 	_, err := m.AddSource("https://other.example")
 	require.NoError(t, err)
 	filtered := request(h, "GET", "/coverage?summary=1&pds=https%3A%2F%2Fpds.example&pds=https%3A%2F%2Fother.example", "", testToken)

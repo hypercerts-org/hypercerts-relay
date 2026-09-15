@@ -314,6 +314,7 @@ type coverageView struct {
 	PDS             string           `json:"pds"`
 	Policy          selection.Policy `json:"policy"`
 	JobID           string           `json:"jobId"`
+	Reason          string           `json:"reason"`
 	State           jobs.State       `json:"state"`
 	CompletedRepos  int              `json:"completedRepos"`
 	TotalRepos      int              `json:"totalRepos"`
@@ -325,7 +326,7 @@ type coverageView struct {
 }
 
 func coverage(j jobs.Job) coverageView {
-	return coverageView{PDS: j.PDS, Policy: j.Policy, JobID: j.ID, State: j.State, CompletedRepos: len(j.CompletedRepos), TotalRepos: j.TotalRepos, TotalReposKnown: j.TotalReposKnown, ErrorCode: j.ErrorCode, CreatedAt: j.CreatedAt, Coverage: j.Coverage, HistoryComplete: j.HistoryComplete}
+	return coverageView{PDS: j.PDS, Policy: j.Policy, JobID: j.ID, Reason: j.Reason, State: j.State, CompletedRepos: len(j.CompletedRepos), TotalRepos: j.TotalRepos, TotalReposKnown: j.TotalReposKnown, ErrorCode: j.ErrorCode, CreatedAt: j.CreatedAt, Coverage: j.Coverage, HistoryComplete: j.HistoryComplete}
 }
 
 // coverageSummaryView is a compact table-enrichment view. The full policy is

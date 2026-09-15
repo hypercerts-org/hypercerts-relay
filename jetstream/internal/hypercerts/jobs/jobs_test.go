@@ -63,6 +63,7 @@ func TestJobsPersistRepositoryTotalBeforeProgress(t *testing.T) {
 			if err := m.SetTotalRepos(running.ID, 12); err != nil {
 				return err
 			}
+			<-ctx.Done()
 			return ctx.Err()
 		})
 	}()
@@ -71,8 +72,10 @@ func TestJobsPersistRepositoryTotalBeforeProgress(t *testing.T) {
 		return job.TotalReposKnown && job.TotalRepos == 12
 	}, time.Second, time.Millisecond)
 	cancel()
-	<-done
+	require.ErrorIs(t, <-done, context.Canceled)
 	require.Equal(t, j.ID, m.List()[0].ID)
+	require.True(t, m.List()[0].TotalReposKnown)
+	require.Equal(t, 12, m.List()[0].TotalRepos)
 }
 
 func TestJobsCrashResumeAndUnavailableCoverage(t *testing.T) {
