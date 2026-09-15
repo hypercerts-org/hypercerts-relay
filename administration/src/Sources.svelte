@@ -7,6 +7,7 @@
     sourceOrigin,
     type Source,
     type Coverage,
+    type JetstreamSummary,
     type Command,
   } from "./api";
   export let rows: Source[] = [];
@@ -22,6 +23,7 @@
     detailRequest = 0,
     lookupRequest = 0;
   $: filter = search.trim().toLowerCase().replace(/^https?:\/\//, "");
+  $: jetstreamStats = coverage ?? selected?.JetstreamCoverage ?? null;
   $: displayedRows = filter
     ? rows.filter((source) =>
         source.Hostname.toLowerCase().includes(filter),
@@ -86,7 +88,11 @@
             selected &&
             sourceOrigin(selected) === origin
           ) {
-            selected = current;
+            selected = {
+              ...current,
+              JetstreamCoverage: selected.JetstreamCoverage,
+              JetstreamUnavailable: selected.JetstreamUnavailable,
+            };
             detailUnavailable = false;
           }
         } catch {
@@ -107,7 +113,7 @@
     selected = source;
     detailUnavailable = false;
     resetCoverage();
-    void refreshSelected();
+    void refreshCoverage(sourceOrigin(source), detailRequest);
   }
   async function find() {
     const query = search,
@@ -127,10 +133,25 @@
       if (request === lookupRequest) error = (e as Error).message;
     }
   }
-  function coverageProgress(item: Coverage) {
+  function coverageProgress(item: Coverage | JetstreamSummary) {
     return item.totalReposKnown
-      ? `${item.completedRepos} of ${item.totalRepos} active repositories scanned`
-      : `${item.completedRepos} repositories scanned; inventory is still being counted`;
+      ? `${item.completedRepos} of ${item.totalRepos} repositories from the initial inventory scanned`
+      : `${item.completedRepos} repositories scanned; initial inventory is still being counted`;
+  }
+  function totalAccounts(
+    item: Coverage | JetstreamSummary | null,
+    unavailable = false,
+  ) {
+    if (unavailable) return "Unavailable";
+    if (!item) return "Unknown";
+    return item.totalReposKnown ? String(item.totalRepos) : "Counting";
+  }
+  function jetstreamAccounts(
+    item: Coverage | JetstreamSummary | null,
+    unavailable = false,
+  ) {
+    if (unavailable) return "Unavailable";
+    return item ? String(item.completedRepos) : "Unknown";
   }
 </script>
 
@@ -226,19 +247,58 @@
         <dt>Relay-observed accounts</dt>
         <dd>{selected.AccountQuota.Count}<small>Accounts currently known to Relay for this source, not a census of the PDS.</small></dd>
       </div>
-      <div>
-        <dt>Jetstream current-state coverage</dt>
-        <dd>
-          {#if coverageUnavailable}
-            Unavailable<small>Jetstream did not return coverage for this source.</small>
-          {:else if coverage}
-            <State value={coverage.state} /><small>{coverageProgress(coverage)}</small><small>Policy revision {coverage.policy.revision}: {coverage.policy.collections.join(", ") || "No collections selected"}</small><small>{coverage.historyComplete ? "Historical coverage complete" : "Current snapshot only; historical coverage is not complete."}</small>{#if coverage.reason}<small>{coverage.reason.replaceAll("_", " ")}</small>{/if}
-          {:else}
-            Unknown<small>No Jetstream backfill result exists for this source.</small>
-          {/if}
-        </dd>
-      </div>
     </dl>
+    <section class="detail" aria-label="Jetstream statistics">
+      <h3>Jetstream</h3>
+      <dl>
+        <div>
+          <dt>Backfill status</dt>
+          <dd>
+              {#if jetstreamStats}
+              <State value={jetstreamStats.state} />{#if coverage?.reason}<small>{coverage.reason.replaceAll("_", " ")}</small>{/if}{#if coverageUnavailable}<small>Latest detailed result unavailable; showing the source-table summary.</small>{/if}
+            {:else if coverageUnavailable}
+              Unavailable<small>Jetstream did not return coverage for this source.</small>
+            {:else}
+              Unknown<small>No Jetstream backfill result exists for this source.</small>
+            {/if}
+          </dd>
+        </div>
+        <div>
+          <dt>Total accounts</dt>
+          <dd>{totalAccounts(jetstreamStats, coverageUnavailable && !jetstreamStats)}<small>Initial active-repository inventory captured for the latest Jetstream job; it is not a live PDS census.</small></dd>
+        </div>
+        <div>
+          <dt>Jetstream accounts</dt>
+          <dd>{jetstreamAccounts(jetstreamStats, coverageUnavailable && !jetstreamStats)}<small>Repositories processed by the latest Jetstream backfill.</small></dd>
+        </div>
+        {#if jetstreamStats}
+          <div>
+            <dt>Backfill progress</dt>
+            <dd>{coverageProgress(jetstreamStats)}</dd>
+          </div>
+          <div>
+            <dt>Current-state coverage</dt>
+            <dd>{jetstreamStats.coverage.replaceAll("_", " ")}<small>{jetstreamStats.historyComplete ? "Historical coverage complete" : "Current snapshot only; historical coverage is not complete."}</small></dd>
+          </div>
+        {/if}
+        {#if coverage}
+          <div>
+            <dt>Collections</dt>
+            <dd>
+              <details>
+                <summary>{coverage.policy.collections.length} selected collections</summary>
+                {#if coverage.policy.collections.length}
+                  <ul>{#each coverage.policy.collections as collection}<li>{collection}</li>{/each}</ul>
+                {:else}
+                  <p>No collections selected.</p>
+                {/if}
+              </details>
+              <small>Policy revision {coverage.policy.revision}</small>
+            </dd>
+          </div>
+        {/if}
+      </dl>
+    </section>
     {#key sourceOrigin(selected)}
       <AccountQuota
         source={selected}
@@ -260,7 +320,7 @@
             kind: "job",
             pds: sourceOrigin(selected!),
             reason: "backfill",
-          })}>Backfill selected collections</button
+          })}>Backfill collections</button
       ><a href={`/jobs?pds=${encodeURIComponent(sourceOrigin(selected))}`}
         >View jobs</a
       ><a href={`/coverage?pds=${encodeURIComponent(sourceOrigin(selected))}`}
@@ -280,7 +340,7 @@
     <caption>Configured sources</caption><thead
       ><tr
         ><th>Source</th><th>State / runtime connection</th><th>Admission check</th
-        ><th>Admission quota</th><th>Relay-observed accounts</th><th>Cursor</th><th>Actions</th></tr
+        ><th>Admission quota</th><th aria-label="Total accounts (Jetstream initial inventory)">Total accounts<small>Jetstream initial inventory</small></th><th aria-label="Relay accounts (observed)">Relay accounts<small>Observed</small></th><th aria-label="Jetstream accounts (processed)">Jetstream accounts<small>Processed</small></th><th>Cursor</th><th>Actions</th></tr
       ></thead
     ><tbody>
       {#each displayedRows as source (source.HostID)}<tr
@@ -299,7 +359,9 @@
             /></td
           ><td>{source.Validation.Status} {source.Validation.Reason}</td
           ><td>{source.AccountQuota.Limit} accounts</td
+          ><td>{totalAccounts(source.JetstreamCoverage ?? null, !!source.JetstreamUnavailable)}</td
           ><td>{source.AccountQuota.Count}</td
+          ><td>{jetstreamAccounts(source.JetstreamCoverage ?? null, !!source.JetstreamUnavailable)}</td
           ><td
             >{source.LastDurableCursor < 0
               ? "Not recorded"
@@ -333,7 +395,7 @@
           ></tr
         >
       {:else}<tr
-          ><td colspan="7" class="empty"
+          ><td colspan="9" class="empty"
             >No sources on this page. Add a PDS origin to begin acquisition.</td
           ></tr
         >{/each}

@@ -137,10 +137,16 @@ stops acquisition without deleting archives. Job progress remains owned by Jetst
 Coverage is a page of PDS/policy results with the exact selected collections, job
 ID, progress and incomplete reason. A completed current snapshot has
 `historyComplete: false`; historical PDS attribution is explicitly unknown.
-Sources without jobs have unknown coverage. Source detail presents the latest
-Jetstream current-state coverage alongside Relay connection state and durable
-cursors. Its admission quota is a limit only: Relay-observed accounts are shown
-separately and are not a census of the PDS or a limit on Jetstream backfill.
+Sources without jobs have unknown coverage. The Sources table presents the
+initial Jetstream inventory totals and processed repositories for the latest job
+beside Relay-observed accounts. Its compact coverage enrichment has a three-second
+private-service bound; on failure, Relay source state remains available and the
+Jetstream cells are marked unavailable. Source detail presents the same Jetstream
+current-state coverage alongside Relay connection state and durable cursors. Its
+admission quota is a limit only:
+Relay-observed accounts are shown separately and are not a census of the PDS or
+a limit on Jetstream backfill. The source-detail collection list is collapsed by
+default.
 
 ## Rate policy
 

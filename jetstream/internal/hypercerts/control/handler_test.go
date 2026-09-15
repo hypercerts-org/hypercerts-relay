@@ -121,6 +121,18 @@ func TestPrivateLifecycleAndCoverage(t *testing.T) {
 	require.Len(t, coveragePage.Items, 1)
 	require.Equal(t, "https://pds.example", coveragePage.Items[0].PDS)
 	require.Equal(t, uint64(2), coveragePage.Items[0].Policy.Revision)
+	_, err := m.AddSource("https://other.example")
+	require.NoError(t, err)
+	filtered := request(h, "GET", "/coverage?summary=1&pds=https%3A%2F%2Fpds.example&pds=https%3A%2F%2Fother.example", "", testToken)
+	require.Equal(t, 200, filtered.Code)
+	var summaries struct {
+		Items []coverageSummaryView `json:"items"`
+	}
+	require.NoError(t, json.Unmarshal(filtered.Body.Bytes(), &summaries))
+	require.Len(t, summaries.Items, 2)
+	require.Equal(t, "https://other.example", summaries.Items[0].PDS)
+	require.Equal(t, "https://pds.example", summaries.Items[1].PDS)
+	require.NotContains(t, filtered.Body.String(), "policy")
 	require.Equal(t, 204, request(h, "DELETE", "/sources", `{"pds":"https://pds.example"}`, testToken).Code)
 }
 func TestPrivateCompleteAndFailedResults(t *testing.T) {

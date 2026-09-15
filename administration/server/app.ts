@@ -132,9 +132,39 @@ export function createApp(
       throw new ApiError(400, "invalid_cursor");
     res.json(store.page("audit", p.after, p.limit));
   });
-  app.get("/api/v1/sources", (req, res) => {
+  app.get("/api/v1/sources", async (req, res) => {
     const p = page.parse(req.query);
-    return services.sources(p.after).then((v) => res.json(v));
+    const sources = (await services.sources(p.after)) as {
+      Sources: { Hostname: string; NoSSL: boolean; [key: string]: unknown }[];
+      NextAfterHostID: number;
+    };
+    const origins = sources.Sources.map(
+      (source) => `${source.NoSSL ? "http" : "https"}://${source.Hostname}`,
+    );
+    if (!origins.length) {
+      res.json(sources);
+      return;
+    }
+    try {
+      const coverage = await services.coverageFor(origins);
+      const byPDS = new Map(coverage.items.map((item) => [item.pds, item]));
+      res.json({
+        ...sources,
+        Sources: sources.Sources.map((source, index) => ({
+          ...source,
+          JetstreamCoverage: byPDS.get(origins[index]) ?? null,
+        })),
+      });
+    } catch {
+      res.json({
+        ...sources,
+        Sources: sources.Sources.map((source) => ({
+          ...source,
+          JetstreamCoverage: null,
+          JetstreamUnavailable: true,
+        })),
+      });
+    }
   });
   app.get("/api/v1/source", (req, res) =>
     services

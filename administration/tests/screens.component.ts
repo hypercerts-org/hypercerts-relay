@@ -299,7 +299,7 @@ test("jobs explain recovery types and use operator-facing progress labels", () =
   expect(screen.getAllByText("Purpose")).toHaveLength(2);
   expect(screen.getAllByText("Quota recovery")).toHaveLength(2);
   expect(screen.getByText("Status")).toBeTruthy();
-  expect(screen.getByText("3 of 10 active repositories processed")).toBeTruthy();
+  expect(screen.getByText("3 of 10 repositories from the initial inventory processed")).toBeTruthy();
   expect(screen.queryByText(/Revision/)).toBeNull();
 });
 
@@ -394,8 +394,13 @@ test("selected source detail is loaded on demand without background polling", as
     });
     await fireEvent.click(screen.getByRole("button", { name: "Filter" }));
     expect(await screen.findByText("connected")).toBeTruthy();
-    expect(await screen.findByText("43 of 13895 active repositories scanned")).toBeTruthy();
+    expect(await screen.findByText("43 of 13895 repositories from the initial inventory scanned")).toBeTruthy();
+    expect(screen.getByText("13895")).toBeTruthy();
+    expect(screen.getByText("43")).toBeTruthy();
     expect(document.body.textContent).toContain("Current snapshot only; historical coverage is not complete.");
+    const collections = screen.getByText("1 selected collections").closest("details");
+    expect(collections?.hasAttribute("open")).toBe(false);
+    expect(screen.getByRole("button", { name: "Backfill collections" })).toBeTruthy();
     expect(fetcher).toHaveBeenCalledTimes(2);
   } finally {
     cleanup();
@@ -424,16 +429,11 @@ test("latest same-source detail refresh wins over an older response", async () =
     });
     return { promise, resolve, reject };
   };
-  const oldSource = deferred<Response>();
   const oldCoverage = deferred<Response>();
-  const newSource = deferred<Response>();
   const newCoverage = deferred<Response>();
-  const sourceResponses = [oldSource, newSource];
   const coverageResponses = [oldCoverage, newCoverage];
-  const fetcher = vi.fn().mockImplementation((url: string) =>
-    url.includes("/coverage")
-      ? coverageResponses.shift()!.promise
-      : sourceResponses.shift()!.promise,
+  const fetcher = vi.fn().mockImplementation(() =>
+    coverageResponses.shift()!.promise,
   );
   vi.stubGlobal("fetch", fetcher);
   try {
@@ -441,8 +441,7 @@ test("latest same-source detail refresh wins over an older response", async () =
     const select = screen.getByRole("button", { name: "race.example" });
     await fireEvent.click(select);
     await fireEvent.click(select);
-    expect(fetcher).toHaveBeenCalledTimes(4);
-    newSource.resolve(Response.json(source));
+    expect(fetcher).toHaveBeenCalledTimes(2);
     newCoverage.resolve(
       Response.json({
         items: [
@@ -463,11 +462,10 @@ test("latest same-source detail refresh wins over an older response", async () =
         ],
       }),
     );
-    expect(await screen.findByText("20 of 20 active repositories scanned")).toBeTruthy();
-    oldSource.reject(new Error("stale source failure"));
+    expect(await screen.findByText("20 of 20 repositories from the initial inventory scanned")).toBeTruthy();
     oldCoverage.reject(new Error("stale coverage failure"));
     await Promise.resolve();
-    expect(screen.getByText("20 of 20 active repositories scanned")).toBeTruthy();
+    expect(screen.getByText("20 of 20 repositories from the initial inventory scanned")).toBeTruthy();
     expect(screen.queryByText("Jetstream did not return coverage for this source.")).toBeNull();
   } finally {
     cleanup();
@@ -496,7 +494,9 @@ test("source overview separates admission quota from Relay-observed accounts", (
   expect(screen.getByText("25 accounts")).toBeTruthy();
   expect(screen.getByText("4")).toBeTruthy();
   expect(screen.getByText("Admission quota")).toBeTruthy();
-  expect(screen.getByText("Relay-observed accounts")).toBeTruthy();
+  expect(screen.getByText("Total accounts")).toBeTruthy();
+  expect(screen.getByText("Relay accounts")).toBeTruthy();
+  expect(screen.getByText("Jetstream accounts")).toBeTruthy();
   expect(screen.getByText("State / runtime connection")).toBeTruthy();
   expect(screen.getByText(/historical collection counts are unavailable/)).toBeTruthy();
 });

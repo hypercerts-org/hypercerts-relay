@@ -200,10 +200,18 @@ func (h *Handler) listCoverage(w http.ResponseWriter, r *http.Request) {
 		}
 		limit = n
 	}
+	requestedPDS := map[string]struct{}{}
+	for _, pds := range r.URL.Query()["pds"] {
+		if pds != "" {
+			requestedPDS[pds] = struct{}{}
+		}
+	}
 	latest := map[string]jobs.Job{}
 	for _, job := range h.jobs.List() {
-		if pds := r.URL.Query().Get("pds"); pds != "" && job.PDS != pds {
-			continue
+		if len(requestedPDS) > 0 {
+			if _, ok := requestedPDS[job.PDS]; !ok {
+				continue
+			}
 		}
 		previous, ok := latest[job.PDS]
 		if !ok || job.CreatedAt.After(previous.CreatedAt) || (job.CreatedAt.Equal(previous.CreatedAt) && job.ID > previous.ID) {
@@ -227,6 +235,17 @@ func (h *Handler) listCoverage(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		out = append(out, coverage(job))
+	}
+	if r.URL.Query().Get("summary") == "1" {
+		summaries := make([]coverageSummaryView, 0, len(out))
+		for _, job := range out {
+			summaries = append(summaries, coverageSummary(job))
+		}
+		reply(w, 200, struct {
+			Items      []coverageSummaryView `json:"items"`
+			NextCursor string                `json:"nextCursor,omitempty"`
+		}{summaries, next})
+		return
 	}
 	reply(w, 200, struct {
 		Items      []coverageView `json:"items"`
@@ -307,4 +326,23 @@ type coverageView struct {
 
 func coverage(j jobs.Job) coverageView {
 	return coverageView{PDS: j.PDS, Policy: j.Policy, JobID: j.ID, State: j.State, CompletedRepos: len(j.CompletedRepos), TotalRepos: j.TotalRepos, TotalReposKnown: j.TotalReposKnown, ErrorCode: j.ErrorCode, CreatedAt: j.CreatedAt, Coverage: j.Coverage, HistoryComplete: j.HistoryComplete}
+}
+
+// coverageSummaryView is a compact table-enrichment view. The full policy is
+// intentionally omitted because it is fetched only for the selected source.
+type coverageSummaryView struct {
+	PDS             string     `json:"pds"`
+	JobID           string     `json:"jobId"`
+	State           jobs.State `json:"state"`
+	CompletedRepos  int        `json:"completedRepos"`
+	TotalRepos      int        `json:"totalRepos"`
+	TotalReposKnown bool       `json:"totalReposKnown"`
+	ErrorCode       string     `json:"errorCode,omitempty"`
+	CreatedAt       time.Time  `json:"createdAt"`
+	Coverage        string     `json:"coverage"`
+	HistoryComplete bool       `json:"historyComplete"`
+}
+
+func coverageSummary(view coverageView) coverageSummaryView {
+	return coverageSummaryView{PDS: view.PDS, JobID: view.JobID, State: view.State, CompletedRepos: view.CompletedRepos, TotalRepos: view.TotalRepos, TotalReposKnown: view.TotalReposKnown, ErrorCode: view.ErrorCode, CreatedAt: view.CreatedAt, Coverage: view.Coverage, HistoryComplete: view.HistoryComplete}
 }

@@ -17,6 +17,8 @@ export interface Source {
   LastDurableCursor: number;
   Validation: { Status: string; Reason: string };
   AccountQuota: { Count: number; Limit: number };
+  JetstreamCoverage?: JetstreamSummary | null;
+  JetstreamUnavailable?: boolean;
 }
 export interface Limit {
   scope: string;
@@ -24,6 +26,17 @@ export interface Limit {
   waitingConnections: number;
   unit: string;
   recovery: string;
+}
+export interface JetstreamSummary {
+  pds: string;
+  jobId: string;
+  state: string;
+  completedRepos: number;
+  totalRepos: number;
+  totalReposKnown: boolean;
+  createdAt: string;
+  coverage: string;
+  historyComplete: boolean;
 }
 export interface Coverage {
   pds: string;

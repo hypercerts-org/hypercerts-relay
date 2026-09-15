@@ -32,6 +32,7 @@ export class Services {
     method = "GET",
     body?: unknown,
     id?: string,
+    timeout = 25000,
   ): Promise<T> {
     const config = service === "relay" ? this.relay : this.jetstream;
     let response: Response;
@@ -44,7 +45,7 @@ export class Services {
           ...(id ? { "Idempotency-Key": id } : {}),
         },
         body: body === undefined ? undefined : JSON.stringify(body),
-        signal: AbortSignal.timeout(25000),
+        signal: AbortSignal.timeout(timeout),
         redirect: "error",
       });
     } catch {
@@ -83,25 +84,32 @@ export class Services {
     );
   }
   coverage(after = "", pds = "") {
-    return this.call<{
-      items: {
-        pds: string;
-        policy: Policy;
-        jobId: string;
-        state: string;
-        completedRepos: number;
-        totalRepos: number;
-        totalReposKnown: boolean;
-        errorCode?: string;
-        createdAt: string;
-        coverage: string;
-        historyComplete: boolean;
-      }[];
-      nextCursor?: string;
-    }>(
+    return this.call<CoveragePage>(
       "jetstream",
       `/coverage?limit=50&after=${encodeURIComponent(after)}&pds=${encodeURIComponent(pds)}`,
     );
+  }
+  async coverageFor(pds: string[]) {
+    const chunks = [] as string[][];
+    for (let i = 0; i < pds.length; i += 20) chunks.push(pds.slice(i, i + 20));
+    const pages = await Promise.all(
+      chunks.map((origins) => {
+        const query = new URLSearchParams({
+          limit: String(origins.length),
+          summary: "1",
+        });
+        for (const origin of origins) query.append("pds", origin);
+        return this.call<CoverageSummaryPage>(
+          "jetstream",
+          `/coverage?${query}`,
+          "GET",
+          undefined,
+          undefined,
+          3000,
+        );
+      }),
+    );
+    return { items: pages.flatMap((page) => page.items) };
   }
   sources(after = "") {
     return this.call<Record<string, unknown>>(
@@ -189,6 +197,38 @@ export class Services {
         : { enabled: false };
     return { relay, jetstream };
   }
+}
+
+interface CoverageSummaryPage {
+  items: {
+    pds: string;
+    jobId: string;
+    state: string;
+    completedRepos: number;
+    totalRepos: number;
+    totalReposKnown: boolean;
+    errorCode?: string;
+    createdAt: string;
+    coverage: string;
+    historyComplete: boolean;
+  }[];
+}
+
+interface CoveragePage {
+  items: {
+    pds: string;
+    policy: Policy;
+    jobId: string;
+    state: string;
+    completedRepos: number;
+    totalRepos: number;
+    totalReposKnown: boolean;
+    errorCode?: string;
+    createdAt: string;
+    coverage: string;
+    historyComplete: boolean;
+  }[];
+  nextCursor?: string;
 }
 
 function allowedControlTransport(url: URL, railwayPrivateNetwork: boolean) {

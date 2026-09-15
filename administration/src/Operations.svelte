@@ -44,11 +44,11 @@
   function jobProgress(job: Job) {
     if (["running", "in_progress"].includes(job.state)) {
       return job.totalReposKnown
-        ? `${job.completedRepos} of ${job.totalRepos} active repositories processed`
-        : "Counting active repositories before backfill starts";
+        ? `${job.completedRepos} of ${job.totalRepos} repositories from the initial inventory processed`
+        : "Counting the initial repository inventory before backfill starts";
     }
     return job.totalReposKnown
-      ? `${job.completedRepos} of ${job.totalRepos} active repositories processed`
+      ? `${job.completedRepos} of ${job.totalRepos} repositories from the initial inventory processed`
       : `${job.completedRepos} repositories processed`;
   }
   function currentStateScope(item: { coverage: string; historyComplete: boolean }) {
@@ -204,8 +204,8 @@
                     ></td
                   ><td
                     >{group.item.totalReposKnown
-                      ? `${group.item.completedRepos} of ${group.item.totalRepos} active repositories processed`
-                      : `${group.item.completedRepos} repositories processed; inventory is still being counted`}<small
+                      ? `${group.item.completedRepos} of ${group.item.totalRepos} repositories from the initial inventory processed`
+                      : `${group.item.completedRepos} repositories processed; initial inventory is still being counted`}<small
                       >Policy revision {group.item.policy.revision}; {currentStateScope(group.item)}</small
                     ><small
                       >{group.item.reason?.replaceAll("_", " ") ||
