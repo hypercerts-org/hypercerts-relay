@@ -135,7 +135,6 @@ volume persistence and cursor recovery still need deployment-specific validation
 - [Railway Dockerfile builds](https://docs.railway.com/builds/dockerfiles)
 - [Volume availability and ownership](https://docs.railway.com/volumes)
 - [Private networking](https://docs.railway.com/networking/private-networking/how-it-works)
-- [Project-local Railway skill](../.agents/skills/hypercerts-railway/SKILL.md)
 
 ## Management transport
 

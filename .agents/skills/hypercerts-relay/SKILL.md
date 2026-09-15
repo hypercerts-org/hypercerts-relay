@@ -55,5 +55,5 @@ A release is a reviewed version tag and GitHub Release, created only through the
 ## Railway packaging
 
 For Railway images, volumes, private networking and runtime secret handling, read
-`docs/railway.md` and `.agents/skills/hypercerts-railway/SKILL.md`. Keep repository
-preparation separate from an authorized platform deployment.
+`docs/railway.md`. Keep repository preparation separate from an authorized platform
+deployment.

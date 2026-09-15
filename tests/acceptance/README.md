@@ -46,7 +46,7 @@ the sealed archive boundary.
 
 ## Run
 
-Requirements: Docker/Compose, Go 1.26.1, `openssl`, `curl`, `python3`, and an
+Requirements: Docker/Compose, Go 1.26.6 or later, `openssl`, `curl`, `python3`, and an
 internet connection for the pinned images and the PLC test dependency on first
 build. The runner generates all test credentials into an ignored per-run
 directory and removes containers and named volumes on exit.
