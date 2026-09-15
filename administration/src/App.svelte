@@ -28,10 +28,16 @@
     ["coverage", "Coverage"],
     ["limits", "Rate limits"],
     ["audit", "Audit log"],
-    ["administrators", "Administrators"],
+    ["manage-adminis", "Administrators"],
   ];
   const route = location.pathname.split("/")[1] || "overview";
-  const screen = route === "changes" ? "audit" : navigation.some(([key]) => key === route) ? route : "overview";
+  const screen = ["administrators", "administrations"].includes(route)
+    ? "manage-adminis"
+    : route === "changes"
+      ? "audit"
+      : navigation.some(([key]) => key === route)
+        ? route
+        : "overview";
   let session: (Administrator & { csrf: string; expires: number }) | null =
       null,
     ready = false,
@@ -60,7 +66,7 @@
     loading = true;
     try {
       switch (screen) {
-        case "administrators": {
+        case "manage-adminis": {
           const r = await api<{
             items: Administrator[];
             next: string | null;
@@ -305,7 +311,7 @@
               ) ?? ""} <a href="/audit">View audit log</a>
             </div>{/if}
         </div>{/if}
-      {#if screen === "administrators"}<Administrators
+      {#if screen === "manage-adminis"}<Administrators
           rows={administrators}
           currentDid={session.did}
           csrf={session.csrf}

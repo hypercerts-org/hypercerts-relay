@@ -4,6 +4,7 @@ export interface Administrator {
   did: string;
   handle?: string | null;
   displayName?: string | null;
+  lastLoggedIn?: string | null;
 }
 export interface Source {
   HostID: number;

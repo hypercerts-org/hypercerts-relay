@@ -135,7 +135,9 @@ test("sign-in persists and refreshes profile presentation without changing membe
   assert.ok(signedIn);
   store.close();
   store = new Store(path);
-  assert.equal(store.administrators("", 50).items[0].displayName, "First Name");
+  const firstProfile = store.administrators("", 50).items[0];
+  assert.equal(firstProfile.displayName, "First Name");
+  assert.ok(firstProfile.lastLoggedIn);
   displayName = "Updated Name";
   await new Auth(store, "https://admin.example", provider).callback(
     request,

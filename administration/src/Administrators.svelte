@@ -122,6 +122,7 @@
         {#if row.displayName}<strong>{row.displayName}</strong>{/if}
         {#if row.handle}<span>@{row.handle}</span>{/if}
         <code>{row.did}</code>
+        <small>Last login: {row.lastLoggedIn ? new Date(row.lastLoggedIn).toLocaleString() : "Never recorded"}</small>
       </div>
       {#if row.did === currentDid}<span>You</span>
       {:else}<button

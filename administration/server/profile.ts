@@ -3,6 +3,7 @@ import { isValidHandle } from "@atproto/syntax";
 export interface AdministratorProfile {
   handle?: string | null;
   displayName?: string | null;
+  lastLoggedIn?: string | null;
 }
 export interface IdentitySession {
   did: string;
