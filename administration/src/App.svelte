@@ -59,8 +59,16 @@
     globalLimits: Limit[] = [];
   let nextOperationAudit: string | null = null,
     nextHistoryAudit: string | null = null;
-  let status: { relay: string; jetstream: string; observedAt: string } | null =
-      null,
+  let status: {
+      relay: string;
+      jetstream: string;
+      publicServiceOrigins: {
+        relay?: string;
+        rainbow?: string;
+        jetstream?: string;
+      };
+      observedAt: string;
+    } | null = null,
     operation: Operation | null = null;
   const pdsFilter = new URLSearchParams(location.search).get("pds") ?? "";
   let cursor = "",
@@ -330,7 +338,9 @@
       <header class="toolbar">
         <span>Administration</span>
         <div class="actions">
-          {#if loading}<span class="refresh-status" role="status">Refreshing…</span>{/if}<button
+          {#if loading}<span class="refresh-status" role="status"
+              >Refreshing…</span
+            >{/if}<button
             disabled={loading}
             onclick={() => {
               error = "";
@@ -357,13 +367,24 @@
           csrf={session.csrf}
           onChanged={load}
         />
-      {:else if screen === "sources"}<Sources bind:this={sourcesComponent} rows={sources} {submit} {busy} />
+      {:else if screen === "sources"}<Sources
+          bind:this={sourcesComponent}
+          rows={sources}
+          {submit}
+          {busy}
+        />
       {:else if screen === "collections"}{#if policyLoaded}<Collections
             {policy}
             {submit}
             {busy}
           />{/if}
-      {:else if screen === "limits"}<Limits rows={limits} {globalLimits} {sources} {submit} {busy} />
+      {:else if screen === "limits"}<Limits
+          rows={limits}
+          {globalLimits}
+          {sources}
+          {submit}
+          {busy}
+        />
       {:else if ["jobs", "coverage", "audit"].includes(screen)}<Operations
           {screen}
           {jobs}
@@ -396,6 +417,36 @@
             <div>
               <dt>Jetstream</dt>
               <dd><State value={status?.jetstream ?? "unknown"} /></dd>
+            </div>
+            <div>
+              <dt>Relay public endpoint</dt>
+              <dd>
+                {#if status?.publicServiceOrigins.relay}
+                  <a href={status.publicServiceOrigins.relay}
+                    >{status.publicServiceOrigins.relay}</a
+                  >
+                {:else}Not configured{/if}
+              </dd>
+            </div>
+            <div>
+              <dt>Rainbow public endpoint</dt>
+              <dd>
+                {#if status?.publicServiceOrigins.rainbow}
+                  <a href={status.publicServiceOrigins.rainbow}
+                    >{status.publicServiceOrigins.rainbow}</a
+                  >
+                {:else}Not configured{/if}
+              </dd>
+            </div>
+            <div>
+              <dt>Jetstream public endpoint</dt>
+              <dd>
+                {#if status?.publicServiceOrigins.jetstream}
+                  <a href={status.publicServiceOrigins.jetstream}
+                    >{status.publicServiceOrigins.jetstream}</a
+                  >
+                {:else}Not configured{/if}
+              </dd>
             </div>
           </dl>
           <p class="note">

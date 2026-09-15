@@ -29,6 +29,9 @@ npm run server
 | `RELAY_CONTROL_TOKEN_FILE`     | Mounted Relay service credential, at least 32 bytes.                                                    |
 | `JETSTREAM_CONTROL_URL`        | Private Jetstream operations origin.                                                                    |
 | `JETSTREAM_CONTROL_TOKEN_FILE` | Mounted Jetstream service credential, at least 32 bytes.                                                |
+| `RELAY_PUBLIC_ORIGIN`          | Optional public Relay HTTPS origin displayed on the Overview page; never use the control URL.           |
+| `RAINBOW_PUBLIC_ORIGIN`        | Optional public Rainbow HTTPS origin displayed on the Overview page.                                    |
+| `JETSTREAM_PUBLIC_ORIGIN`      | Optional public Jetstream HTTPS origin displayed on the Overview page; never use the control URL.       |
 
 Run one administration process per database. Use a process supervisor; this is a
 stateful Node service, not a stateless function. Keep the database directory and
@@ -43,7 +46,10 @@ API. In Jetstream, configure `JETSTREAM_DEBUG_ADDR` and
 `JETSTREAM_CONTROL_TOKEN_FILE` as documented in `../jetstream/README.md`. Use
 TLS between services, or Railway private service origins with `HC_RAILWAY_STARTUP=1`.
 Control URLs reject plaintext HTTP except loopback and single-service
-`*.railway.internal` origins in Railway startup mode. No component is deployed by this change.
+`*.railway.internal` origins in Railway startup mode. The three optional
+`*_PUBLIC_ORIGIN` values accept only HTTPS origins (or loopback HTTP for local
+development) and are display-only; they must not expose private management/debug
+listeners. No component is deployed by this change.
 
 `/oauth-client-metadata.json` must be reachable by authorization servers at the
 public origin. OAuth uses the maintained AT Protocol Node client for discovery,
@@ -102,19 +108,19 @@ use the immutable DID, never a handle or display name.
 
 The browser-facing API is `/api/v1`; all endpoints below require authorization.
 
-| Endpoint                                 | Contract                                                                                          |
-| ---------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| `GET /administrators`                 | Paginated current administrator DIDs with cached presentation and last login.                      |
-| `POST /administrators`                | `{did, action}` with `grant` or `remove`; actor audited, CSRF protected; cannot remove oneself.            |
-| `GET /session`                           | Current DID, CSRF token, expiry.                                                                  |
-| `POST /signout`, `/revoke-sessions`      | Revoke the current or all local sessions.                                                         |
-| `POST /operations`                       | Validated command plus UUID `Idempotency-Key`; returns durable operation and HTTP 202.            |
-| `GET /operations`, `/operations/{id}`    | Requested command, actor, state, observed result and bounded failure code.                        |
-| `POST /operations/{id}/retry`, `/cancel` | Retry failed/incomplete work or cancel work not yet applying; actor audited.                      |
+| Endpoint                                 | Contract                                                                                                   |
+| ---------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `GET /administrators`                    | Paginated current administrator DIDs with cached presentation and last login.                              |
+| `POST /administrators`                   | `{did, action}` with `grant` or `remove`; actor audited, CSRF protected; cannot remove oneself.            |
+| `GET /session`                           | Current DID, CSRF token, expiry.                                                                           |
+| `POST /signout`, `/revoke-sessions`      | Revoke the current or all local sessions.                                                                  |
+| `POST /operations`                       | Validated command plus UUID `Idempotency-Key`; returns durable operation and HTTP 202.                     |
+| `GET /operations`, `/operations/{id}`    | Requested command, actor, state, observed result and bounded failure code.                                 |
+| `POST /operations/{id}/retry`, `/cancel` | Retry failed/incomplete work or cancel work not yet applying; actor audited.                               |
 | `GET /sources`, `/source?pds=…`          | Relay's desired, validation, connection, admission-quota, Relay-observed-account and durable-cursor state. |
-| `GET /policy`                            | Jetstream's applied collection-policy revision.                                                   |
-| `GET /jobs`, `/coverage`                 | Jetstream job state and source/policy-scoped current-state coverage; optional exact `pds` filter. |
-| `GET /limits`, `/status`, `/audit`       | Applied policies, bounded service health, durable actor-attributed history.                       |
+| `GET /policy`                            | Jetstream's applied collection-policy revision.                                                            |
+| `GET /jobs`, `/coverage`                 | Jetstream job state and source/policy-scoped current-state coverage; optional exact `pds` filter.          |
+| `GET /limits`, `/status`, `/audit`       | Applied policies, bounded service health, durable actor-attributed history.                                |
 
 Commands are discriminated by `kind`: `source` (`pds`, `state`), `collections`
 (`expectedRevision`, exact `collections`), `job` (`pds`, `reason`), `job_action`

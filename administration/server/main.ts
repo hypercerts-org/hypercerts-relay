@@ -18,6 +18,24 @@ function secret(name: string) {
     throw new Error(`${name} must contain at least 32 bytes`);
   return value;
 }
+function publicOrigin(name: string) {
+  const value = process.env[name];
+  if (!value) return undefined;
+  const url = new URL(value);
+  const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+  if (
+    (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) ||
+    url.username ||
+    url.password ||
+    url.pathname !== "/" ||
+    url.search ||
+    url.hash
+  )
+    throw new Error(
+      `${name} must be a public HTTPS origin without credentials, path, query, or fragment`,
+    );
+  return url.origin;
+}
 const base = new URL(required("ADMIN_PUBLIC_ORIGIN")).origin;
 if (
   !base.startsWith("https:") &&
@@ -56,6 +74,11 @@ const server = createApp(
       (process.env.HC_RAILWAY_STARTUP === "1"
         ? ["loopback", "linklocal", "uniquelocal"]
         : undefined),
+    publicServiceOrigins: {
+      relay: publicOrigin("RELAY_PUBLIC_ORIGIN"),
+      rainbow: publicOrigin("RAINBOW_PUBLIC_ORIGIN"),
+      jetstream: publicOrigin("JETSTREAM_PUBLIC_ORIGIN"),
+    },
   },
 ).listen(
   Number(process.env.PORT ?? 3000),

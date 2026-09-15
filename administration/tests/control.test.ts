@@ -8,7 +8,7 @@ import { Store } from "../server/store.ts";
 import { Worker } from "../server/worker.ts";
 import { Services } from "../server/services.ts";
 import { Auth, type OAuthProvider } from "../server/auth.ts";
-import { createApp } from "../server/app.ts";
+import { createApp, type AppOptions } from "../server/app.ts";
 import { ApiError, command } from "../server/contracts.ts";
 
 const did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
@@ -21,7 +21,7 @@ const oauth: OAuthProvider = {
   },
   async revoke() {},
 };
-async function fixture(t: TestContext) {
+async function fixture(t: TestContext, options: AppOptions = {}) {
   const store = new Store(":memory:");
   store.db.prepare("INSERT INTO administrators VALUES(?)").run(did);
   const token = "browser-session",
@@ -36,7 +36,14 @@ async function fixture(t: TestContext) {
   );
   const base = "http://127.0.0.1:3000";
   const auth = new Auth(store, base, oauth);
-  const server = createApp(store, services, auth, {}).listen(0, "127.0.0.1");
+  const server = createApp(
+    store,
+    services,
+    auth,
+    {},
+    undefined,
+    options,
+  ).listen(0, "127.0.0.1");
   await new Promise<void>((resolve) => server.once("listening", resolve));
   const address = server.address() as { port: number };
   t.after(() => {
@@ -62,6 +69,23 @@ async function fixture(t: TestContext) {
     });
   return { store, services, auth, request };
 }
+test("status displays only configured public service origins", async (t) => {
+  const { request } = await fixture(t, {
+    publicServiceOrigins: {
+      relay: "https://relay.example",
+      rainbow: "https://rainbow.example",
+      jetstream: "https://jetstream.example",
+    },
+  });
+  const response = await request("/api/v1/status");
+  assert.equal(response.status, 200);
+  const status = await response.json();
+  assert.deepEqual(status.publicServiceOrigins, {
+    relay: "https://relay.example",
+    rainbow: "https://rainbow.example",
+    jetstream: "https://jetstream.example",
+  });
+});
 test("authentication, CSRF and immediate administrator removal guard durable mutations", async (t) => {
   const { store, request } = await fixture(t);
   const body = { kind: "source", pds: "https://pds.example", state: "enabled" };

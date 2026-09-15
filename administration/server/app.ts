@@ -12,6 +12,15 @@ import { Store } from "./store.ts";
 import { Services } from "./services.ts";
 import type { AdministratorProfile } from "./profile.ts";
 
+export interface PublicServiceOrigins {
+  relay?: string;
+  rainbow?: string;
+  jetstream?: string;
+}
+export interface AppOptions extends ProxyOptions {
+  publicServiceOrigins?: PublicServiceOrigins;
+}
+
 const page = z.object({
   after: z.string().max(200).default(""),
   limit: z.coerce.number().int().min(1).max(100).default(50),
@@ -22,12 +31,12 @@ export function createApp(
   auth: Auth,
   metadata: unknown,
   staticDir?: string,
-  proxy: ProxyOptions = {},
+  options: AppOptions = {},
 ) {
   const app = express();
   app.disable("x-powered-by");
-  app.set("trust proxy", proxy.trustProxy ?? false);
-  app.use(railwayClientIP(proxy));
+  app.set("trust proxy", options.trustProxy ?? false);
+  app.use(railwayClientIP(options));
   app.use((_req, res, next) => {
     res.set({
       "Cache-Control": "no-store",
@@ -214,6 +223,7 @@ export function createApp(
     res.json({
       relay: checks[0].status === "fulfilled" ? "available" : "unavailable",
       jetstream: checks[1].status === "fulfilled" ? "available" : "unavailable",
+      publicServiceOrigins: options.publicServiceOrigins ?? {},
       observedAt: new Date().toISOString(),
     });
   });
