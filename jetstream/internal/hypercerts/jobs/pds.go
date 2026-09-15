@@ -32,24 +32,17 @@ func (p PDSProcessor) Run(ctx context.Context, job Job) error {
 	httpClient := *p.HTTPClient
 	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	client := atmossync.NewClient(atmossync.Options{Client: &xrpc.Client{Host: job.PDS, HTTPClient: gt.Some(&httpClient), Retry: gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(1)})}, Directory: gt.Some(p.Directory)})
-	if !job.TotalReposKnown {
-		total, err := countActiveRepositories(ctx, client)
-		if err != nil {
-			return inputFailure(ctx, "source_unavailable")
-		}
-		if err := p.Manager.SetTotalRepos(job.ID, total); err != nil {
-			return err
-		}
-		job.TotalRepos = total
-		job.TotalReposKnown = true
-	}
 	for page, err := range client.ListRepos(ctx, 100, job.Cursor) {
 		if err != nil {
 			return inputFailure(ctx, "source_unavailable")
 		}
+		active := 0
 		for _, entry := range page.Entries {
 			if !entry.Active {
 				continue
+			}
+			if !job.TotalReposKnown {
+				active++
 			}
 			if rev, ok := job.CompletedRepos[string(entry.DID)]; ok && rev == entry.Rev {
 				continue
@@ -57,31 +50,32 @@ func (p PDSProcessor) Run(ctx context.Context, job Job) error {
 			if err := p.repository(ctx, client, job, entry); err != nil {
 				return err
 			}
+			// Keep this page-local snapshot current: duplicate entries must not
+			// trigger a second download before the page checkpoint commits.
+			job.CompletedRepos[string(entry.DID)] = entry.Rev
 		}
-		if err := p.Manager.Checkpoint(job.ID, "", "", page.NextCursor); err != nil {
-			return err
+		if job.TotalReposKnown {
+			if err := p.Manager.Checkpoint(job.ID, "", "", page.NextCursor); err != nil {
+				return err
+			}
+		} else {
+			if err := p.Manager.CheckpointEnumeration(job.ID, page.NextCursor, active, page.NextCursor == ""); err != nil {
+				return err
+			}
+			job.EnumeratedRepos += active
+			if page.NextCursor == "" {
+				job.TotalRepos = job.EnumeratedRepos
+				job.TotalReposKnown = true
+			}
 		}
 		job.Cursor = page.NextCursor
 	}
-	return nil
-}
-
-// countActiveRepositories establishes the bounded operator-facing total before
-// processing begins. The subsequent scan still validates and snapshots every
-// repository against the admitted PDS.
-func countActiveRepositories(ctx context.Context, client *atmossync.Client) (int, error) {
-	total := 0
-	for page, err := range client.ListRepos(ctx, 100, "") {
-		if err != nil {
-			return 0, err
-		}
-		for _, entry := range page.Entries {
-			if entry.Active {
-				total++
-			}
-		}
+	// Atmos does not yield an empty terminal page. It is still a complete,
+	// durable inventory and therefore has a total of the saved subtotal.
+	if !job.TotalReposKnown {
+		return p.Manager.CheckpointEnumeration(job.ID, job.Cursor, 0, true)
 	}
-	return total, nil
+	return nil
 }
 
 func inputFailure(ctx context.Context, code string) error {

@@ -37,22 +37,25 @@ var ErrNotFound = errors.New("job not found")
 var ErrInvalidInput = errors.New("invalid job input")
 
 type Job struct {
-	ID              string            `json:"id"`
-	PDS             string            `json:"pds"`
-	Policy          selection.Policy  `json:"policy"`
-	Reason          string            `json:"reason"`
-	State           State             `json:"state"`
-	Attempts        int               `json:"attempts"`
-	CompletedRepos  map[string]string `json:"completedRepos"`
-	TotalRepos      int               `json:"totalRepos"`
-	TotalReposKnown bool              `json:"totalReposKnown"`
-	Cursor          string            `json:"cursor"`
-	ErrorCode       string            `json:"errorCode,omitempty"`
-	CreatedAt       time.Time         `json:"createdAt"`
-	StartedAt       time.Time         `json:"startedAt,omitempty"`
-	FinishedAt      time.Time         `json:"finishedAt,omitempty"`
-	Coverage        string            `json:"coverage"`
-	HistoryComplete bool              `json:"historyComplete"`
+	ID             string            `json:"id"`
+	PDS            string            `json:"pds"`
+	Policy         selection.Policy  `json:"policy"`
+	Reason         string            `json:"reason"`
+	State          State             `json:"state"`
+	Attempts       int               `json:"attempts"`
+	CompletedRepos map[string]string `json:"completedRepos"`
+	// EnumeratedRepos is the durable, non-public subtotal used to resume a
+	// single PDS inventory scan without re-counting earlier pages.
+	EnumeratedRepos int       `json:"enumeratedRepos"`
+	TotalRepos      int       `json:"totalRepos"`
+	TotalReposKnown bool      `json:"totalReposKnown"`
+	Cursor          string    `json:"cursor"`
+	ErrorCode       string    `json:"errorCode,omitempty"`
+	CreatedAt       time.Time `json:"createdAt"`
+	StartedAt       time.Time `json:"startedAt,omitempty"`
+	FinishedAt      time.Time `json:"finishedAt,omitempty"`
+	Coverage        string    `json:"coverage"`
+	HistoryComplete bool      `json:"historyComplete"`
 }
 type data struct {
 	Actions     map[string]string `json:"actions,omitempty"`
@@ -385,9 +388,8 @@ func (m *Manager) Apply(id string, write func() error) error {
 	return write()
 }
 
-// SetTotalRepos records the active PDS snapshot size before repository work
-// begins. It is deliberately separate from completed repositories: a retry can
-// resume progress against the same observed source snapshot.
+// SetTotalRepos records a known PDS snapshot size. PDSProcessor normally uses
+// CheckpointEnumeration so retries never need to re-count earlier pages.
 func (m *Manager) SetTotalRepos(id string, total int) error {
 	if total < 0 {
 		return ErrInvalidInput
@@ -401,6 +403,30 @@ func (m *Manager) SetTotalRepos(id string, total int) error {
 	job := next.Jobs[id]
 	job.TotalRepos = total
 	job.TotalReposKnown = true
+	next.Jobs[id] = job
+	return m.commit(next)
+}
+
+// CheckpointEnumeration atomically advances a completed inventory page and its
+// active-repository subtotal. A retry begins at the saved cursor, so each page
+// contributes to the eventual total at most once.
+func (m *Manager) CheckpointEnumeration(id, cursor string, active int, complete bool) error {
+	if active < 0 {
+		return ErrInvalidInput
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.active(id) {
+		return ErrConflict
+	}
+	next := clone(m.data)
+	job := next.Jobs[id]
+	job.Cursor = cursor
+	job.EnumeratedRepos += active
+	if complete {
+		job.TotalRepos = job.EnumeratedRepos
+		job.TotalReposKnown = true
+	}
 	next.Jobs[id] = job
 	return m.commit(next)
 }
