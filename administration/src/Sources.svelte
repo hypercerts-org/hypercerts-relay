@@ -224,8 +224,8 @@
         <dd><State value={selected.DesiredState} /></dd>
       </div>
       <div>
-        <dt>Runtime connection</dt>
-        <dd><State value={selected.RuntimeState} /><small>Live Relay connectivity for this PDS; administrative state above controls whether it should connect.</small></dd>
+        <dt>Relay connection</dt>
+        <dd><State value={selected.RuntimeState} /><small>Live Relay connectivity for this PDS..</small></dd>
       </div>
       <div>
         <dt>Cursor</dt>
@@ -237,15 +237,15 @@
       </div>
       <div>
         <dt>Admission check</dt>
-        <dd>{selected.Validation.Status} {selected.Validation.Reason}<small>Validates that the configured PDS can be safely reached and admitted before Relay acquisition starts.</small></dd>
+        <dd>{selected.Validation.Status} {selected.Validation.Reason}<small>Validates that the PDS is reachable for the relay.</small></dd>
       </div>
       <div>
         <dt>Admission quota</dt>
-        <dd>{selected.AccountQuota.Limit} accounts<small>Maximum accounts Relay may admit from this PDS. This is not the PDS account total.</small></dd>
+        <dd>{selected.AccountQuota.Limit} accounts<small>Maximum accounts Relay will crawl from this PDS, not the account total.</small></dd>
       </div>
       <div>
         <dt>Relay-observed accounts</dt>
-        <dd>{selected.AccountQuota.Count}<small>Accounts currently known to Relay for this source, not a census of the PDS.</small></dd>
+        <dd>{selected.AccountQuota.Count}<small>Accounts seen since the relay started crawling it.</small></dd>
       </div>
     </dl>
     <section class="detail" aria-label="Jetstream statistics">
