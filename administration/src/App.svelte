@@ -176,6 +176,7 @@
     }
   }
   async function loadMoreAudit(kind: "operations" | "history") {
+    if (loading) return;
     const after = kind === "operations" ? nextOperationAudit : nextHistoryAudit;
     if (!after) return;
     loading = true;

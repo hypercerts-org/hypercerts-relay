@@ -57,6 +57,21 @@ test("journal entries retain actor handles after profile removal", (t) => {
   );
 });
 
+test("operation fallback never attributes a later transition actor", (t) => {
+  const store = new Store(":memory:");
+  t.after(() => store.close());
+  const op = store.request(actor, command);
+  const transitionActor = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+  store.set("administrator-profile", transitionActor, {
+    handle: "later-operator.example",
+  });
+  assert.equal(
+    store.transition(op.id, "applied", null, null, transitionActor),
+    true,
+  );
+  assert.equal(store.operation(op.id)?.actorHandle, null);
+});
+
 test("stale transitions leave state and audit unchanged; canceled work is not claimed", async (t) => {
   const store = new Store(":memory:");
   t.after(() => store.close());

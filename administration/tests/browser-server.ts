@@ -147,6 +147,7 @@ const services = {
           id: id.replaceAll("-", "").slice(0, 32),
           pds: command.pds,
           policy,
+          reason: command.reason,
           state: "incomplete",
           completedRepos: 0,
           totalRepos: 0,

@@ -186,9 +186,9 @@ export class Store {
             )?.handle ??
             ((this.db
               .prepare(
-                "SELECT actorHandle FROM audit WHERE operation=? AND actorHandle IS NOT NULL ORDER BY seq LIMIT 1",
+                "SELECT actorHandle FROM audit WHERE operation=? AND actor=? AND actorHandle IS NOT NULL ORDER BY seq LIMIT 1",
               )
-              .get(r.id) as { actorHandle?: string | null } | undefined)
+              .get(r.id, r.actor) as { actorHandle?: string | null } | undefined)
               ?.actorHandle ?? null),
           command: JSON.parse(r.command as string),
           result: r.result ? JSON.parse(r.result as string) : null,
