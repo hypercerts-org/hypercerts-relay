@@ -86,6 +86,7 @@ See [RELEASING.md](RELEASING.md) for the exact process and rollback guidance.
 - [CHANGELOG.md](CHANGELOG.md) — Hypercerts Relay release history.
 - [`.agents/skills/hypercerts-relay/SKILL.md`](.agents/skills/hypercerts-relay/SKILL.md) — focused repository guidance for work on the Relay and Rainbow fork.
 - [`jetstream/README.md`](jetstream/README.md) — Jetstream v2 provenance, maintenance, and local operation.
+- [`docs/contracts/`](docs/contracts/) — approved data, job, management and service-ownership contracts.
 
 ## License
 
