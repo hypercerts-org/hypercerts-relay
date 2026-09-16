@@ -6,6 +6,8 @@ archive/live test for [TECH-594](https://linear.app/hypercerts/issue/TECH-594/co
 for [TECH-634](https://linear.app/hypercerts/issue/TECH-634/unify-jetstream-acquisition-verification-and-durability-fault-coverage).
 `./tests/acceptance/run T03-lifecycle` owns the local private-control lifecycle
 receipt seam for [TECH-637](https://linear.app/hypercerts/issue/TECH-637/persist-cross-service-recovery-receipts-for-admitted-pdss).
+`./tests/acceptance/run T04`, `T07`, and `T15-selection` own the executable
+selected-record storage evidence for [TECH-595](https://linear.app/hypercerts/issue/TECH-595/store-only-enabled-record-collections-in-jetstream-v2).
 Unknown selectors fail with exit 64.
 
 ## Topology
@@ -68,8 +70,19 @@ directory and removes containers and named volumes on exit.
 ```sh
 ./tests/acceptance/run T01
 ./tests/acceptance/run T03-lifecycle
+./tests/acceptance/run T04
+./tests/acceptance/run T07
 ./tests/acceptance/run T15-core
+./tests/acceptance/run T15-selection
 ```
+
+T04 runs the real owned Relay-to-Jetstream archive/replay/restart path with one
+selected and one excluded record. T07 proves that an empty policy still persists
+protocol markers and source progress across restart, while selected deletes remain
+archive events. T15-selection inspects every durable file produced by the direct-PDS
+bootstrap and retry paths for an excluded fixture payload. These selectors do not
+claim raw Relay/Rainbow retention is selected-only: raw frame stores retain their
+documented time window, and direct-PDS CAR input is permitted only in process memory.
 
 T03-lifecycle runs a dedicated local Relay private-control receiver test. It
 proves that a synthetic, bounded durable-completion coordinate clears only the

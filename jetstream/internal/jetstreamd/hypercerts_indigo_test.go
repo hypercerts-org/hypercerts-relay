@@ -26,7 +26,7 @@ import (
 
 // This crosses the real Indigo disk event manager/subscribeRepos handler,
 // Jetstream verification/storage/server, and the public archive-to-live client.
-func TestHypercertsIndigoArchiveRestartAndLive(t *testing.T) {
+func TestT04SelectionArchiveReplayRestartAndLive(t *testing.T) {
 	bin := filepath.Join(t.TempDir(), "relay-source")
 	build := exec.CommandContext(t.Context(), "go", "build", "-o", bin, "./tests/jetstream-source")
 	build.Dir = "../../.."
@@ -62,8 +62,8 @@ func TestHypercertsIndigoArchiveRestartAndLive(t *testing.T) {
 	options.CollectionSelection = true
 	options.InitialCollections = []string{"app.bsky.feed.post"}
 	options.LogOutput = io.Discard
-	emit := func(key string) {
-		frame, _, err := w.GenerateRecordOpForTest(t.Context(), 0, "create", "app.bsky.feed.post", key)
+	emit := func(collection, key string) {
+		frame, _, err := w.GenerateRecordOpForTest(t.Context(), 0, "create", collection, key)
 		require.NoError(t, err)
 		resp, err := http.Post(source+"/fixture/emit", "application/cbor", bytes.NewReader(frame))
 		require.NoError(t, err)
@@ -94,8 +94,19 @@ func TestHypercertsIndigoArchiveRestartAndLive(t *testing.T) {
 		return rt, writer, cleanup
 	}
 	rt, writer, stop := start()
-	emit("archived")
+	emit("app.bsky.feed.post", "archived")
 	require.Eventually(t, func() bool { return writer.NextSeq() > 1 }, 10*time.Second, 10*time.Millisecond)
+	require.NoError(t, writer.DrainDurability(t.Context()))
+	beforeExcluded, err := live.LoadUpstreamCursor(rt.metaStore, live.CursorKey)
+	require.NoError(t, err)
+	// The Relay remains a complete raw source. This excluded record is accepted
+	// upstream, but it must not acquire a Jetstream archive sequence.
+	emit("app.bsky.feed.like", "excluded")
+	require.Eventually(t, func() bool {
+		cursor, loadErr := live.LoadUpstreamCursor(rt.metaStore, live.CursorKey)
+		return loadErr == nil && cursor > beforeExcluded
+	}, 10*time.Second, 10*time.Millisecond, "filtered input must still advance the durable source cursor")
+	require.Equal(t, uint64(2), writer.NextSeq(), "excluded input must not acquire an archive sequence")
 	require.NoError(t, writer.ForceRotate(t.Context()))
 	require.NoError(t, writer.DrainDurability(t.Context()))
 	require.Eventually(t, func() bool { n, e := live.LoadUpstreamCursor(rt.metaStore, live.CursorKey); return e == nil && n > 0 }, 5*time.Second, 10*time.Millisecond)
@@ -129,6 +140,10 @@ func TestHypercertsIndigoArchiveRestartAndLive(t *testing.T) {
 		for {
 			select {
 			case e := <-received:
+				if e.Commit != nil {
+					require.Equal(t, "app.bsky.feed.post", e.Commit.Collection, "archive/replay must never expose an excluded collection")
+					require.NotEqual(t, "excluded", e.Commit.Rkey)
+				}
 				if e.Commit != nil && e.Commit.Rkey == key {
 					return e
 				}
@@ -142,7 +157,7 @@ func TestHypercertsIndigoArchiveRestartAndLive(t *testing.T) {
 	archived := read("archived")
 	// The client records page completion after yielding its final batch.
 	require.Eventually(t, func() bool { return consumer.Stats().Pages > 0 }, time.Second, time.Millisecond, "consumer must read the archive planner")
-	emit("live")
+	emit("app.bsky.feed.post", "live")
 	latest := read("live")
 	require.Greater(t, latest.Seq, archived.Seq)
 	consumer.Close()
@@ -151,7 +166,7 @@ func TestHypercertsIndigoArchiveRestartAndLive(t *testing.T) {
 	resumed, err := client.Subscribe("http://"+rt.PublicAddr(), client.WithLiveCursor(latest.Seq), client.WithBatchSize(1))
 	require.NoError(t, err)
 	defer resumed.Close()
-	emit("reconnected")
+	emit("app.bsky.feed.post", "reconnected")
 	resumeCtx, resumeCancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer resumeCancel()
 	found := false

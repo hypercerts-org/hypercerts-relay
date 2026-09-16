@@ -65,6 +65,26 @@ its existing 72-hour persistence window. This is a time-only retention policy:
 no byte cap is selected, and Rainbow's existing `persist-bytes=0` behavior is
 not changed. Capacity planning belongs to D07.
 
+### Persistence producer inventory
+
+The selected-record boundary is enforced before each Jetstream writer below.
+The inventory deliberately calls out stores that are allowed to carry raw or
+transient payloads so an archive-only assertion is not overstated.
+
+| Producer | Durable output | Selection rule | Allowed non-selected payload |
+| --- | --- | --- | --- |
+| Relay event manager | Raw subscribeRepos replay | Not a Jetstream archive; Relay remains complete | Raw frames for its documented 72-hour window |
+| Rainbow event store, if deployed | Raw Relay fan-out replay | Not a Jetstream archive | Raw frames for its documented 72-hour window |
+| `internal/ingest/backfill` bootstrap and retry | Jetstream segments and source progress | Exact policy before append or readable-log write | Direct-PDS CAR is process memory only; no CAR temp file is permitted |
+| `internal/ingest/live` | Jetstream live segments, archive cursor and progress | Exact policy before append | Upstream frame is transient process memory only |
+| `internal/ingest` snapshot reconciliation | Selected record replacements/deletes and protocol markers | Exact policy and per-collection reconciliation | Snapshot input is process memory only |
+| Jetstream policy/job/control stores | Policy, job, cursor and bounded non-payload rejection metadata | They never materialize record payloads | No record payload is permitted |
+
+`T04`, `T07`, and `T15-selection` exercise this inventory through
+`./tests/acceptance/run`. They prove selected archive/replay data, empty-policy
+progress and markers, selected deletes, restart durability, and absence of the
+excluded direct-PDS fixture value from every durable file the writer creates.
+
 ## Deferred evidence
 
 [TECH-595](https://linear.app/hypercerts/issue/TECH-595/store-only-enabled-record-collections-in-jetstream-v2)

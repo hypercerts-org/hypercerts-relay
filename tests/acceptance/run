@@ -3,8 +3,8 @@
 set -euo pipefail
 
 case_id=${1:-}
-if [[ $# -ne 1 || ( "$case_id" != "T01" && "$case_id" != "T03-lifecycle" && "$case_id" != "T15-core" ) ]]; then
-	printf '%s\n' 'usage: ./tests/acceptance/run T01|T03-lifecycle|T15-core' >&2
+if [[ $# -ne 1 || ( "$case_id" != "T01" && "$case_id" != "T03-lifecycle" && "$case_id" != "T04" && "$case_id" != "T07" && "$case_id" != "T15-core" && "$case_id" != "T15-selection" ) ]]; then
+	printf '%s\n' 'usage: ./tests/acceptance/run T01|T03-lifecycle|T04|T07|T15-core|T15-selection' >&2
 	exit 64
 fi
 
@@ -15,6 +15,20 @@ if [[ "$case_id" == "T03-lifecycle" ]]; then
 		GOCACHE="${GOCACHE:-/tmp/hypercerts-relay-go-cache}" go test -mod=readonly -count=1 ./cmd/relay -run '^TestRecoveryReceiptAcceptance$'
 	)
 	printf '%s\n' 'T03-lifecycle passed: the private Relay receipt receiver accepts only a current admitted source revision and rejects a stale acknowledgement. Jetstream completion proof remains Plan 006.'
+	exit 0
+fi
+
+if [[ "$case_id" == "T04" || "$case_id" == "T07" || "$case_id" == "T15-selection" ]]; then
+	case "$case_id" in
+		T04) package=./internal/jetstreamd test_name='^TestT04SelectionArchiveReplayRestartAndLive$' ;;
+		T07) package=./internal/ingest/live test_name='^TestT07SelectionEmptyPolicyProgressMarkersDeletesAndRestart$' ;;
+		T15-selection) package=./internal/ingest/backfill test_name='^TestT15SelectionDirectPDSPermittedTemporaryStorage$' ;;
+	esac
+	(
+		cd "$root/jetstream"
+		GOCACHE="${GOCACHE:-/tmp/hypercerts-relay-go-cache}" go test -mod=readonly -count=1 "$package" -run "$test_name"
+	)
+	printf '%s\n' "$case_id passed: selected-record storage evidence completed. Raw Relay frames and in-memory direct-PDS CAR input remain explicitly permitted outside Jetstream durable materialization."
 	exit 0
 fi
 

@@ -2,26 +2,77 @@ package live
 
 import (
 	"context"
-	"github.com/jcalabro/atmos"
-	"github.com/jcalabro/atmos/crypto"
-	"github.com/jcalabro/atmos/identity"
-	"github.com/jcalabro/atmos/mst"
-	atmosrepo "github.com/jcalabro/atmos/repo"
-	atmossync "github.com/jcalabro/atmos/sync"
-	"github.com/jcalabro/atmos/xrpc"
-	"github.com/jcalabro/gt"
-	"io"
-	"log/slog"
-	"net/http/httptest"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 	"github.com/bluesky-social/jetstream/segment"
+	"github.com/jcalabro/atmos"
+	"github.com/jcalabro/atmos/api/comatproto"
+	"github.com/jcalabro/atmos/api/lextypes"
+	"github.com/jcalabro/atmos/crypto"
+	"github.com/jcalabro/atmos/identity"
+	"github.com/jcalabro/atmos/mst"
+	atmosrepo "github.com/jcalabro/atmos/repo"
 	"github.com/jcalabro/atmos/streaming"
+	atmossync "github.com/jcalabro/atmos/sync"
+	"github.com/jcalabro/atmos/xrpc"
+	"github.com/jcalabro/gt"
 	"github.com/stretchr/testify/require"
+	"io"
+	"log/slog"
+	"net/http/httptest"
 )
+
+func TestT07SelectionEmptyPolicyProgressMarkersDeletesAndRestart(t *testing.T) {
+	t.Run("empty policy persists marker and source progress", func(t *testing.T) {
+		st := newTestStore(t)
+		dir := filepath.Join(t.TempDir(), "segments")
+		policy, err := selection.Open(st, nil)
+		require.NoError(t, err)
+		var delivered []segment.Event
+		cfg := Config{SegmentsDir: dir, SeqKey: SteadySeqKey, CursorKey: CursorKey, Store: st, RelayURL: "https://example.invalid", Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Verifier: newTestVerifier(t), CollectionPolicy: policy, OnEvent: func(e *segment.Event) { delivered = append(delivered, *e) }}
+		c, err := Open(cfg)
+		require.NoError(t, err)
+		excluded, _ := buildCommit(t, "did:plc:empty", "3l3qo2vutsw2b", struct{ Coll, Rkey string }{"app.bsky.feed.like", "excluded"})
+		excluded.Seq = 41
+		identity := streaming.Event{Seq: 42, Identity: &comatproto.SyncSubscribeRepos_Identity{DID: "did:plc:empty", Handle: gt.Some("empty.test"), Seq: 42, Time: "2026-09-16T00:00:00Z"}}
+		require.NoError(t, c.processBatch(t.Context(), []streaming.Event{excluded, identity}))
+		require.Equal(t, int64(42), c.LastUpstreamSeq())
+		require.Len(t, delivered, 1)
+		require.Equal(t, segment.KindIdentity, delivered[0].Kind)
+		require.Equal(t, uint64(2), c.Writer().NextSeq(), "empty policy must not allocate an archive sequence for a record")
+		require.NoError(t, c.Close())
+		c, err = Open(cfg)
+		require.NoError(t, err)
+		cursor, err := LoadUpstreamCursor(st, CursorKey)
+		require.NoError(t, err)
+		require.Equal(t, int64(42), cursor, "filtered-only commit progress survives restart")
+		require.NoError(t, c.Close())
+		rows := readAllSegmentEvents(t, dir)
+		require.Len(t, rows, 1)
+		require.Equal(t, segment.KindIdentity, rows[0].Kind)
+	})
+
+	t.Run("selected delete remains an archive event", func(t *testing.T) {
+		st := newTestStore(t)
+		policy, err := selection.Open(st, []string{"app.bsky.feed.post"})
+		require.NoError(t, err)
+		c, err := Open(Config{SegmentsDir: filepath.Join(t.TempDir(), "segments"), SeqKey: SteadySeqKey, CursorKey: CursorKey, Store: st, RelayURL: "https://example.invalid", Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Verifier: newTestVerifier(t), CollectionPolicy: policy})
+		require.NoError(t, err)
+		deletion, _ := buildCommit(t, "did:plc:delete", "3l3qo2vutsw2b", struct{ Coll, Rkey string }{"app.bsky.feed.post", "selected"})
+		deletion.Seq = 43
+		deletion.Commit.Ops[0].Action = "delete"
+		deletion.Commit.Ops[0].CID = gt.None[lextypes.LexCIDLink]()
+		require.NoError(t, c.processBatch(t.Context(), []streaming.Event{deletion}))
+		require.NoError(t, c.Close())
+		rows := readAllSegmentEvents(t, c.cfg.SegmentsDir)
+		require.Len(t, rows, 1)
+		require.Equal(t, segment.KindDelete, rows[0].Kind)
+		require.Equal(t, "app.bsky.feed.post", rows[0].Collection)
+	})
+}
 
 func TestHypercertsMixedAndFilteredOnlyProgress(t *testing.T) {
 	st := newTestStore(t)
