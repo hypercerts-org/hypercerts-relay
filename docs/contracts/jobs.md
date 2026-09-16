@@ -58,7 +58,9 @@ as historical proof.
 
 `GET /hypercerts/v1/snapshot-rejections` accepts the normal private bearer
 credential, optional repeated `pds` filters, `limit` (1–200), and an opaque
-`after` cursor. It returns only bounded non-payload rejection metadata:
+`after` cursor. It retains the most recent 1,000 rejections across all sources;
+older rejections are evicted by rejection time (with a deterministic stored-key
+tie-breaker). It returns only bounded non-payload rejection metadata:
 origin, policy revision, DID, listed revision, rejection kind/code and timestamp.
 It must not expose CAR bytes, records, repository tokens, or durable storage
 keys. A permanent direct-PDS snapshot rejection is not inventory progress; it

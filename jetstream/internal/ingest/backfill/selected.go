@@ -135,20 +135,57 @@ func (r *selectedRunner) reportIdentityMetadataError(did atmos.DID, err error) {
 }
 
 // verifyCompleteCommit verifies a complete CAR against directory when supplied.
-// On an initial failure it discards the cached identity for did and verifies once
-// more, so a rotated signing key can take effect before the CAR is rejected.
+// A cryptographic verification failure can be caused by a rotated signing key,
+// so it discards the cached identity for did and retries once in that case.
+// Resolver, identity, and malformed-commit failures do not mutate the cache.
 // A nil directory preserves the relay-trusted behavior for direct callers.
 func verifyCompleteCommit(ctx context.Context, directory *atmosidentity.Directory, did atmos.DID, commit *atmosrepo.Commit) error {
 	if directory == nil {
 		return nil
 	}
-	if err := atmossync.VerifyCommitWithDirectory(ctx, directory, commit); err != nil {
-		directory.Purge(ctx, did)
-		if err := atmossync.VerifyCommitWithDirectory(ctx, directory, commit); err != nil {
-			return err
-		}
+	signatureFailed, err := verifyCompleteCommitOnce(ctx, directory, commit)
+	if err == nil {
+		return nil
 	}
-	return nil
+	if !signatureFailed {
+		return err
+	}
+	directory.Purge(ctx, did)
+	_, err = verifyCompleteCommitOnce(ctx, directory, commit)
+	return err
+}
+
+// verifyCompleteCommitOnce mirrors atmos's directory verification while
+// retaining whether the failure was specifically a validly encoded signature
+// that did not verify. That distinction prevents cache eviction for temporary
+// resolver errors and malformed CAR input.
+func verifyCompleteCommitOnce(ctx context.Context, directory *atmosidentity.Directory, commit *atmosrepo.Commit) (bool, error) {
+	if commit == nil {
+		return false, errors.New("backfill: missing commit")
+	}
+	did, err := atmos.ParseDID(commit.DID)
+	if err != nil {
+		return false, fmt.Errorf("backfill: invalid DID in commit: %w", err)
+	}
+	ident, err := directory.LookupDID(ctx, did)
+	if err != nil {
+		return false, fmt.Errorf("backfill: resolving DID %s: %w", did, err)
+	}
+	key, err := ident.PublicKey()
+	if err != nil {
+		return false, fmt.Errorf("backfill: getting public key for %s: %w", did, err)
+	}
+	if len(commit.Sig) != 64 {
+		return false, fmt.Errorf("backfill: invalid signature length for %s", did)
+	}
+	unsigned, err := commit.UnsignedBytes()
+	if err != nil {
+		return false, fmt.Errorf("backfill: encoding unsigned commit for %s: %w", did, err)
+	}
+	if err := key.HashAndVerify(unsigned, commit.Sig); err != nil {
+		return true, fmt.Errorf("backfill: signature verification failed for %s: %w", did, err)
+	}
+	return false, nil
 }
 
 // processRepo mirrors the atmos engine's two-budget retry loop (see

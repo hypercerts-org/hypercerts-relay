@@ -73,36 +73,61 @@ func (p PDSProcessor) processEntries(ctx context.Context, client *atmossync.Clie
 		if !job.TotalReposKnown {
 			active++
 		}
-		did := string(entry.DID)
-		if _, err := atmos.ParseDID(did); err != nil {
-			if rejection, ok := p.Manager.lookupSnapshotRejection(job.PDS, job.Policy.Revision, did, entry.Rev, directPDSSnapshotRejectionKind); ok {
-				return active, &InputError{Code: rejection.Code}
-			}
-			return active, p.rejectSnapshot(job, did, entry.Rev, "invalid_listing_did")
-		}
-		if _, err := atmos.ParseTID(entry.Rev); err != nil {
-			return active, p.rejectSnapshot(job, did, entry.Rev, "invalid_listing_revision")
-		}
-		if rejection, ok := p.Manager.lookupSnapshotRejection(job.PDS, job.Policy.Revision, did, entry.Rev, directPDSSnapshotRejectionKind); ok {
-			// hypercerts: A matching durable verdict prevents another untrusted
-			// CAR download, but must leave this page unacknowledged.
-			return active, &InputError{Code: rejection.Code}
-		}
-		if rev, ok := job.CompletedRepos[did]; ok && rev == entry.Rev {
-			continue
-		}
-		if err := p.repository(ctx, client, *job, entry); err != nil {
-			var input *InputError
-			if !errors.As(err, &input) || input.Unavailable {
+		discardProgress, err := p.processActiveEntry(ctx, client, job, entry)
+		if err != nil {
+			if discardProgress {
 				return 0, err
 			}
-			return active, p.rejectSnapshot(job, did, entry.Rev, input.Code)
+			return active, err
 		}
-		// Keep this page-local snapshot current: duplicate entries must not
-		// trigger a second download before the page checkpoint commits.
-		job.CompletedRepos[did] = entry.Rev
 	}
 	return active, nil
+}
+
+// processActiveEntry returns whether a transient failure must discard this
+// page's uncheckpointed enumeration subtotal.
+func (p PDSProcessor) processActiveEntry(ctx context.Context, client *atmossync.Client, job *Job, entry atmossync.ListReposEntry) (bool, error) {
+	did := string(entry.DID)
+	if err := p.validateListedSnapshot(job, entry); err != nil {
+		return false, err
+	}
+	if rev, ok := job.CompletedRepos[did]; ok && rev == entry.Rev {
+		return false, nil
+	}
+	if err := p.repository(ctx, client, *job, entry); err != nil {
+		return p.handleRepositoryFailure(job, entry, err)
+	}
+	// Keep this page-local snapshot current: duplicate entries must not trigger
+	// a second download before the page checkpoint commits.
+	job.CompletedRepos[did] = entry.Rev
+	return false, nil
+}
+
+func (p PDSProcessor) validateListedSnapshot(job *Job, entry atmossync.ListReposEntry) error {
+	did := string(entry.DID)
+	if _, err := atmos.ParseDID(did); err != nil {
+		if rejection, ok := p.Manager.lookupSnapshotRejection(job.PDS, job.Policy.Revision, did, entry.Rev, directPDSSnapshotRejectionKind); ok {
+			return &InputError{Code: rejection.Code}
+		}
+		return p.rejectSnapshot(job, did, entry.Rev, "invalid_listing_did")
+	}
+	if _, err := atmos.ParseTID(entry.Rev); err != nil {
+		return p.rejectSnapshot(job, did, entry.Rev, "invalid_listing_revision")
+	}
+	if rejection, ok := p.Manager.lookupSnapshotRejection(job.PDS, job.Policy.Revision, did, entry.Rev, directPDSSnapshotRejectionKind); ok {
+		// hypercerts: A matching durable verdict prevents another untrusted CAR
+		// download, but must leave this page unacknowledged.
+		return &InputError{Code: rejection.Code}
+	}
+	return nil
+}
+
+func (p PDSProcessor) handleRepositoryFailure(job *Job, entry atmossync.ListReposEntry, err error) (bool, error) {
+	var input *InputError
+	if !errors.As(err, &input) || input.Unavailable {
+		return true, err
+	}
+	return false, p.rejectSnapshot(job, string(entry.DID), entry.Rev, input.Code)
 }
 
 // rejectSnapshot persists a permanent input verdict without acknowledging the
@@ -270,10 +295,11 @@ func (p PDSProcessor) verifySnapshot(ctx context.Context, job Job, entry atmossy
 	if err != nil || commitTID.Time().After(time.Now().Add(5*time.Minute)) {
 		return &InputError{Code: "invalid_revision"}
 	}
-	// Purge is the Directory API for a network revalidation. Do not accept a
-	// direct-PDS snapshot using a cached binding that may have migrated.
-	p.Directory.Purge(ctx, entry.DID)
-	refreshed, err := p.Directory.LookupDID(ctx, entry.DID)
+	// Resolve this snapshot independently instead of purging the shared
+	// directory cache used by live consumers. Direct PDS jobs still require a
+	// fresh binding, but their verification must not evict another request's
+	// identity entry.
+	refreshed, err := p.freshSnapshotIdentity(ctx, entry.DID)
 	if err != nil || refreshed == nil {
 		return inputFailure(ctx, "identity_unavailable")
 	}
@@ -291,6 +317,14 @@ func (p PDSProcessor) verifySnapshot(ctx context.Context, job Job, entry atmossy
 		return &InputError{Code: "snapshot_behind_listing", Unavailable: true}
 	}
 	return nil
+}
+
+func (p PDSProcessor) freshSnapshotIdentity(ctx context.Context, did atmos.DID) (*identity.Identity, error) {
+	document, err := p.Directory.Resolver.ResolveDID(ctx, did)
+	if err != nil {
+		return nil, err
+	}
+	return identity.IdentityFromDocument(document)
 }
 
 func projectSnapshot(ctx context.Context, job Job, did atmos.DID, r *repo.Repo, rev string) (ingest.Snapshot, error) {

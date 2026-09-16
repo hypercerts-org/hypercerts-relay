@@ -135,11 +135,13 @@ type repoFixture struct {
 }
 
 type stubIdentityResolver struct {
-	docs map[atmos.DID]*atmosidentity.DIDDocument
-	err  error
+	docs  map[atmos.DID]*atmosidentity.DIDDocument
+	err   error
+	calls atomic.Int64
 }
 
 func (r *stubIdentityResolver) ResolveDID(_ context.Context, did atmos.DID) (*atmosidentity.DIDDocument, error) {
+	r.calls.Add(1)
 	if r.err != nil {
 		return nil, r.err
 	}
@@ -912,72 +914,70 @@ func TestRun_PassesBackfillWorkersToAtmos(t *testing.T) {
 func TestRun_DirectoryVerifiesBootstrapCommitSignatures(t *testing.T) {
 	t.Parallel()
 
-	for _, tc := range []struct {
-		name             string
-		invalidSignature bool
-		wantStatus       Status
-	}{
-		{name: "accepts simulator signing key", wantStatus: StatusComplete},
-		{name: "rejects different signing key", invalidSignature: true, wantStatus: StatusFailed},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			account, srv := newSimulatorSignatureFixture(t, 1, 0, func(baseHandler http.Handler, wld *world.World, account world.Account) http.Handler {
-				if !tc.invalidSignature {
-					return baseHandler
+	t.Run("accepts simulator signing key", func(t *testing.T) {
+		runBootstrapSignatureVerification(t, false, StatusComplete)
+	})
+	t.Run("rejects different signing key", func(t *testing.T) {
+		runBootstrapSignatureVerification(t, true, StatusFailed)
+	})
+}
+
+func runBootstrapSignatureVerification(t *testing.T, invalidSignature bool, wantStatus Status) {
+	account, srv := newSimulatorSignatureFixture(t, 1, 0, func(baseHandler http.Handler, wld *world.World, account world.Account) http.Handler {
+		if !invalidSignature {
+			return baseHandler
+		}
+		wrongKey, err := crypto.GenerateK256()
+		require.NoError(t, err)
+		return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+			if req.URL.Path == "/xrpc/com.atproto.sync.getRepo" && req.URL.Query().Get("did") == string(account.DID) {
+				rp, _, err := wld.LoadRepo(account.Index)
+				if err != nil {
+					http.Error(rw, err.Error(), http.StatusInternalServerError)
+					return
 				}
-				wrongKey, err := crypto.GenerateK256()
-				require.NoError(t, err)
-				return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-					if req.URL.Path == "/xrpc/com.atproto.sync.getRepo" && req.URL.Query().Get("did") == string(account.DID) {
-						rp, _, err := wld.LoadRepo(account.Index)
-						if err != nil {
-							http.Error(rw, err.Error(), http.StatusInternalServerError)
-							return
-						}
-						rw.Header().Set("Content-Type", "application/vnd.ipld.car")
-						if err := rp.ExportCAR(rw, wrongKey); err != nil {
-							http.Error(rw, err.Error(), http.StatusInternalServerError)
-						}
-						return
-					}
-					baseHandler.ServeHTTP(rw, req)
-				})
-			})
-
-			db, err := store.Open(t.TempDir(), nil)
-			require.NoError(t, err)
-			t.Cleanup(func() { _ = db.Close() })
-			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-			segmentsDir := filepath.Join(t.TempDir(), "segments")
-			writer, err := ingest.Open(ingest.Config{
-				SegmentsDir:       segmentsDir,
-				Store:             db,
-				Logger:            logger,
-				MaxEventsPerBlock: 4,
-				MaxSegmentBytes:   1 << 30,
-			})
-			require.NoError(t, err)
-			t.Cleanup(func() { _ = writer.Close() })
-
-			require.NoError(t, Run(t.Context(), Config{
-				Store:          db,
-				HTTPClient:     srv.Client(),
-				Writer:         writer,
-				RelayURL:       srv.URL,
-				Logger:         logger,
-				Directory:      simulatorSignatureDirectory(srv),
-				RetryBaseDelay: time.Millisecond,
-				RetryMaxDelay:  10 * time.Millisecond,
-			}))
-
-			rs, err := NewStore(db, nil).readRepoStatus(account.DID)
-			require.NoError(t, err)
-			require.Equal(t, tc.wantStatus, rs.Backfill.Status)
-			if tc.invalidSignature {
-				require.Contains(t, rs.Backfill.LastError, "signature verification failed")
-				requireNoMaterializedEvents(t, segmentsDir)
+				rw.Header().Set("Content-Type", "application/vnd.ipld.car")
+				if err := rp.ExportCAR(rw, wrongKey); err != nil {
+					http.Error(rw, err.Error(), http.StatusInternalServerError)
+				}
+				return
 			}
+			baseHandler.ServeHTTP(rw, req)
 		})
+	})
+
+	db, err := store.Open(t.TempDir(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	segmentsDir := filepath.Join(t.TempDir(), "segments")
+	writer, err := ingest.Open(ingest.Config{
+		SegmentsDir:       segmentsDir,
+		Store:             db,
+		Logger:            logger,
+		MaxEventsPerBlock: 4,
+		MaxSegmentBytes:   1 << 30,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = writer.Close() })
+
+	require.NoError(t, Run(t.Context(), Config{
+		Store:          db,
+		HTTPClient:     srv.Client(),
+		Writer:         writer,
+		RelayURL:       srv.URL,
+		Logger:         logger,
+		Directory:      simulatorSignatureDirectory(srv),
+		RetryBaseDelay: time.Millisecond,
+		RetryMaxDelay:  10 * time.Millisecond,
+	}))
+
+	rs, err := NewStore(db, nil).readRepoStatus(account.DID)
+	require.NoError(t, err)
+	require.Equal(t, wantStatus, rs.Backfill.Status)
+	if invalidSignature {
+		require.Contains(t, rs.Backfill.LastError, "signature verification failed")
+		requireNoMaterializedEvents(t, segmentsDir)
 	}
 }
 
@@ -1019,98 +1019,100 @@ func TestRun_BackfillReposDownloadsSelectedDIDsWithoutListRepos(t *testing.T) {
 func TestRun_BackfillReposVerifiesSimulatorCommitSignatures(t *testing.T) {
 	t.Parallel()
 
-	for _, tc := range []struct {
-		name             string
-		invalidSignature bool
-		wantStatus       Status
-	}{
-		{name: "accepts simulator signing key", wantStatus: StatusComplete},
-		{name: "rejects different signing key", invalidSignature: true, wantStatus: StatusFailed},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg := world.DefaultConfig()
-			cfg.DataDir = filepath.Join(t.TempDir(), "simulator")
-			cfg.Accounts = 2
-			cfg.PDSHosts = 1
-			cfg.InitialRecords = 1
-			wld, err := world.New(t.Context(), cfg)
-			require.NoError(t, err)
-			t.Cleanup(func() { _ = wld.Close() })
-			_, err = wld.EnsureSeed()
-			require.NoError(t, err)
-			require.NoError(t, wld.Bootstrap(t.Context(), slog.New(slog.NewTextHandler(io.Discard, nil))))
-			account, err := wld.LoadAccount(1)
-			require.NoError(t, err)
+	t.Run("accepts simulator signing key", func(t *testing.T) {
+		runSelectedSignatureVerification(t, false, StatusComplete)
+	})
+	t.Run("rejects different signing key", func(t *testing.T) {
+		runSelectedSignatureVerification(t, true, StatusFailed)
+	})
+}
 
-			srv := httptest.NewUnstartedServer(nil)
-			baseURL := "http://" + srv.Listener.Addr().String()
-			baseHandler := simhttp.NewHandler(wld, baseURL)
-			handler := baseHandler
-			if tc.invalidSignature {
-				wrongKey, err := crypto.GenerateK256()
-				require.NoError(t, err)
-				handler = http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-					if req.URL.Path == "/xrpc/com.atproto.sync.getRepo" && req.URL.Query().Get("did") == string(account.DID) {
-						rp, _, err := wld.LoadRepo(account.Index)
-						if err != nil {
-							http.Error(rw, err.Error(), http.StatusInternalServerError)
-							return
-						}
-						rw.Header().Set("Content-Type", "application/vnd.ipld.car")
-						if err := rp.ExportCAR(rw, wrongKey); err != nil {
-							http.Error(rw, err.Error(), http.StatusInternalServerError)
-						}
-						return
-					}
-					baseHandler.ServeHTTP(rw, req)
-				})
-			}
-			srv.Config.Handler = handler
-			srv.Start()
-			t.Cleanup(srv.Close)
+func runSelectedSignatureVerification(t *testing.T, invalidSignature bool, wantStatus Status) {
+	cfg := world.DefaultConfig()
+	cfg.DataDir = filepath.Join(t.TempDir(), "simulator")
+	cfg.Accounts = 2
+	cfg.PDSHosts = 1
+	cfg.InitialRecords = 1
+	wld, err := world.New(t.Context(), cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = wld.Close() })
+	_, err = wld.EnsureSeed()
+	require.NoError(t, err)
+	require.NoError(t, wld.Bootstrap(t.Context(), slog.New(slog.NewTextHandler(io.Discard, nil))))
+	account, err := wld.LoadAccount(1)
+	require.NoError(t, err)
 
-			db, err := store.Open(t.TempDir(), nil)
-			require.NoError(t, err)
-			t.Cleanup(func() { _ = db.Close() })
-			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-			segmentsDir := filepath.Join(t.TempDir(), "segments")
-			writer, err := ingest.Open(ingest.Config{
-				SegmentsDir:       segmentsDir,
-				Store:             db,
-				Logger:            logger,
-				MaxEventsPerBlock: 4,
-				MaxSegmentBytes:   1 << 30,
-			})
-			require.NoError(t, err)
-			t.Cleanup(func() { _ = writer.Close() })
+	srv := httptest.NewUnstartedServer(nil)
+	baseURL := "http://" + srv.Listener.Addr().String()
+	baseHandler := simhttp.NewHandler(wld, baseURL)
+	handler := selectedSignatureHandler(t, baseHandler, wld, account, invalidSignature)
+	srv.Config.Handler = handler
+	srv.Start()
+	t.Cleanup(srv.Close)
 
-			directory := &atmosidentity.Directory{
-				Resolver: &atmosidentity.DefaultResolver{
-					HTTPClient: gt.Some(srv.Client()),
-					PLCURL:     gt.Some(srv.URL),
-				},
-				SkipHandleVerification: true,
-			}
-			require.NoError(t, Run(t.Context(), Config{
-				Store:            db,
-				HTTPClient:       srv.Client(),
-				Writer:           writer,
-				RelayURL:         srv.URL,
-				Logger:           logger,
-				BackfillRepos:    []atmos.DID{account.DID},
-				IdentityResolver: directory.Resolver,
-				Directory:        directory,
-			}))
+	db, err := store.Open(t.TempDir(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	segmentsDir := filepath.Join(t.TempDir(), "segments")
+	writer, err := ingest.Open(ingest.Config{
+		SegmentsDir:       segmentsDir,
+		Store:             db,
+		Logger:            logger,
+		MaxEventsPerBlock: 4,
+		MaxSegmentBytes:   1 << 30,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = writer.Close() })
 
-			rs, err := NewStore(db, nil).readRepoStatus(account.DID)
-			require.NoError(t, err)
-			require.Equal(t, tc.wantStatus, rs.Backfill.Status)
-			if tc.invalidSignature {
-				require.Contains(t, rs.Backfill.LastError, "signature verification failed")
-				requireNoMaterializedEvents(t, segmentsDir)
-			}
-		})
+	directory := &atmosidentity.Directory{
+		Resolver: &atmosidentity.DefaultResolver{
+			HTTPClient: gt.Some(srv.Client()),
+			PLCURL:     gt.Some(srv.URL),
+		},
+		SkipHandleVerification: true,
 	}
+	require.NoError(t, Run(t.Context(), Config{
+		Store:            db,
+		HTTPClient:       srv.Client(),
+		Writer:           writer,
+		RelayURL:         srv.URL,
+		Logger:           logger,
+		BackfillRepos:    []atmos.DID{account.DID},
+		IdentityResolver: directory.Resolver,
+		Directory:        directory,
+	}))
+
+	rs, err := NewStore(db, nil).readRepoStatus(account.DID)
+	require.NoError(t, err)
+	require.Equal(t, wantStatus, rs.Backfill.Status)
+	if invalidSignature {
+		require.Contains(t, rs.Backfill.LastError, "signature verification failed")
+		requireNoMaterializedEvents(t, segmentsDir)
+	}
+}
+
+func selectedSignatureHandler(t *testing.T, baseHandler http.Handler, wld *world.World, account world.Account, invalidSignature bool) http.Handler {
+	if !invalidSignature {
+		return baseHandler
+	}
+	wrongKey, err := crypto.GenerateK256()
+	require.NoError(t, err)
+	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == "/xrpc/com.atproto.sync.getRepo" && req.URL.Query().Get("did") == string(account.DID) {
+			rp, _, err := wld.LoadRepo(account.Index)
+			if err != nil {
+				http.Error(rw, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			rw.Header().Set("Content-Type", "application/vnd.ipld.car")
+			if err := rp.ExportCAR(rw, wrongKey); err != nil {
+				http.Error(rw, err.Error(), http.StatusInternalServerError)
+			}
+			return
+		}
+		baseHandler.ServeHTTP(rw, req)
+	})
 }
 
 func TestRun_BackfillReposRefreshesRotatedSigningKey(t *testing.T) {
@@ -1174,6 +1176,17 @@ func TestRun_BackfillReposRefreshesRotatedSigningKey(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, StatusComplete, rs.Backfill.Status)
 	require.Equal(t, int64(2), plcLookups.Load(), "failed verification must purge the stale key and verify with a fresh DID document")
+}
+
+func TestVerifyCompleteCommitDoesNotRetryResolverFailure(t *testing.T) {
+	t.Parallel()
+
+	did := atmos.DID("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
+	resolver := &stubIdentityResolver{err: errors.New("temporary resolver failure")}
+	directory := &atmosidentity.Directory{Resolver: resolver}
+	err := verifyCompleteCommit(t.Context(), directory, did, &atmosrepo.Commit{DID: string(did)})
+	require.ErrorContains(t, err, "temporary resolver failure")
+	require.Equal(t, int64(1), resolver.calls.Load(), "resolver failures must not purge and retry the directory")
 }
 
 func TestRun_BackfillReposIndexesDeclaredHandle(t *testing.T) {

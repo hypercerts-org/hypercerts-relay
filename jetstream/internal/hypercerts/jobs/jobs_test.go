@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -241,6 +242,52 @@ func TestSnapshotRejectionBoundsUntrustedSourcePositions(t *testing.T) {
 	found, ok = m.lookupSnapshotRejection(oversizedPDS, 1, noncanonicalDID, noncanonicalRevision, directPDSSnapshotRejectionKind)
 	require.True(t, ok)
 	require.Equal(t, bounded, found)
+}
+
+func TestSnapshotRejectionsRetainRecentBoundedLedgerAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	m, db := newManager(t, dir)
+
+	const pds = "https://pds.example"
+	base := time.Now().UTC().Add(-time.Hour)
+	seeded := make(map[string]SnapshotRejection, maxSnapshotRejections)
+	var oldestKey string
+	for i := range maxSnapshotRejections {
+		rejection := SnapshotRejection{
+			PDS:            pds,
+			PolicyRevision: 1,
+			DID:            snapshotRejectionDigest(fmt.Sprintf("seed-did-%d", i)),
+			ListedRevision: snapshotRejectionDigest(fmt.Sprintf("seed-revision-%d", i)),
+			Kind:           directPDSSnapshotRejectionKind,
+			Code:           "verification_failed",
+			RejectedAt:     base.Add(time.Duration(i) * time.Second),
+		}
+		key := snapshotRejectionStoredKey(rejection.PDS, rejection.PolicyRevision, rejection.DID, rejection.ListedRevision, rejection.Kind)
+		seeded[key] = rejection
+		if i == 0 {
+			oldestKey = key
+		}
+	}
+	m.data.SnapshotRejections = seeded
+	require.NoError(t, m.save(m.data))
+
+	latest, err := m.recordSnapshotRejection(pds, 1, "did:plc:latest", "3l3qo2vutsw2b", directPDSSnapshotRejectionKind, "verification_failed")
+	require.NoError(t, err)
+	latestKey := snapshotRejectionStoredKey(latest.PDS, latest.PolicyRevision, latest.DID, latest.ListedRevision, latest.Kind)
+	require.Len(t, m.ListSnapshotRejections(), maxSnapshotRejections)
+	_, foundOldest := m.data.SnapshotRejections[oldestKey]
+	require.False(t, foundOldest, "the oldest ledger entry must be evicted at the retention cap")
+	_, foundLatest := m.data.SnapshotRejections[latestKey]
+	require.True(t, foundLatest)
+
+	require.NoError(t, db.Close())
+	m, db = newManager(t, dir)
+	defer db.Close()
+	require.Len(t, m.ListSnapshotRejections(), maxSnapshotRejections)
+	_, foundOldest = m.data.SnapshotRejections[oldestKey]
+	require.False(t, foundOldest)
+	_, foundLatest = m.data.SnapshotRejections[latestKey]
+	require.True(t, foundLatest)
 }
 
 func TestSnapshotRejectionsPersistIdempotently(t *testing.T) {

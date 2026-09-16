@@ -46,148 +46,155 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 
 		liveSegmentsDir := filepath.Join(o.cfg.DataDir, "backfill", "live_segments")
 		segmentsDir := filepath.Join(o.cfg.DataDir, "segments")
-
-		// Restart-after-cleanup guard.
-		if _, err := statStorageFS(o.cfg.FS, liveSegmentsDir); isStorageNotExist(err) {
-			// The prior process removed the backfill tree but may have died
-			// (e.g. SIGKILL, page cache intact) before that dirent removal was
-			// made durable. Observing live_segments as gone does not prove the
-			// removal reached stable storage, and the cursor deletes below are
-			// SyncWrites (durable immediately). Fsync the data dir first so a
-			// power loss here cannot leave the cursors deleted while the backfill
-			// tree reappears — which would skip this guard next boot and re-drain
-			// from cursor 0, duplicating already-merged events.
-			if err := syncStorageDirFS(o.cfg.FS, o.cfg.DataDir); err != nil {
-				return fmt.Errorf("orchestrator: merge: sync data dir in restart-after-cleanup guard: %w", err)
-			}
-			if err := deleteMergeCursor(o.cfg.Store); err != nil {
-				return err
-			}
-			return nil
-		} else if err != nil {
-			return fmt.Errorf("orchestrator: merge: stat live_segments: %w", err)
+		cleaned, err := o.mergeRestartAfterCleanup(ctx, liveSegmentsDir)
+		if err != nil {
+			return err
 		}
-		// Seal guard: a crash at crashpoint.AfterBootstrapLiveCloseBeforeSeal
-		// (finishBootstrap closed the bootstrap-live consumer but died before
-		// re-opening it to seal) leaves the source tree with an unsealed
-		// trailing segment. The drain loop's segment.Open would reject it
-		// with ErrActiveSegment, so seal it here before draining.
+		if cleaned {
+			return nil
+		}
 		if err := o.sealActiveMergeSource(ctx, liveSegmentsDir); err != nil {
 			return err
 		}
-
-		dst, err := ingest.Open(ingest.Config{
-			SegmentsDir:            segmentsDir,
-			DataDir:                o.cfg.DataDir,
-			FS:                     o.cfg.FS,
-			Store:                  o.cfg.Store,
-			SeqKey:                 live.SteadySeqKey,
-			Logger:                 o.cfg.Logger,
-			Metrics:                o.cfg.IngestMetrics,
-			SegmentMetrics:         o.cfg.SegmentMetrics,
-			OnAfterSeal:            o.cfg.IngestOnAfterSeal,
-			SegmentIOFaultInjector: o.cfg.SegmentIOFaultInjector,
-		})
+		dst, err := o.openMergeDestination(segmentsDir)
 		if err != nil {
 			return fmt.Errorf("orchestrator: merge: open dst writer: %w", err)
 		}
-		if err := initCompactionWatermarkFloor(o.cfg.Store, dst.NextSeq()); err != nil {
-			if cerr := dst.Close(); cerr != nil {
-				o.logger.WarnContext(ctx, "dst writer close after compaction watermark init failure", "err", cerr)
-			}
-			return err
-		}
-
 		runner := newMergeRunner(dst, o.cfg.Store, liveSegmentsDir, o.cfg.FS, o.cfg.Logger, o.cfg.Metrics, o.cfg.CrashInjector)
-
-		if err := runner.run(ctx); err != nil {
-			if cerr := dst.Close(); cerr != nil {
-				o.logger.WarnContext(ctx, "dst writer close after merge error", "err", cerr)
-			}
+		if err := o.runMergeIntoDestination(ctx, dst, runner, segmentsDir); err != nil {
 			return err
 		}
-
-		// Bootstrap restart can defer pre-existing not_started rows to pending
-		// (#262). Repair them only after the captured live tail has merged, so
-		// the synthetic sync + replacement rows land above any stale account
-		// tombstones that were replayed from live_segments.
-		if err := backfill.RunPendingRepoRetryPass(ctx, backfill.RetryConfig{
-			Store:         o.cfg.Store,
-			Writer:        dst,
-			HTTPClient:    o.cfg.HTTPClient,
-			RelayURL:      o.cfg.RelayURL,
-			Logger:        o.cfg.Logger,
-			Metrics:       o.cfg.BackfillMetrics,
-			DropMetrics:   o.cfg.DropMetrics,
-			NewHostClient: o.cfg.BackfillNewHostClient,
-			// hypercerts: Merge recovery retry shares the runtime live-verifier directory.
-			Directory:   o.cfg.Directory,
-			Interval:    o.cfg.FailedRepoRetryInterval,
-			Workers:     o.cfg.FailedRepoRetryWorkers,
-			HostWorkers: o.cfg.FailedRepoRetryHostWorkers,
-			MaxDelay:    o.cfg.FailedRepoRetryMaxDelay,
-		}); err != nil {
-			if cerr := dst.Close(); cerr != nil {
-				o.logger.WarnContext(ctx, "dst writer close after pending retry error", "err", cerr)
-			}
-			return fmt.Errorf("orchestrator: merge: pending repo retry: %w", err)
-		}
-
-		if err := dst.SealActiveAndClose(); err != nil {
-			return fmt.Errorf("orchestrator: merge: seal dst: %w", err)
-		}
-
-		if err := o.runDeleteCompaction(ctx, compactionMergeTail, nil); err != nil {
-			return fmt.Errorf("orchestrator: merge-tail compaction: %w", err)
-		}
-		// One-shot manifest reconcile (spec §7): the merge-tail pass is
-		// manifest-oblivious, so before serving ungates every manifest
-		// entry must match its on-disk header. Reconcile failure aborts
-		// the transition — internal-state correctness, crash-loud.
-		if err := o.reconcileCompactionManifestFromDisk(segmentsDir); err != nil {
-			return fmt.Errorf("orchestrator: merge-tail compaction manifest reconcile: %w", err)
-		}
-
-		if err := o.simulateCrash(ctx, crashpoint.AfterMergeDstSealBeforeDiscovery); err != nil {
+		if err := o.runMergeDiscovery(ctx, runner); err != nil {
 			return err
-		}
-
-		if !o.cfg.SkipMergeDiscovery {
-			limits := discoveryLimits{
-				maxHosts:       o.cfg.BackfillMaxHosts,
-				maxActiveHosts: o.cfg.BackfillMaxActiveHosts,
-				retryDelay:     o.cfg.MergeDiscoveryRetryBaseDelay,
-			}
-			if err := runner.runDiscoveryWithClient(ctx, o.cfg.RelayURL, o.cfg.HTTPClient, o.cfg.BackfillNewHostClient, limits); err != nil {
-				return err
-			}
 		}
 		if err := o.simulateCrash(ctx, crashpoint.AfterMergeDiscoveryBeforeCleanup); err != nil {
 			return err
 		}
+		return o.cleanupMergedBackfill(ctx)
+	})
+}
 
-		if err := removeAllStorageFS(o.cfg.FS, filepath.Join(o.cfg.DataDir, "backfill")); err != nil {
-			return fmt.Errorf("orchestrator: merge: remove backfill dir: %w", err)
-		}
-		// Make the backfill-subtree removal durable before deleting the merge
-		// cursors. deleteMergeCursor commits with store.SyncWrites, so without
-		// this fsync a power loss could leave the cursor deletion durable while
-		// the data/backfill dirent removal is not. On restart the phase is
-		// still PhaseMerging, live_segments would reappear, the
-		// restart-after-cleanup guard would be skipped, and the drain would
-		// re-run from cursor 0 — appending already-merged events into
-		// data/segments and corrupting the archive.
+// mergeRestartAfterCleanup handles a restart after the prior process removed
+// the source tree. The data directory must be synced before durable cursor
+// deletion, or a power loss could make the tree reappear with its cursors gone.
+func (o *Orchestrator) mergeRestartAfterCleanup(ctx context.Context, liveSegmentsDir string) (bool, error) {
+	_, err := statStorageFS(o.cfg.FS, liveSegmentsDir)
+	if isStorageNotExist(err) {
 		if err := syncStorageDirFS(o.cfg.FS, o.cfg.DataDir); err != nil {
-			return fmt.Errorf("orchestrator: merge: sync data dir after backfill removal: %w", err)
+			return false, fmt.Errorf("orchestrator: merge: sync data dir in restart-after-cleanup guard: %w", err)
 		}
 		if err := deleteMergeCursor(o.cfg.Store); err != nil {
-			return err
+			return false, err
 		}
-		if err := o.simulateCrash(ctx, crashpoint.AfterMergeCleanupComplete); err != nil {
-			return err
-		}
-		return nil
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("orchestrator: merge: stat live_segments: %w", err)
+	}
+	return false, nil
+}
+
+func (o *Orchestrator) openMergeDestination(segmentsDir string) (*ingest.Writer, error) {
+	return ingest.Open(ingest.Config{
+		SegmentsDir:            segmentsDir,
+		DataDir:                o.cfg.DataDir,
+		FS:                     o.cfg.FS,
+		Store:                  o.cfg.Store,
+		SeqKey:                 live.SteadySeqKey,
+		Logger:                 o.cfg.Logger,
+		Metrics:                o.cfg.IngestMetrics,
+		SegmentMetrics:         o.cfg.SegmentMetrics,
+		OnAfterSeal:            o.cfg.IngestOnAfterSeal,
+		SegmentIOFaultInjector: o.cfg.SegmentIOFaultInjector,
 	})
+}
+
+func (o *Orchestrator) runMergeIntoDestination(ctx context.Context, dst *ingest.Writer, runner *mergeRunner, segmentsDir string) error {
+	if err := initCompactionWatermarkFloor(o.cfg.Store, dst.NextSeq()); err != nil {
+		return o.closeMergeDestinationAfter(ctx, dst, "dst writer close after compaction watermark init failure", err)
+	}
+	if err := runner.run(ctx); err != nil {
+		return o.closeMergeDestinationAfter(ctx, dst, "dst writer close after merge error", err)
+	}
+	if err := o.runMergePendingRepoRetry(ctx, dst); err != nil {
+		return o.closeMergeDestinationAfter(ctx, dst, "dst writer close after pending retry error", err)
+	}
+	if err := dst.SealActiveAndClose(); err != nil {
+		return fmt.Errorf("orchestrator: merge: seal dst: %w", err)
+	}
+	return o.finishMergedDestination(ctx, segmentsDir)
+}
+
+func (o *Orchestrator) closeMergeDestinationAfter(ctx context.Context, dst *ingest.Writer, message string, err error) error {
+	if closeErr := dst.Close(); closeErr != nil {
+		o.logger.WarnContext(ctx, message, "err", closeErr)
+	}
+	return err
+}
+
+// runMergePendingRepoRetry repairs pre-existing not_started rows only after
+// the captured live tail has merged, so replacement rows sort above any stale
+// account tombstones replayed from live_segments.
+func (o *Orchestrator) runMergePendingRepoRetry(ctx context.Context, dst *ingest.Writer) error {
+	err := backfill.RunPendingRepoRetryPass(ctx, backfill.RetryConfig{
+		Store:         o.cfg.Store,
+		Writer:        dst,
+		HTTPClient:    o.cfg.HTTPClient,
+		RelayURL:      o.cfg.RelayURL,
+		Logger:        o.cfg.Logger,
+		Metrics:       o.cfg.BackfillMetrics,
+		DropMetrics:   o.cfg.DropMetrics,
+		NewHostClient: o.cfg.BackfillNewHostClient,
+		// hypercerts: Merge recovery retry shares the runtime live-verifier directory.
+		Directory:   o.cfg.Directory,
+		Interval:    o.cfg.FailedRepoRetryInterval,
+		Workers:     o.cfg.FailedRepoRetryWorkers,
+		HostWorkers: o.cfg.FailedRepoRetryHostWorkers,
+		MaxDelay:    o.cfg.FailedRepoRetryMaxDelay,
+	})
+	if err != nil {
+		return fmt.Errorf("orchestrator: merge: pending repo retry: %w", err)
+	}
+	return nil
+}
+
+func (o *Orchestrator) finishMergedDestination(ctx context.Context, segmentsDir string) error {
+	if err := o.runDeleteCompaction(ctx, compactionMergeTail, nil); err != nil {
+		return fmt.Errorf("orchestrator: merge-tail compaction: %w", err)
+	}
+	// The merge-tail pass is manifest-oblivious, so reconcile every manifest
+	// entry with its on-disk header before serving ungates the transition.
+	if err := o.reconcileCompactionManifestFromDisk(segmentsDir); err != nil {
+		return fmt.Errorf("orchestrator: merge-tail compaction manifest reconcile: %w", err)
+	}
+	return o.simulateCrash(ctx, crashpoint.AfterMergeDstSealBeforeDiscovery)
+}
+
+func (o *Orchestrator) runMergeDiscovery(ctx context.Context, runner *mergeRunner) error {
+	if o.cfg.SkipMergeDiscovery {
+		return nil
+	}
+	limits := discoveryLimits{
+		maxHosts:       o.cfg.BackfillMaxHosts,
+		maxActiveHosts: o.cfg.BackfillMaxActiveHosts,
+		retryDelay:     o.cfg.MergeDiscoveryRetryBaseDelay,
+	}
+	return runner.runDiscoveryWithClient(ctx, o.cfg.RelayURL, o.cfg.HTTPClient, o.cfg.BackfillNewHostClient, limits)
+}
+
+func (o *Orchestrator) cleanupMergedBackfill(ctx context.Context) error {
+	if err := removeAllStorageFS(o.cfg.FS, filepath.Join(o.cfg.DataDir, "backfill")); err != nil {
+		return fmt.Errorf("orchestrator: merge: remove backfill dir: %w", err)
+	}
+	// deleteMergeCursor uses SyncWrites. Sync the source-tree removal first so a
+	// power loss cannot retain the tree while its cursors have been deleted.
+	if err := syncStorageDirFS(o.cfg.FS, o.cfg.DataDir); err != nil {
+		return fmt.Errorf("orchestrator: merge: sync data dir after backfill removal: %w", err)
+	}
+	if err := deleteMergeCursor(o.cfg.Store); err != nil {
+		return err
+	}
+	return o.simulateCrash(ctx, crashpoint.AfterMergeCleanupComplete)
 }
 
 // sealActiveMergeSource ensures the trailing source segment is sealed

@@ -358,29 +358,38 @@ func snapshotRejectionView(rejection jobs.SnapshotRejection) rejectionView {
 	return rejectionView{PDS: rejection.PDS, PolicyRevision: rejection.PolicyRevision, DID: rejection.DID, ListedRevision: rejection.ListedRevision, Kind: rejection.Kind, Code: rejection.Code, RejectedAt: rejection.RejectedAt}
 }
 
-func (h *Handler) listSnapshotRejections(w http.ResponseWriter, r *http.Request) {
+type snapshotRejectionListOptions struct {
+	limit        int
+	after        rejectionCursor
+	hasAfter     bool
+	requestedPDS map[string]struct{}
+}
+
+func parseSnapshotRejectionListOptions(r *http.Request) (snapshotRejectionListOptions, string) {
+	query := r.URL.Query()
 	limit := 100
-	if raw := r.URL.Query().Get("limit"); raw != "" {
+	if raw := query.Get("limit"); raw != "" {
 		n, err := strconv.Atoi(raw)
 		if err != nil || n < 1 || n > 200 {
-			reply(w, 400, map[string]string{"error": "invalid_limit"})
-			return
+			return snapshotRejectionListOptions{}, "invalid_limit"
 		}
 		limit = n
 	}
-	after := r.URL.Query().Get("after")
-	cursor, ok := parseRejectionCursor(after)
+	rawAfter := query.Get("after")
+	cursor, ok := parseRejectionCursor(rawAfter)
 	if !ok {
-		reply(w, 400, map[string]string{"error": "invalid_cursor"})
-		return
+		return snapshotRejectionListOptions{}, "invalid_cursor"
 	}
-	requestedPDS, ok := snapshotRejectionPDSFilters(r.URL.Query()["pds"])
+	requestedPDS, ok := snapshotRejectionPDSFilters(query["pds"])
 	if !ok {
-		reply(w, 400, map[string]string{"error": "invalid_pds"})
-		return
+		return snapshotRejectionListOptions{}, "invalid_pds"
 	}
+	return snapshotRejectionListOptions{limit: limit, after: cursor, hasAfter: rawAfter != "", requestedPDS: requestedPDS}, ""
+}
+
+func snapshotRejectionViews(rejections []jobs.SnapshotRejection, requestedPDS map[string]struct{}) []rejectionView {
 	all := make([]rejectionView, 0)
-	for _, rejection := range h.jobs.ListSnapshotRejections() {
+	for _, rejection := range rejections {
 		if len(requestedPDS) > 0 {
 			if _, found := requestedPDS[rejection.PDS]; !found {
 				continue
@@ -389,26 +398,31 @@ func (h *Handler) listSnapshotRejections(w http.ResponseWriter, r *http.Request)
 		all = append(all, snapshotRejectionView(rejection))
 	}
 	sort.Slice(all, func(i, j int) bool { return compareRejection(all[i], all[j]) < 0 })
+	return all
+}
 
+func pageSnapshotRejectionViews(all []rejectionView, after rejectionCursor, hasAfter bool, limit int) ([]rejectionView, string) {
 	out := make([]rejectionView, 0, limit)
 	for _, rejection := range all {
-		if compareRejection(rejection, rejectionView(cursor)) <= 0 && after != "" {
+		if hasAfter && compareRejection(rejection, rejectionView(after)) <= 0 {
 			continue
 		}
 		if len(out) == limit {
-			break
+			return out, rejectionCursorFor(out[len(out)-1])
 		}
 		out = append(out, rejection)
 	}
-	next := ""
-	if len(out) == limit {
-		for _, rejection := range all {
-			if compareRejection(rejection, out[len(out)-1]) > 0 {
-				next = rejectionCursorFor(out[len(out)-1])
-				break
-			}
-		}
+	return out, ""
+}
+
+func (h *Handler) listSnapshotRejections(w http.ResponseWriter, r *http.Request) {
+	options, errorCode := parseSnapshotRejectionListOptions(r)
+	if errorCode != "" {
+		reply(w, 400, map[string]string{"error": errorCode})
+		return
 	}
+	all := snapshotRejectionViews(h.jobs.ListSnapshotRejections(), options.requestedPDS)
+	out, next := pageSnapshotRejectionViews(all, options.after, options.hasAfter, options.limit)
 	reply(w, 200, struct {
 		Rejections []rejectionView `json:"rejections"`
 		NextCursor string          `json:"nextCursor,omitempty"`

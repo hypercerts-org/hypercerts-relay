@@ -220,7 +220,14 @@ fi
 # resulting sealed boundary contains the complete seed phase.
 sealed=0
 for _ in $(seq 1 90); do
-  curl --fail --silent --show-error --request POST "$jetstream_url/hypercerts/acceptance/seal"
+  # The driver can finish its Relay-facing bootstrap before Jetstream has
+  # published its steady-state writer. The acceptance-only seal route returns
+  # 503 during that documented readiness window, so retry it with the archive
+  # assertion rather than failing before the loop can observe readiness.
+  if ! curl --fail --silent --show-error --request POST "$jetstream_url/hypercerts/acceptance/seal"; then
+    sleep 1
+    continue
+  fi
   curl --fail --silent --show-error --request POST \
     --header 'content-type: application/json' \
     --data '{}' \

@@ -213,7 +213,10 @@ func TestPDSProcessorVerifySnapshotRefreshClassification(t *testing.T) {
 				require.Equal(t, tc.wantCode, input.Code)
 				require.Equal(t, tc.unavailable, input.Unavailable)
 			}
-			require.Equal(t, 1, resolver.Calls(), "the cached identity must be purged before verification")
+			require.Equal(t, 1, resolver.Calls(), "snapshot verification must resolve a fresh identity without using the cache")
+			cached, ok := directory.Cache.Get(t.Context(), "did:"+string(did))
+			require.True(t, ok, "direct-PDS verification must not evict the shared directory cache")
+			require.Equal(t, pds, cached.PDSEndpoint())
 		})
 	}
 }

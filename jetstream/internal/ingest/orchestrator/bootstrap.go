@@ -47,171 +47,153 @@ func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 	return obs.Span(ctx, func(ctx context.Context) error {
 		segmentsDir := filepath.Join(o.cfg.DataDir, "segments")
 		liveSegmentsDir := filepath.Join(o.cfg.DataDir, "backfill", "live_segments")
-
-		// Backfill writer (shared with the backfill engine).
-		bw, err := ingest.Open(ingest.Config{
-			// hypercerts: Gate direct-PDS bootstrap materialization before durable storage.
-			CollectionPolicy:       o.cfg.CollectionPolicy,
-			SegmentsDir:            segmentsDir,
-			DataDir:                o.cfg.DataDir,
-			FS:                     o.cfg.FS,
-			Store:                  o.cfg.Store,
-			Logger:                 o.cfg.Logger,
-			Metrics:                o.cfg.IngestMetrics,
-			SegmentMetrics:         o.cfg.SegmentMetrics,
-			AsyncFlushWorkers:      o.cfg.BackfillAsyncFlushWorkers,
-			OnAfterSeal:            o.cfg.IngestOnAfterSeal,
-			SegmentIOFaultInjector: o.cfg.SegmentIOFaultInjector,
-		})
+		bw, err := o.openBootstrapWriter(segmentsDir)
 		if err != nil {
 			return fmt.Errorf("orchestrator: open backfill ingest writer: %w", err)
 		}
-
-		// Bootstrap-time live consumer.
-		bootstrapLive, err := live.Open(live.Config{
-			// hypercerts: Bootstrap and restart share the same persisted collection policy.
-			CollectionPolicy:  o.cfg.CollectionPolicy,
-			DataDir:           o.cfg.DataDir,
-			SegmentsDir:       liveSegmentsDir,
-			FS:                o.cfg.FS,
-			Store:             o.cfg.Store,
-			SeqKey:            live.BootstrapSeqKey,
-			CursorKey:         live.CursorKey,
-			RelayURL:          o.cfg.RelayURL,
-			Logger:            o.cfg.Logger,
-			Metrics:           o.cfg.LiveMetrics,
-			DropMetrics:       o.cfg.DropMetrics,
-			Verifier:          o.cfg.Verifier,
-			SyncStateStore:    o.cfg.SyncStateStore,
-			MaxSegmentBytes:   o.cfg.BootstrapLiveMaxSegmentBytes,
-			MaxEventsPerBlock: o.cfg.BootstrapLiveMaxEventsPerBlock,
-			SegmentMetrics:    o.cfg.SegmentMetrics,
-			OnEvent:           o.cfg.OnBootstrapLiveEvent,
-			ReconnectBackoff:  o.cfg.LiveReconnectBackoff,
-			Dial:              o.cfg.LiveDial,
-
-			SegmentIOFaultInjector: o.cfg.SegmentIOFaultInjector,
-		})
+		bootstrapLive, err := o.openBootstrapLive(liveSegmentsDir)
 		if err != nil {
-			if cerr := bw.Close(); cerr != nil {
-				o.logger.WarnContext(ctx, "backfill writer close after bootstrap-live open failure", "err", cerr)
-			}
+			o.closeBootstrapWriterAfterLiveOpenFailure(ctx, bw)
 			return fmt.Errorf("orchestrator: open bootstrap-live consumer: %w", err)
 		}
-
-		g, gctx := errgroup.WithContext(ctx)
-
-		// Derived context the orchestrator cancels at cutover-time.
-		// Wrapping gctx means errgroup-driven cancellation (e.g. from a
-		// backfill error) also propagates to the live consumer, while
-		// still letting us call cancelLive() to stop ONLY the live
-		// consumer when backfill drains successfully — gctx remains
-		// uncancelled so the backfill goroutine can return nil normally.
-		liveCtx, cancelLive := context.WithCancel(gctx)
-		defer cancelLive()
-
-		// drainStartUnixNano is set by the backfill goroutine just before
-		// cancelLive(); the live goroutine reads it after observing
-		// liveCtx.Done(). Atomic rather than a plain time.Time because the
-		// happens-before via context.cancel is implicit and a future
-		// refactor that moves the read off the cancel chain would race.
-		// Zero means cutover was not initiated cleanly (error path).
-		var drainStartUnixNano atomic.Int64
-
-		g.Go(func() error {
-			err := backfill.Run(gctx, backfill.Config{
-				Store:             o.cfg.Store,
-				HTTPClient:        o.cfg.HTTPClient,
-				Writer:            bw,
-				RelayURL:          o.cfg.RelayURL,
-				Logger:            o.cfg.Logger,
-				Metrics:           o.cfg.BackfillMetrics,
-				DropMetrics:       o.cfg.DropMetrics,
-				MaxRepos:          o.cfg.MaxBackfillRepos,
-				GlobalDownloads:   o.cfg.BackfillGlobalDownloads,
-				HostWorkers:       o.cfg.BackfillHostWorkers,
-				MaxActiveHosts:    o.cfg.BackfillMaxActiveHosts,
-				MaxHosts:          o.cfg.BackfillMaxHosts,
-				BackfillWorkers:   o.cfg.BackfillWorkers,
-				NewHostClient:     o.cfg.BackfillNewHostClient,
-				BackfillBatchSize: o.cfg.BackfillBatchSize,
-				BackfillRepos:     o.cfg.BackfillRepos,
-				IdentityResolver:  o.cfg.Directory.Resolver,
-				// hypercerts: Bootstrap CAR verification shares the runtime live-verifier directory.
-				Directory:         o.cfg.Directory,
-				RetryBaseDelay:    o.cfg.BackfillRetryBaseDelay,
-				AfterRepoComplete: o.cfg.AfterRepoComplete,
-				CrashInjector:     o.cfg.CrashInjector,
-			})
-			if err != nil {
-				return err
-			}
-
-			// Backfill drained cleanly. Trigger the cutover by writing
-			// phase=merging FIRST (commit point #1), THEN cancelling the
-			// live consumer. The order matters: the phase write is the
-			// only durable signal that backfill has finished, and a crash
-			// after the phase write recovers via PhaseMerging restart.
-			o.logger.InfoContext(ctx, "cutover begin")
-			if err := o.writeMergingPhase(); err != nil {
-				return err
-			}
-
-			// Optional pre-cutover barrier: the bootstrap-live consumer is
-			// still running here, so a validation harness that injected live
-			// traffic during bootstrap can wait for it to be fully archived
-			// before the cancel below tears the consumer down. Nil in
-			// production (cutover proceeds immediately; any in-flight live
-			// events are re-fetched from the persisted cursor in steady-state).
-			if o.cfg.BarrierBeforeCutover != nil {
-				if err := o.cfg.BarrierBeforeCutover(gctx); err != nil {
-					return fmt.Errorf("orchestrator: before-cutover barrier: %w", err)
-				}
-			}
-
-			// Cancel the bootstrap-live consumer's context. This signals
-			// state 2. The live consumer's Run goroutine returns shortly,
-			// and its return value is the second errgroup goroutine's
-			// result.
-			drainStartUnixNano.Store(time.Now().UnixNano())
-			cancelLive()
-			return nil
-		})
-
-		g.Go(func() error {
-			err := bootstrapLive.Run(liveCtx)
-
-			// If the only thing that happened is the orchestrator's own
-			// cancelLive() call (after backfill drained successfully),
-			// liveCtx is cancelled but ctx (the outer process ctx) is
-			// still healthy. Treat that as a clean stop.
-			if err != nil && errors.Is(err, context.Canceled) && liveCtx.Err() != nil && ctx.Err() == nil {
-				if startNs := drainStartUnixNano.Load(); startNs != 0 {
-					o.cfg.Metrics.observeState("drain_bootstrap", time.Since(time.Unix(0, startNs)).Seconds())
-				}
-				return nil
-			}
-			return err
-		})
-
-		if err := g.Wait(); err != nil {
-			// Best-effort cleanup. Close errors are logged, not returned,
-			// because the underlying error is what we want surfaced.
-			if cerr := bootstrapLive.Close(); cerr != nil {
-				o.logger.WarnContext(ctx, "bootstrap-live close after error", "err", cerr)
-			}
-			if cerr := bw.Close(); cerr != nil {
-				o.logger.WarnContext(ctx, "backfill writer close after error", "err", cerr)
-			}
+		if err := o.runBootstrapWorkers(ctx, bw, bootstrapLive); err != nil {
+			o.cleanupBootstrapAfterError(ctx, bootstrapLive, bw)
 			return err
 		}
-
-		// Success path. Cleanup ordering is: try to seal/close everything
-		// even if an intermediate step fails, then return the first error.
-		// We must reach bw.Close() so its Flush+saveNextSeq run; a leaked
-		// bw also leaks fd/locking on data/segments.
 		return o.finishBootstrap(ctx, bootstrapLive, bw, liveSegmentsDir)
 	})
+}
+
+func (o *Orchestrator) openBootstrapWriter(segmentsDir string) (*ingest.Writer, error) {
+	return ingest.Open(ingest.Config{
+		// hypercerts: Gate direct-PDS bootstrap materialization before durable storage.
+		CollectionPolicy:       o.cfg.CollectionPolicy,
+		SegmentsDir:            segmentsDir,
+		DataDir:                o.cfg.DataDir,
+		FS:                     o.cfg.FS,
+		Store:                  o.cfg.Store,
+		Logger:                 o.cfg.Logger,
+		Metrics:                o.cfg.IngestMetrics,
+		SegmentMetrics:         o.cfg.SegmentMetrics,
+		AsyncFlushWorkers:      o.cfg.BackfillAsyncFlushWorkers,
+		OnAfterSeal:            o.cfg.IngestOnAfterSeal,
+		SegmentIOFaultInjector: o.cfg.SegmentIOFaultInjector,
+	})
+}
+
+func (o *Orchestrator) openBootstrapLive(liveSegmentsDir string) (*live.Consumer, error) {
+	return live.Open(live.Config{
+		// hypercerts: Bootstrap and restart share the same persisted collection policy.
+		CollectionPolicy:  o.cfg.CollectionPolicy,
+		DataDir:           o.cfg.DataDir,
+		SegmentsDir:       liveSegmentsDir,
+		FS:                o.cfg.FS,
+		Store:             o.cfg.Store,
+		SeqKey:            live.BootstrapSeqKey,
+		CursorKey:         live.CursorKey,
+		RelayURL:          o.cfg.RelayURL,
+		Logger:            o.cfg.Logger,
+		Metrics:           o.cfg.LiveMetrics,
+		DropMetrics:       o.cfg.DropMetrics,
+		Verifier:          o.cfg.Verifier,
+		SyncStateStore:    o.cfg.SyncStateStore,
+		MaxSegmentBytes:   o.cfg.BootstrapLiveMaxSegmentBytes,
+		MaxEventsPerBlock: o.cfg.BootstrapLiveMaxEventsPerBlock,
+		SegmentMetrics:    o.cfg.SegmentMetrics,
+		OnEvent:           o.cfg.OnBootstrapLiveEvent,
+		ReconnectBackoff:  o.cfg.LiveReconnectBackoff,
+		Dial:              o.cfg.LiveDial,
+
+		SegmentIOFaultInjector: o.cfg.SegmentIOFaultInjector,
+	})
+}
+
+func (o *Orchestrator) closeBootstrapWriterAfterLiveOpenFailure(ctx context.Context, bw *ingest.Writer) {
+	if err := bw.Close(); err != nil {
+		o.logger.WarnContext(ctx, "backfill writer close after bootstrap-live open failure", "err", err)
+	}
+}
+
+func (o *Orchestrator) cleanupBootstrapAfterError(ctx context.Context, bootstrapLive *live.Consumer, bw *ingest.Writer) {
+	// Best-effort cleanup. Close errors are logged, not returned, because the
+	// worker error is what callers need surfaced.
+	if err := bootstrapLive.Close(); err != nil {
+		o.logger.WarnContext(ctx, "bootstrap-live close after error", "err", err)
+	}
+	if err := bw.Close(); err != nil {
+		o.logger.WarnContext(ctx, "backfill writer close after error", "err", err)
+	}
+}
+
+func (o *Orchestrator) runBootstrapWorkers(ctx context.Context, bw *ingest.Writer, bootstrapLive *live.Consumer) error {
+	g, gctx := errgroup.WithContext(ctx)
+	// Wrapping gctx lets an errgroup failure cancel live processing while still
+	// allowing a clean backfill drain to stop only the bootstrap-live consumer.
+	liveCtx, cancelLive := context.WithCancel(gctx)
+	defer cancelLive()
+
+	// The backfill worker stores this immediately before cancellation. The live
+	// worker reads it after observing liveCtx.Done(), so an atomic keeps a future
+	// change to that ordering race-free.
+	var drainStartUnixNano atomic.Int64
+	g.Go(func() error { return o.runBootstrapBackfill(gctx, bw, cancelLive, &drainStartUnixNano) })
+	g.Go(func() error { return o.runBootstrapLive(ctx, liveCtx, bootstrapLive, &drainStartUnixNano) })
+	return g.Wait()
+}
+
+func (o *Orchestrator) runBootstrapBackfill(ctx context.Context, bw *ingest.Writer, cancelLive context.CancelFunc, drainStartUnixNano *atomic.Int64) error {
+	err := backfill.Run(ctx, backfill.Config{
+		Store:             o.cfg.Store,
+		HTTPClient:        o.cfg.HTTPClient,
+		Writer:            bw,
+		RelayURL:          o.cfg.RelayURL,
+		Logger:            o.cfg.Logger,
+		Metrics:           o.cfg.BackfillMetrics,
+		DropMetrics:       o.cfg.DropMetrics,
+		MaxRepos:          o.cfg.MaxBackfillRepos,
+		GlobalDownloads:   o.cfg.BackfillGlobalDownloads,
+		HostWorkers:       o.cfg.BackfillHostWorkers,
+		MaxActiveHosts:    o.cfg.BackfillMaxActiveHosts,
+		MaxHosts:          o.cfg.BackfillMaxHosts,
+		BackfillWorkers:   o.cfg.BackfillWorkers,
+		NewHostClient:     o.cfg.BackfillNewHostClient,
+		BackfillBatchSize: o.cfg.BackfillBatchSize,
+		BackfillRepos:     o.cfg.BackfillRepos,
+		IdentityResolver:  o.cfg.Directory.Resolver,
+		// hypercerts: Bootstrap CAR verification shares the runtime live-verifier directory.
+		Directory:         o.cfg.Directory,
+		RetryBaseDelay:    o.cfg.BackfillRetryBaseDelay,
+		AfterRepoComplete: o.cfg.AfterRepoComplete,
+		CrashInjector:     o.cfg.CrashInjector,
+	})
+	if err != nil {
+		return err
+	}
+	// Write phase=merging before cancelling live processing: this is the durable
+	// commit point for a clean backfill drain.
+	o.logger.InfoContext(ctx, "cutover begin")
+	if err := o.writeMergingPhase(); err != nil {
+		return err
+	}
+	if o.cfg.BarrierBeforeCutover != nil {
+		if err := o.cfg.BarrierBeforeCutover(ctx); err != nil {
+			return fmt.Errorf("orchestrator: before-cutover barrier: %w", err)
+		}
+	}
+	drainStartUnixNano.Store(time.Now().UnixNano())
+	cancelLive()
+	return nil
+}
+
+func (o *Orchestrator) runBootstrapLive(parentCtx, liveCtx context.Context, bootstrapLive *live.Consumer, drainStartUnixNano *atomic.Int64) error {
+	err := bootstrapLive.Run(liveCtx)
+	if err != nil && errors.Is(err, context.Canceled) && liveCtx.Err() != nil && parentCtx.Err() == nil {
+		if startNs := drainStartUnixNano.Load(); startNs != 0 {
+			o.cfg.Metrics.observeState("drain_bootstrap", time.Since(time.Unix(0, startNs)).Seconds())
+		}
+		return nil
+	}
+	return err
 }
 
 // finishBootstrap drives States 3 and 4. Split out so the success

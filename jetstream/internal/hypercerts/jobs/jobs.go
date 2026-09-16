@@ -76,6 +76,7 @@ const (
 	snapshotRejectionDigestPrefix    = "sha256:"
 	maxSnapshotRejectionPDSLength    = 2048
 	snapshotRejectionDigestHexLength = sha256.Size * 2
+	maxSnapshotRejections            = 1000
 )
 
 // hypercerts: Direct-PDS snapshot rejections are separate from job outcomes so
@@ -127,6 +128,7 @@ func Open(db *store.Store, policy *selection.Manager) (*Manager, error) {
 			return nil, errors.New("invalid persisted snapshot rejection")
 		}
 	}
+	trimSnapshotRejections(m.data.SnapshotRejections)
 	for id, job := range m.data.Jobs {
 		if job.ID != id || job.CompletedRepos == nil || job.Policy.Revision == 0 {
 			return nil, errors.New("invalid persisted job")
@@ -491,7 +493,7 @@ func (m *Manager) lookupSnapshotRejection(pds string, policyRevision uint64, did
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	rejection, ok := m.data.SnapshotRejections[snapshotRejectionStoredKey(pds, policyRevision, did, listedRevision, kind)]
-	return clone(rejection), ok
+	return rejection, ok
 }
 
 // ListSnapshotRejections provides deterministic, bounded non-payload
@@ -500,13 +502,21 @@ func (m *Manager) lookupSnapshotRejection(pds string, policyRevision uint64, did
 func (m *Manager) ListSnapshotRejections() []SnapshotRejection {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	out := make([]SnapshotRejection, 0, len(m.data.SnapshotRejections))
-	for _, rejection := range m.data.SnapshotRejections {
-		out = append(out, clone(rejection))
+	type keyedRejection struct {
+		key       string
+		rejection SnapshotRejection
 	}
-	slices.SortFunc(out, func(a, b SnapshotRejection) int {
-		return strings.Compare(snapshotRejectionStoredKey(a.PDS, a.PolicyRevision, a.DID, a.ListedRevision, a.Kind), snapshotRejectionStoredKey(b.PDS, b.PolicyRevision, b.DID, b.ListedRevision, b.Kind))
+	keyed := make([]keyedRejection, 0, len(m.data.SnapshotRejections))
+	for key, rejection := range m.data.SnapshotRejections {
+		keyed = append(keyed, keyedRejection{key: key, rejection: rejection})
+	}
+	slices.SortFunc(keyed, func(a, b keyedRejection) int {
+		return strings.Compare(a.key, b.key)
 	})
+	out := make([]SnapshotRejection, len(keyed))
+	for i, item := range keyed {
+		out[i] = item.rejection
+	}
 	return out
 }
 
@@ -522,14 +532,45 @@ func (m *Manager) recordSnapshotRejection(pds string, policyRevision uint64, did
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if existing, ok := m.data.SnapshotRejections[key]; ok {
-		return clone(existing), nil
+		return existing, nil
 	}
-	next := clone(m.data)
+	next := m.data
+	next.SnapshotRejections = cloneSnapshotRejections(m.data.SnapshotRejections)
 	next.SnapshotRejections[key] = rejection
+	trimSnapshotRejections(next.SnapshotRejections)
 	if err := m.commit(next); err != nil {
 		return SnapshotRejection{}, err
 	}
-	return clone(rejection), nil
+	return rejection, nil
+}
+
+func cloneSnapshotRejections(source map[string]SnapshotRejection) map[string]SnapshotRejection {
+	cloned := make(map[string]SnapshotRejection, len(source)+1)
+	for key, rejection := range source {
+		cloned[key] = rejection
+	}
+	return cloned
+}
+
+// trimSnapshotRejections retains recent durable verdicts without allowing a
+// single JSON state document to grow with every rejected listing. Equal
+// timestamps use the stored-key order so eviction is deterministic.
+func trimSnapshotRejections(rejections map[string]SnapshotRejection) {
+	for len(rejections) > maxSnapshotRejections {
+		delete(rejections, oldestSnapshotRejectionKey(rejections))
+	}
+}
+
+func oldestSnapshotRejectionKey(rejections map[string]SnapshotRejection) string {
+	var oldestKey string
+	var oldest SnapshotRejection
+	for key, rejection := range rejections {
+		if oldestKey == "" || rejection.RejectedAt.Before(oldest.RejectedAt) || (rejection.RejectedAt.Equal(oldest.RejectedAt) && key < oldestKey) {
+			oldestKey = key
+			oldest = rejection
+		}
+	}
+	return oldestKey
 }
 
 func (m *Manager) active(id string) bool {

@@ -15,9 +15,19 @@ const collection = 'app.bsky.feed.post'
 const origins = { a: 'https://pds-a.test', b: 'https://pds-b.test' }
 const directPDS = origins.a
 const plcURL = 'https://plc.test'
+const acceptanceOrigins = new Set([
+  'http://relay:2471',
+  'http://jetstream:8081',
+  'http://fault-proxy:3000',
+  origins.a,
+  origins.b,
+  plcURL,
+])
 
 async function request(url, options = {}) {
-  const response = await fetch(url, options)
+  const target = new URL(url)
+  if (!acceptanceOrigins.has(target.origin)) throw new TypeError(`unexpected acceptance request origin: ${target.origin}`)
+  const response = await fetch(target, options)
   const text = await response.text()
   let body
   try {
@@ -231,7 +241,7 @@ async function control(path, options = {}) {
   const token = await jetstreamToken()
   return request(`${jetstreamControlURL}${path}`, {
     ...options,
-    headers: { authorization: `Bearer ${token}`, ...(options.headers ?? {}) },
+    headers: { authorization: `Bearer ${token}`, ...options.headers },
   })
 }
 

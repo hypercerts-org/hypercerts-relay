@@ -189,7 +189,7 @@ All paths below start with `/hypercerts/v1`:
 | `DELETE /sources` | Same body; cancels acquisition without deleting the archive. |
 | `POST /jobs` | `{"pds":"https://pds.example","reason":"backfill","requestId":"optional-idempotency-key"}` or reason `quota_recovery`; the same nonempty request ID returns its prior job, while unkeyed duplicate active work is reused and a later terminal recovery creates fresh work. |
 | `GET /jobs?limit=100&after=<cursor>` | Sorted page, maximum 200 jobs, optional `nextCursor`. Concurrent additions may require a fresh listing. |
-| `GET /snapshot-rejections?limit=100&after=<cursor>` | Bounded non-payload direct-PDS snapshot rejections, with optional repeated exact `pds` filters. Returns origin, policy/listed revisions, DID, kind/code and timestamp; never CAR bytes, records, tokens or storage keys. |
+| `GET /snapshot-rejections?limit=100&after=<cursor>` | The most recent 1,000 bounded non-payload direct-PDS snapshot rejections, with optional repeated exact `pds` filters. Older rejections are evicted. Returns origin, policy/listed revisions, DID, kind/code and timestamp; never CAR bytes, records, tokens or storage keys. |
 | `GET /coverage?limit=100&after=<pds>` | Latest current-state job per PDS, sorted and paginated by PDS with optional exact `pds` filter. |
 | `GET /jobs/{id}` | Durable state, progress, attempt count, and coverage. |
 | `POST /jobs/{id}/cancel` | Cancels pending/running work. |
