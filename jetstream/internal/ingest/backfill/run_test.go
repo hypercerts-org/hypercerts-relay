@@ -922,6 +922,68 @@ func TestRun_DirectoryVerifiesBootstrapCommitSignatures(t *testing.T) {
 	})
 }
 
+func TestRun_DirectoryRefreshesStaleBootstrapSigningKey(t *testing.T) {
+	t.Parallel()
+
+	staleKey, err := crypto.GenerateK256()
+	require.NoError(t, err)
+	stalePub, ok := staleKey.PublicKey().(*crypto.K256PublicKey)
+	require.True(t, ok)
+	var plcLookups atomic.Int64
+	account, srv := newSimulatorSignatureFixture(t, 1, 0, func(baseHandler http.Handler, _ *world.World, account world.Account) http.Handler {
+		return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+			if req.URL.Path == "/"+string(account.DID) && plcLookups.Add(1) == 1 {
+				rw.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(rw).Encode(map[string]any{
+					"id": string(account.DID),
+					"verificationMethod": []map[string]string{{
+						"id":                 string(account.DID) + "#atproto",
+						"type":               "Multikey",
+						"controller":         string(account.DID),
+						"publicKeyMultibase": stalePub.Multibase(),
+					}},
+				})
+				return
+			}
+			baseHandler.ServeHTTP(rw, req)
+		})
+	})
+
+	db, err := store.Open(t.TempDir(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	segmentsDir := filepath.Join(t.TempDir(), "segments")
+	writer, err := ingest.Open(ingest.Config{
+		SegmentsDir:       segmentsDir,
+		Store:             db,
+		Logger:            logger,
+		MaxEventsPerBlock: 4,
+		MaxSegmentBytes:   1 << 30,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = writer.Close() })
+
+	directory := simulatorSignatureDirectory(srv)
+	directory.Cache = atmosidentity.NewLRUCache(1, time.Hour)
+	require.NoError(t, Run(t.Context(), Config{
+		Store:          db,
+		HTTPClient:     srv.Client(),
+		Writer:         writer,
+		RelayURL:       srv.URL,
+		Logger:         logger,
+		Directory:      directory,
+		RetryBaseDelay: time.Millisecond,
+		RetryMaxDelay:  10 * time.Millisecond,
+	}))
+
+	rs, err := NewStore(db, nil).readRepoStatus(account.DID)
+	require.NoError(t, err)
+	require.Equal(t, StatusComplete, rs.Backfill.Status)
+	require.Equal(t, int64(2), plcLookups.Load(), "signature failure must purge the stale key and verify with a fresh DID document")
+	require.NotEmpty(t, collectActiveEvents(t, filepath.Join(segmentsDir, ingest.SegmentFilename(0))), "verified bootstrap must materialize the repository")
+}
+
 func runBootstrapSignatureVerification(t *testing.T, invalidSignature bool, wantStatus Status) {
 	account, srv := newSimulatorSignatureFixture(t, 1, 0, func(baseHandler http.Handler, wld *world.World, account world.Account) http.Handler {
 		if !invalidSignature {

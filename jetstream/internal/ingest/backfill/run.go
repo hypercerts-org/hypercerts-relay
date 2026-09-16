@@ -193,8 +193,15 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 
 		var limited atomic.Bool
+		engineHandler := atmosbackfill.Handler(handler)
+		// hypercerts: keep direct-PDS signature verification at the handler
+		// boundary so a signature mismatch can refresh one stale DID cache entry
+		// before the engine records a permanent repository failure.
+		if cfg.Directory != nil {
+			engineHandler = verifiedBootstrapHandler{next: handler, directory: cfg.Directory}
+		}
 		engineOpts := atmosbackfill.Options{
-			Relay: relay, NewHostClient: gt.Some(newHostClient), Store: st.AtmosStore(), Handler: handler,
+			Relay: relay, NewHostClient: gt.Some(newHostClient), Store: st.AtmosStore(), Handler: engineHandler,
 			OnError: gt.Some(func(did atmos.DID, err error) {
 				if shouldLogBackfillError(err) {
 					logger.WarnContext(ctx, "repo failed", "did", string(did), "err", err)
@@ -235,12 +242,6 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 		if cfg.BackfillBatchSize > 0 {
 			engineOpts.BatchSize = gt.Some(cfg.BackfillBatchSize)
-		}
-		// hypercerts: opt into Atmos complete-CAR signature checks only when
-		// callers provide a directory, retaining compatibility for direct callers.
-		if cfg.Directory != nil {
-			engineOpts.Directory = gt.Some(cfg.Directory)
-			engineOpts.VerifyCommits = gt.Some(true)
 		}
 		if cfg.MaxRetries > 0 {
 			engineOpts.MaxRetries = gt.Some(cfg.MaxRetries)

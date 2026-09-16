@@ -155,6 +155,23 @@ func verifyCompleteCommit(ctx context.Context, directory *atmosidentity.Director
 	return err
 }
 
+// verifiedBootstrapHandler verifies normal direct-PDS complete CARs before
+// handing them to the segment writer. Atmos v0.3.6 exposes only an all-or-
+// nothing engine verifier, so it cannot refresh a cached identity after a
+// signature failure. This adapter preserves the same one-refresh policy as
+// selected and retry backfill without allowing unverified materialization.
+type verifiedBootstrapHandler struct {
+	next      *SegmentHandler
+	directory *atmosidentity.Directory
+}
+
+func (h verifiedBootstrapHandler) HandleRepo(ctx context.Context, did atmos.DID, rp *atmosrepo.Repo, commit *atmosrepo.Commit) error {
+	if err := verifyCompleteCommit(ctx, h.directory, did, commit); err != nil {
+		return fmt.Errorf("backfill: verify bootstrap commit: %w", err)
+	}
+	return h.next.HandleRepo(ctx, did, rp, commit)
+}
+
 // verifyCompleteCommitOnce mirrors atmos's directory verification while
 // retaining whether the failure was specifically a validly encoded signature
 // that did not verify. That distinction prevents cache eviction for temporary
