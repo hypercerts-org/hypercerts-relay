@@ -6,11 +6,11 @@ Hypercerts Relay is the controlled AT Protocol event source for Hypercerts servi
 
 The Relay connects to approved PDS instances and publishes a raw `com.atproto.sync.subscribeRepos` stream. The relay does not select Hypercerts records or provide a consumer archive. The `jetstream/` module receives this stream, retains only the enabled record collections, and performs durable collection backfills. Rainbow sits in front of the raw Relay stream when connection pooling and fan-out are needed.
 
-The administration control plane will manage PDS sources, record collections, rate limits, backfills, and relay telemetry. Its Svelte web interface is not the inherited Relay admin UI: the existing Basic-auth interface under `cmd/relay/relay-admin-ui` remains upstream code until the control-plane work replaces it.
+The administration control plane manages PDS sources, record collections, rate limits, backfills, and relay telemetry. Its Svelte web interface is not the inherited Relay admin UI: the existing Basic-auth interface under `cmd/relay/relay-admin-ui` remains upstream code and is not the control plane.
 
 ## Status
 
-This repository contains the maintained Relay and Rainbow base, durable Relay processing and rejections, a managed PDS registry, and a copied Jetstream v2 runtime baseline. Hypercerts collection-selection policy, scoped backfill jobs, and the new administration control plane remain before deployment.
+This repository contains the maintained Relay and Rainbow base, durable Relay processing and rejections, a managed PDS registry, a copied Jetstream v2 runtime, collection-selection policy, scoped backfill jobs, and the administration control plane. Their remaining acceptance, recovery, upgrade and deployment gates are tracked in the implementation plans; their presence is not deployment qualification.
 
 ## Event durability
 

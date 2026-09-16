@@ -16,9 +16,13 @@ The private Jetstream interface provides:
 - `GET /hypercerts/v1/coverage`.
 
 Job requests and retry/cancel actions use durable, separate receipt namespaces.
-The same nonempty request receipt returns its prior job. Without a receipt,
-repeated requests coalesce only applicable pending or running work; a later
-unkeyed request after terminal work may create a new job.
+`POST /jobs` accepts an optional JSON `requestId` of at most 128 bytes. The same
+nonempty request receipt returns its prior job; reuse with a different PDS or
+reason returns conflict. `POST /jobs/{id}/cancel` and `/retry` accept an optional
+`Idempotency-Key` header of at most 128 bytes. Reuse with a different job or
+action returns conflict. Without a receipt, repeated job requests coalesce only
+applicable pending or running work; a later unkeyed request after terminal work
+may create a new job.
 
 ## Completion semantics
 

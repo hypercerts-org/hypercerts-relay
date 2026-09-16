@@ -150,14 +150,16 @@ cannot overwrite a completed snapshot; newer live rows win. Restart retries a
 running job from its persisted page/repository progress. A crash before progress
 acknowledgment may replay work safely.
 
-Coverage is explicitly `current_state`, with `historyComplete: false`: a PDS
-snapshot cannot prove historical event completeness. Unavailable sources, changed
-DID hosting, stale snapshots, and the 64 MiB per-repository input limit produce
-`incomplete`; malformed or unverifiable input produces `failed`. Both require an
-explicit retry. Local persistence failures stop the runtime without acknowledging
-completion. Each repository request has a two-minute deadline. Reconciliation
-currently scans the archive under its rewrite lock, so large archives can pause
-live appends during an individual repository reconciliation.
+Coverage is explicitly `current_state`: a PDS snapshot cannot prove historical
+event completeness. The currently emitted `historyComplete: false` field is
+transitional and always false; Plan 006 removes it from job state and control/UI
+responses. Unavailable sources, changed DID hosting, stale snapshots, and the 64
+MiB per-repository input limit produce `incomplete`; malformed or unverifiable
+input produces `failed`. Both require an explicit retry. Local persistence
+failures stop the runtime without acknowledging completion. Each repository
+request has a two-minute deadline. Reconciliation currently scans the archive
+under its rewrite lock, so large archives can pause live appends during an
+individual repository reconciliation.
 
 ## Private service interface
 
@@ -184,7 +186,7 @@ All paths below start with `/hypercerts/v1`:
 | `GET /sources` | Explicit PDS origins and enabled flags. |
 | `POST /sources` | `{"pds":"https://pds.example"}`; adds source and returns its job. |
 | `DELETE /sources` | Same body; cancels acquisition without deleting the archive. |
-| `POST /jobs` | `{"pds":"https://pds.example","reason":"backfill"}` or reason `quota_recovery`; duplicate active work is reused, a later terminal recovery creates a fresh job. |
+| `POST /jobs` | `{"pds":"https://pds.example","reason":"backfill","requestId":"optional-idempotency-key"}` or reason `quota_recovery`; the same nonempty request ID returns its prior job, while unkeyed duplicate active work is reused and a later terminal recovery creates fresh work. |
 | `GET /jobs?limit=100&after=<cursor>` | Sorted page, maximum 200 jobs, optional `nextCursor`. Concurrent additions may require a fresh listing. |
 | `GET /coverage?limit=100&after=<pds>` | Latest current-state job per PDS, sorted and paginated by PDS with optional exact `pds` filter. |
 | `GET /jobs/{id}` | Durable state, progress, attempt count, and coverage. |
@@ -194,12 +196,13 @@ All paths below start with `/hypercerts/v1`:
 Each job reports `id`, `pds`, `policy.revision`, `policy.collections`, `reason`,
 `state`, `attempts`, `completedRepos` (count), `totalRepos` with
 `totalReposKnown`, page `cursor`, bounded `errorCode`,
-creation/start/finish times, `coverage`, and `historyComplete`. Job states are
-`pending`, `running`, `failed`, `canceled`, `incomplete`, and `complete`. A completed
-job identifies the exact PDS origin and policy revision whose **current state** it
-covers. `historyComplete: false` explicitly records that older history is not
-proven recoverable; administration clients must not present this as full historical
-coverage. An unreachable PDS returns `incomplete`, never `complete`.
+creation/start/finish times, `coverage`, and the currently emitted transitional
+`historyComplete` field. Job states are `pending`, `running`, `failed`, `canceled`,
+`incomplete`, and `complete`. A completed job identifies the exact PDS origin and
+policy revision whose **current state** it covers. `historyComplete` is always
+false and is scheduled for Plan 006 removal; clients must not present it as a
+historical-coverage indicator. An unreachable PDS returns `incomplete`, never
+`complete`.
 
 Errors use a bounded JSON `error` code: 400 invalid input, 401 authentication,
 404 unknown job/source, 409 policy/state conflict, and 500 persistence failure.
