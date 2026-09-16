@@ -769,6 +769,9 @@ func (r *Relay) reconcileSourceLocked(ctx context.Context, source *models.Source
 		if source.ValidationStatus != models.SourceValidationPassed || banned || host.Status == models.HostStatusBanned {
 			return r.Slurper.StopSource(ctx, host.Hostname)
 		}
+		if err := r.requireRateAdmission(ctx); err != nil {
+			return err
+		}
 		if err := r.Slurper.Subscribe(host); err != nil {
 			return fmt.Errorf("starting source: %w", err)
 		}
