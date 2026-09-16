@@ -30,6 +30,9 @@ an assumed successful mutation.
 
 A Relay source remains recovery-required until a matching successful Jetstream
 job crosses the durable receipt boundary defined by [TECH-637](https://linear.app/hypercerts/issue/TECH-637/persist-cross-service-recovery-receipts-for-admitted-pdss).
+The receipt is keyed by admitted PDS, Relay source revision, Jetstream policy
+revision, job ID and durable completion boundary, so a lifecycle change cannot
+be acknowledged by earlier work.
 Removing a PDS stops future acquisition and dependent work; it does not purge
 already retained Jetstream archive data. An admitted migration target requires an explicit
 Jetstream current-state job and does not restore unavailable history.

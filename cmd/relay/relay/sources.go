@@ -14,13 +14,15 @@ import (
 )
 
 var (
-	ErrSourceNotFound         = errors.New("unknown managed source")
-	ErrSourceRevisionConflict = errors.New("source revision conflict")
-	ErrInvalidSourceState     = errors.New("invalid source state")
-	ErrInvalidSourceURL       = errors.New("invalid source URL")
-	ErrSourceDomainBanned     = errors.New("source hostname is banned")
-	ErrSourceValidationFailed = errors.New("source validation failed")
-	ErrSourceDisabled         = errors.New("source acquisition is disabled")
+	ErrSourceNotFound          = errors.New("unknown managed source")
+	ErrSourceRevisionConflict  = errors.New("source revision conflict")
+	ErrInvalidSourceState      = errors.New("invalid source state")
+	ErrInvalidSourceURL        = errors.New("invalid source URL")
+	ErrSourceDomainBanned      = errors.New("source hostname is banned")
+	ErrSourceValidationFailed  = errors.New("source validation failed")
+	ErrSourceDisabled          = errors.New("source acquisition is disabled")
+	ErrInvalidRecoveryReceipt  = errors.New("invalid recovery receipt")
+	ErrRecoveryReceiptConflict = errors.New("recovery receipt does not match the current source")
 )
 
 const (
@@ -68,6 +70,17 @@ type SourceView struct {
 type SourcePage struct {
 	Sources         []*SourceView
 	NextAfterHostID uint64
+}
+
+// RecoveryReceiptInput is the bounded cross-service completion coordinate that
+// Jetstream records only after a current-state job reaches its durable boundary.
+// Plan 006 owns submitting it after a real job completion.
+type RecoveryReceiptInput struct {
+	PDS             string
+	SourceRevision  uint64
+	PolicyRevision  uint64
+	JobID           string
+	DurableBoundary string
 }
 
 // SourceAccountView keeps historical source observation distinct from current
@@ -235,6 +248,8 @@ func (r *Relay) ValidateSource(ctx context.Context, hostID, expectedRevision uin
 			"validation_reason":     reason,
 			"revision":              updatedRevision,
 			"last_operation":        "validate",
+			// hypercerts: Any source revision invalidates an older recovery receipt.
+			"recovery_required": true,
 		})
 	if result.Error != nil {
 		return nil, fmt.Errorf("saving source validation: %w", result.Error)
@@ -248,6 +263,7 @@ func (r *Relay) ValidateSource(ctx context.Context, hostID, expectedRevision uin
 	source.ValidationReason = reason
 	source.Revision = updatedRevision
 	source.LastOperation = "validate"
+	source.RecoveryRequired = true
 	view, err := r.sourceViewLocked(ctx, source, host)
 	if err != nil {
 		return nil, err
@@ -291,9 +307,8 @@ func (r *Relay) SetSourceState(ctx context.Context, hostID, expectedRevision uin
 			"revision":       source.Revision + 1,
 			"last_operation": operation,
 		}
-		if state == models.SourceStateEnabled {
-			updates["recovery_required"] = true
-		}
+		// hypercerts: A source revision invalidates every older recovery receipt.
+		updates["recovery_required"] = true
 		result := r.db.WithContext(ctx).Model(&models.Source{}).
 			Where("host_id = ? AND revision = ?", source.HostID, source.Revision).
 			Updates(updates)
@@ -306,9 +321,7 @@ func (r *Relay) SetSourceState(ctx context.Context, hostID, expectedRevision uin
 		source.State = state
 		source.Revision++
 		source.LastOperation = operation
-		if state == models.SourceStateEnabled {
-			source.RecoveryRequired = true
-		}
+		source.RecoveryRequired = true
 	}
 
 	view, viewErr := r.sourceViewLocked(ctx, source, host)
@@ -323,6 +336,93 @@ func (r *Relay) SetSourceState(ctx context.Context, hostID, expectedRevision uin
 		return nil, err
 	}
 	return r.sourceViewLocked(ctx, source, host)
+}
+
+// AcknowledgeSourceRecovery persists Jetstream's completed-job coordinate and
+// clears RecoveryRequired only while the admitted source still has that exact
+// revision. The caller is the private service boundary; it must submit this
+// only after the Jetstream job completion itself is durable.
+func (r *Relay) AcknowledgeSourceRecovery(ctx context.Context, input RecoveryReceiptInput) (*SourceView, error) {
+	if !validRecoveryReceiptInput(input) {
+		return nil, ErrInvalidRecoveryReceipt
+	}
+	hostname, noSSL, err := ParseHostname(input.PDS)
+	if err != nil {
+		return nil, ErrInvalidRecoveryReceipt
+	}
+
+	r.sourcesLk.Lock()
+	defer r.sourcesLk.Unlock()
+
+	var host models.Host
+	if err := r.db.WithContext(ctx).Where("hostname = ?", hostname).First(&host).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrSourceNotFound
+		}
+		return nil, fmt.Errorf("loading receipt source host: %w", err)
+	}
+	if host.NoSSL != noSSL {
+		return nil, ErrInvalidRecoveryReceipt
+	}
+	source, sourceHost, err := r.sourceAndHostLocked(ctx, host.ID)
+	if err != nil {
+		return nil, err
+	}
+	if source.State != models.SourceStateEnabled || source.Revision != input.SourceRevision {
+		return nil, ErrRecoveryReceiptConflict
+	}
+
+	receipt := models.RecoveryReceipt{
+		PDS:             sourceHostURL(sourceHost),
+		HostID:          sourceHost.ID,
+		SourceRevision:  input.SourceRevision,
+		PolicyRevision:  input.PolicyRevision,
+		JobID:           input.JobID,
+		DurableBoundary: input.DurableBoundary,
+	}
+	if err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&receipt).Error; err != nil {
+			return fmt.Errorf("saving recovery receipt: %w", err)
+		}
+		// The source lock protects this process's lifecycle transitions. The
+		// revision predicate protects the durable state as well, so a stale
+		// completion can never clear a newer requirement.
+		result := tx.Model(&models.Source{}).
+			Where("host_id = ? AND revision = ? AND state = ?", source.HostID, input.SourceRevision, models.SourceStateEnabled).
+			Update("recovery_required", false)
+		if result.Error != nil {
+			return fmt.Errorf("clearing recovered source: %w", result.Error)
+		}
+		if result.RowsAffected != 1 {
+			return ErrRecoveryReceiptConflict
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	source.RecoveryRequired = false
+	return r.sourceViewLocked(ctx, source, sourceHost)
+}
+
+func validRecoveryReceiptInput(input RecoveryReceiptInput) bool {
+	if input.SourceRevision == 0 || input.PolicyRevision == 0 || !validRecoveryCoordinate(input.JobID, 128) || !validRecoveryCoordinate(input.DurableBoundary, 256) {
+		return false
+	}
+	return true
+}
+
+// validRecoveryCoordinate excludes whitespace and opaque payload text while
+// leaving the durable job implementation free to choose a stable identifier.
+func validRecoveryCoordinate(value string, max int) bool {
+	if len(value) == 0 || len(value) > max {
+		return false
+	}
+	for _, r := range value {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '-' && r != '_' && r != '.' && r != ':' {
+			return false
+		}
+	}
+	return true
 }
 
 // checkSourceEnablement enforces validation and bans before acquisition is enabled.

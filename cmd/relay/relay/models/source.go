@@ -53,6 +53,30 @@ func (Source) TableName() string {
 	return "source"
 }
 
+// RecoveryReceipt is the Relay-owned acknowledgement of one Jetstream job's
+// durable current-state boundary. It records only bounded coordinates, never
+// job input, archive payloads, or a remote error.
+//
+// The composite key deliberately includes every versioned boundary. A receipt
+// for a prior source or collection-policy revision cannot acknowledge a later
+// recovery requirement.
+type RecoveryReceipt struct {
+	ID uint64 `gorm:"column:id;primarykey" json:"id"`
+
+	CreatedAt time.Time `json:"createdAt"`
+
+	PDS             string `gorm:"column:pds;not null;uniqueIndex:idx_recovery_receipt_boundary,priority:1" json:"pds"`
+	HostID          uint64 `gorm:"column:host_id;not null;index" json:"hostID"`
+	SourceRevision  uint64 `gorm:"column:source_revision;not null;uniqueIndex:idx_recovery_receipt_boundary,priority:2" json:"sourceRevision"`
+	PolicyRevision  uint64 `gorm:"column:policy_revision;not null;uniqueIndex:idx_recovery_receipt_boundary,priority:3" json:"policyRevision"`
+	JobID           string `gorm:"column:job_id;not null;uniqueIndex:idx_recovery_receipt_boundary,priority:4" json:"jobID"`
+	DurableBoundary string `gorm:"column:durable_boundary;not null;uniqueIndex:idx_recovery_receipt_boundary,priority:5" json:"durableBoundary"`
+}
+
+func (RecoveryReceipt) TableName() string {
+	return "recovery_receipt"
+}
+
 // AccountSourceObservation preserves source attribution independently from an
 // account's current HostID. One row is maintained for each DID/source pair.
 type AccountSourceObservation struct {

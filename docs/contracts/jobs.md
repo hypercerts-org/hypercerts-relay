@@ -7,6 +7,17 @@ reconciliation, checkpoints and current-state coverage. Relay source admission
 and lifecycle remain Relay-owned. A [TECH-637 recovery receipt](https://linear.app/hypercerts/issue/TECH-637/persist-cross-service-recovery-receipts-for-admitted-pdss)
 must bridge those owners before Relay clears a source recovery requirement.
 
+After persisting a successful job completion, Jetstream's Plan 006 executor
+submits Relay's
+`POST /hypercerts/v1/source/recovery-receipt` with the exact admitted PDS,
+Relay source revision, Jetstream policy revision, job ID, and bounded durable
+completion boundary. Relay persists that composite receipt and clears
+`RecoveryRequired` only while the enabled source still has that exact revision.
+Stale, removed, or disabled sources reject the acknowledgement. Plan 006 owns
+the private sender and completion proof; a submitted job is not itself a
+receipt. The endpoint is a trusted internal Jetstream-to-Relay control seam,
+not an administration or browser API.
+
 The private Jetstream interface provides:
 
 - `GET`, `POST` and `DELETE /hypercerts/v1/sources`;

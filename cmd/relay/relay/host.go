@@ -72,11 +72,14 @@ func (r *Relay) ListHosts(ctx context.Context, cursor int64, limit int, everActi
 }
 
 func (r *Relay) UpdateHostStatus(ctx context.Context, hostID uint64, status models.HostStatus) error {
+	r.sourcesLk.Lock()
+	defer r.sourcesLk.Unlock()
+
 	// hypercerts: Security bans also survive source-policy restarts.
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if status == models.HostStatusBanned {
 			if err := tx.Model(&models.Source{}).Where("host_id = ? AND state = ?", hostID, models.SourceStateEnabled).
-				Updates(map[string]any{"state": models.SourceStateDisabled, "revision": gorm.Expr("revision + 1"), "last_operation": "ban"}).Error; err != nil {
+				Updates(map[string]any{"state": models.SourceStateDisabled, "revision": gorm.Expr("revision + 1"), "last_operation": "ban", "recovery_required": true}).Error; err != nil {
 				return err
 			}
 		}
