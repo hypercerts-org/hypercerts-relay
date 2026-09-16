@@ -28,6 +28,11 @@ Dockerfiles and build contexts listed above. Administration uses
 `docker build -f administration/Dockerfile .`; Jetstream retains its nested module
 context.
 
+Before a candidate is deployed, use the [forward upgrade and restore
+runbook](upgrade-restore.md). It qualifies copied stopped state locally; it does
+not provision Railway, make a production snapshot claim, or authorize binary
+rollback after a state migration.
+
 The separate `administration/` application builds with `npm ci --ignore-scripts &&
 npm run build` in that directory and runs with `npm run server`. It requires Node
 24.18+, durable local SQLite storage, file-based runtime secrets, private service
