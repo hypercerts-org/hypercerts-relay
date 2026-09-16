@@ -28,6 +28,11 @@ type PDSProcessor struct {
 }
 
 func (p PDSProcessor) Run(ctx context.Context, job Job) error {
+	// A directory is required even for an empty inventory: otherwise a later
+	// page could be treated as covered without any identity verification.
+	if p.Directory == nil {
+		return inputFailure(ctx, "identity_unavailable")
+	}
 	client := p.client(job)
 	for page, err := range client.ListRepos(ctx, 100, job.Cursor) {
 		if err != nil {
@@ -49,19 +54,18 @@ func (p PDSProcessor) client(job Job) *atmossync.Client {
 }
 
 func (p PDSProcessor) processPage(ctx context.Context, client *atmossync.Client, job *Job, page atmossync.ListReposPage) error {
-	active, processErr := p.processEntries(ctx, client, job, page.Entries)
-	// A permanent snapshot rejection is acknowledged only after this page's
-	// durable checkpoint. The job still fails below, rather than claiming that
-	// its current-state coverage is complete.
-	if err := p.checkpointPage(job, page.NextCursor, active); err != nil {
+	active, err := p.processEntries(ctx, client, job, page.Entries)
+	if err != nil {
+		// A permanent rejection is durable, but it is not inventory progress.
+		// Leave this page's cursor and subtotal unchanged so a retry remains
+		// incomplete at the rejected listing position.
 		return err
 	}
-	return processErr
+	return p.checkpointPage(job, page.NextCursor, active)
 }
 
 func (p PDSProcessor) processEntries(ctx context.Context, client *atmossync.Client, job *Job, entries []atmossync.ListReposEntry) (int, error) {
 	active := 0
-	var permanentErr *InputError
 	for _, entry := range entries {
 		if !entry.Active {
 			continue
@@ -70,17 +74,19 @@ func (p PDSProcessor) processEntries(ctx context.Context, client *atmossync.Clie
 			active++
 		}
 		did := string(entry.DID)
-		_, rejectionDID, rejectionRevision := snapshotRejectionPosition(job.PDS, did, entry.Rev)
+		if _, err := atmos.ParseDID(did); err != nil {
+			if rejection, ok := p.Manager.lookupSnapshotRejection(job.PDS, job.Policy.Revision, did, entry.Rev, directPDSSnapshotRejectionKind); ok {
+				return active, &InputError{Code: rejection.Code}
+			}
+			return active, p.rejectSnapshot(job, did, entry.Rev, "invalid_listing_did")
+		}
+		if _, err := atmos.ParseTID(entry.Rev); err != nil {
+			return active, p.rejectSnapshot(job, did, entry.Rev, "invalid_listing_revision")
+		}
 		if rejection, ok := p.Manager.lookupSnapshotRejection(job.PDS, job.Policy.Revision, did, entry.Rev, directPDSSnapshotRejectionKind); ok {
-			// hypercerts: An already-durable permanent verdict acknowledges this
-			// exact listed snapshot without another untrusted CAR download.
-			if err := p.acknowledgeRejectedSnapshot(job, rejectionDID, rejectionRevision); err != nil {
-				return 0, err
-			}
-			if permanentErr == nil {
-				permanentErr = &InputError{Code: rejection.Code}
-			}
-			continue
+			// hypercerts: A matching durable verdict prevents another untrusted
+			// CAR download, but must leave this page unacknowledged.
+			return active, &InputError{Code: rejection.Code}
 		}
 		if rev, ok := job.CompletedRepos[did]; ok && rev == entry.Rev {
 			continue
@@ -90,41 +96,23 @@ func (p PDSProcessor) processEntries(ctx context.Context, client *atmossync.Clie
 			if !errors.As(err, &input) || input.Unavailable {
 				return 0, err
 			}
-			// Persist before marking this listed revision acknowledged. A crash
-			// between these writes retries from the durable rejection, never from
-			// an unrecorded acknowledgement.
-			rejection, recordErr := p.Manager.recordSnapshotRejection(job.PDS, job.Policy.Revision, did, entry.Rev, directPDSSnapshotRejectionKind, input.Code)
-			if recordErr != nil {
-				return 0, recordErr
-			}
-			if err := p.acknowledgeRejectedSnapshot(job, rejectionDID, rejectionRevision); err != nil {
-				return 0, err
-			}
-			if permanentErr == nil {
-				permanentErr = &InputError{Code: rejection.Code}
-			}
-			continue
+			return active, p.rejectSnapshot(job, did, entry.Rev, input.Code)
 		}
 		// Keep this page-local snapshot current: duplicate entries must not
 		// trigger a second download before the page checkpoint commits.
 		job.CompletedRepos[did] = entry.Rev
 	}
-	if permanentErr != nil {
-		return active, permanentErr
-	}
 	return active, nil
 }
 
-// acknowledgeRejectedSnapshot records listed progress only after the rejection
-// ledger has been synchronously persisted. The page cursor is intentionally not
-// advanced here: a restart replays the page, finds the ledger entry, and avoids
-// another download.
-func (p PDSProcessor) acknowledgeRejectedSnapshot(job *Job, did, listedRevision string) error {
-	if err := p.Manager.Checkpoint(job.ID, did, listedRevision, job.Cursor); err != nil {
+// rejectSnapshot persists a permanent input verdict without acknowledging the
+// listed position. Retries must stop at that position until the listing changes.
+func (p PDSProcessor) rejectSnapshot(job *Job, did, listedRevision, code string) error {
+	rejection, err := p.Manager.recordSnapshotRejection(job.PDS, job.Policy.Revision, did, listedRevision, directPDSSnapshotRejectionKind, code)
+	if err != nil {
 		return err
 	}
-	job.CompletedRepos[did] = listedRevision
-	return nil
+	return &InputError{Code: rejection.Code}
 }
 
 func (p PDSProcessor) checkpointPage(job *Job, cursor string, active int) error {
@@ -172,7 +160,7 @@ func (p PDSProcessor) repository(ctx context.Context, client *atmossync.Client, 
 	if err != nil {
 		return err
 	}
-	if err := p.verifySnapshot(ctx, client, job, entry, commit); err != nil {
+	if err := p.verifySnapshot(ctx, job, entry, commit); err != nil {
 		return err
 	}
 	snapshot, err := projectSnapshot(ctx, job, entry.DID, r, commit.Rev)
@@ -204,9 +192,32 @@ func (r *repositoryReadErrors) Read(p []byte) (int, error) {
 }
 
 func (p PDSProcessor) verifySource(ctx context.Context, did atmos.DID, pds string) error {
-	ident, err := p.Directory.LookupDID(ctx, did)
-	if err != nil {
+	if p.Directory == nil {
 		return inputFailure(ctx, "identity_unavailable")
+	}
+	// A cache-only directory can still reject an already-moved source before a
+	// download. It cannot accept a snapshot: verifySnapshot requires a resolver
+	// and forces a refresh after the download.
+	if p.Directory.Resolver == nil {
+		if p.Directory.Cache == nil {
+			return inputFailure(ctx, "identity_unavailable")
+		}
+		ident, ok := p.Directory.Cache.Get(ctx, "did:"+string(did))
+		if !ok || ident == nil {
+			return inputFailure(ctx, "identity_unavailable")
+		}
+		return verifySourceIdentity(ident, pds)
+	}
+	ident, err := p.Directory.LookupDID(ctx, did)
+	if err != nil || ident == nil {
+		return inputFailure(ctx, "identity_unavailable")
+	}
+	return verifySourceIdentity(ident, pds)
+}
+
+func verifySourceIdentity(ident *identity.Identity, pds string) error {
+	if ident == nil {
+		return &InputError{Code: "identity_unavailable", Unavailable: true}
 	}
 	actual, err := normalizeSource(ident.PDSEndpoint())
 	if err != nil || actual != pds {
@@ -244,23 +255,39 @@ func fetchRepository(ctx context.Context, client *atmossync.Client, did atmos.DI
 	return r, commit, nil
 }
 
-func (p PDSProcessor) verifySnapshot(ctx context.Context, client *atmossync.Client, job Job, entry atmossync.ListReposEntry, commit *repo.Commit) error {
+func (p PDSProcessor) verifySnapshot(ctx context.Context, job Job, entry atmossync.ListReposEntry, commit *repo.Commit) error {
+	if p.Directory == nil || p.Directory.Resolver == nil {
+		return inputFailure(ctx, "identity_unavailable")
+	}
 	if commit.DID != string(entry.DID) {
 		return &InputError{Code: "repository_did_mismatch"}
 	}
-	if tid, err := atmos.ParseTID(commit.Rev); err != nil || tid.Time().After(time.Now().Add(5*time.Minute)) {
+	listedTID, err := atmos.ParseTID(entry.Rev)
+	if err != nil {
+		return &InputError{Code: "invalid_listing_revision"}
+	}
+	commitTID, err := atmos.ParseTID(commit.Rev)
+	if err != nil || commitTID.Time().After(time.Now().Add(5*time.Minute)) {
 		return &InputError{Code: "invalid_revision"}
 	}
-	if err := client.VerifyCommit(ctx, commit); err != nil {
-		p.Directory.Purge(ctx, entry.DID)
-		if err := client.VerifyCommit(ctx, commit); err != nil {
-			return &InputError{Code: "verification_failed"}
-		}
-		if err := p.verifySource(ctx, entry.DID, job.PDS); err != nil {
-			return err
-		}
+	// Purge is the Directory API for a network revalidation. Do not accept a
+	// direct-PDS snapshot using a cached binding that may have migrated.
+	p.Directory.Purge(ctx, entry.DID)
+	refreshed, err := p.Directory.LookupDID(ctx, entry.DID)
+	if err != nil || refreshed == nil {
+		return inputFailure(ctx, "identity_unavailable")
 	}
-	if commit.Rev < entry.Rev {
+	if err := verifySourceIdentity(refreshed, job.PDS); err != nil {
+		return err
+	}
+	key, err := refreshed.PublicKey()
+	if err != nil {
+		return inputFailure(ctx, "identity_unavailable")
+	}
+	if err := commit.VerifySignature(key); err != nil {
+		return &InputError{Code: "verification_failed"}
+	}
+	if commitTID.Integer() < listedTID.Integer() {
 		return &InputError{Code: "snapshot_behind_listing", Unavailable: true}
 	}
 	return nil

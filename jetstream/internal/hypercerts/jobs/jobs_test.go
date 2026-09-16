@@ -252,7 +252,7 @@ func TestSnapshotRejectionsPersistIdempotently(t *testing.T) {
 	require.NoError(t, m.save(legacy))
 	require.NoError(t, db.Close())
 	m, db = newManager(t, dir)
-	require.Empty(t, m.listSnapshotRejections())
+	require.Empty(t, m.ListSnapshotRejections())
 
 	rejection, err := m.recordSnapshotRejection("https://pds.example", 1, "did:plc:test", "3l3qo2vutsw2b", directPDSSnapshotRejectionKind, "verification_failed")
 	require.NoError(t, err)
@@ -264,7 +264,10 @@ func TestSnapshotRejectionsPersistIdempotently(t *testing.T) {
 	require.Equal(t, rejection, found)
 	_, ok = m.lookupSnapshotRejection("https://pds.example", 1, "did:plc:test", "3l3qo2vutsw2c", directPDSSnapshotRejectionKind)
 	require.False(t, ok, "a changed listing revision requires a fresh snapshot")
-	require.Equal(t, []snapshotRejection{rejection}, m.listSnapshotRejections())
+	listed := m.ListSnapshotRejections()
+	require.Equal(t, []SnapshotRejection{rejection}, listed)
+	listed[0].Code = "mutated"
+	require.Equal(t, rejection, m.ListSnapshotRejections()[0], "the read model must not expose durable state")
 	require.NoError(t, db.Close())
 
 	m, db = newManager(t, dir)
@@ -272,7 +275,7 @@ func TestSnapshotRejectionsPersistIdempotently(t *testing.T) {
 	found, ok = m.lookupSnapshotRejection("https://pds.example", 1, "did:plc:test", "3l3qo2vutsw2b", directPDSSnapshotRejectionKind)
 	require.True(t, ok)
 	require.Equal(t, rejection, found)
-	require.Equal(t, []snapshotRejection{rejection}, m.listSnapshotRejections())
+	require.Equal(t, []SnapshotRejection{rejection}, m.ListSnapshotRejections())
 }
 
 func TestReceiptNamespacesAndLegacyMigration(t *testing.T) {

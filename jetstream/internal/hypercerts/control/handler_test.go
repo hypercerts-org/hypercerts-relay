@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -14,6 +15,8 @@ import (
 	"github.com/bluesky-social/jetstream/internal/hypercerts/jobs"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/jcalabro/atmos"
+	"github.com/jcalabro/atmos/identity"
 	"github.com/stretchr/testify/require"
 )
 
@@ -42,7 +45,7 @@ func request(h http.Handler, method, path, body, token string) *httptest.Respons
 }
 func TestPrivateAuthenticationAndInputValidation(t *testing.T) {
 	h, m := setup(t)
-	for _, path := range []string{"/policy", "/sources", "/jobs", "/coverage", "/jobs/unknown", "/jobs/unknown/cancel", "/jobs/unknown/retry"} {
+	for _, path := range []string{"/policy", "/sources", "/jobs", "/snapshot-rejections", "/coverage", "/jobs/unknown", "/jobs/unknown/cancel", "/jobs/unknown/retry"} {
 		for _, method := range []string{"GET", "POST", "PUT", "DELETE"} {
 			w := request(h, method, path, `{}`, "")
 			require.Equal(t, 401, w.Code)
@@ -60,6 +63,113 @@ func TestPrivateAuthenticationAndInputValidation(t *testing.T) {
 	_, err := New("", m, h.policy)
 	require.Error(t, err)
 }
+func seedSnapshotRejections(t *testing.T, manager *jobs.Manager, dids []string, nextPolicy bool) string {
+	t.Helper()
+	pds := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/xrpc/com.atproto.sync.listRepos":
+			w.Header().Set("Content-Type", "application/json")
+			entries := make([]string, 0, len(dids))
+			for _, did := range dids {
+				entries = append(entries, `{"did":"`+did+`","rev":"3l3qo2vutsw2b","head":"head","active":true}`)
+			}
+			_, _ = w.Write([]byte(`{"repos":[` + strings.Join(entries, ",") + `]}`))
+		case "/xrpc/com.atproto.sync.getRepo":
+			_, _ = w.Write([]byte{1, 0xff})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(pds.Close)
+	job, err := manager.AddSource(pds.URL)
+	require.NoError(t, err)
+	directory := &identity.Directory{Cache: identity.NewLRUCache(len(dids), time.Hour)}
+	for _, did := range dids {
+		directory.Cache.Set(t.Context(), "did:"+did, &identity.Identity{DID: atmos.DID(did), Services: map[string]identity.ServiceEndpoint{"atproto_pds": {URL: pds.URL}}})
+	}
+	processor := jobs.PDSProcessor{Manager: manager, HTTPClient: pds.Client(), Directory: directory}
+	err = processor.Run(t.Context(), job)
+	require.Error(t, err)
+	if nextPolicy {
+		_, err = manager.SetPolicy(1, []string{})
+		require.NoError(t, err)
+		var replacement jobs.Job
+		for _, candidate := range manager.List() {
+			if candidate.PDS == pds.URL && candidate.Policy.Revision == 2 {
+				replacement = candidate
+				break
+			}
+		}
+		require.NotEmpty(t, replacement.ID)
+		require.Error(t, processor.Run(t.Context(), replacement))
+	}
+	return pds.URL
+}
+
+func TestPrivateSnapshotRejectionsView(t *testing.T) {
+	h, manager := setup(t)
+	pdsA := seedSnapshotRejections(t, manager, []string{"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"}, true)
+	pdsB := seedSnapshotRejections(t, manager, []string{"did:plc:cccccccccccccccccccccccc"}, false)
+	require.Len(t, manager.ListSnapshotRejections(), 3)
+
+	first := request(h, "GET", "/snapshot-rejections?limit=1&pds="+url.QueryEscape(pdsA), "", testToken)
+	require.Equal(t, 200, first.Code)
+	var page struct {
+		Rejections []rejectionView `json:"rejections"`
+		NextCursor string          `json:"nextCursor"`
+	}
+	require.NoError(t, json.Unmarshal(first.Body.Bytes(), &page))
+	require.Len(t, page.Rejections, 1)
+	require.NotEmpty(t, page.NextCursor)
+	require.Equal(t, pdsA, page.Rejections[0].PDS)
+	require.Equal(t, uint64(1), page.Rejections[0].PolicyRevision)
+	require.Equal(t, "direct_pds_snapshot", page.Rejections[0].Kind)
+	require.Equal(t, "invalid_repository", page.Rejections[0].Code)
+	require.NotContains(t, first.Body.String(), "snapshotRejections")
+	require.NotContains(t, first.Body.String(), "completedRepos")
+
+	second := request(h, "GET", "/snapshot-rejections?limit=1&pds="+url.QueryEscape(pdsA)+"&after="+url.QueryEscape(page.NextCursor), "", testToken)
+	require.Equal(t, 200, second.Code)
+	var next struct {
+		Rejections []rejectionView `json:"rejections"`
+		NextCursor string          `json:"nextCursor"`
+	}
+	require.NoError(t, json.Unmarshal(second.Body.Bytes(), &next))
+	require.Len(t, next.Rejections, 1)
+	require.Empty(t, next.NextCursor)
+	require.NotEqual(t, page.Rejections[0].PolicyRevision, next.Rejections[0].PolicyRevision)
+
+	filtered := request(h, "GET", "/snapshot-rejections?pds="+url.QueryEscape(pdsB), "", testToken)
+	require.Equal(t, 200, filtered.Code)
+	var result struct {
+		Rejections []rejectionView `json:"rejections"`
+	}
+	require.NoError(t, json.Unmarshal(filtered.Body.Bytes(), &result))
+	require.Len(t, result.Rejections, 1)
+	require.Equal(t, pdsB, result.Rejections[0].PDS)
+	require.Equal(t, 400, request(h, "GET", "/snapshot-rejections?after=not-a-cursor", "", testToken).Code)
+}
+
+func TestPrivateSnapshotRejectionQueryBounds(t *testing.T) {
+	h, _ := setup(t)
+	validPDS := strings.Repeat("p", maxSnapshotRejectionPDSLength)
+	require.Equal(t, 200, request(h, "GET", "/snapshot-rejections?pds="+url.QueryEscape(validPDS), "", testToken).Code)
+	require.Equal(t, 400, request(h, "GET", "/snapshot-rejections?pds="+url.QueryEscape(validPDS+"p"), "", testToken).Code)
+
+	atLimit := url.Values{}
+	for range maxSnapshotRejectionPDSFilters {
+		atLimit.Add("pds", "https://pds.example")
+	}
+	require.Equal(t, 200, request(h, "GET", "/snapshot-rejections?"+atLimit.Encode(), "", testToken).Code)
+	atLimit.Add("pds", "https://one-too-many.example")
+	require.Equal(t, 400, request(h, "GET", "/snapshot-rejections?"+atLimit.Encode(), "", testToken).Code)
+
+	overlongAfter := strings.Repeat("A", maxSnapshotRejectionAfterLength+1)
+	_, ok := parseRejectionCursor(overlongAfter)
+	require.False(t, ok, "oversized encoded cursors must be rejected before decoding")
+	require.Equal(t, 400, request(h, "GET", "/snapshot-rejections?after="+overlongAfter, "", testToken).Code)
+}
+
 func TestPrivateLifecycleAndCoverage(t *testing.T) {
 	h, m := setup(t)
 	w := request(h, "POST", "/sources", `{"pds":"https://pds.example"}`, testToken)
