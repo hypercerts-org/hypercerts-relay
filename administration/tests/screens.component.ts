@@ -84,7 +84,9 @@ test("collection drafts support removal and an explicit empty policy", async () 
     policy: { revision: 4, collections: ["app.bsky.feed.post"] },
     submit,
   });
-  await fireEvent.click(screen.getByRole("button", { name: "Remove app.bsky.feed.post" }));
+  await fireEvent.click(
+    screen.getByRole("button", { name: "Remove app.bsky.feed.post" }),
+  );
   await fireEvent.click(
     screen.getByRole("button", { name: "Request policy change" }),
   );
@@ -102,13 +104,17 @@ test("collection drafts reject invalid and duplicate NSIDs", async () => {
   const input = screen.getByLabelText("Collection NSID");
   await fireEvent.input(input, { target: { value: "not an nsid" } });
   await fireEvent.click(screen.getByRole("button", { name: "Add collection" }));
-  expect(screen.getByRole("alert").textContent).toContain("Enter a valid exact collection NSID.");
+  expect(screen.getByRole("alert").textContent).toContain(
+    "Enter a valid exact collection NSID.",
+  );
   await fireEvent.input(input, { target: { value: "app.bsky.feed.like" } });
   await fireEvent.click(screen.getByRole("button", { name: "Add collection" }));
   expect(screen.getByText("app.bsky.feed.like")).toBeTruthy();
   await fireEvent.input(input, { target: { value: "app.bsky.feed.like" } });
   await fireEvent.click(screen.getByRole("button", { name: "Add collection" }));
-  expect(screen.getByRole("alert").textContent).toContain("already in this policy");
+  expect(screen.getByRole("alert").textContent).toContain(
+    "already in this policy",
+  );
 });
 test("collection suggestions use the pinned seed without restricting exact NSIDs", async () => {
   render(Collections, {
@@ -134,7 +140,9 @@ test("collection acknowledgement adopts canonical collections at the new revisio
     target: { value: "app.bsky.feed.like" },
   });
   await fireEvent.click(screen.getByRole("button", { name: "Add collection" }));
-  await fireEvent.click(screen.getByRole("button", { name: "Request policy change" }));
+  await fireEvent.click(
+    screen.getByRole("button", { name: "Request policy change" }),
+  );
   expect(submit).toHaveBeenCalledWith({
     kind: "collections",
     expectedRevision: 4,
@@ -147,7 +155,9 @@ test("collection acknowledgement adopts canonical collections at the new revisio
     },
   });
   expect(screen.queryByRole("status")).toBeNull();
-  await fireEvent.click(screen.getByRole("button", { name: "Request policy change" }));
+  await fireEvent.click(
+    screen.getByRole("button", { name: "Request policy change" }),
+  );
   expect(submit).toHaveBeenLastCalledWith({
     kind: "collections",
     expectedRevision: 5,
@@ -162,15 +172,27 @@ test("collection drafts survive polling and require reset after a stale revision
     target: { value: "app.bsky.feed.like" },
   });
   await fireEvent.click(screen.getByRole("button", { name: "Add collection" }));
-  await view.rerender({ policy: { revision: 4, collections: ["app.bsky.feed.repost"] } });
+  await view.rerender({
+    policy: { revision: 4, collections: ["app.bsky.feed.repost"] },
+  });
   expect(screen.getByText("app.bsky.feed.like")).toBeTruthy();
-  await view.rerender({ policy: { revision: 5, collections: ["app.bsky.feed.repost"] } });
-  expect(screen.getByRole("status").textContent).toContain("draft is preserved");
-  await fireEvent.click(screen.getByRole("button", { name: "Request policy change" }));
+  await view.rerender({
+    policy: { revision: 5, collections: ["app.bsky.feed.repost"] },
+  });
+  expect(screen.getByRole("status").textContent).toContain(
+    "draft is preserved",
+  );
+  await fireEvent.click(
+    screen.getByRole("button", { name: "Request policy change" }),
+  );
   expect(submit).not.toHaveBeenCalled();
-  await fireEvent.click(screen.getByRole("button", { name: "Use current policy" }));
+  await fireEvent.click(
+    screen.getByRole("button", { name: "Use current policy" }),
+  );
   expect(screen.getByText("app.bsky.feed.repost")).toBeTruthy();
-  await fireEvent.click(screen.getByRole("button", { name: "Request policy change" }));
+  await fireEvent.click(
+    screen.getByRole("button", { name: "Request policy change" }),
+  );
   expect(submit).toHaveBeenCalledWith({
     kind: "collections",
     expectedRevision: 5,
@@ -213,12 +235,19 @@ test("audit log combines requested changes and handle-first actor display", () =
   expect(screen.getByText("Requested changes")).toBeTruthy();
   expect(screen.getByText("Audit history")).toBeTruthy();
   const handles = screen.getAllByText("@operator.example");
-  expect(handles[0].getAttribute("title")).toBe("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa");
+  expect(handles[0].getAttribute("title")).toBe(
+    "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+  );
   expect(
-    screen.getAllByRole("button", { name: "Copy DID for @operator.example" }).length,
+    screen.getAllByRole("button", { name: "Copy DID for @operator.example" })
+      .length,
   ).toBe(2);
-  expect(screen.getByRole("button", { name: "Load more requested changes" })).toBeTruthy();
-  expect(screen.getByRole("button", { name: "Load more audit history" })).toBeTruthy();
+  expect(
+    screen.getByRole("button", { name: "Load more requested changes" }),
+  ).toBeTruthy();
+  expect(
+    screen.getByRole("button", { name: "Load more audit history" }),
+  ).toBeTruthy();
 });
 
 test("rate limits show current globals and PDS typeahead suggestions", async () => {
@@ -267,8 +296,12 @@ test("rate limits show current globals and PDS typeahead suggestions", async () 
   expect(screen.getByText("Current global rate limits")).toBeTruthy();
   expect(screen.getAllByText(/100 events\/second/).length).toBeGreaterThan(0);
   expect(screen.getByText("Rate Limit policies")).toBeTruthy();
-  await fireEvent.change(screen.getByLabelText("Scope"), { target: { value: "pds" } });
-  expect(document.querySelector('option[value="https://pds.example"]')).toBeTruthy();
+  await fireEvent.change(screen.getByLabelText("Scope"), {
+    target: { value: "pds" },
+  });
+  expect(
+    document.querySelector('option[value="https://pds.example"]'),
+  ).toBeTruthy();
 });
 
 test("jobs explain recovery types and use operator-facing progress labels", () => {
@@ -288,7 +321,6 @@ test("jobs explain recovery types and use operator-facing progress labels", () =
         totalReposKnown: true,
         attempts: 1,
         createdAt: "2026-09-09T00:00:00.000Z",
-        historyComplete: false,
         coverage: "partial",
       },
     ],
@@ -299,7 +331,11 @@ test("jobs explain recovery types and use operator-facing progress labels", () =
   expect(screen.getAllByText("Purpose")).toHaveLength(2);
   expect(screen.getAllByText("Quota recovery")).toHaveLength(2);
   expect(screen.getByText("Status")).toBeTruthy();
-  expect(screen.getByText("3 of 10 repositories from the initial inventory processed")).toBeTruthy();
+  expect(
+    screen.getByText(
+      "3 of 10 repositories from the initial inventory processed",
+    ),
+  ).toBeTruthy();
   expect(screen.queryByText(/Revision/)).toBeNull();
 });
 
@@ -319,7 +355,6 @@ test("coverage groups collections by collapsed PDS and explains unknown history"
         totalReposKnown: true,
         createdAt: "2026-09-08T00:00:00.000Z",
         reason: "source_unavailable",
-        historyComplete: false,
         historicalPDSAttribution: "unknown",
         coverage: "current_state",
       },
@@ -333,7 +368,6 @@ test("coverage groups collections by collapsed PDS and explains unknown history"
         totalReposKnown: true,
         createdAt: "2026-09-09T00:00:00.000Z",
         reason: null,
-        historyComplete: false,
         historicalPDSAttribution: "unknown",
         coverage: "current_state",
       },
@@ -341,10 +375,14 @@ test("coverage groups collections by collapsed PDS and explains unknown history"
   });
   const group = screen.getByText("https://pds.example").closest("details");
   expect(group?.hasAttribute("open")).toBe(false);
-  expect(document.body.textContent).toContain("do not preserve which PDS supplied older records");
+  expect(document.body.textContent).toContain(
+    "do not preserve which PDS supplied older records",
+  );
   expect(screen.getAllByText("app.bsky.feed.post")).toHaveLength(1);
   expect(screen.getByText(/Policy revision 2; current state/)).toBeTruthy();
-  expect(screen.getByRole("link", { name: "Manage PDS instances" })).toBeTruthy();
+  expect(
+    screen.getByRole("link", { name: "Manage PDS instances" }),
+  ).toBeTruthy();
 });
 
 test("selected source detail is loaded on demand without background polling", async () => {
@@ -377,7 +415,6 @@ test("selected source detail is loaded on demand without background polling", as
                 totalReposKnown: true,
                 createdAt: "2026-09-09T00:00:00.000Z",
                 reason: null,
-                historyComplete: false,
                 historicalPDSAttribution: "unknown",
                 coverage: "current_state",
               },
@@ -394,13 +431,23 @@ test("selected source detail is loaded on demand without background polling", as
     });
     await fireEvent.click(screen.getByRole("button", { name: "Filter" }));
     expect(await screen.findByText("connected")).toBeTruthy();
-    expect(await screen.findByText("43 of 13895 repositories from the initial inventory scanned")).toBeTruthy();
+    expect(
+      await screen.findByText(
+        "43 of 13895 repositories from the initial inventory scanned",
+      ),
+    ).toBeTruthy();
     expect(screen.getByText("13895")).toBeTruthy();
     expect(screen.getByText("43")).toBeTruthy();
-    expect(document.body.textContent).toContain("Current snapshot only; historical coverage is not complete.");
-    const collections = screen.getByText("1 selected collections").closest("details");
+    expect(document.body.textContent).toContain(
+      "Current snapshot only; historical coverage is unknown.",
+    );
+    const collections = screen
+      .getByText("1 selected collections")
+      .closest("details");
     expect(collections?.hasAttribute("open")).toBe(false);
-    expect(screen.getByRole("button", { name: "Backfill collections" })).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Backfill collections" }),
+    ).toBeTruthy();
     expect(fetcher).toHaveBeenCalledTimes(2);
   } finally {
     cleanup();
@@ -420,7 +467,7 @@ test("latest same-source detail refresh wins over an older response", async () =
     Validation: { Status: "passed", Reason: "" },
     AccountQuota: { Count: 4, Limit: 25 },
   };
-  const deferred = <T,>() => {
+  const deferred = <T>() => {
     let resolve!: (value: T) => void;
     let reject!: (reason?: unknown) => void;
     const promise = new Promise<T>((res, rej) => {
@@ -432,9 +479,9 @@ test("latest same-source detail refresh wins over an older response", async () =
   const oldCoverage = deferred<Response>();
   const newCoverage = deferred<Response>();
   const coverageResponses = [oldCoverage, newCoverage];
-  const fetcher = vi.fn().mockImplementation(() =>
-    coverageResponses.shift()!.promise,
-  );
+  const fetcher = vi
+    .fn()
+    .mockImplementation(() => coverageResponses.shift()!.promise);
   vi.stubGlobal("fetch", fetcher);
   try {
     render(Sources, { rows: [source], submit: vi.fn() });
@@ -455,18 +502,27 @@ test("latest same-source detail refresh wins over an older response", async () =
             totalReposKnown: true,
             createdAt: "2026-09-09T00:00:00.000Z",
             reason: null,
-            historyComplete: false,
             historicalPDSAttribution: "unknown",
             coverage: "current_state",
           },
         ],
       }),
     );
-    expect(await screen.findByText("20 of 20 repositories from the initial inventory scanned")).toBeTruthy();
+    expect(
+      await screen.findByText(
+        "20 of 20 repositories from the initial inventory scanned",
+      ),
+    ).toBeTruthy();
     oldCoverage.reject(new Error("stale coverage failure"));
     await Promise.resolve();
-    expect(screen.getByText("20 of 20 repositories from the initial inventory scanned")).toBeTruthy();
-    expect(screen.queryByText("Jetstream did not return coverage for this source.")).toBeNull();
+    expect(
+      screen.getByText(
+        "20 of 20 repositories from the initial inventory scanned",
+      ),
+    ).toBeTruthy();
+    expect(
+      screen.queryByText("Jetstream did not return coverage for this source."),
+    ).toBeNull();
   } finally {
     cleanup();
     vi.unstubAllGlobals();
@@ -498,5 +554,7 @@ test("source overview separates admission quota from Relay-observed accounts", (
   expect(screen.getByText("Relay accounts")).toBeTruthy();
   expect(screen.getByText("Jetstream accounts")).toBeTruthy();
   expect(screen.getByText("State / runtime connection")).toBeTruthy();
-  expect(screen.getByText(/historical collection counts are unavailable/)).toBeTruthy();
+  expect(
+    screen.getByText(/historical collection counts are unavailable/),
+  ).toBeTruthy();
 });

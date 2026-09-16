@@ -51,11 +51,9 @@
       ? `${job.completedRepos} of ${job.totalRepos} repositories from the initial inventory processed`
       : `${job.completedRepos} repositories processed`;
   }
-  function currentStateScope(item: { coverage: string; historyComplete: boolean }) {
+  function currentStateScope(item: { coverage: string }) {
     const scope = item.coverage.replaceAll("_", " ");
-    return item.historyComplete
-      ? `${scope}; historical coverage complete`
-      : `${scope}; historical coverage is not complete`;
+    return `${scope}; historical coverage is unknown`;
   }
   function actorLabel(actor: { actor: string; actorHandle?: string | null }) {
     return actor.actorHandle ? `@${actor.actorHandle}` : actor.actor;

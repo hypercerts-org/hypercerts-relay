@@ -134,12 +134,13 @@ func (h *Handler) setPolicy(w http.ResponseWriter, r *http.Request) {
 }
 func (h *Handler) addSource(w http.ResponseWriter, r *http.Request) {
 	var input struct {
-		PDS string `json:"pds"`
+		PDS            string `json:"pds"`
+		SourceRevision uint64 `json:"sourceRevision,omitempty"`
 	}
 	if !decode(w, r, &input) {
 		return
 	}
-	j, err := h.jobs.AddSource(input.PDS)
+	j, err := h.jobs.AddSourceWithRevision(input.PDS, input.SourceRevision)
 	if err != nil {
 		failure(w, err)
 		return
@@ -161,14 +162,15 @@ func (h *Handler) removeSource(w http.ResponseWriter, r *http.Request) {
 }
 func (h *Handler) requestJob(w http.ResponseWriter, r *http.Request) {
 	var input struct {
-		PDS       string `json:"pds"`
-		Reason    string `json:"reason"`
-		RequestID string `json:"requestId,omitempty"`
+		PDS            string `json:"pds"`
+		Reason         string `json:"reason"`
+		RequestID      string `json:"requestId,omitempty"`
+		SourceRevision uint64 `json:"sourceRevision,omitempty"`
 	}
 	if !decode(w, r, &input) {
 		return
 	}
-	j, err := h.jobs.RequestOnce(input.PDS, input.Reason, input.RequestID)
+	j, err := h.jobs.RequestOnceWithSourceRevision(input.PDS, input.Reason, input.RequestID, input.SourceRevision)
 	if err != nil {
 		failure(w, err)
 		return
@@ -499,11 +501,10 @@ type jobView struct {
 	StartedAt       time.Time        `json:"startedAt"`
 	FinishedAt      time.Time        `json:"finishedAt"`
 	Coverage        string           `json:"coverage"`
-	HistoryComplete bool             `json:"historyComplete"`
 }
 
 func view(j jobs.Job) jobView {
-	return jobView{ID: j.ID, PDS: j.PDS, Policy: j.Policy, Reason: j.Reason, State: j.State, Attempts: j.Attempts, CompletedRepos: len(j.CompletedRepos), TotalRepos: j.TotalRepos, TotalReposKnown: j.TotalReposKnown, Cursor: j.Cursor, ErrorCode: j.ErrorCode, CreatedAt: j.CreatedAt, StartedAt: j.StartedAt, FinishedAt: j.FinishedAt, Coverage: j.Coverage, HistoryComplete: j.HistoryComplete}
+	return jobView{ID: j.ID, PDS: j.PDS, Policy: j.Policy, Reason: j.Reason, State: j.State, Attempts: j.Attempts, CompletedRepos: len(j.CompletedRepos), TotalRepos: j.TotalRepos, TotalReposKnown: j.TotalReposKnown, Cursor: j.Cursor, ErrorCode: j.ErrorCode, CreatedAt: j.CreatedAt, StartedAt: j.StartedAt, FinishedAt: j.FinishedAt, Coverage: j.Coverage}
 }
 
 type coverageView struct {
@@ -518,11 +519,10 @@ type coverageView struct {
 	ErrorCode       string           `json:"errorCode,omitempty"`
 	CreatedAt       time.Time        `json:"createdAt"`
 	Coverage        string           `json:"coverage"`
-	HistoryComplete bool             `json:"historyComplete"`
 }
 
 func coverage(j jobs.Job) coverageView {
-	return coverageView{PDS: j.PDS, Policy: j.Policy, JobID: j.ID, Reason: j.Reason, State: j.State, CompletedRepos: len(j.CompletedRepos), TotalRepos: j.TotalRepos, TotalReposKnown: j.TotalReposKnown, ErrorCode: j.ErrorCode, CreatedAt: j.CreatedAt, Coverage: j.Coverage, HistoryComplete: j.HistoryComplete}
+	return coverageView{PDS: j.PDS, Policy: j.Policy, JobID: j.ID, Reason: j.Reason, State: j.State, CompletedRepos: len(j.CompletedRepos), TotalRepos: j.TotalRepos, TotalReposKnown: j.TotalReposKnown, ErrorCode: j.ErrorCode, CreatedAt: j.CreatedAt, Coverage: j.Coverage}
 }
 
 // coverageSummaryView is a compact table-enrichment view. The full policy is
@@ -537,9 +537,8 @@ type coverageSummaryView struct {
 	ErrorCode       string     `json:"errorCode,omitempty"`
 	CreatedAt       time.Time  `json:"createdAt"`
 	Coverage        string     `json:"coverage"`
-	HistoryComplete bool       `json:"historyComplete"`
 }
 
 func coverageSummary(view coverageView) coverageSummaryView {
-	return coverageSummaryView{PDS: view.PDS, JobID: view.JobID, State: view.State, CompletedRepos: view.CompletedRepos, TotalRepos: view.TotalRepos, TotalReposKnown: view.TotalReposKnown, ErrorCode: view.ErrorCode, CreatedAt: view.CreatedAt, Coverage: view.Coverage, HistoryComplete: view.HistoryComplete}
+	return coverageSummaryView{PDS: view.PDS, JobID: view.JobID, State: view.State, CompletedRepos: view.CompletedRepos, TotalRepos: view.TotalRepos, TotalReposKnown: view.TotalReposKnown, ErrorCode: view.ErrorCode, CreatedAt: view.CreatedAt, Coverage: view.Coverage}
 }

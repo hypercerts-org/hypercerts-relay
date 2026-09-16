@@ -32,16 +32,27 @@ const (
 	Complete   State = "complete"
 )
 const stateKey = "hypercerts/backfill-jobs"
+const inventoryKeyPrefix = "hypercerts/backfill-job-inventory/"
+
+const (
+	receiptRetryBase = time.Second
+	receiptRetryMax  = time.Minute
+)
 
 var ErrConflict = errors.New("job or source state conflict")
 var ErrNotFound = errors.New("job not found")
 var ErrInvalidInput = errors.New("invalid job input")
+var ErrReceiptStale = errors.New("recovery receipt rejected as stale")
+var ErrReceiptSourceMissing = errors.New("recovery receipt source no longer exists")
 
 type Job struct {
-	ID             string            `json:"id"`
-	PDS            string            `json:"pds"`
-	Policy         selection.Policy  `json:"policy"`
-	Reason         string            `json:"reason"`
+	ID     string           `json:"id"`
+	PDS    string           `json:"pds"`
+	Policy selection.Policy `json:"policy"`
+	Reason string           `json:"reason"`
+	// SourceRevision is the Relay lifecycle revision this job is allowed to
+	// acknowledge after it reaches its durable current-state boundary.
+	SourceRevision uint64            `json:"sourceRevision,omitempty"`
 	State          State             `json:"state"`
 	Attempts       int               `json:"attempts"`
 	CompletedRepos map[string]string `json:"completedRepos"`
@@ -56,7 +67,17 @@ type Job struct {
 	StartedAt       time.Time `json:"startedAt,omitempty"`
 	FinishedAt      time.Time `json:"finishedAt,omitempty"`
 	Coverage        string    `json:"coverage"`
-	HistoryComplete bool      `json:"historyComplete"`
+	ReceiptPending  bool      `json:"receiptPending,omitempty"`
+	ReceiptAttempts int       `json:"receiptAttempts,omitempty"`
+	ReceiptRetryAt  time.Time `json:"receiptRetryAt,omitempty"`
+	ReceiptError    string    `json:"receiptError,omitempty"`
+}
+
+// inventory is kept under a per-job key instead of inside the job-state
+// document. It freezes one accepted listRepos traversal before repository
+// downloads begin, without making every page rewrite every other job.
+type inventory struct {
+	Entries map[string]string `json:"entries"`
 }
 
 // SnapshotRejection is durable, bounded non-payload metadata for a direct-PDS
@@ -87,24 +108,30 @@ type data struct {
 	Requests           map[string]string            `json:"requests,omitempty"`
 	Initialized        bool                         `json:"initialized"`
 	Sources            map[string]bool              `json:"sources"`
+	SourceRevisions    map[string]uint64            `json:"sourceRevisions,omitempty"`
 	Jobs               map[string]Job               `json:"jobs"`
 	SnapshotRejections map[string]SnapshotRejection `json:"snapshotRejections"`
 }
 type Manager struct {
-	mu        sync.Mutex
-	db        *store.Store
-	policy    *selection.Manager
-	data      data
-	cancel    context.CancelFunc
-	running   bool
-	runningID string
+	mu            sync.Mutex
+	db            *store.Store
+	policy        *selection.Manager
+	data          data
+	cancel        context.CancelFunc
+	running       bool
+	runningID     string
+	receiptSender ReceiptSender
 }
+
+// ReceiptSender submits a completed job's bounded recovery coordinate to the
+// Relay owner. It is nil when no private Relay control seam is configured.
+type ReceiptSender func(context.Context, Job) error
 
 func Open(db *store.Store, policy *selection.Manager) (*Manager, error) {
 	if policy == nil {
 		return nil, errors.New("jobs require collection policy")
 	}
-	m := &Manager{db: db, policy: policy, data: data{Sources: map[string]bool{}, Jobs: map[string]Job{}, SnapshotRejections: map[string]SnapshotRejection{}}}
+	m := &Manager{db: db, policy: policy, data: data{Sources: map[string]bool{}, SourceRevisions: map[string]uint64{}, Jobs: map[string]Job{}, SnapshotRejections: map[string]SnapshotRejection{}}}
 	b, closer, err := db.Get([]byte(stateKey))
 	if errors.Is(err, store.ErrNotFound) {
 		return m, nil
@@ -118,6 +145,9 @@ func Open(db *store.Store, policy *selection.Manager) (*Manager, error) {
 	}
 	if m.data.Sources == nil || m.data.Jobs == nil {
 		return nil, errors.New("invalid persisted job state")
+	}
+	if m.data.SourceRevisions == nil {
+		m.data.SourceRevisions = map[string]uint64{}
 	}
 	// hypercerts: Older job documents predate the direct-PDS rejection ledger.
 	if m.data.SnapshotRejections == nil {
@@ -167,6 +197,12 @@ func clone[T any](value T) T {
 	_ = json.Unmarshal(b, &out)
 	return out
 }
+
+func ensureSourceRevisions(next *data) {
+	if next.SourceRevisions == nil {
+		next.SourceRevisions = map[string]uint64{}
+	}
+}
 func (m *Manager) save(next data) error {
 	b, err := json.Marshal(next)
 	if err != nil {
@@ -181,9 +217,51 @@ func (m *Manager) commit(next data) error {
 	m.data = next
 	return nil
 }
-func newJob(pds string, policy selection.Policy, reason string) Job {
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\n%d\n%s", pds, policy.Revision, reason)))
-	return Job{ID: hex.EncodeToString(sum[:16]), PDS: pds, Policy: policy, Reason: reason, State: Pending, CompletedRepos: map[string]string{}, CreatedAt: time.Now().UTC(), Coverage: "current_state", HistoryComplete: false}
+
+func jobInventoryKey(id string) []byte { return []byte(inventoryKeyPrefix + id) }
+
+func (m *Manager) readInventory(id string) (inventory, error) {
+	b, closer, err := m.db.Get(jobInventoryKey(id))
+	if errors.Is(err, store.ErrNotFound) {
+		return inventory{Entries: map[string]string{}}, nil
+	}
+	if err != nil {
+		return inventory{}, err
+	}
+	defer closer.Close()
+	var out inventory
+	if err := json.Unmarshal(b, &out); err != nil || out.Entries == nil {
+		return inventory{}, errors.New("invalid persisted job inventory")
+	}
+	return out, nil
+}
+
+func (m *Manager) commitInventory(next data, id string, inv inventory) error {
+	encodedState, err := json.Marshal(next)
+	if err != nil {
+		return err
+	}
+	encodedInventory, err := json.Marshal(inv)
+	if err != nil {
+		return err
+	}
+	batch := m.db.NewBatch()
+	defer batch.Close()
+	if err := batch.Set([]byte(stateKey), encodedState, nil); err != nil {
+		return err
+	}
+	if err := batch.Set(jobInventoryKey(id), encodedInventory, nil); err != nil {
+		return err
+	}
+	if err := m.db.Commit(batch, store.SyncWrites); err != nil {
+		return err
+	}
+	m.data = next
+	return nil
+}
+func newJob(pds string, policy selection.Policy, reason string, sourceRevision uint64) Job {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\n%d\n%s\n%d", pds, policy.Revision, reason, sourceRevision)))
+	return Job{ID: hex.EncodeToString(sum[:16]), PDS: pds, Policy: policy, Reason: reason, SourceRevision: sourceRevision, State: Pending, CompletedRepos: map[string]string{}, CreatedAt: time.Now().UTC(), Coverage: "current_state"}
 }
 
 // SeedSources applies CLI configuration once; stale environment cannot revive a removed source.
@@ -194,13 +272,14 @@ func (m *Manager) SeedSources(sources []string) error {
 		return nil
 	}
 	next := clone(m.data)
+	ensureSourceRevisions(&next)
 	for _, raw := range sources {
 		pds, err := normalizeSource(raw)
 		if err != nil {
 			return err
 		}
 		next.Sources[pds] = true
-		j := newJob(pds, m.policy.Current(), "source_added")
+		j := newJob(pds, m.policy.Current(), "source_added", next.SourceRevisions[pds])
 		next.Jobs[j.ID] = j
 	}
 	next.Initialized = true
@@ -210,6 +289,12 @@ func (m *Manager) SeedSources(sources []string) error {
 // AddSource admits an explicit direct-PDS acquisition target and schedules its
 // current-state job without waiting for any live relay event.
 func (m *Manager) AddSource(raw string) (Job, error) {
+	return m.AddSourceWithRevision(raw, 0)
+}
+
+// AddSourceWithRevision remembers the Relay lifecycle coordinate that made an
+// explicitly admitted source eligible for a recovery acknowledgement.
+func (m *Manager) AddSourceWithRevision(raw string, sourceRevision uint64) (Job, error) {
 	pds, err := normalizeSource(raw)
 	if err != nil {
 		return Job{}, err
@@ -217,7 +302,18 @@ func (m *Manager) AddSource(raw string) (Job, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	next := clone(m.data)
-	job := newJob(pds, m.policy.Current(), "source_added")
+	ensureSourceRevisions(&next)
+	if sourceRevision > 0 && sourceRevision < next.SourceRevisions[pds] {
+		return Job{}, ErrConflict
+	}
+	advanced := sourceRevision > 0 && sourceRevision > next.SourceRevisions[pds]
+	if sourceRevision > 0 {
+		next.SourceRevisions[pds] = sourceRevision
+	}
+	if advanced {
+		m.cancelStaleSourceJobs(&next, pds, sourceRevision)
+	}
+	job := newJob(pds, m.policy.Current(), "source_added", next.SourceRevisions[pds])
 	if existing, ok := next.Jobs[job.ID]; ok && next.Sources[pds] {
 		return clone(existing), nil
 	}
@@ -225,6 +321,9 @@ func (m *Manager) AddSource(raw string) (Job, error) {
 	next.Jobs[job.ID] = job
 	if err := m.commit(next); err != nil {
 		return Job{}, err
+	}
+	if advanced && m.cancel != nil && m.runningID != "" && m.data.Jobs[m.runningID].PDS == pds && m.data.Jobs[m.runningID].SourceRevision != sourceRevision {
+		m.cancel()
 	}
 	return clone(job), nil
 }
@@ -260,6 +359,7 @@ func (m *Manager) SetPolicy(expected uint64, collections []string) (selection.Po
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	next := clone(m.data)
+	ensureSourceRevisions(&next)
 	policy, err := m.policy.Update(expected, collections, func(policy selection.Policy, b *pebble.Batch) error {
 		for id, j := range next.Jobs {
 			if j.State == Pending || j.State == Running {
@@ -271,7 +371,7 @@ func (m *Manager) SetPolicy(expected uint64, collections []string) (selection.Po
 		}
 		for pds, enabled := range next.Sources {
 			if enabled {
-				j := newJob(pds, policy, "policy_changed")
+				j := newJob(pds, policy, "policy_changed", next.SourceRevisions[pds])
 				next.Jobs[j.ID] = j
 			}
 		}
@@ -294,6 +394,12 @@ func (m *Manager) Request(raw, reason string) (Job, error) { return m.RequestOnc
 
 // RequestOnce durably deduplicates control-plane retries, including terminal jobs.
 func (m *Manager) RequestOnce(raw, reason, requestID string) (Job, error) {
+	return m.RequestOnceWithSourceRevision(raw, reason, requestID, 0)
+}
+
+// RequestOnceWithSourceRevision binds lifecycle/quota intent to the Relay
+// source version observed by the control plane.
+func (m *Manager) RequestOnceWithSourceRevision(raw, reason, requestID string, sourceRevision uint64) (Job, error) {
 	if len(requestID) > 128 {
 		return Job{}, ErrInvalidInput
 	}
@@ -306,6 +412,9 @@ func (m *Manager) RequestOnce(raw, reason, requestID string) (Job, error) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if sourceRevision > 0 && sourceRevision < m.data.SourceRevisions[pds] {
+		return Job{}, ErrConflict
+	}
 	if id, ok := m.data.Requests[requestID]; requestID != "" && ok {
 		existing := m.data.Jobs[id]
 		if existing.PDS != pds || existing.Reason != reason {
@@ -317,17 +426,44 @@ func (m *Manager) RequestOnce(raw, reason, requestID string) (Job, error) {
 		return Job{}, ErrConflict
 	}
 	next := clone(m.data)
-	j := requestJob(next, pds, reason, m.policy.Current())
-	return m.rememberRequest(next, j, requestID)
+	ensureSourceRevisions(&next)
+	advanced := sourceRevision > 0 && sourceRevision > next.SourceRevisions[pds]
+	if sourceRevision > 0 {
+		next.SourceRevisions[pds] = sourceRevision
+	}
+	if advanced {
+		m.cancelStaleSourceJobs(&next, pds, sourceRevision)
+	}
+	j := requestJob(next, pds, reason, m.policy.Current(), next.SourceRevisions[pds])
+	remembered, err := m.rememberRequest(next, j, requestID)
+	if err != nil {
+		return Job{}, err
+	}
+	if advanced && m.cancel != nil && m.runningID != "" && m.data.Jobs[m.runningID].PDS == pds && m.data.Jobs[m.runningID].SourceRevision != sourceRevision {
+		m.cancel()
+	}
+	return remembered, nil
 }
 
-func requestJob(next data, pds, reason string, policy selection.Policy) Job {
+func (m *Manager) cancelStaleSourceJobs(next *data, pds string, sourceRevision uint64) {
+	for id, job := range next.Jobs {
+		if job.PDS != pds || (job.State != Pending && job.State != Running) || job.SourceRevision == sourceRevision {
+			continue
+		}
+		job.State = Canceled
+		job.ErrorCode = "source_revision_changed"
+		job.FinishedAt = time.Now().UTC()
+		next.Jobs[id] = job
+	}
+}
+
+func requestJob(next data, pds, reason string, policy selection.Policy, sourceRevision uint64) Job {
 	for _, existing := range next.Jobs {
 		if existing.PDS == pds && existing.Policy.Revision == policy.Revision && existing.Reason == reason && (existing.State == Pending || existing.State == Running) {
 			return existing
 		}
 	}
-	j := newJob(pds, policy, reason)
+	j := newJob(pds, policy, reason, sourceRevision)
 	if existing, ok := next.Jobs[j.ID]; ok {
 		if existing.State == Pending || existing.State == Running {
 			return existing
@@ -379,13 +515,27 @@ func (m *Manager) commitTransition(j Job, state State, requestID string) error {
 	if requestID != "" && (j.State == state || (state == Pending && j.State == Running)) {
 		return m.commit(next)
 	}
+	resetInventory := state == Pending && j.State == Failed
 	j.State = state
 	j.ErrorCode = ""
 	j.FinishedAt = time.Time{}
+	if resetInventory {
+		// A permanent listing/snapshot verdict may become valid only when the
+		// PDS exposes a changed revision. An explicit retry therefore starts a
+		// new frozen inventory rather than treating an old denominator as live.
+		j.Cursor = ""
+		j.EnumeratedRepos = 0
+		j.TotalRepos = 0
+		j.TotalReposKnown = false
+		j.CompletedRepos = map[string]string{}
+	}
 	if state == Canceled {
 		j.FinishedAt = time.Now().UTC()
 	}
 	next.Jobs[j.ID] = j
+	if resetInventory {
+		return m.commitInventory(next, j.ID, inventory{Entries: map[string]string{}})
+	}
 	if err := m.commit(next); err != nil {
 		return err
 	}
@@ -404,10 +554,30 @@ func (m *Manager) List() []Job {
 	slices.SortFunc(out, func(a, b Job) int { return strings.Compare(a.ID, b.ID) })
 	return out
 }
+
+// Get returns one durable job snapshot.
+func (m *Manager) Get(id string) (Job, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	job, ok := m.data.Jobs[id]
+	if !ok {
+		return Job{}, ErrNotFound
+	}
+	return clone(job), nil
+}
 func (m *Manager) Sources() map[string]bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return clone(m.data.Sources)
+}
+
+// SetReceiptSender configures the private Relay acknowledgement seam. The
+// sender is intentionally optional: standalone Jetstream remains usable, but
+// only jobs carrying a Relay source revision create a receipt obligation.
+func (m *Manager) SetReceiptSender(sender ReceiptSender) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.receiptSender = sender
 }
 
 // snapshotRejectionPosition bounds untrusted source/listing coordinates before
@@ -575,7 +745,7 @@ func oldestSnapshotRejectionKey(rejections map[string]SnapshotRejection) string 
 
 func (m *Manager) active(id string) bool {
 	j, ok := m.data.Jobs[id]
-	return ok && j.State == Running && m.data.Sources[j.PDS] && j.Policy.Revision == m.policy.Current().Revision
+	return ok && j.State == Running && m.data.Sources[j.PDS] && j.Policy.Revision == m.policy.Current().Revision && (m.data.SourceRevisions[j.PDS] == 0 || j.SourceRevision == m.data.SourceRevisions[j.PDS])
 }
 
 // Apply holds the policy/source cancellation boundary through the archive write.
@@ -631,6 +801,69 @@ func (m *Manager) CheckpointEnumeration(id, cursor string, active int, complete 
 	return m.commit(next)
 }
 
+// CheckpointInventory records one validated listRepos page and advances its
+// cursor atomically with the job state. The caller must finish this one scan
+// before it starts repository downloads, making the published denominator a
+// frozen current-state snapshot rather than a moving PDS census.
+func (m *Manager) CheckpointInventory(id, cursor string, entries map[string]string, complete bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.active(id) {
+		return ErrConflict
+	}
+	inv, err := m.readInventory(id)
+	if err != nil {
+		return err
+	}
+	for did, rev := range entries {
+		if existing, ok := inv.Entries[did]; ok && existing != rev {
+			return ErrInvalidInput
+		}
+		inv.Entries[did] = rev
+	}
+	next := clone(m.data)
+	job := next.Jobs[id]
+	job.Cursor = cursor
+	job.EnumeratedRepos = len(inv.Entries)
+	if complete {
+		job.TotalRepos = len(inv.Entries)
+		job.TotalReposKnown = true
+	}
+	next.Jobs[id] = job
+	return m.commitInventory(next, id, inv)
+}
+
+// Inventory returns the frozen, active listing in DID order. It is available
+// only after the terminal listRepos page is durable.
+func (m *Manager) Inventory(id string) ([]ListedRepository, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	job, ok := m.data.Jobs[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	if !job.TotalReposKnown {
+		return nil, ErrConflict
+	}
+	inv, err := m.readInventory(id)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ListedRepository, 0, len(inv.Entries))
+	for did, rev := range inv.Entries {
+		out = append(out, ListedRepository{DID: did, Revision: rev})
+	}
+	slices.SortFunc(out, func(a, b ListedRepository) int { return strings.Compare(a.DID, b.DID) })
+	return out, nil
+}
+
+// ListedRepository is a validated direct-PDS snapshot coordinate frozen for a
+// single job. It deliberately excludes CAR data and listing-only metadata.
+type ListedRepository struct {
+	DID      string
+	Revision string
+}
+
 func (m *Manager) Checkpoint(id, did, rev, cursor string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -672,6 +905,9 @@ func (m *Manager) Run(ctx context.Context, process Processor) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if err := m.flushReceipts(ctx); err != nil {
+			return err
+		}
 		worked, err := m.runNext(ctx, process)
 		if err != nil {
 			return err
@@ -709,6 +945,17 @@ func (m *Manager) claimNextLocked() (Job, error) {
 		if job.State != Pending {
 			continue
 		}
+		if current := m.data.SourceRevisions[job.PDS]; current > 0 && job.SourceRevision != current {
+			next := clone(m.data)
+			job.State = Canceled
+			job.ErrorCode = "source_revision_changed"
+			job.FinishedAt = time.Now().UTC()
+			next.Jobs[job.ID] = job
+			if err := m.commit(next); err != nil {
+				return Job{}, err
+			}
+			continue
+		}
 		next := clone(m.data)
 		job.State = Running
 		job.Attempts++
@@ -741,11 +988,90 @@ func (m *Manager) finishJob(ctx context.Context, id string, processErr error) er
 	job := next.Jobs[id]
 	job.FinishedAt = time.Now().UTC()
 	job.State = state
+	if state == Complete && job.SourceRevision != 0 && m.receiptSender != nil {
+		// This flag is written in the same durable job record as Complete, so a
+		// process loss after local success replays the acknowledgement on restart.
+		job.ReceiptPending = true
+	}
 	if code != "" {
 		job.ErrorCode = code
 	}
 	next.Jobs[id] = job
 	return m.commit(next)
+}
+
+func (m *Manager) flushReceipts(ctx context.Context) error {
+	m.mu.Lock()
+	sender := m.receiptSender
+	pending := make([]Job, 0)
+	now := time.Now().UTC()
+	if sender != nil {
+		for _, job := range m.data.Jobs {
+			if job.State == Complete && job.ReceiptPending && !job.ReceiptRetryAt.After(now) {
+				pending = append(pending, clone(job))
+			}
+		}
+	}
+	m.mu.Unlock()
+	for _, job := range pending {
+		if err := sender(ctx, job); err != nil {
+			if err := m.recordReceiptFailure(job, err); err != nil {
+				return err
+			}
+			continue
+		}
+		m.mu.Lock()
+		next := clone(m.data)
+		current, ok := next.Jobs[job.ID]
+		if ok && current.State == Complete && current.ReceiptPending && current.SourceRevision == job.SourceRevision {
+			current.ReceiptPending = false
+			current.ReceiptRetryAt = time.Time{}
+			current.ReceiptError = ""
+			next.Jobs[job.ID] = current
+			if err := m.commit(next); err != nil {
+				m.mu.Unlock()
+				return err
+			}
+		}
+		m.mu.Unlock()
+	}
+	return nil
+}
+
+func (m *Manager) recordReceiptFailure(job Job, receiptErr error) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	next := clone(m.data)
+	current, ok := next.Jobs[job.ID]
+	if !ok || current.State != Complete || !current.ReceiptPending || current.SourceRevision != job.SourceRevision {
+		return nil
+	}
+	if errors.Is(receiptErr, ErrReceiptStale) {
+		current.ReceiptPending = false
+		current.ReceiptRetryAt = time.Time{}
+		current.ReceiptError = "stale_source_revision"
+	} else if errors.Is(receiptErr, ErrReceiptSourceMissing) {
+		current.ReceiptPending = false
+		current.ReceiptRetryAt = time.Time{}
+		current.ReceiptError = "source_not_found"
+	} else {
+		current.ReceiptAttempts++
+		current.ReceiptRetryAt = time.Now().UTC().Add(receiptBackoff(current.ReceiptAttempts))
+		current.ReceiptError = "relay_unavailable"
+	}
+	next.Jobs[job.ID] = current
+	return m.commit(next)
+}
+
+func receiptBackoff(attempts int) time.Duration {
+	delay := receiptRetryBase
+	for i := 1; i < attempts && delay < receiptRetryMax; i++ {
+		delay *= 2
+	}
+	if delay > receiptRetryMax {
+		return receiptRetryMax
+	}
+	return delay
 }
 
 func jobOutcome(err error) (State, string, error) {

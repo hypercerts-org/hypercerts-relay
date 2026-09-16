@@ -61,8 +61,13 @@ type Options struct {
 	DataDir                string
 	// StorageFS is the filesystem for Jetstream-owned durable storage under
 	// DataDir (segments + Pebble). Nil uses the host OS filesystem.
-	StorageFS          vfs.FS
-	RelayURL           string
+	StorageFS vfs.FS
+	RelayURL  string
+	// RelayControlURL and RelayControlToken are the private Plan 004 receipt
+	// seam. Both must be configured together; the CLI reads the token from a
+	// mounted file rather than accepting a command-line secret.
+	RelayControlURL    string
+	RelayControlToken  string
 	PLCURL             string
 	OTelServiceName    string
 	LogLevel           string

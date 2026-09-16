@@ -57,7 +57,6 @@ const services = {
         errorCode: job.errorCode,
         createdAt: job.createdAt,
         coverage: job.coverage,
-        historyComplete: job.historyComplete,
       })),
     };
   },
@@ -74,7 +73,6 @@ const services = {
         errorCode: job.errorCode,
         createdAt: job.createdAt,
         coverage: job.coverage,
-        historyComplete: job.historyComplete,
       })),
     };
   },
@@ -156,7 +154,6 @@ const services = {
           attempts: 1,
           createdAt: new Date().toISOString(),
           errorCode: "source_unavailable",
-          historyComplete: false,
           coverage: "current_state",
         };
         jobs.push(job);

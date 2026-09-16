@@ -97,7 +97,6 @@ func TestHypercertsQuietPDSAndEnabledCollectionJobs(t *testing.T) {
 		require.Equal(t, pds.URL, job.PDS)
 		require.Equal(t, "current_state", job.Coverage)
 		require.Len(t, job.CompletedRepos, 1)
-		require.False(t, job.HistoryComplete)
 	}
 	require.NoError(t, writer.ForceRotate(t.Context()))
 	consumer, err := client.Subscribe("http://"+rt.PublicAddr(), client.WithAfterSeq(0), client.WithSnapshotOnly(), client.WithBatchSize(1))

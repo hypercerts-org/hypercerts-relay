@@ -2,7 +2,10 @@ package jobs
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -117,7 +120,7 @@ func TestJobsCrashResumeAndUnavailableCoverage(t *testing.T) {
 		done <- m.Run(ctx, func(context.Context, Job) error { return &InputError{Code: "source_unavailable", Unavailable: true} })
 	}()
 	require.Eventually(t, func() bool { return m.List()[0].State == Incomplete }, time.Second, time.Millisecond)
-	require.False(t, m.List()[0].HistoryComplete)
+	require.Equal(t, "current_state", m.List()[0].Coverage)
 	require.NoError(t, m.Retry(j.ID))
 	require.Eventually(t, func() bool { return m.List()[0].Attempts >= 3 }, time.Second, time.Millisecond)
 	cancel()
@@ -161,6 +164,173 @@ func TestJobsRepeatedQuotaRecoveryStartsFreshWork(t *testing.T) {
 	require.NotEqual(t, first.ID, second.ID)
 	require.Equal(t, Pending, second.State)
 	require.Empty(t, second.CompletedRepos)
+}
+
+func TestCompletedRecoveryReceiptRetriesAfterRestart(t *testing.T) {
+	dir := t.TempDir()
+	m, db := newManager(t, dir)
+	job, err := m.AddSourceWithRevision("https://pds.example", 7)
+	require.NoError(t, err)
+	m.SetReceiptSender(func(context.Context, Job) error { return errors.New("relay unavailable") })
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- m.Run(ctx, func(context.Context, Job) error { return nil }) }()
+	require.Eventually(t, func() bool {
+		current, getErr := m.Get(job.ID)
+		return getErr == nil && current.State == Complete && current.ReceiptPending && current.ReceiptAttempts == 1
+	}, time.Second, time.Millisecond)
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+	current, err := m.Get(job.ID)
+	require.NoError(t, err)
+	require.Equal(t, Complete, current.State)
+	require.True(t, current.ReceiptPending)
+	require.NoError(t, db.Close())
+
+	m, db = newManager(t, dir)
+	defer db.Close()
+	received := make(chan Job, 1)
+	m.SetReceiptSender(func(_ context.Context, receipt Job) error {
+		received <- receipt
+		return nil
+	})
+	ctx, cancel = context.WithCancel(t.Context())
+	done = make(chan error, 1)
+	go func() { done <- m.Run(ctx, func(context.Context, Job) error { return nil }) }()
+	receivedJob := <-received
+	require.Equal(t, uint64(7), receivedJob.SourceRevision)
+	require.Equal(t, Complete, receivedJob.State)
+	require.Eventually(t, func() bool {
+		stored, getErr := m.Get(job.ID)
+		return getErr == nil && !stored.ReceiptPending
+	}, time.Second, time.Millisecond)
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+}
+
+func TestSourceRevisionAdvanceCancelsInFlightJobAndSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	m, db := newManager(t, dir)
+	first, err := m.AddSourceWithRevision("https://pds.example", 1)
+	require.NoError(t, err)
+	started := make(chan struct{})
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- m.Run(ctx, func(jobCtx context.Context, _ Job) error {
+			select {
+			case <-started:
+			default:
+				close(started)
+			}
+			<-jobCtx.Done()
+			return jobCtx.Err()
+		})
+	}()
+	<-started
+	second, err := m.AddSourceWithRevision("https://pds.example", 2)
+	require.NoError(t, err)
+	require.NotEqual(t, first.ID, second.ID)
+	require.Eventually(t, func() bool {
+		old, oldErr := m.Get(first.ID)
+		return oldErr == nil && old.State == Canceled && old.ErrorCode == "source_revision_changed"
+	}, time.Second, time.Millisecond)
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+	require.NoError(t, db.Close())
+
+	m, db = newManager(t, dir)
+	defer db.Close()
+	old, err := m.Get(first.ID)
+	require.NoError(t, err)
+	require.Equal(t, Canceled, old.State)
+	current, err := m.Get(second.ID)
+	require.NoError(t, err)
+	require.Equal(t, Pending, current.State)
+	require.Equal(t, uint64(2), current.SourceRevision)
+}
+
+func TestLowerSourceRevisionIsRejectedForSourceAndQuotaRequests(t *testing.T) {
+	m, db := newManager(t, t.TempDir())
+	defer db.Close()
+	newest, err := m.AddSourceWithRevision("https://pds.example", 9)
+	require.NoError(t, err)
+	_, err = m.AddSourceWithRevision("https://pds.example", 8)
+	require.ErrorIs(t, err, ErrConflict)
+	_, err = m.RequestOnceWithSourceRevision("https://pds.example", "quota_recovery", "quota-old", 8)
+	require.ErrorIs(t, err, ErrConflict)
+	current, err := m.Get(newest.ID)
+	require.NoError(t, err)
+	require.Equal(t, uint64(9), current.SourceRevision)
+	require.Len(t, m.List(), 1, "delayed source and quota commands must not create jobs")
+}
+
+func TestStaleRecoveryReceiptIsTerminalWithoutStoppingJobs(t *testing.T) {
+	m, db := newManager(t, t.TempDir())
+	defer db.Close()
+	job, err := m.AddSourceWithRevision("https://pds.example", 4)
+	require.NoError(t, err)
+	m.SetReceiptSender(func(context.Context, Job) error { return ErrReceiptStale })
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- m.Run(ctx, func(context.Context, Job) error { return nil }) }()
+	require.Eventually(t, func() bool {
+		current, getErr := m.Get(job.ID)
+		return getErr == nil && current.State == Complete && !current.ReceiptPending && current.ReceiptError == "stale_source_revision"
+	}, time.Second, time.Millisecond)
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+}
+
+func TestMissingRecoveryReceiptSourceIsTerminalWithoutStoppingJobs(t *testing.T) {
+	m, db := newManager(t, t.TempDir())
+	defer db.Close()
+	job, err := m.AddSourceWithRevision("https://pds.example", 4)
+	require.NoError(t, err)
+	m.SetReceiptSender(func(context.Context, Job) error { return ErrReceiptSourceMissing })
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- m.Run(ctx, func(context.Context, Job) error { return nil }) }()
+	require.Eventually(t, func() bool {
+		current, getErr := m.Get(job.ID)
+		return getErr == nil && current.State == Complete && !current.ReceiptPending && current.ReceiptError == "source_not_found"
+	}, time.Second, time.Millisecond)
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+}
+
+func TestRelayReceiptSenderClassifiesMissingSource(t *testing.T) {
+	relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/hypercerts/v1/source/recovery-receipt", r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":"source_not_found"}`))
+	}))
+	defer relay.Close()
+	err := (RelayReceiptSender{URL: relay.URL, Token: "fixture-service-credential-32-bytes-minimum", Client: relay.Client()}).Send(t.Context(), Job{ID: "job-1", PDS: "https://pds.example", SourceRevision: 1, Policy: selection.Policy{Revision: 1}})
+	require.ErrorIs(t, err, ErrReceiptSourceMissing)
+}
+
+func TestRelayReceiptSenderRetriesAmbiguousNotFoundResponses(t *testing.T) {
+	for _, response := range []struct {
+		name string
+		body string
+	}{
+		{name: "empty", body: ""},
+		{name: "html", body: "<html>not found</html>"},
+		{name: "generic json", body: `{"error":"not_found"}`},
+	} {
+		t.Run(response.name, func(t *testing.T) {
+			relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(response.body))
+			}))
+			defer relay.Close()
+			err := (RelayReceiptSender{URL: relay.URL, Token: "fixture-service-credential-32-bytes-minimum", Client: relay.Client()}).Send(t.Context(), Job{ID: "job-1", PDS: "https://pds.example", SourceRevision: 1, Policy: selection.Policy{Revision: 1}})
+			require.Error(t, err)
+			require.NotErrorIs(t, err, ErrReceiptSourceMissing)
+		})
+	}
 }
 
 func TestRequestReceiptSurvivesCompletionAndRestart(t *testing.T) {

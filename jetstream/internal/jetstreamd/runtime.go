@@ -86,6 +86,9 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	if opts.EnablePprof && opts.DebugAddr == "" && opts.DebugListener == nil {
 		return nil, errors.New("profiling requires a private debug listener")
 	}
+	if (opts.RelayControlURL == "") != (opts.RelayControlToken == "") {
+		return nil, errors.New("relay control URL and token must be configured together")
+	}
 	if opts.SegmentCacheMaxAge < 0 {
 		return nil, fmt.Errorf("serve: --segment-cache-max-age must be >= 0 (SegmentCacheMaxAge must be >= 0), got %s", opts.SegmentCacheMaxAge)
 	}
@@ -485,6 +488,10 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	// hypercerts: Snapshots use the same identity directory and direct-PDS HTTP client.
 	if rt.BackfillJobs != nil {
 		rt.jobProcessor = jobs.PDSProcessor{Manager: rt.BackfillJobs, HTTPClient: xrpcClient.HTTPClient.Val(), Directory: directory, Reconcile: orch.ReconcileSnapshot}.Run
+		if opts.RelayControlURL != "" {
+			receiver := jobs.RelayReceiptSender{URL: opts.RelayControlURL, Token: opts.RelayControlToken, Client: xrpcClient.HTTPClient.Val()}
+			rt.BackfillJobs.SetReceiptSender(receiver.Send)
+		}
 	}
 
 	// Timestamp-import job manager (design §8 M6). Always constructed so the

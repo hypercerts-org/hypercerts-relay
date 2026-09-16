@@ -151,9 +151,7 @@ running job from its persisted page/repository progress. A crash before progress
 acknowledgment may replay work safely.
 
 Coverage is explicitly `current_state`: a PDS snapshot cannot prove historical
-event completeness. The currently emitted `historyComplete: false` field is
-transitional and always false; [TECH-597](https://linear.app/hypercerts/issue/TECH-597/expose-jetstream-backfill-progress-and-coverage)
-removes it from job state and control/UI responses. Unavailable sources, changed
+event completeness. Unavailable sources, changed
 DID hosting, stale snapshots, and the 64
 MiB per-repository input limit produce `incomplete`; malformed or unverifiable
 input produces `failed`. Both require an explicit retry. Local persistence
@@ -178,6 +176,19 @@ and return `Cache-Control: no-store`. Use TLS/private transport between services
 The public listener does not expose the API. This is a service contract for the
 separate administration control plane, not the OAuth administration UI.
 
+When Jetstream must clear a Relay source's `RecoveryRequired` flag, configure
+both `JETSTREAM_RELAY_CONTROL_URL` and
+`JETSTREAM_RELAY_CONTROL_TOKEN_FILE`. The URL is the private Relay control
+origin; the token file is a mounted copy of Relay's private-control credential,
+read once at startup and never accepted as a command-line value. Configure
+neither setting for standalone Jetstream. Configuring only one is an error.
+Keep the URL on private TLS or an explicitly trusted private network, mount the
+token read-only only into Jetstream, and do not expose either setting through
+the public listener, browser administration API, image, or repository. After a
+job's current-state completion is durable, Jetstream submits the bounded receipt
+to Relay. Transport failures remain pending and retry with a persisted bounded
+backoff; a Relay 409 stale-revision conflict is terminal for that old receipt.
+
 All paths below start with `/hypercerts/v1`:
 
 | Method and path | Request / result |
@@ -198,12 +209,9 @@ All paths below start with `/hypercerts/v1`:
 Each job reports `id`, `pds`, `policy.revision`, `policy.collections`, `reason`,
 `state`, `attempts`, `completedRepos` (count), `totalRepos` with
 `totalReposKnown`, page `cursor`, bounded `errorCode`,
-creation/start/finish times, `coverage`, and the currently emitted transitional
-`historyComplete` field. Job states are `pending`, `running`, `failed`, `canceled`,
-`incomplete`, and `complete`. A completed job identifies the exact PDS origin and
-policy revision whose **current state** it covers. `historyComplete` is always
-false and is scheduled for [TECH-597](https://linear.app/hypercerts/issue/TECH-597/expose-jetstream-backfill-progress-and-coverage)
-removal; clients must not present it as a historical-coverage indicator. An
+creation/start/finish times, and `coverage`. Job states are `pending`, `running`,
+`failed`, `canceled`, `incomplete`, and `complete`. A completed job identifies the
+exact PDS origin and policy revision whose **current state** it covers. An
 unreachable PDS returns `incomplete`, never
 `complete`.
 

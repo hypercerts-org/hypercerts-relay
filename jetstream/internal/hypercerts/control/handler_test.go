@@ -88,8 +88,18 @@ func seedSnapshotRejections(t *testing.T, manager *jobs.Manager, dids []string, 
 		directory.Cache.Set(t.Context(), "did:"+did, &identity.Identity{DID: atmos.DID(did), Services: map[string]identity.ServiceEndpoint{"atproto_pds": {URL: pds.URL}}})
 	}
 	processor := jobs.PDSProcessor{Manager: manager, HTTPClient: pds.Client(), Directory: directory}
-	err = processor.Run(t.Context(), job)
-	require.Error(t, err)
+	run := func(job jobs.Job) {
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+		go func() { done <- manager.Run(ctx, processor.Run) }()
+		require.Eventually(t, func() bool {
+			current, getErr := manager.Get(job.ID)
+			return getErr == nil && current.State == jobs.Failed
+		}, time.Second, time.Millisecond)
+		cancel()
+		require.ErrorIs(t, <-done, context.Canceled)
+	}
+	run(job)
 	if nextPolicy {
 		_, err = manager.SetPolicy(1, []string{})
 		require.NoError(t, err)
@@ -101,7 +111,7 @@ func seedSnapshotRejections(t *testing.T, manager *jobs.Manager, dids []string, 
 			}
 		}
 		require.NotEmpty(t, replacement.ID)
-		require.Error(t, processor.Run(t.Context(), replacement))
+		run(replacement)
 	}
 	return pds.URL
 }
@@ -205,7 +215,7 @@ func TestPrivateLifecycleAndCoverage(t *testing.T) {
 	require.NoError(t, json.Unmarshal(request(h, "GET", "/jobs/"+pending.ID, "", testToken).Body.Bytes(), &incomplete))
 	require.Equal(t, jobs.Incomplete, incomplete.State)
 	require.Equal(t, "source_unavailable", incomplete.ErrorCode)
-	require.False(t, incomplete.HistoryComplete)
+	require.Equal(t, "current_state", incomplete.Coverage)
 	require.Equal(t, "https://pds.example", incomplete.PDS)
 	require.Equal(t, uint64(1), incomplete.Policy.Revision)
 	require.Equal(t, 200, request(h, "POST", "/jobs/"+pending.ID+"/retry", "", testToken).Code)
@@ -297,7 +307,7 @@ func TestPrivateCompleteAndFailedResults(t *testing.T) {
 			require.Equal(t, state, got.State)
 			require.Equal(t, j.Policy, got.Policy)
 			require.Equal(t, j.PDS, got.PDS)
-			require.False(t, got.HistoryComplete)
+			require.Equal(t, "current_state", got.Coverage)
 			if state == jobs.Complete {
 				require.Equal(t, 1, got.CompletedRepos)
 				require.Equal(t, "current_state", got.Coverage)

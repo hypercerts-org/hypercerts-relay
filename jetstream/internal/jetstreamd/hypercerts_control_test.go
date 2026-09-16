@@ -79,7 +79,7 @@ func TestHypercertsPrivateInterfaceReportsUnavailablePDS(t *testing.T) {
 			Policy struct {
 				Revision uint64 `json:"revision"`
 			} `json:"policy"`
-			HistoryComplete bool `json:"historyComplete"`
+			Coverage string `json:"coverage"`
 		} `json:"jobs"`
 	}
 	require.NoError(t, json.Unmarshal(body, &response))
@@ -87,7 +87,7 @@ func TestHypercertsPrivateInterfaceReportsUnavailablePDS(t *testing.T) {
 	require.Equal(t, jobs.Incomplete, response.Jobs[0].State)
 	require.Equal(t, unavailable.URL, response.Jobs[0].PDS)
 	require.Equal(t, uint64(1), response.Jobs[0].Policy.Revision)
-	require.False(t, response.Jobs[0].HistoryComplete)
+	require.Equal(t, "current_state", response.Jobs[0].Coverage)
 	// Enabling control must leave profiling disabled on the same listener.
 	resp, err := http.Get("http://" + private.Addr().String() + "/debug/pprof/")
 	require.NoError(t, err)
