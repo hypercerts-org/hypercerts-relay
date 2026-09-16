@@ -152,8 +152,9 @@ acknowledgment may replay work safely.
 
 Coverage is explicitly `current_state`: a PDS snapshot cannot prove historical
 event completeness. The currently emitted `historyComplete: false` field is
-transitional and always false; Plan 006 removes it from job state and control/UI
-responses. Unavailable sources, changed DID hosting, stale snapshots, and the 64
+transitional and always false; [TECH-597](https://linear.app/hypercerts/issue/TECH-597/expose-jetstream-backfill-progress-and-coverage)
+removes it from job state and control/UI responses. Unavailable sources, changed
+DID hosting, stale snapshots, and the 64
 MiB per-repository input limit produce `incomplete`; malformed or unverifiable
 input produces `failed`. Both require an explicit retry. Local persistence
 failures stop the runtime without acknowledging completion. Each repository
@@ -200,8 +201,9 @@ creation/start/finish times, `coverage`, and the currently emitted transitional
 `historyComplete` field. Job states are `pending`, `running`, `failed`, `canceled`,
 `incomplete`, and `complete`. A completed job identifies the exact PDS origin and
 policy revision whose **current state** it covers. `historyComplete` is always
-false and is scheduled for Plan 006 removal; clients must not present it as a
-historical-coverage indicator. An unreachable PDS returns `incomplete`, never
+false and is scheduled for [TECH-597](https://linear.app/hypercerts/issue/TECH-597/expose-jetstream-backfill-progress-and-coverage)
+removal; clients must not present it as a historical-coverage indicator. An
+unreachable PDS returns `incomplete`, never
 `complete`.
 
 Errors use a bounded JSON `error` code: 400 invalid input, 401 authentication,

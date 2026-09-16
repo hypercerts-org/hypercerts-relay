@@ -29,15 +29,17 @@ an assumed successful mutation.
 ## Cross-service boundaries
 
 A Relay source remains recovery-required until a matching successful Jetstream
-job crosses the durable receipt boundary defined by Plan 004. Removing a PDS
-stops future acquisition and dependent work; it does not purge already retained
-Jetstream archive data. An admitted migration target requires an explicit
+job crosses the durable receipt boundary defined by [TECH-637](https://linear.app/hypercerts/issue/TECH-637/persist-cross-service-recovery-receipts-for-admitted-pdss).
+Removing a PDS stops future acquisition and dependent work; it does not purge
+already retained Jetstream archive data. An admitted migration target requires an explicit
 Jetstream current-state job and does not restore unavailable history.
 
 ## Deferred evidence
 
-Plan 004 owns the lifecycle recovery receipt and T03-lifecycle. Plan 006 owns
-job cancellation/onboarding recovery and the stable-inventory contract. Plan 009
-owns Rainbow persistence/recovery, and Plan 010 owns upgrade/restore
-qualification. No deferred selector is passing merely because its service owner
-exists.
+[TECH-637](https://linear.app/hypercerts/issue/TECH-637/persist-cross-service-recovery-receipts-for-admitted-pdss)
+owns the lifecycle recovery receipt. [TECH-596](https://linear.app/hypercerts/issue/TECH-596/backfill-record-collections-for-a-pds)
+owns job cancellation/onboarding recovery and the stable-inventory contract.
+[TECH-635](https://linear.app/hypercerts/issue/TECH-635/validate-rainbow-raw-stream-recovery-and-retention)
+owns Rainbow persistence/recovery, and [TECH-636](https://linear.app/hypercerts/issue/TECH-636/qualify-hypercerts-relay-upgrade-and-restore)
+owns upgrade/restore qualification. No deferred selector is passing merely because
+its service owner exists.

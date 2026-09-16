@@ -4,8 +4,8 @@
 
 Jetstream owns durable direct-PDS source state, jobs, policy-scoped
 reconciliation, checkpoints and current-state coverage. Relay source admission
-and lifecycle remain Relay-owned. A Plan 004 recovery receipt must bridge those
-owners before Relay clears a source recovery requirement.
+and lifecycle remain Relay-owned. A [TECH-637 recovery receipt](https://linear.app/hypercerts/issue/TECH-637/persist-cross-service-recovery-receipts-for-admitted-pdss)
+must bridge those owners before Relay clears a source recovery requirement.
 
 The private Jetstream interface provides:
 
@@ -38,21 +38,23 @@ fails. Neither result is completion. Cancellation and policy/source changes must
 not allow obsolete work to report success.
 
 `historyComplete` is transitional baseline state only: it is always false and
-does not communicate a useful operator choice. Plan 006 removes it from persisted
-job state, Jetstream control responses, administration contracts/UI, tests and
-documentation. Until then, no client may treat the field as historical proof.
+does not communicate a useful operator choice. [TECH-597](https://linear.app/hypercerts/issue/TECH-597/expose-jetstream-backfill-progress-and-coverage)
+removes it from persisted job state, Jetstream control responses, administration
+contracts/UI, tests and documentation. Until then, no client may treat the field
+as historical proof.
 
 ## Acceptance mapping
 
 | Action or terminal outcome | Required evidence owner |
 | --- | --- |
-| Quiet/new admitted PDS reaches selected current state | Plan 006: T02 |
-| Disabled source prevents pending/active job work | Plans 004 and 006: T03-lifecycle and T03-jobs |
-| Adding a collection reconciles each enabled source | Plan 006: T05 |
-| Policy/source changes cancel obsolete work; removal preserves archive | Plan 006: T06 and T09 |
-| Crash, retry, receipt and checkpoint handling | Plan 006: T08 |
-| Complete/incomplete/failed coverage wording | Plan 006: T02, T05, T08 and T09 |
+| Quiet/new admitted PDS reaches selected current state | [TECH-596](https://linear.app/hypercerts/issue/TECH-596/backfill-record-collections-for-a-pds) |
+| Disabled source prevents pending/active job work | [TECH-637](https://linear.app/hypercerts/issue/TECH-637/persist-cross-service-recovery-receipts-for-admitted-pdss) and [TECH-596](https://linear.app/hypercerts/issue/TECH-596/backfill-record-collections-for-a-pds) |
+| Adding a collection reconciles each enabled source | [TECH-596](https://linear.app/hypercerts/issue/TECH-596/backfill-record-collections-for-a-pds) |
+| Policy/source changes cancel obsolete work; removal preserves archive | [TECH-596](https://linear.app/hypercerts/issue/TECH-596/backfill-record-collections-for-a-pds) |
+| Crash, retry, receipt and checkpoint handling | [TECH-596](https://linear.app/hypercerts/issue/TECH-596/backfill-record-collections-for-a-pds) |
+| Complete/incomplete/failed coverage wording | [TECH-597](https://linear.app/hypercerts/issue/TECH-597/expose-jetstream-backfill-progress-and-coverage) |
 
-Plan 006 also owns the compatibility test for reading older persisted job JSON
-while no longer emitting `historyComplete`. Plan 009 owns complete-topology
-recovery evidence.
+[TECH-597](https://linear.app/hypercerts/issue/TECH-597/expose-jetstream-backfill-progress-and-coverage)
+also owns the compatibility test for reading older persisted job JSON while no
+longer emitting `historyComplete`. [TECH-635](https://linear.app/hypercerts/issue/TECH-635/validate-rainbow-raw-stream-recovery-and-retention)
+owns complete-topology recovery evidence.

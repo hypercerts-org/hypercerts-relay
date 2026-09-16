@@ -1,8 +1,10 @@
-# Plan 001 acceptance fixtures
+# Acceptance fixtures
 
 `./tests/acceptance/run T01` owns the disposable two-PDS Relay → Jetstream
-archive/live test. It rejects every other selector, including `T15-core`, until
-that case is implemented by its owning plan.
+archive/live test for [TECH-594](https://linear.app/hypercerts/issue/TECH-594/connect-jetstream-v2-to-the-hypercerts-indigo-relay).
+It rejects every other selector, including `T15-core`, until
+[TECH-634](https://linear.app/hypercerts/issue/TECH-634/unify-jetstream-acquisition-verification-and-durability-fault-coverage)
+implements that case.
 
 ## Topology
 
@@ -62,5 +64,5 @@ cleanup; Docker containers and named volumes are also removed. A nonzero result
 is an observed failure, not a skipped case.
 
 No Cloudflare, Railway, public DNS, external PLC, or running deployment is used.
-Rainbow is intentionally absent from T01; its persistence/recovery validation is
-Plan 009 work.
+Rainbow is intentionally absent from T01; [TECH-635](https://linear.app/hypercerts/issue/TECH-635/validate-rainbow-raw-stream-recovery-and-retention)
+owns its persistence/recovery validation.

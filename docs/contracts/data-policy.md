@@ -67,7 +67,9 @@ not changed. Capacity planning belongs to D07.
 
 ## Deferred evidence
 
-Plan 005 owns T04, T07 and T15-selection. It must inspect archive, replay and
-permitted temporary storage with excluded fixture values; selected-only durable
-storage does not mean raw Relay frames or in-memory CAR input are filtered.
-Plan 009 owns any Rainbow raw-retention and recovery evidence.
+[TECH-595](https://linear.app/hypercerts/issue/TECH-595/store-only-enabled-record-collections-in-jetstream-v2)
+owns selected-storage evidence. It must inspect archive, replay and permitted
+temporary storage with excluded fixture values; selected-only durable storage
+does not mean raw Relay frames or in-memory CAR input are filtered.
+[TECH-635](https://linear.app/hypercerts/issue/TECH-635/validate-rainbow-raw-stream-recovery-and-retention)
+owns any Rainbow raw-retention and recovery evidence.

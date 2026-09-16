@@ -51,11 +51,11 @@ best-effort, and multi-active/distributed Relay enforcement is out of scope.
 
 | Management operation | Owner and required evidence |
 | --- | --- |
-| Source enable, disable and remove | Relay/Jetstream; Plans 004 and 006: T03 and T09 |
-| Global exact collection-policy revision | Jetstream; Plans 005 and 006: T04, T05 and T07 |
-| Job submission, retry and cancellation | Jetstream; Plan 006: T02, T05, T06, T08 and T09 |
-| Global or PDS raw-frame rate policy | Relay; Plan 007: T10, T11 and T12 |
-| Administrator membership, session revocation and CSRF-protected mutation | Administration; Plan 008: T13 and T14 |
+| Source enable, disable and remove | Relay/Jetstream; [TECH-637](https://linear.app/hypercerts/issue/TECH-637/persist-cross-service-recovery-receipts-for-admitted-pdss) and [TECH-596](https://linear.app/hypercerts/issue/TECH-596/backfill-record-collections-for-a-pds) |
+| Global exact collection-policy revision | Jetstream; [TECH-595](https://linear.app/hypercerts/issue/TECH-595/store-only-enabled-record-collections-in-jetstream-v2) and [TECH-596](https://linear.app/hypercerts/issue/TECH-596/backfill-record-collections-for-a-pds) |
+| Job submission, retry and cancellation | Jetstream; [TECH-596](https://linear.app/hypercerts/issue/TECH-596/backfill-record-collections-for-a-pds) |
+| Global or PDS raw-frame rate policy | Relay; [TECH-602](https://linear.app/hypercerts/issue/TECH-602/manage-global-and-pds-specific-relay-rate-limits) |
+| Administrator membership, session revocation and CSRF-protected mutation | Administration; [TECH-588](https://linear.app/hypercerts/issue/TECH-588/set-up-the-administration-control-plane-and-web-ui) |
 
-Neither Plan 007 nor Plan 008 has production OAuth qualification or a deployment
-claim.
+Neither the rate-limit nor administration work has production OAuth qualification
+or a deployment claim.
