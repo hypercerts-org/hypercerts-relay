@@ -3,12 +3,16 @@
 set -euo pipefail
 
 case_id=${1:-}
-if [[ $# -ne 1 || ( "$case_id" != "T01" && "$case_id" != "T02" && "$case_id" != "T03-lifecycle" && "$case_id" != "T03-jobs" && "$case_id" != "T04" && "$case_id" != "T05" && "$case_id" != "T06" && "$case_id" != "T07" && "$case_id" != "T08" && "$case_id" != "T09" && "$case_id" != "T10" && "$case_id" != "T11" && "$case_id" != "T12" && "$case_id" != "T13" && "$case_id" != "T14" && "$case_id" != "T15-core" && "$case_id" != "T15-selection" ) ]]; then
-	printf '%s\n' 'usage: ./tests/acceptance/run T01|T02|T03-lifecycle|T03-jobs|T04|T05|T06|T07|T08|T09|T10|T11|T12|T13|T14|T15-core|T15-selection' >&2
+if [[ $# -ne 1 || ( "$case_id" != "T01" && "$case_id" != "T02" && "$case_id" != "T03-lifecycle" && "$case_id" != "T03-jobs" && "$case_id" != "T04" && "$case_id" != "T05" && "$case_id" != "T06" && "$case_id" != "T07" && "$case_id" != "T08" && "$case_id" != "T09" && "$case_id" != "T10" && "$case_id" != "T11" && "$case_id" != "T12" && "$case_id" != "T13" && "$case_id" != "T14" && "$case_id" != "T15-core" && "$case_id" != "T15-selection" && "$case_id" != "T19" ) ]]; then
+	printf '%s\n' 'usage: ./tests/acceptance/run T01|T02|T03-lifecycle|T03-jobs|T04|T05|T06|T07|T08|T09|T10|T11|T12|T13|T14|T15-core|T15-selection|T19' >&2
 	exit 64
 fi
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+if [[ "$case_id" == "T19" ]]; then
+	exec "$root/tests/upgrade/t19" T19
+fi
+
 if [[ "$case_id" == "T03-lifecycle" ]]; then
 	(
 		cd "$root"
