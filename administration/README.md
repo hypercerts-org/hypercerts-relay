@@ -184,10 +184,15 @@ npm run test:browser
 disposable databases. These fixtures simulate source validation and unavailable
 PDS acquisition; Relay and Jetstream's own suites cover their actual ingestion and
 backfill engines. Browser tests use the real control-plane HTTP API with explicit
-test-only OAuth/service doubles. They exercise operator flows and desktop/mobile
-accessibility; they are not a live external-PDS OAuth qualification. Production
-`server/main.ts` cannot select those doubles. The root verification scripts remain
-required for Go service changes.
+test-only OAuth double. T13 and T14 compile and launch the real loopback Relay
+and Jetstream private-control handlers; no browser test substitutes a service-owner
+API. The OAuth double only provides a deterministic local callback and is not a
+live external-PDS OAuth qualification. Production `server/main.ts` cannot select
+the double or fixture. T13 proves DID authorization, CSRF, session revocation and
+an administration journal entry that survives reopen; T14 proves accessible
+desktop/mobile browser workflows through those local owners. Run them with
+`./tests/acceptance/run T13` and `./tests/acceptance/run T14`. The root verification
+scripts remain required for Go service changes.
 
 ## Brand assets
 

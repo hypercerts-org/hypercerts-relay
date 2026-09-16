@@ -3,8 +3,8 @@
 set -euo pipefail
 
 case_id=${1:-}
-if [[ $# -ne 1 || ( "$case_id" != "T01" && "$case_id" != "T02" && "$case_id" != "T03-lifecycle" && "$case_id" != "T03-jobs" && "$case_id" != "T04" && "$case_id" != "T05" && "$case_id" != "T06" && "$case_id" != "T07" && "$case_id" != "T08" && "$case_id" != "T09" && "$case_id" != "T10" && "$case_id" != "T11" && "$case_id" != "T12" && "$case_id" != "T15-core" && "$case_id" != "T15-selection" ) ]]; then
-	printf '%s\n' 'usage: ./tests/acceptance/run T01|T02|T03-lifecycle|T03-jobs|T04|T05|T06|T07|T08|T09|T10|T11|T12|T15-core|T15-selection' >&2
+if [[ $# -ne 1 || ( "$case_id" != "T01" && "$case_id" != "T02" && "$case_id" != "T03-lifecycle" && "$case_id" != "T03-jobs" && "$case_id" != "T04" && "$case_id" != "T05" && "$case_id" != "T06" && "$case_id" != "T07" && "$case_id" != "T08" && "$case_id" != "T09" && "$case_id" != "T10" && "$case_id" != "T11" && "$case_id" != "T12" && "$case_id" != "T13" && "$case_id" != "T14" && "$case_id" != "T15-core" && "$case_id" != "T15-selection" ) ]]; then
+	printf '%s\n' 'usage: ./tests/acceptance/run T01|T02|T03-lifecycle|T03-jobs|T04|T05|T06|T07|T08|T09|T10|T11|T12|T13|T14|T15-core|T15-selection' >&2
 	exit 64
 fi
 
@@ -76,6 +76,24 @@ if [[ "$case_id" == "T11" || "$case_id" == "T12" ]]; then
 	else
 		printf '%s\n' 'T12 passed: policy measurements are bounded, process-local counters and rate-policy pages are capped at 100 items.'
 	fi
+	exit 0
+fi
+
+if [[ "$case_id" == "T13" ]]; then
+	(
+		cd "$root/administration"
+		CONTROL_GO_BINARY="$(command -v go)" ./node_modules/.bin/tsx --test tests/t13-admin-acceptance.test.ts
+	)
+	printf '%s\n' 'T13 passed: the documented local OAuth double proved DID authorization, CSRF, revocation and a durable operation through real loopback Relay control.'
+	exit 0
+fi
+
+if [[ "$case_id" == "T14" ]]; then
+	(
+		cd "$root/administration"
+		CONTROL_GO_BINARY="$(command -v go)" ./node_modules/.bin/playwright test tests/browser/operations.spec.ts --grep 'administrator operates|desktop and mobile'
+	)
+	printf '%s\n' 'T14 passed: accessible desktop and mobile browser workflows exercised the local OAuth double and real loopback Relay and Jetstream owners.'
 	exit 0
 fi
 

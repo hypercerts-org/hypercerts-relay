@@ -1,11 +1,12 @@
-// Test-only OAuth provider and service double; production main never imports this.
+// Test-only OAuth provider; production main never imports it. The service owners
+// below are real loopback Relay and Jetstream private-control fixtures.
 import { createApp } from "../server/app.ts";
 import { Auth, type OAuthProvider } from "../server/auth.ts";
 import { Store } from "../server/store.ts";
 import { Services } from "../server/services.ts";
 import { Worker } from "../server/worker.ts";
-import { ApiError, type Command } from "../server/contracts.ts";
 import { resolve } from "node:path";
+import { startControlFixtures } from "./control-fixtures.ts";
 const base = "http://127.0.0.1:3188",
   did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
 const store = new Store(":memory:");
@@ -29,150 +30,28 @@ const oauth: OAuthProvider = {
     return { handle: "operator.example", displayName: "Test Operator" };
   },
 };
-let policy = { revision: 1, collections: ["app.bsky.feed.post"] };
-let sources: any[] = [];
-let jobs: any[] = [];
-let limits: any[] = [];
-const services = {
-  async sources() {
-    return { Sources: sources, NextAfterHostID: 0 };
-  },
-  async policy() {
-    return policy;
-  },
-  async jobs() {
-    return { jobs };
-  },
-  async coverage() {
-    return {
-      items: jobs.map((job) => ({
-        pds: job.pds,
-        policy: job.policy,
-        jobId: job.id,
-        reason: job.reason,
-        state: job.state,
-        completedRepos: job.completedRepos,
-        totalRepos: job.totalRepos,
-        totalReposKnown: job.totalReposKnown,
-        errorCode: job.errorCode,
-        createdAt: job.createdAt,
-        coverage: job.coverage,
-      })),
-    };
-  },
-  async coverageFor() {
-    return {
-      items: jobs.map((job) => ({
-        pds: job.pds,
-        policy: job.policy,
-        jobId: job.id,
-        state: job.state,
-        completedRepos: job.completedRepos,
-        totalRepos: job.totalRepos,
-        totalReposKnown: job.totalReposKnown,
-        errorCode: job.errorCode,
-        createdAt: job.createdAt,
-        coverage: job.coverage,
-      })),
-    };
-  },
-  async call(_service: string, path: string) {
-    if (path.startsWith("/limits")) return { items: limits, next: null };
-    if (path.startsWith("/source?")) {
-      const pds = new URL(path, base).searchParams.get("pds");
-      const source = sources.find((s) => `https://${s.Hostname}` === pds);
-      if (!source) throw new ApiError(404, "source_not_found");
-      return source;
-    }
-    throw new Error("Unexpected fixture route");
-  },
-  async apply(command: Command, id: string) {
-    switch (command.kind) {
-      case "account_quota": {
-        const source = sources.find(
-          (s) => s.Hostname === new URL(command.pds).host,
-        );
-        if (!source) throw new ApiError(404, "source_not_found");
-        if (
-          source.AccountQuota.Limit !== command.expectedLimit &&
-          source.AccountQuota.Limit !== command.accountLimit
-        )
-          throw new ApiError(409, "revision_conflict");
-        source.AccountQuota.Limit = command.accountLimit;
-        return source;
-      }
-      case "source": {
-        let source = sources.find(
-          (s) => s.Hostname === new URL(command.pds).host,
-        );
-        if (!source) {
-          source = {
-            HostID: sources.length + 1,
-            Hostname: new URL(command.pds).host,
-            NoSSL: false,
-            DesiredState: "enabled",
-            RuntimeState: "configured",
-            Revision: 1,
-            RecoveryRequired: true,
-            LastDurableCursor: -1,
-            Validation: { Status: "passed", Reason: "" },
-            AccountQuota: { Count: 0, Limit: 100 },
-          };
-          sources.push(source);
-        }
-        source.DesiredState = command.state;
-        return { relay: source };
-      }
-      case "collections":
-        policy = {
-          revision: policy.revision + 1,
-          collections: command.collections,
-        };
-        return policy;
-      case "limit":
-        limits = [
-          ...limits.filter((l) => l.scope !== command.scope),
-          {
-            ...command,
-            waitingConnections: 0,
-            unit: "events/second",
-            recovery:
-              "Backpressure pauses socket reads; replay gaps require recovery.",
-          },
-        ];
-        return command;
-      case "job": {
-        const job = {
-          id: id.replaceAll("-", "").slice(0, 32),
-          pds: command.pds,
-          policy,
-          reason: command.reason,
-          state: "incomplete",
-          completedRepos: 0,
-          totalRepos: 0,
-          totalReposKnown: false,
-          attempts: 1,
-          createdAt: new Date().toISOString(),
-          errorCode: "source_unavailable",
-          coverage: "current_state",
-        };
-        jobs.push(job);
-        return job;
-      }
-      case "job_action": {
-        const job = jobs.find((j) => j.id === command.id);
-        job.state = command.action === "cancel" ? "canceled" : "pending";
-        return job;
-      }
-    }
-  },
-} as unknown as Services;
+const fixtures = await startControlFixtures();
+const services = new Services(
+  { url: fixtures.relayURL, token: fixtures.token },
+  { url: fixtures.jetstreamURL, token: fixtures.token },
+);
 const worker = new Worker(store, services);
-setInterval(() => void worker.tick(), 50);
-createApp(
+const timer = setInterval(() => void worker.tick(), 50);
+const server = createApp(
   store,
   services,
   new Auth(store, base, oauth),
   {},
   resolve("dist"),
 ).listen(3188, "127.0.0.1");
+let stopping = false;
+async function shutdown() {
+  if (stopping) return;
+  stopping = true;
+  clearInterval(timer);
+  server.close();
+  store.close();
+  await fixtures.close();
+}
+process.once("SIGINT", () => void shutdown());
+process.once("SIGTERM", () => void shutdown());

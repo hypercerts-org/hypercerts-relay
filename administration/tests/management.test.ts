@@ -21,6 +21,10 @@ test(
       );
     const temp = mkdtempSync(join(tmpdir(), "management-acceptance-"));
     const compile = promisify(execFile);
+    const goEnv = {
+      ...process.env,
+      GOCACHE: process.env.GOCACHE ?? "/tmp/hypercerts-relay-go-cache",
+    };
     const fixtures = [
       { name: "relay", cwd: resolve(".."), pkg: "./cmd/relay" },
       {
@@ -38,6 +42,7 @@ test(
           ["test", "-c", "-o", join(temp, name + ".test"), pkg],
           {
             cwd,
+            env: goEnv,
             timeout: 300000,
             signal: t.signal,
             maxBuffer: 2 * 1024 * 1024,
@@ -58,7 +63,7 @@ test(
         {
           cwd,
           env: {
-            ...process.env,
+            ...goEnv,
             CONTROL_ACCEPTANCE_READY: ready,
             ...(relayURL === undefined
               ? {}
