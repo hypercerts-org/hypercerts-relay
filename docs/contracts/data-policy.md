@@ -3,8 +3,9 @@
 ## Scope and owner
 
 Jetstream owns durable selected-record materialization. Relay remains a complete
-raw `com.atproto.sync.subscribeRepos` source; Rainbow, if selected by D06,
-remains a raw fan-out service. Neither is a selected-record archive.
+raw `com.atproto.sync.subscribeRepos` source. Rainbow is deferred from the
+initial launch and, if later activated, remains a raw fan-out service. Neither is
+a selected-record archive.
 
 Consumers use Jetstream v2 archive, replay and subscription interfaces.
 
@@ -60,10 +61,12 @@ per-repository input limit and two-minute repository operation deadline are
 implementation limits; a limit breach must report non-payload incomplete
 coverage rather than claim completion.
 
-Relay raw replay uses its existing 72-hour window. Rainbow, if deployed, uses
-its existing 72-hour persistence window. This is a time-only retention policy:
-no byte cap is selected, and Rainbow's existing `persist-bytes=0` behavior is
-not changed. Capacity planning belongs to D07.
+Relay raw replay uses its existing 72-hour window. Rainbow is not deployed at
+initial launch; any later activation would use its existing 72-hour persistence
+window unless that deferred contract changes. This is a time-only retention
+policy: no byte cap is selected, and Rainbow's existing `persist-bytes=0`
+behavior is not changed. Capacity planning will be measured and refined from
+production workload rather than treated as a launch acceptance result.
 
 ### Persistence producer inventory
 
@@ -74,7 +77,7 @@ transient payloads so an archive-only assertion is not overstated.
 | Producer | Durable output | Selection rule | Allowed non-selected payload |
 | --- | --- | --- | --- |
 | Relay event manager | Raw subscribeRepos replay | Not a Jetstream archive; Relay remains complete | Raw frames for its documented 72-hour window |
-| Rainbow event store, if deployed | Raw Relay fan-out replay | Not a Jetstream archive | Raw frames for its documented 72-hour window |
+| Rainbow event store, deferred from initial launch | Raw Relay fan-out replay if later activated | Not a Jetstream archive | Raw frames for its documented 72-hour window |
 | `internal/ingest/backfill` bootstrap and retry | Jetstream segments and source progress | Exact policy before append or readable-log write | Direct-PDS CAR is process memory only; no CAR temp file is permitted |
 | `internal/ingest/live` | Jetstream live segments, archive cursor and progress | Exact policy before append | Upstream frame is transient process memory only |
 | `internal/ingest` snapshot reconciliation | Selected record replacements/deletes and protocol markers | Exact policy and per-collection reconciliation | Snapshot input is process memory only |

@@ -4,7 +4,7 @@
 
 Hypercerts Relay is the controlled AT Protocol event source for Hypercerts services. It contains the Relay and Rainbow Indigo closure plus a separately maintained, copied Jetstream v2 runtime module.
 
-The Relay connects to approved PDS instances and publishes a raw `com.atproto.sync.subscribeRepos` stream. The relay does not select Hypercerts records or provide a consumer archive. The `jetstream/` module receives this stream, retains only the enabled record collections, and performs durable collection backfills. Rainbow sits in front of the raw Relay stream when connection pooling and fan-out are needed.
+The Relay connects to approved PDS instances and publishes a raw `com.atproto.sync.subscribeRepos` stream. The relay does not select Hypercerts records or provide a consumer archive. The `jetstream/` module receives this stream, retains only the enabled record collections, and performs durable collection backfills. Rainbow is a deferred raw-stream fan-out option, not part of the initial launch topology.
 
 The administration control plane manages PDS sources, record collections, rate limits, backfills, and relay telemetry. Its Svelte web interface is not the inherited Relay admin UI: the existing Basic-auth interface under `cmd/relay/relay-admin-ui` remains upstream code and is not the control plane.
 
@@ -86,7 +86,7 @@ See [RELEASING.md](RELEASING.md) for the exact process and rollback guidance.
 - [CHANGELOG.md](CHANGELOG.md) — Hypercerts Relay release history.
 - [`.agents/skills/hypercerts-relay/SKILL.md`](.agents/skills/hypercerts-relay/SKILL.md) — focused repository guidance for work on the Relay and Rainbow fork.
 - [`jetstream/README.md`](jetstream/README.md) — Jetstream v2 provenance, maintenance, and local operation.
-- [`docs/contracts/`](docs/contracts/) — approved data, job, management and service-ownership contracts.
+- [`docs/contracts/`](docs/contracts/) — approved data, job, management, ownership, and [initial-launch topology](docs/contracts/launch-topology.md) contracts.
 
 ## License
 
