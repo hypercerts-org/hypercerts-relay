@@ -55,7 +55,7 @@ best-effort, and multi-active/distributed Relay enforcement is out of scope.
 | Global exact collection-policy revision | Jetstream; [TECH-595](https://linear.app/hypercerts/issue/TECH-595/store-only-enabled-record-collections-in-jetstream-v2) and [TECH-596](https://linear.app/hypercerts/issue/TECH-596/backfill-record-collections-for-a-pds) |
 | Job submission, retry and cancellation | Jetstream; [TECH-596](https://linear.app/hypercerts/issue/TECH-596/backfill-record-collections-for-a-pds) |
 | Global or PDS raw-frame rate policy | Relay; [TECH-602](https://linear.app/hypercerts/issue/TECH-602/manage-global-and-pds-specific-relay-rate-limits) |
-| Administrator membership, session revocation and CSRF-protected mutation | Administration; [TECH-588](https://linear.app/hypercerts/issue/TECH-588/set-up-the-administration-control-plane-and-web-ui) |
+| Administrator membership, session revocation and CSRF-protected mutation | Administration; [TECH-599](https://linear.app/hypercerts/issue/TECH-599/secure-the-relay-administration-api-with-at-protocol-oauth) |
 
 Neither the rate-limit nor administration work has production OAuth qualification
 or a deployment claim.
