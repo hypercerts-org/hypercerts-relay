@@ -86,7 +86,7 @@ test("status displays only configured public service origins", async (t) => {
     jetstream: "https://jetstream.example",
   });
 });
-test("coverage preserves Jetstream's reason independently of its error code", async (t) => {
+test("T10 coverage preserves current-state limits, unknown historical provenance and Jetstream reason", async (t) => {
   const { request, services } = await fixture(t);
   services.coverage = async () => ({
     items: [
@@ -112,6 +112,8 @@ test("coverage preserves Jetstream's reason independently of its error code", as
   const page = await response.json();
   assert.equal(page.items[0].reason, "quota_recovery");
   assert.equal(page.items[0].errorCode, "source_unavailable");
+  assert.equal(page.items[0].coverage, "current_state");
+  assert.equal(page.items[0].historicalPDSAttribution, "unknown");
   assert.equal(page.next, "next-page");
 });
 test("authentication, CSRF and immediate administrator removal guard durable mutations", async (t) => {

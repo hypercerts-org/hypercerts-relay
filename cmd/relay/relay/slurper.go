@@ -49,11 +49,14 @@ type Slurper struct {
 
 type SlurperConfig struct {
 	// hypercerts: Apply explicit policy before queueing a raw source event.
-	WaitRateCapacity    func(context.Context, string) error
-	UserAgent           string
-	ConcurrencyPerHost  int
-	QueueDepthPerHost   int
-	PersistCursorPeriod time.Duration
+	WaitRateCapacity func(context.Context, string) error
+	// hypercerts: Fence each initial dial and redial behind the active Relay
+	// admission lease. A lease loss cancels subscriptions before a redial.
+	RequireRateAdmission func(context.Context) error
+	UserAgent            string
+	ConcurrencyPerHost   int
+	QueueDepthPerHost    int
+	PersistCursorPeriod  time.Duration
 
 	BaselinePerSecondLimit int64
 	BaselinePerHourLimit   int64
@@ -356,6 +359,13 @@ func (s *Slurper) subscribeWithRedialer(ctx context.Context, host *models.Host, 
 		case <-ctx.Done():
 			return
 		default:
+		}
+		if s.Config.RequireRateAdmission != nil {
+			if err := s.Config.RequireRateAdmission(ctx); err != nil {
+				sub.setState("failing")
+				logger.Warn("rate admission lost before source dial", "err", err)
+				return
+			}
 		}
 
 		u := host.SubscribeReposURL()

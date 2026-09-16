@@ -370,6 +370,7 @@ func runRelay(ctx context.Context, cmd *cli.Command) error {
 	relayConfig.HostPerDayLimit = cmd.Int64("new-hosts-per-day-limit")
 	relayConfig.TrustedDomains = cmd.StringSlice("trusted-domains")
 	relayConfig.LenientSyncValidation = cmd.Bool("lenient-sync-validation")
+	relayConfig.RequireRateAdmission = true
 
 	svcConfig := DefaultServiceConfig()
 	svcConfig.AllowInsecureHosts = cmd.Bool("allow-insecure-hosts")
@@ -395,6 +396,18 @@ func runRelay(ctx context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
+	// hypercerts: D04 selects one active Relay process rather than a distributed
+	// limiter. Hold a renewable database lease before any source socket starts.
+	const rateAdmissionTTL = 30 * time.Second
+	rateAdmissionHolder := fmt.Sprintf("relay-%d-%d", os.Getpid(), time.Now().UnixNano())
+	if err := r.AcquireRateAdmission(ctx, rateAdmissionHolder, rateAdmissionTTL); err != nil {
+		return fmt.Errorf("acquiring single-process rate admission: %w", err)
+	}
+	defer func() {
+		if err := r.ReleaseRateAdmission(context.Background(), rateAdmissionHolder); err != nil {
+			logger.Warn("releasing rate admission", "err", err)
+		}
+	}()
 	svc, err := NewService(r, svcConfig)
 	if err != nil {
 		return err
@@ -430,6 +443,25 @@ func runRelay(ctx context.Context, cmd *cli.Command) error {
 		})
 	}
 	defer stopAlerts()
+
+	admissionCtx, cancelAdmission := context.WithCancel(ctx)
+	defer cancelAdmission()
+	admissionErr := make(chan error, 1)
+	go func() {
+		ticker := time.NewTicker(rateAdmissionTTL / 3)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-admissionCtx.Done():
+				return
+			case <-ticker.C:
+				if err := r.RenewRateAdmission(admissionCtx, rateAdmissionHolder, rateAdmissionTTL); err != nil {
+					admissionErr <- err
+					return
+				}
+			}
+		}
+	}()
 
 	// start metrics endpoint
 	go func() {
@@ -481,6 +513,13 @@ func runRelay(ctx context.Context, cmd *cli.Command) error {
 			logger.Error("error during startup", "err", err)
 		}
 		logger.Info("shutting down")
+		stopAlerts()
+		errs := svc.Shutdown()
+		for err := range errs {
+			logger.Error("error during shutdown", "err", err)
+		}
+	case err := <-admissionErr:
+		logger.Error("lost single-process rate admission; stopping source reads", "err", err)
 		stopAlerts()
 		errs := svc.Shutdown()
 		for err := range errs {
