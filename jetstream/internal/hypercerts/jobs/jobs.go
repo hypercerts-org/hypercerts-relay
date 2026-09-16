@@ -18,6 +18,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/cockroachdb/pebble"
+	"github.com/jcalabro/atmos"
 )
 
 type State string
@@ -57,12 +58,36 @@ type Job struct {
 	Coverage        string    `json:"coverage"`
 	HistoryComplete bool      `json:"historyComplete"`
 }
+
+// snapshotRejection is durable, bounded non-payload metadata for a direct-PDS
+// snapshot that is permanently invalid under the listed policy revision.
+type snapshotRejection struct {
+	PDS            string    `json:"pds"`
+	PolicyRevision uint64    `json:"policyRevision"`
+	DID            string    `json:"did"`
+	ListedRevision string    `json:"listedRevision"`
+	Kind           string    `json:"kind"`
+	Code           string    `json:"code"`
+	RejectedAt     time.Time `json:"rejectedAt"`
+}
+
+const (
+	directPDSSnapshotRejectionKind   = "direct_pds_snapshot"
+	snapshotRejectionDigestPrefix    = "sha256:"
+	maxSnapshotRejectionPDSLength    = 2048
+	snapshotRejectionDigestHexLength = sha256.Size * 2
+)
+
+// hypercerts: Direct-PDS snapshot rejections are separate from job outcomes so
+// retries can acknowledge the same permanently invalid listed revision without
+// downloading or materializing it again.
 type data struct {
-	Actions     map[string]string `json:"actions,omitempty"`
-	Requests    map[string]string `json:"requests,omitempty"`
-	Initialized bool              `json:"initialized"`
-	Sources     map[string]bool   `json:"sources"`
-	Jobs        map[string]Job    `json:"jobs"`
+	Actions            map[string]string            `json:"actions,omitempty"`
+	Requests           map[string]string            `json:"requests,omitempty"`
+	Initialized        bool                         `json:"initialized"`
+	Sources            map[string]bool              `json:"sources"`
+	Jobs               map[string]Job               `json:"jobs"`
+	SnapshotRejections map[string]snapshotRejection `json:"snapshotRejections"`
 }
 type Manager struct {
 	mu        sync.Mutex
@@ -78,7 +103,7 @@ func Open(db *store.Store, policy *selection.Manager) (*Manager, error) {
 	if policy == nil {
 		return nil, errors.New("jobs require collection policy")
 	}
-	m := &Manager{db: db, policy: policy, data: data{Sources: map[string]bool{}, Jobs: map[string]Job{}}}
+	m := &Manager{db: db, policy: policy, data: data{Sources: map[string]bool{}, Jobs: map[string]Job{}, SnapshotRejections: map[string]snapshotRejection{}}}
 	b, closer, err := db.Get([]byte(stateKey))
 	if errors.Is(err, store.ErrNotFound) {
 		return m, nil
@@ -92,6 +117,15 @@ func Open(db *store.Store, policy *selection.Manager) (*Manager, error) {
 	}
 	if m.data.Sources == nil || m.data.Jobs == nil {
 		return nil, errors.New("invalid persisted job state")
+	}
+	// hypercerts: Older job documents predate the direct-PDS rejection ledger.
+	if m.data.SnapshotRejections == nil {
+		m.data.SnapshotRejections = map[string]snapshotRejection{}
+	}
+	for key, rejection := range m.data.SnapshotRejections {
+		if !validSnapshotRejection(rejection) || key != snapshotRejectionStoredKey(rejection.PDS, rejection.PolicyRevision, rejection.DID, rejection.ListedRevision, rejection.Kind) {
+			return nil, errors.New("invalid persisted snapshot rejection")
+		}
 	}
 	for id, job := range m.data.Jobs {
 		if job.ID != id || job.CompletedRepos == nil || job.Policy.Revision == 0 {
@@ -373,6 +407,130 @@ func (m *Manager) Sources() map[string]bool {
 	defer m.mu.Unlock()
 	return clone(m.data.Sources)
 }
+
+// snapshotRejectionPosition bounds untrusted source/listing coordinates before
+// they enter the durable rejection ledger. Canonical PDS origins, DIDs, and
+// TIDs remain exact for operator correlation; every other value becomes a
+// fixed digest, never retained raw.
+func snapshotRejectionPosition(pds, did, listedRevision string) (string, string, string) {
+	return snapshotRejectionPDSPosition(pds), snapshotRejectionDIDPosition(did), snapshotRejectionRevisionPosition(listedRevision)
+}
+
+func snapshotRejectionPDSPosition(value string) string {
+	normalized, err := normalizeSource(value)
+	if err == nil && normalized == value && len(value) <= maxSnapshotRejectionPDSLength {
+		return value
+	}
+	return snapshotRejectionDigest(value)
+}
+
+func snapshotRejectionDIDPosition(value string) string {
+	if _, err := atmos.ParseDID(value); err == nil {
+		return value
+	}
+	return snapshotRejectionDigest(value)
+}
+
+func snapshotRejectionRevisionPosition(value string) string {
+	if _, err := atmos.ParseTID(value); err == nil {
+		return value
+	}
+	return snapshotRejectionDigest(value)
+}
+
+func snapshotRejectionDigest(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return snapshotRejectionDigestPrefix + hex.EncodeToString(sum[:])
+}
+
+func validSnapshotRejectionDigest(value string) bool {
+	if len(value) != len(snapshotRejectionDigestPrefix)+snapshotRejectionDigestHexLength || !strings.HasPrefix(value, snapshotRejectionDigestPrefix) {
+		return false
+	}
+	decoded, err := hex.DecodeString(strings.TrimPrefix(value, snapshotRejectionDigestPrefix))
+	return err == nil && hex.EncodeToString(decoded) == strings.TrimPrefix(value, snapshotRejectionDigestPrefix)
+}
+
+func validSnapshotRejectionPDSPosition(value string) bool {
+	if validSnapshotRejectionDigest(value) {
+		return true
+	}
+	normalized, err := normalizeSource(value)
+	return err == nil && normalized == value && len(value) <= maxSnapshotRejectionPDSLength
+}
+
+func validSnapshotRejectionDIDPosition(value string) bool {
+	if validSnapshotRejectionDigest(value) {
+		return true
+	}
+	_, err := atmos.ParseDID(value)
+	return err == nil
+}
+
+func validSnapshotRejectionRevisionPosition(value string) bool {
+	if validSnapshotRejectionDigest(value) {
+		return true
+	}
+	_, err := atmos.ParseTID(value)
+	return err == nil
+}
+
+func snapshotRejectionStoredKey(pds string, policyRevision uint64, did, listedRevision, kind string) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\n%d\n%s\n%s\n%s", pds, policyRevision, did, listedRevision, kind)))
+	return hex.EncodeToString(sum[:])
+}
+
+func validSnapshotRejection(rejection snapshotRejection) bool {
+	return validSnapshotRejectionPDSPosition(rejection.PDS) && rejection.PolicyRevision != 0 && validSnapshotRejectionDIDPosition(rejection.DID) && validSnapshotRejectionRevisionPosition(rejection.ListedRevision) && rejection.Kind == directPDSSnapshotRejectionKind && len(rejection.Code) > 0 && len(rejection.Code) <= 64 && !rejection.RejectedAt.IsZero()
+}
+
+// lookupSnapshotRejection returns only an exact listed snapshot decision. A
+// changed listed revision deliberately requires a fresh download and verdict.
+func (m *Manager) lookupSnapshotRejection(pds string, policyRevision uint64, did, listedRevision, kind string) (snapshotRejection, bool) {
+	pds, did, listedRevision = snapshotRejectionPosition(pds, did, listedRevision)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rejection, ok := m.data.SnapshotRejections[snapshotRejectionStoredKey(pds, policyRevision, did, listedRevision, kind)]
+	return clone(rejection), ok
+}
+
+// listSnapshotRejections provides deterministic, non-payload inspection for
+// future private control-plane work without changing the current control API.
+func (m *Manager) listSnapshotRejections() []snapshotRejection {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]snapshotRejection, 0, len(m.data.SnapshotRejections))
+	for _, rejection := range m.data.SnapshotRejections {
+		out = append(out, clone(rejection))
+	}
+	slices.SortFunc(out, func(a, b snapshotRejection) int {
+		return strings.Compare(snapshotRejectionStoredKey(a.PDS, a.PolicyRevision, a.DID, a.ListedRevision, a.Kind), snapshotRejectionStoredKey(b.PDS, b.PolicyRevision, b.DID, b.ListedRevision, b.Kind))
+	})
+	return out
+}
+
+// recordSnapshotRejection synchronously persists an exact permanent verdict.
+// Repeating the same key returns its original bounded metadata unchanged.
+func (m *Manager) recordSnapshotRejection(pds string, policyRevision uint64, did, listedRevision, kind, code string) (snapshotRejection, error) {
+	pds, did, listedRevision = snapshotRejectionPosition(pds, did, listedRevision)
+	rejection := snapshotRejection{PDS: pds, PolicyRevision: policyRevision, DID: did, ListedRevision: listedRevision, Kind: kind, Code: code, RejectedAt: time.Now().UTC()}
+	if !validSnapshotRejection(rejection) {
+		return snapshotRejection{}, ErrInvalidInput
+	}
+	key := snapshotRejectionStoredKey(pds, policyRevision, did, listedRevision, kind)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if existing, ok := m.data.SnapshotRejections[key]; ok {
+		return clone(existing), nil
+	}
+	next := clone(m.data)
+	next.SnapshotRejections[key] = rejection
+	if err := m.commit(next); err != nil {
+		return snapshotRejection{}, err
+	}
+	return clone(rejection), nil
+}
+
 func (m *Manager) active(id string) bool {
 	j, ok := m.data.Jobs[id]
 	return ok && j.State == Running && m.data.Sources[j.PDS] && j.Policy.Revision == m.policy.Current().Revision

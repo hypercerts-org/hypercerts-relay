@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"io"
@@ -48,15 +49,19 @@ func (p PDSProcessor) client(job Job) *atmossync.Client {
 }
 
 func (p PDSProcessor) processPage(ctx context.Context, client *atmossync.Client, job *Job, page atmossync.ListReposPage) error {
-	active, err := p.processEntries(ctx, client, job, page.Entries)
-	if err != nil {
+	active, processErr := p.processEntries(ctx, client, job, page.Entries)
+	// A permanent snapshot rejection is acknowledged only after this page's
+	// durable checkpoint. The job still fails below, rather than claiming that
+	// its current-state coverage is complete.
+	if err := p.checkpointPage(job, page.NextCursor, active); err != nil {
 		return err
 	}
-	return p.checkpointPage(job, page.NextCursor, active)
+	return processErr
 }
 
 func (p PDSProcessor) processEntries(ctx context.Context, client *atmossync.Client, job *Job, entries []atmossync.ListReposEntry) (int, error) {
 	active := 0
+	var permanentErr *InputError
 	for _, entry := range entries {
 		if !entry.Active {
 			continue
@@ -64,17 +69,62 @@ func (p PDSProcessor) processEntries(ctx context.Context, client *atmossync.Clie
 		if !job.TotalReposKnown {
 			active++
 		}
-		if rev, ok := job.CompletedRepos[string(entry.DID)]; ok && rev == entry.Rev {
+		did := string(entry.DID)
+		_, rejectionDID, rejectionRevision := snapshotRejectionPosition(job.PDS, did, entry.Rev)
+		if rejection, ok := p.Manager.lookupSnapshotRejection(job.PDS, job.Policy.Revision, did, entry.Rev, directPDSSnapshotRejectionKind); ok {
+			// hypercerts: An already-durable permanent verdict acknowledges this
+			// exact listed snapshot without another untrusted CAR download.
+			if err := p.acknowledgeRejectedSnapshot(job, rejectionDID, rejectionRevision); err != nil {
+				return 0, err
+			}
+			if permanentErr == nil {
+				permanentErr = &InputError{Code: rejection.Code}
+			}
+			continue
+		}
+		if rev, ok := job.CompletedRepos[did]; ok && rev == entry.Rev {
 			continue
 		}
 		if err := p.repository(ctx, client, *job, entry); err != nil {
-			return 0, err
+			var input *InputError
+			if !errors.As(err, &input) || input.Unavailable {
+				return 0, err
+			}
+			// Persist before marking this listed revision acknowledged. A crash
+			// between these writes retries from the durable rejection, never from
+			// an unrecorded acknowledgement.
+			rejection, recordErr := p.Manager.recordSnapshotRejection(job.PDS, job.Policy.Revision, did, entry.Rev, directPDSSnapshotRejectionKind, input.Code)
+			if recordErr != nil {
+				return 0, recordErr
+			}
+			if err := p.acknowledgeRejectedSnapshot(job, rejectionDID, rejectionRevision); err != nil {
+				return 0, err
+			}
+			if permanentErr == nil {
+				permanentErr = &InputError{Code: rejection.Code}
+			}
+			continue
 		}
 		// Keep this page-local snapshot current: duplicate entries must not
 		// trigger a second download before the page checkpoint commits.
-		job.CompletedRepos[string(entry.DID)] = entry.Rev
+		job.CompletedRepos[did] = entry.Rev
+	}
+	if permanentErr != nil {
+		return active, permanentErr
 	}
 	return active, nil
+}
+
+// acknowledgeRejectedSnapshot records listed progress only after the rejection
+// ledger has been synchronously persisted. The page cursor is intentionally not
+// advanced here: a restart replays the page, finds the ledger entry, and avoids
+// another download.
+func (p PDSProcessor) acknowledgeRejectedSnapshot(job *Job, did, listedRevision string) error {
+	if err := p.Manager.Checkpoint(job.ID, did, listedRevision, job.Cursor); err != nil {
+		return err
+	}
+	job.CompletedRepos[did] = listedRevision
+	return nil
 }
 
 func (p PDSProcessor) checkpointPage(job *Job, cursor string, active int) error {
@@ -138,6 +188,21 @@ func (p PDSProcessor) repository(ctx context.Context, client *atmossync.Client, 
 	return p.Manager.Checkpoint(job.ID, string(entry.DID), commit.Rev, job.Cursor)
 }
 
+// repositoryReadErrors records a non-EOF getRepo body failure so it cannot
+// be misclassified as a permanent CAR syntax error by the decoder above it.
+type repositoryReadErrors struct {
+	io.Reader
+	err error
+}
+
+func (r *repositoryReadErrors) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	if err != nil && !errors.Is(err, io.EOF) && r.err == nil {
+		r.err = err
+	}
+	return n, err
+}
+
 func (p PDSProcessor) verifySource(ctx context.Context, did atmos.DID, pds string) error {
 	ident, err := p.Directory.LookupDID(ctx, did)
 	if err != nil {
@@ -153,15 +218,25 @@ func (p PDSProcessor) verifySource(ctx context.Context, did atmos.DID, pds strin
 func fetchRepository(ctx context.Context, client *atmossync.Client, did atmos.DID) (*repo.Repo, *repo.Commit, error) {
 	body, err := client.GetRepoStream(ctx, did, "")
 	if err != nil {
-		return nil, nil, inputFailure(ctx, "repository_unavailable")
+		return nil, nil, &InputError{Code: "repository_unavailable", Unavailable: true}
 	}
 	defer body.Close()
 	// Bound transient full-CAR input. Exceeding the bound is explicit incomplete
 	// coverage; unrelated CAR blocks are never written to Jetstream segments.
 	limited := &io.LimitedReader{R: body, N: 64 << 20}
-	r, commit, err := repo.LoadFromCAR(limited)
+	readErrors := &repositoryReadErrors{Reader: limited}
+	// hypercerts: A direct getRepo response is a full snapshot. Reject a CAR
+	// that parses at a block boundary but omits reachable blocks as unavailable
+	// rather than materializing a partial repository.
+	r, commit, err := repo.LoadCompleteFromCAR(bufio.NewReader(readErrors))
 	if limited.N == 0 {
 		return nil, nil, &InputError{Code: "repository_size_limit", Unavailable: true}
+	}
+	if ctx.Err() != nil || readErrors.err != nil {
+		return nil, nil, &InputError{Code: "repository_unavailable", Unavailable: true}
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return nil, nil, &InputError{Code: "repository_incomplete", Unavailable: true}
 	}
 	if err != nil {
 		return nil, nil, &InputError{Code: "invalid_repository"}
