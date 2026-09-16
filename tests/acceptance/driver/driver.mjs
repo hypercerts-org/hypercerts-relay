@@ -377,12 +377,14 @@ async function t15IdentityRetry() {
 
 async function t15SourceFault() {
   const state = await readT15State()
+  const account = await createAccount(directPDS, 'recovered.pds-a.test', 'recovered@example.test')
+  const record = await createRecord(directPDS, account, 't15-source-transient-record')
   await configureFaults({ targetPDS: 'pds-a', pdsListRepos5xx: true })
   const created = await requestDirectJob('t15-source-fault')
   const incomplete = await waitForJob(created.id, ['incomplete'], 'source fault job')
   const fault = await assertFaultHit('pdsListRepos5xx', 'source fault job')
   await assertNoRejection('source fault job')
-  state.source = { fault, job: jobEvidence(incomplete) }
+  state.source = { did: account.did, rkey: record.rkey, fault, job: jobEvidence(incomplete) }
   await saveT15State(state)
   writeJSON(state.source)
 }

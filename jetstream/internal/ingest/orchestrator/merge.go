@@ -36,6 +36,8 @@ import (
 //     discovery (listRepos resume), RemoveAll the backfill tree,
 //     delete both cursor keys.
 func (o *Orchestrator) runMerge(ctx context.Context) error {
+	// hypercerts: Preserve the split merge phases so verification-aware
+	// bootstrap recovery remains reviewable against copied upstream behavior.
 	return obs.Span(ctx, o.runMergePhases)
 }
 

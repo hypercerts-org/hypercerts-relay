@@ -201,6 +201,8 @@ fs.writeFileSync(outputPath, `${JSON.stringify({
   sealedTipSeq: snapshot.sealedTipSeq,
   archiveEventCount: events.length,
   valid: { did: state.valid.did, rkey: state.valid.rkey, matchingEvents: matches(state.valid.did, state.valid.rkey) },
+  identity: { did: state.identity.did, rkey: state.identity.rkey, matchingEvents: matches(state.identity.did, state.identity.rkey) },
+  source: { did: state.source.did, rkey: state.source.rkey, matchingEvents: matches(state.source.did, state.source.rkey) },
   invalid: { did: state.invalid.did, rkey: state.invalid.rkey, matchingEvents: matches(state.invalid.did, state.invalid.rkey) },
 })}\n`)
 NODE

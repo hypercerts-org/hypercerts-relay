@@ -44,6 +44,8 @@ import (
 // the errgroup cancels both and the error is returned without
 // touching the phase.
 func (o *Orchestrator) runBootstrap(ctx context.Context) error {
+	// hypercerts: Keep the decomposed bootstrap recovery flow explicit while
+	// direct-PDS verification is enforced at the durable writer boundary.
 	return obs.Span(ctx, func(ctx context.Context) error {
 		segmentsDir := filepath.Join(o.cfg.DataDir, "segments")
 		liveSegmentsDir := filepath.Join(o.cfg.DataDir, "backfill", "live_segments")

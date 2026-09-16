@@ -18,11 +18,14 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/internal/simulator/world"
 	metastore "github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/cockroachdb/pebble"
 	"github.com/jcalabro/atmos"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
+	"github.com/jcalabro/atmos/crypto"
+	atmosidentity "github.com/jcalabro/atmos/identity"
 	atmossync "github.com/jcalabro/atmos/sync"
 	"github.com/jcalabro/atmos/xrpc"
 	"github.com/jcalabro/gt"
@@ -335,6 +338,124 @@ func TestRetryRunner_SuccessAppendsResyncAndCompletes(t *testing.T) {
 	require.Equal(t, 0, rs.Backfill.RetryCount)
 	require.True(t, rs.Backfill.NextAttemptAt.IsZero())
 	require.Empty(t, rs.Backfill.LastError)
+}
+
+// TestRetryRunner_DirectoryVerifiesDirectPDSCommits proves the direct-PDS retry
+// route has the same verification boundary as bootstrap and selected backfill:
+// an identity failure remains retryable, while an invalid signature never reaches
+// the resync writer.
+func TestRetryRunner_DirectoryVerifiesDirectPDSCommits(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name                string
+		identityUnavailable bool
+		invalidSignature    bool
+		staleSigningKey     bool
+		wantStatus          Status
+		wantError           string
+	}{
+		{name: "valid", wantStatus: StatusComplete},
+		{name: "stale signing key refreshes", staleSigningKey: true, wantStatus: StatusComplete},
+		{name: "identity unavailable remains replayable", identityUnavailable: true, wantStatus: StatusFailed, wantError: "503"},
+		{name: "invalid signature is not materialized", invalidSignature: true, wantStatus: StatusFailed, wantError: "signature verification failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var stalePub *crypto.K256PublicKey
+			if tc.staleSigningKey {
+				staleKey, err := crypto.GenerateK256()
+				require.NoError(t, err)
+				var ok bool
+				stalePub, ok = staleKey.PublicKey().(*crypto.K256PublicKey)
+				require.True(t, ok)
+			}
+			var plcLookups atomic.Int64
+			account, srv := newSimulatorSignatureFixture(t, 1, 0, func(baseHandler http.Handler, wld *world.World, account world.Account) http.Handler {
+				if tc.staleSigningKey {
+					return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+						if req.URL.Path == "/"+string(account.DID) {
+							plcLookups.Add(1)
+						}
+						baseHandler.ServeHTTP(rw, req)
+					})
+				}
+				if tc.identityUnavailable {
+					return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+						if req.URL.Path == "/"+string(account.DID) {
+							http.Error(rw, "temporary identity outage", http.StatusServiceUnavailable)
+							return
+						}
+						baseHandler.ServeHTTP(rw, req)
+					})
+				}
+				if !tc.invalidSignature {
+					return baseHandler
+				}
+				wrongKey, err := crypto.GenerateK256()
+				require.NoError(t, err)
+				return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+					if req.URL.Path == "/xrpc/com.atproto.sync.getRepo" && req.URL.Query().Get("did") == string(account.DID) {
+						rp, _, err := wld.LoadRepo(account.Index)
+						if err != nil {
+							http.Error(rw, err.Error(), http.StatusInternalServerError)
+							return
+						}
+						rw.Header().Set("Content-Type", "application/vnd.ipld.car")
+						if err := rp.ExportCAR(rw, wrongKey); err != nil {
+							http.Error(rw, err.Error(), http.StatusInternalServerError)
+						}
+						return
+					}
+					baseHandler.ServeHTTP(rw, req)
+				})
+			})
+			st, writer, segmentsDir := newRetryTestWriter(t)
+			backfillStore := NewStore(st, nil)
+			host := mustURLHost(t, srv.URL)
+			now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+			require.NoError(t, backfillStore.onDiscover(t.Context(), host, atmossync.ListReposEntry{DID: account.DID, Active: true}))
+			require.NoError(t, backfillStore.OnFail(t.Context(), account.DID, host, errors.New("bootstrap unavailable"), 1))
+			require.NoError(t, backfillStore.RecordRetryFailure(t.Context(), account.DID, host, errors.New("retry due"), now.Add(-time.Minute)))
+
+			directory := simulatorSignatureDirectory(srv)
+			if tc.staleSigningKey {
+				directory.Cache = atmosidentity.NewLRUCache(1, time.Hour)
+				directory.Cache.Set(t.Context(), "did:"+string(account.DID), &atmosidentity.Identity{
+					DID: account.DID,
+					Keys: map[string]atmosidentity.Key{
+						"atproto": {Type: "Multikey", Multibase: stalePub.Multibase()},
+					},
+				})
+			}
+			runner, err := newRetryRunner(RetryConfig{
+				Store: st, Writer: writer, HTTPClient: srv.Client(), RelayURL: srv.URL,
+				Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Interval: time.Hour,
+				Workers: 1, HostWorkers: 1, MaxDelay: time.Hour, Directory: directory,
+				NewHostClient: func(string) (*atmossync.Client, error) {
+					return atmossync.NewClient(atmossync.Options{Client: &xrpc.Client{
+						Host: srv.URL, HTTPClient: gt.Some(srv.Client()), Retry: gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(1)}),
+					}}), nil
+				},
+				now: func() time.Time { return now },
+			})
+			require.NoError(t, err)
+			require.NoError(t, runner.runPass(t.Context()))
+
+			rs, err := backfillStore.readRepoStatus(account.DID)
+			require.NoError(t, err)
+			require.Equal(t, tc.wantStatus, rs.Backfill.Status)
+			if tc.wantError == "" {
+				if tc.staleSigningKey {
+					require.Equal(t, int64(1), plcLookups.Load(), "a stale cached retry key must be purged before one fresh DID lookup")
+				}
+				require.NotEmpty(t, collectActiveEvents(t, filepath.Join(segmentsDir, ingest.SegmentFilename(0))))
+				return
+			}
+			require.Contains(t, rs.Backfill.LastError, tc.wantError)
+			require.True(t, rs.Backfill.NextAttemptAt.After(now), "retryable failures must retain a durable retry schedule")
+			requireNoMaterializedEvents(t, segmentsDir)
+		})
+	}
 }
 
 // TestRetryRunner_StalePDSFallsBackToRelayAndRestamps covers the migration

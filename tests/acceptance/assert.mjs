@@ -124,13 +124,16 @@ function assertSeedReady(events, bootstrap) {
 }
 
 async function assertT15Archive(events, phase) {
-  if (!phase?.valid?.did || !phase.valid.rkey || !phase?.invalid?.did || !phase.invalid.rkey) {
-    fail('T15 phase artifact is missing valid or invalid record coordinates')
+  if (!phase?.valid?.did || !phase.valid.rkey || !phase?.identity?.did || !phase.identity.rkey ||
+    !phase?.source?.did || !phase.source.rkey || !phase?.invalid?.did || !phase.invalid.rkey) {
+    fail('T15 phase artifact is missing record coordinates')
   }
   // A direct-PDS snapshot materializes the current selected record as an update.
-  const valid = events.filter((event) => event.did === phase.valid.did && event.kind === 'commit' &&
-    event.commit?.operation === 'update' && event.commit?.collection === 'app.bsky.feed.post' && event.commit?.rkey === phase.valid.rkey)
-  if (valid.length !== 1) fail(`T15 archive expected exactly one selected valid record, got ${valid.length}`)
+  for (const [label, record] of [['valid', phase.valid], ['identity retry', phase.identity], ['source retry', phase.source]]) {
+    const selected = events.filter((event) => event.did === record.did && event.kind === 'commit' &&
+      event.commit?.operation === 'update' && event.commit?.collection === 'app.bsky.feed.post' && event.commit?.rkey === record.rkey)
+    if (selected.length !== 1) fail(`T15 archive expected exactly one selected ${label} record, got ${selected.length}`)
+  }
   const invalid = events.filter((event) => event.did === phase.invalid.did && event.kind === 'commit' && event.commit?.rkey === phase.invalid.rkey)
   if (invalid.length !== 0) fail(`T15 archive contains invalid-signature record (${invalid.length} events)`)
 }
