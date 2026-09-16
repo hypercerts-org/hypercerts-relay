@@ -130,5 +130,9 @@ named volumes are also removed. A nonzero result is an observed failure, not a
 skipped case.
 
 No Cloudflare, Railway, public DNS, external PLC, or running deployment is used.
-Rainbow is intentionally absent from T01; [TECH-635](https://linear.app/hypercerts/issue/TECH-635/validate-rainbow-raw-stream-recovery-and-retention)
-owns its persistence/recovery validation.
+Rainbow is intentionally absent from the initial launch and this fixture. There
+are no initial-launch raw-stream consumers, so no `T15-rainbow` or `T16`
+selector is registered. [TECH-635](https://linear.app/hypercerts/issue/TECH-635/validate-rainbow-raw-stream-recovery-and-retention)
+remains backlog work and must prove its persistence/recovery activation gates
+before a Rainbow selector is added. See
+[the launch topology contract](../../docs/contracts/launch-topology.md).
