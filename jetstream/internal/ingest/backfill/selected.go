@@ -23,8 +23,10 @@ type selectedReposConfig struct {
 	Handler          *SegmentHandler
 	SyncClient       *atmossync.Client
 	IdentityResolver atmosidentity.Resolver
-	Metrics          *Metrics
-	OnError          func(atmos.DID, error)
+	// hypercerts: optional identity verification for selected complete CARs.
+	Directory *atmosidentity.Directory
+	Metrics   *Metrics
+	OnError   func(atmos.DID, error)
 
 	MaxRetries     int
 	RetryBaseDelay time.Duration
@@ -130,6 +132,23 @@ func (r *selectedRunner) reportIdentityMetadataError(did atmos.DID, err error) {
 	if r.cfg.OnError != nil {
 		r.cfg.OnError(did, err)
 	}
+}
+
+// verifyCompleteCommit verifies a complete CAR against directory when supplied.
+// On an initial failure it discards the cached identity for did and verifies once
+// more, so a rotated signing key can take effect before the CAR is rejected.
+// A nil directory preserves the relay-trusted behavior for direct callers.
+func verifyCompleteCommit(ctx context.Context, directory *atmosidentity.Directory, did atmos.DID, commit *atmosrepo.Commit) error {
+	if directory == nil {
+		return nil
+	}
+	if err := atmossync.VerifyCommitWithDirectory(ctx, directory, commit); err != nil {
+		directory.Purge(ctx, did)
+		if err := atmossync.VerifyCommitWithDirectory(ctx, directory, commit); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // processRepo mirrors the atmos engine's two-budget retry loop (see
@@ -240,8 +259,10 @@ func selectedBackoffDelay(base, maxDelay time.Duration, attempt int, jitter jitt
 // tryRepo downloads via the relay SyncClient (302→PDS), parses, and
 // hands the repo to the handler. It returns the host the CAR came from
 // (post-redirect) so a failure can be attributed even though no identity
-// resolution happens on this path. Commit signatures are not verified
-// (this debug path mirrors the bootstrap engine's relay-trusted default).
+// resolution happens on this path.
+// hypercerts: Direct callers may omit Directory and retain relay-trusted
+// behavior; production wires the shared live-verifier directory through Config
+// so selected CARs are verified.
 func (r *selectedRunner) tryRepo(ctx context.Context, did atmos.DID) (string, error) {
 	body, host, err := r.cfg.SyncClient.GetRepoStreamHost(ctx, did, "")
 	if err != nil {
@@ -262,6 +283,12 @@ func (r *selectedRunner) tryRepo(ctx context.Context, did atmos.DID) (string, er
 	// engine's check, which this debug path bypasses.
 	if rp.DID != did {
 		return host, fmt.Errorf("backfill: selected: getRepo DID mismatch: requested %s, CAR commit is %s", did, rp.DID)
+	}
+	// hypercerts: verify after complete-CAR and requested-DID checks, before
+	// selected records are materialized. A verification retry refreshes a stale
+	// cached signing key after rotation.
+	if err := verifyCompleteCommit(ctx, r.cfg.Directory, did, commit); err != nil {
+		return host, fmt.Errorf("backfill: selected: verify commit: %w", err)
 	}
 	if err := r.cfg.Handler.HandleRepo(ctx, did, rp, commit); err != nil {
 		return host, err

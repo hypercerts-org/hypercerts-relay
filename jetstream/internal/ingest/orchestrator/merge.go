@@ -120,10 +120,12 @@ func (o *Orchestrator) runMerge(ctx context.Context) error {
 			Metrics:       o.cfg.BackfillMetrics,
 			DropMetrics:   o.cfg.DropMetrics,
 			NewHostClient: o.cfg.BackfillNewHostClient,
-			Interval:      o.cfg.FailedRepoRetryInterval,
-			Workers:       o.cfg.FailedRepoRetryWorkers,
-			HostWorkers:   o.cfg.FailedRepoRetryHostWorkers,
-			MaxDelay:      o.cfg.FailedRepoRetryMaxDelay,
+			// hypercerts: Merge recovery retry shares the runtime live-verifier directory.
+			Directory:   o.cfg.Directory,
+			Interval:    o.cfg.FailedRepoRetryInterval,
+			Workers:     o.cfg.FailedRepoRetryWorkers,
+			HostWorkers: o.cfg.FailedRepoRetryHostWorkers,
+			MaxDelay:    o.cfg.FailedRepoRetryMaxDelay,
 		}); err != nil {
 			if cerr := dst.Close(); cerr != nil {
 				o.logger.WarnContext(ctx, "dst writer close after pending retry error", "err", cerr)

@@ -137,6 +137,8 @@ func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 				BackfillBatchSize: o.cfg.BackfillBatchSize,
 				BackfillRepos:     o.cfg.BackfillRepos,
 				IdentityResolver:  o.cfg.Directory.Resolver,
+				// hypercerts: Bootstrap CAR verification shares the runtime live-verifier directory.
+				Directory:         o.cfg.Directory,
 				RetryBaseDelay:    o.cfg.BackfillRetryBaseDelay,
 				AfterRepoComplete: o.cfg.AfterRepoComplete,
 				CrashInjector:     o.cfg.CrashInjector,

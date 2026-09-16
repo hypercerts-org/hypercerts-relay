@@ -58,6 +58,8 @@ type Config struct {
 
 	BackfillRepos    []atmos.DID
 	IdentityResolver atmosidentity.Resolver
+	// hypercerts: optional identity verification for bootstrap and selected CARs.
+	Directory *atmosidentity.Directory
 
 	MaxRetries     int
 	RetryBaseDelay time.Duration
@@ -167,7 +169,7 @@ func Run(ctx context.Context, cfg Config) error {
 			logger.InfoContext(ctx, "starting selected repo backfill", "repos", len(cfg.BackfillRepos))
 			err := runSelectedRepos(runCtx, selectedReposConfig{
 				Repos: cfg.BackfillRepos, Store: st, Handler: handler,
-				SyncClient: relay, IdentityResolver: cfg.IdentityResolver, Metrics: cfg.Metrics,
+				SyncClient: relay, IdentityResolver: cfg.IdentityResolver, Directory: cfg.Directory, Metrics: cfg.Metrics,
 				MaxRetries: cfg.MaxRetries, RetryBaseDelay: cfg.RetryBaseDelay, RetryMaxDelay: cfg.RetryMaxDelay,
 				OnError: func(did atmos.DID, err error) {
 					if shouldLogBackfillError(err) {
@@ -233,6 +235,12 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 		if cfg.BackfillBatchSize > 0 {
 			engineOpts.BatchSize = gt.Some(cfg.BackfillBatchSize)
+		}
+		// hypercerts: opt into Atmos complete-CAR signature checks only when
+		// callers provide a directory, retaining compatibility for direct callers.
+		if cfg.Directory != nil {
+			engineOpts.Directory = gt.Some(cfg.Directory)
+			engineOpts.VerifyCommits = gt.Some(true)
 		}
 		if cfg.MaxRetries > 0 {
 			engineOpts.MaxRetries = gt.Some(cfg.MaxRetries)

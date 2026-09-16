@@ -127,10 +127,12 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 					Metrics:       o.cfg.BackfillMetrics,
 					DropMetrics:   o.cfg.DropMetrics,
 					NewHostClient: o.cfg.BackfillNewHostClient,
-					Interval:      o.cfg.FailedRepoRetryInterval,
-					Workers:       o.cfg.FailedRepoRetryWorkers,
-					HostWorkers:   o.cfg.FailedRepoRetryHostWorkers,
-					MaxDelay:      o.cfg.FailedRepoRetryMaxDelay,
+					// hypercerts: Steady retry shares the runtime live-verifier directory.
+					Directory:   o.cfg.Directory,
+					Interval:    o.cfg.FailedRepoRetryInterval,
+					Workers:     o.cfg.FailedRepoRetryWorkers,
+					HostWorkers: o.cfg.FailedRepoRetryHostWorkers,
+					MaxDelay:    o.cfg.FailedRepoRetryMaxDelay,
 				})
 				if errors.Is(err, context.Canceled) {
 					return nil
