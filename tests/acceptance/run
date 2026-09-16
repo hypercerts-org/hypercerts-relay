@@ -3,19 +3,21 @@
 set -euo pipefail
 
 case_id=${1:-}
-if [[ $# -ne 1 || "$case_id" != "T01" ]]; then
-  printf '%s\n' 'usage: ./tests/acceptance/run T01' >&2
-  printf '%s\n' 'T15-core is intentionally not implemented by TECH-634 and must fail.' >&2
+if [[ $# -ne 1 || ( "$case_id" != "T01" && "$case_id" != "T15-core" ) ]]; then
+  printf '%s\n' 'usage: ./tests/acceptance/run T01|T15-core' >&2
   exit 64
 fi
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 mkdir -p "$root/tests/acceptance/results"
-run_dir=$(mktemp -d "$root/tests/acceptance/results/T01.XXXXXX")
-project="hc-t01-$(basename "$run_dir" | tr -cd '[:alnum:]' | tr '[:upper:]' '[:lower:]')"
+run_dir=$(mktemp -d "$root/tests/acceptance/results/${case_id}.XXXXXX")
+project="hc-$(basename "$run_dir" | tr -cd '[:alnum:]' | tr '[:upper:]' '[:lower:]')"
 env_file="$run_dir/.env"
 compose=(docker compose --project-name "$project" --env-file "$env_file" -f "$root/docker-compose.acceptance.yml")
 consumer_pid=''
+t15_archive_raw=''
+t15_archive_stderr=''
+t15_snapshot=''
 
 cleanup() {
   status=$?
@@ -24,7 +26,7 @@ cleanup() {
   "${compose[@]}" down --volumes --remove-orphans >>"$run_dir/compose.log" 2>&1 || true
   # The runner's generated file contains all ephemeral credentials. Keep only
   # sanitized evidence and source revisions in the retained result directory.
-  rm -f "$env_file"
+  rm -f "$env_file" "$t15_archive_raw" "$t15_archive_stderr" "$t15_snapshot"
   exit "$status"
 }
 trap cleanup EXIT INT TERM
@@ -41,6 +43,55 @@ sock = socket.socket()
 sock.bind(('127.0.0.1', 0))
 print(sock.getsockname()[1])
 sock.close()
+PY
+}
+write_executed_tree_manifest() {
+  python3 - "$root" "$run_dir/executed-tree.json" <<'PY'
+import hashlib
+import json
+import os
+import subprocess
+import sys
+
+root, output = sys.argv[1:]
+base = subprocess.check_output(["git", "-C", root, "rev-parse", "HEAD"], text=True).strip()
+status = subprocess.check_output(
+    ["git", "-C", root, "status", "--porcelain=v1", "-z", "--untracked-files=all"]
+)
+entries = []
+items = status.split(b"\0")
+index = 0
+while index < len(items) and items[index]:
+    item = items[index]
+    code = item[:2].decode("ascii")
+    path = item[3:].decode("utf-8", "surrogateescape")
+    index += 1
+    entry = {"path": path, "status": code}
+    if "R" in code or "C" in code:
+        entry["previousPath"] = items[index].decode("utf-8", "surrogateescape")
+        index += 1
+    full_path = os.path.join(root, path)
+    if os.path.islink(full_path):
+        entry["contentSHA256"] = hashlib.sha256(("symlink:" + os.readlink(full_path)).encode()).hexdigest()
+    elif os.path.isfile(full_path):
+        digest = hashlib.sha256()
+        with open(full_path, "rb") as source:
+            for chunk in iter(lambda: source.read(1 << 20), b""):
+                digest.update(chunk)
+        entry["contentSHA256"] = digest.hexdigest()
+    else:
+        entry["contentSHA256"] = None
+    entries.append(entry)
+
+encoded_entries = json.dumps(entries, sort_keys=True, separators=(",", ":")).encode()
+manifest = {
+    "baseRevision": base,
+    "dirty": entries,
+    "dirtyContentSHA256": hashlib.sha256(encoded_entries).hexdigest(),
+}
+with open(output, "w", encoding="utf-8") as destination:
+    json.dump(manifest, destination, sort_keys=True, separators=(",", ":"))
+    destination.write("\n")
 PY
 }
 wait_for_http() {
@@ -72,6 +123,7 @@ cat >"$env_file" <<EOF
 ACCEPTANCE_STATE_DIR=$run_dir
 JETSTREAM_HOST_PORT=$(free_port)
 RELAY_CONTROL_TOKEN=$(random_hex 32)
+JETSTREAM_CONTROL_TOKEN=$(random_hex 32)
 RELAY_ADMIN_PASSWORD=$(random_hex 24)
 PDS_A_JWT_SECRET=$(random_hex 32)
 PDS_A_ADMIN_PASSWORD=$(random_hex 24)
@@ -84,13 +136,81 @@ chmod 600 "$env_file"
 printf '%s\n' "run directory: $run_dir"
 git -C "$root" rev-parse HEAD >"$run_dir/relay-revision"
 git -C "$root/jetstream" rev-parse HEAD >"$run_dir/jetstream-revision"
+write_executed_tree_manifest
 
 "${compose[@]}" config --quiet
 "${compose[@]}" up --build --detach
 
 jetstream_port=$(awk -F= '$1 == "JETSTREAM_HOST_PORT" { print $2 }' "$env_file")
 jetstream_url="http://127.0.0.1:$jetstream_port"
-wait_for_http "$jetstream_url/" Jetstream
+if [[ "$case_id" == "T01" ]]; then
+  wait_for_http "$jetstream_url/" Jetstream
+fi
+
+if [[ "$case_id" == "T15-core" ]]; then
+  # Each phase writes sanitized job/rejection coordinates. The driver reads the
+  # control credential only from its mounted disposable secret file.
+  "${compose[@]}" exec --no-TTY driver node /app/driver.mjs t15-valid | tee "$run_dir/t15-valid.json"
+  "${compose[@]}" exec --no-TTY driver node /app/driver.mjs t15-identity-fault | tee "$run_dir/t15-identity-fault.json"
+  "${compose[@]}" restart jetstream
+  "${compose[@]}" exec --no-TTY driver node /app/driver.mjs t15-identity-retry | tee "$run_dir/t15-identity-retry.json"
+  "${compose[@]}" exec --no-TTY driver node /app/driver.mjs t15-source-fault | tee "$run_dir/t15-source-fault.json"
+  "${compose[@]}" restart jetstream
+  "${compose[@]}" exec --no-TTY driver node /app/driver.mjs t15-source-retry | tee "$run_dir/t15-source-retry.json"
+  "${compose[@]}" exec --no-TTY driver node /app/driver.mjs t15-invalid-signature | tee "$run_dir/t15-invalid-signature.json"
+  "${compose[@]}" restart jetstream
+  "${compose[@]}" exec --no-TTY driver node /app/driver.mjs t15-check-rejection | tee "$run_dir/t15-rejection.json"
+
+  curl --fail --silent --show-error --request POST "$jetstream_url/hypercerts/acceptance/seal"
+  t15_snapshot=$(mktemp "$run_dir/.t15-archive-snapshot.XXXXXX")
+  curl --fail --silent --show-error --request POST \
+    --header 'content-type: application/json' \
+    --data '{}' \
+    "$jetstream_url/xrpc/network.bsky.jetstream.planSnapshot" >"$t15_snapshot"
+  sealed=$(node -e 'const fs = require("fs"); const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8")).sealedTipSeq; process.stdout.write(Number.isSafeInteger(value) ? String(value) : "0")' "$t15_snapshot")
+  if (( sealed <= 0 )); then
+    printf '%s\n' 'T15-core did not produce a sealed archive boundary' >&2
+    exit 1
+  fi
+  # The archive client emits decoded record payloads. Keep that raw output only
+  # long enough to assert it, then retain a coordinate/count-only summary.
+  t15_archive_raw=$(mktemp "$run_dir/.t15-archive.ndjson.XXXXXX")
+  t15_archive_stderr=$(mktemp "$run_dir/.t15-archive.stderr.XXXXXX")
+  (
+    cd "$root/jetstream"
+    go run ./cmd/client \
+      --host "127.0.0.1:$jetstream_port" \
+      --after-seq 0 \
+      --before-seq "$sealed" \
+      --backfill-only \
+      --collection app.bsky.feed.post \
+      --batch-size 1 \
+      --zstd=false \
+      --print
+  ) >"$t15_archive_raw" 2>"$t15_archive_stderr"
+  "${compose[@]}" exec --no-TTY driver cat /state/t15-state.json >"$run_dir/t15-state.json"
+  node "$root/tests/acceptance/assert.mjs" t15-archive "$run_dir/t15-state.json" "$t15_archive_raw"
+  node - "$run_dir/t15-state.json" "$t15_snapshot" "$t15_archive_raw" "$run_dir/t15-archive-evidence.json" <<'NODE'
+const fs = require('fs')
+const [statePath, snapshotPath, archivePath, outputPath] = process.argv.slice(2)
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'))
+const snapshot = JSON.parse(fs.readFileSync(snapshotPath, 'utf8'))
+const events = fs.readFileSync(archivePath, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line))
+const matches = (did, rkey) => events.filter((event) => event.did === did && event.kind === 'commit' && event.commit?.rkey === rkey).length
+fs.writeFileSync(outputPath, `${JSON.stringify({
+  sealedTipSeq: snapshot.sealedTipSeq,
+  archiveEventCount: events.length,
+  valid: { did: state.valid.did, rkey: state.valid.rkey, matchingEvents: matches(state.valid.did, state.valid.rkey) },
+  invalid: { did: state.invalid.did, rkey: state.invalid.rkey, matchingEvents: matches(state.invalid.did, state.invalid.rkey) },
+})}\n`)
+NODE
+  rm -f "$t15_archive_raw" "$t15_archive_stderr" "$t15_snapshot"
+  t15_archive_raw=''
+  t15_archive_stderr=''
+  t15_snapshot=''
+  printf '%s\n' 'T15-core passed: direct-PDS selection completed, transient identity/source faults recovered after restart, and an invalid signature was durably rejected without archive materialization.'
+  exit 0
+fi
 
 "${compose[@]}" exec --no-TTY driver node /app/driver.mjs bootstrap | tee "$run_dir/bootstrap.json"
 

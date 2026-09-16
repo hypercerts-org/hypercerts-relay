@@ -12,8 +12,9 @@ The private Jetstream interface provides:
 - `GET`, `POST` and `DELETE /hypercerts/v1/sources`;
 - `GET /hypercerts/v1/jobs`, `POST /hypercerts/v1/jobs`, and
   `GET /hypercerts/v1/jobs/{id}`;
-- `POST /hypercerts/v1/jobs/{id}/cancel` and `/retry`; and
-- `GET /hypercerts/v1/coverage`.
+- `POST /hypercerts/v1/jobs/{id}/cancel` and `/retry`;
+- `GET /hypercerts/v1/coverage`; and
+- `GET /hypercerts/v1/snapshot-rejections`.
 
 Job requests and retry/cancel actions use durable, separate receipt namespaces.
 `POST /jobs` accepts an optional JSON `requestId` of at most 128 bytes. The same
@@ -53,6 +54,31 @@ as historical proof.
 | Policy/source changes cancel obsolete work; removal preserves archive | [TECH-596](https://linear.app/hypercerts/issue/TECH-596/backfill-record-collections-for-a-pds) |
 | Crash, retry, receipt and checkpoint handling | [TECH-596](https://linear.app/hypercerts/issue/TECH-596/backfill-record-collections-for-a-pds) |
 | Complete/incomplete/failed coverage wording | [TECH-597](https://linear.app/hypercerts/issue/TECH-597/expose-jetstream-backfill-progress-and-coverage) |
+| Real-process direct-PDS verification/restart matrix | [TECH-634](https://linear.app/hypercerts/issue/TECH-634/unify-jetstream-acquisition-verification-and-durability-fault-coverage), `./tests/acceptance/run T15-core` |
+
+`GET /hypercerts/v1/snapshot-rejections` accepts the normal private bearer
+credential, optional repeated `pds` filters, `limit` (1–200), and an opaque
+`after` cursor. It returns only bounded non-payload rejection metadata:
+origin, policy revision, DID, listed revision, rejection kind/code and timestamp.
+It must not expose CAR bytes, records, repository tokens, or durable storage
+keys. A permanent direct-PDS snapshot rejection is not inventory progress; it
+survives restart and the job remains failed until an operator retry reaches a
+changed or valid input.
+
+`T15-core` is the real-process acceptance evidence owner for the current direct
+PDS matrix. It authenticates and polls the private control `GET /policy` before
+control calls, including retry phases after each Jetstream restart; it does not
+use a public root-route response as readiness. It adds the source, proves a
+selected record reaches the archive, injects targeted transient PLC-DID and
+PDS-listRepos 5xx responses, and records bounded non-payload proxy hit evidence
+for each configured route. It then substitutes the target DID signing key to
+prove one durable non-payload rejection and no archive materialization. Archive
+client output is temporary for the assertion and is deleted; retained archive
+evidence is sanitized coordinates/count only. The runner also retains the base
+revision and an executed-tree dirty manifest containing paths/statuses and
+content digests, not source content, credentials, or payloads. Retained
+per-phase artifacts are evidence of a run, not a claim that a run passed unless
+the command exit/result says so.
 
 [TECH-597](https://linear.app/hypercerts/issue/TECH-597/expose-jetstream-backfill-progress-and-coverage)
 also owns the compatibility test for reading older persisted job JSON while no

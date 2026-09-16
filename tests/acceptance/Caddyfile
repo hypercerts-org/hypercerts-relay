@@ -2,17 +2,26 @@
 	auto_https disable_redirects
 }
 
+# The acceptance fault proxy is default-pass-through. Its only controls are
+# Docker-internal and used by T15-core; every public fixture address still has
+# this Caddy-issued TLS identity.
 https://plc.test {
 	tls internal
-	reverse_proxy plc:2582
+	reverse_proxy fault-proxy:3000 {
+		header_up X-Acceptance-Upstream plc
+	}
 }
 
 https://pds-a.test {
 	tls internal
-	reverse_proxy pds-a:3000
+	reverse_proxy fault-proxy:3000 {
+		header_up X-Acceptance-Upstream pds-a
+	}
 }
 
 https://pds-b.test {
 	tls internal
-	reverse_proxy pds-b:3000
+	reverse_proxy fault-proxy:3000 {
+		header_up X-Acceptance-Upstream pds-b
+	}
 }
