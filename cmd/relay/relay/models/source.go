@@ -43,7 +43,7 @@ type Source struct {
 	ValidationCheckedAt *time.Time             `gorm:"column:validation_checked_at" json:"validationCheckedAt,omitempty"`
 	ValidationReason    SourceValidationReason `gorm:"column:validation_reason;not null;default:''" json:"validationReason,omitempty"`
 
-	// RecoveryRequired remains true until the Plan 006 recovery owner records a
+	// RecoveryRequired remains true until TECH-637 records a
 	// durable boundary. Relay lifecycle changes never clear it.
 	// Creation paths explicitly require recovery; preserve a completed boundary's false value.
 	RecoveryRequired bool `gorm:"column:recovery_required;not null" json:"recoveryRequired"`

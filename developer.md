@@ -2,7 +2,7 @@
 
 `docker-compose.pds-fixture.yml` runs two separately stateful official AT Protocol
 PDS containers and two Cloudflare Tunnel sidecars. It is a developer fixture for
-constructing the controlled two-PDS topology required by Plan 001. It is **not** a
+constructing the controlled two-PDS topology required by [TECH-594](https://linear.app/hypercerts/issue/TECH-594/connect-jetstream-v2-to-the-hypercerts-indigo-relay). It is **not** a
 production deployment, a Relay/Rainbow/Jetstream Compose stack, or an acceptance
 pass by itself.
 
@@ -126,10 +126,11 @@ routes, or any data already delivered to another service. Remove named tunnels a
 DNS routes through the private Cloudflare configuration after the test, and record
 that cleanup separately.
 
-## Plan 001 local acceptance topology
+## Local acceptance topology
 
 The Cloudflare fixture above is for an explicitly requested public-PDS exercise.
-Plan 001's disposable T01 topology instead uses
+[TECH-594](https://linear.app/hypercerts/issue/TECH-594/connect-jetstream-v2-to-the-hypercerts-indigo-relay)'s
+disposable T01 topology instead uses
 [`docker-compose.acceptance.yml`](docker-compose.acceptance.yml) and
 [`tests/acceptance/run`](tests/acceptance/run). It starts two real PDS containers,
 a local `@did-plc/server`, local internal TLS/DNS, an acceptance-tag Relay, and
@@ -142,6 +143,6 @@ Run only its declared case:
 
 See [`tests/acceptance/README.md`](tests/acceptance/README.md) for boundaries and
 requirements. T01 does not replace T15-core fault characterization, Rainbow
-recovery work, or the account-alert baseline diagnosis. A Plan 001 completion
-record still needs the actual runner result, exact commands/revisions, and the
-documented baseline outcome.
+recovery work, or the account-alert baseline diagnosis. The acceptance record
+must retain the actual runner result, exact commands/revisions, and the documented
+baseline outcome.
