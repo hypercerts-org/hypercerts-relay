@@ -47,6 +47,9 @@ func (r *Relay) SubscribeToHost(ctx context.Context, hostname string, noSSL, adm
 
 // hypercerts: Restart from durable policy, including quiet and previously unavailable sources.
 func (r *Relay) ResubscribeAllHosts(ctx context.Context) error {
+	if err := r.requireRateAdmission(ctx); err != nil {
+		return err
+	}
 	var after uint64
 	for {
 		var sources []models.Source
