@@ -6,6 +6,10 @@ archive/live test for [TECH-594](https://linear.app/hypercerts/issue/TECH-594/co
 for [TECH-634](https://linear.app/hypercerts/issue/TECH-634/unify-jetstream-acquisition-verification-and-durability-fault-coverage).
 `./tests/acceptance/run T03-lifecycle` owns the local private-control lifecycle
 receipt seam for [TECH-637](https://linear.app/hypercerts/issue/TECH-637/persist-cross-service-recovery-receipts-for-admitted-pdss).
+`./tests/acceptance/run T02`, `T03-jobs`, `T05`, `T06`, `T08`, and `T09` own
+the durable direct-PDS inventory, receipt retry, cancellation/restart, invalid
+snapshot, and bounded control-view evidence for Plan 006. They use the real
+Jetstream job/control owners, not a placeholder process.
 `./tests/acceptance/run T04`, `T07`, and `T15-selection` own the executable
 selected-record storage evidence for [TECH-595](https://linear.app/hypercerts/issue/TECH-595/store-only-enabled-record-collections-in-jetstream-v2).
 Unknown selectors fail with exit 64.
@@ -69,9 +73,15 @@ directory and removes containers and named volumes on exit.
 
 ```sh
 ./tests/acceptance/run T01
+./tests/acceptance/run T02
 ./tests/acceptance/run T03-lifecycle
+./tests/acceptance/run T03-jobs
 ./tests/acceptance/run T04
+./tests/acceptance/run T05
+./tests/acceptance/run T06
 ./tests/acceptance/run T07
+./tests/acceptance/run T08
+./tests/acceptance/run T09
 ./tests/acceptance/run T15-core
 ./tests/acceptance/run T15-selection
 ```
