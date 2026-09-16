@@ -36,42 +36,52 @@ import (
 //     discovery (listRepos resume), RemoveAll the backfill tree,
 //     delete both cursor keys.
 func (o *Orchestrator) runMerge(ctx context.Context) error {
-	return obs.Span(ctx, func(ctx context.Context) error {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
+	return obs.Span(ctx, o.runMergePhases)
+}
 
-		start := time.Now()
-		defer func() { o.cfg.Metrics.observeState("merge", time.Since(start).Seconds()) }()
+func (o *Orchestrator) runMergePhases(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
-		liveSegmentsDir := filepath.Join(o.cfg.DataDir, "backfill", "live_segments")
-		segmentsDir := filepath.Join(o.cfg.DataDir, "segments")
-		cleaned, err := o.mergeRestartAfterCleanup(ctx, liveSegmentsDir)
-		if err != nil {
-			return err
-		}
-		if cleaned {
-			return nil
-		}
-		if err := o.sealActiveMergeSource(ctx, liveSegmentsDir); err != nil {
-			return err
-		}
-		dst, err := o.openMergeDestination(segmentsDir)
-		if err != nil {
-			return fmt.Errorf("orchestrator: merge: open dst writer: %w", err)
-		}
-		runner := newMergeRunner(dst, o.cfg.Store, liveSegmentsDir, o.cfg.FS, o.cfg.Logger, o.cfg.Metrics, o.cfg.CrashInjector)
-		if err := o.runMergeIntoDestination(ctx, dst, runner, segmentsDir); err != nil {
-			return err
-		}
-		if err := o.runMergeDiscovery(ctx, runner); err != nil {
-			return err
-		}
-		if err := o.simulateCrash(ctx, crashpoint.AfterMergeDiscoveryBeforeCleanup); err != nil {
-			return err
-		}
-		return o.cleanupMergedBackfill(ctx)
-	})
+	start := time.Now()
+	defer func() { o.cfg.Metrics.observeState("merge", time.Since(start).Seconds()) }()
+
+	liveSegmentsDir := filepath.Join(o.cfg.DataDir, "backfill", "live_segments")
+	segmentsDir := filepath.Join(o.cfg.DataDir, "segments")
+	cleaned, err := o.prepareMergeSource(ctx, liveSegmentsDir)
+	if err != nil {
+		return err
+	}
+	if cleaned {
+		return nil
+	}
+	dst, err := o.openMergeDestination(segmentsDir)
+	if err != nil {
+		return fmt.Errorf("orchestrator: merge: open dst writer: %w", err)
+	}
+	runner := newMergeRunner(dst, o.cfg.Store, liveSegmentsDir, o.cfg.FS, o.cfg.Logger, o.cfg.Metrics, o.cfg.CrashInjector)
+	if err := o.runMergeIntoDestination(ctx, dst, runner, segmentsDir); err != nil {
+		return err
+	}
+	if err := o.runMergeDiscovery(ctx, runner); err != nil {
+		return err
+	}
+	if err := o.simulateCrash(ctx, crashpoint.AfterMergeDiscoveryBeforeCleanup); err != nil {
+		return err
+	}
+	return o.cleanupMergedBackfill(ctx)
+}
+
+func (o *Orchestrator) prepareMergeSource(ctx context.Context, liveSegmentsDir string) (bool, error) {
+	cleaned, err := o.mergeRestartAfterCleanup(ctx, liveSegmentsDir)
+	if err != nil || cleaned {
+		return cleaned, err
+	}
+	if err := o.sealActiveMergeSource(ctx, liveSegmentsDir); err != nil {
+		return false, err
+	}
+	return false, nil
 }
 
 // mergeRestartAfterCleanup handles a restart after the prior process removed
