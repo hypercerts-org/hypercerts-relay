@@ -257,6 +257,54 @@ func TestPrivateLifecycleAndCoverage(t *testing.T) {
 	require.Equal(t, 204, request(h, "DELETE", "/sources", `{"pds":"https://pds.example"}`, testToken).Code)
 }
 
+// TestT10CoverageTruthfulness proves a configured source is not silently
+// promoted to complete: it has no coverage before a job, and an unavailable
+// current-state acquisition stays explicitly incomplete. Historical provenance
+// is intentionally not inferred by this owner.
+func TestT10CoverageTruthfulness(t *testing.T) {
+	h, m := setup(t)
+	job, err := m.AddSource("https://offline.example")
+	require.NoError(t, err)
+
+	before := request(h, "GET", "/coverage", "", testToken)
+	require.Equal(t, http.StatusOK, before.Code)
+	var empty struct {
+		Items []coverageView `json:"items"`
+	}
+	require.NoError(t, json.Unmarshal(before.Body.Bytes(), &empty))
+	require.Len(t, empty.Items, 1)
+	require.Equal(t, jobs.Pending, empty.Items[0].State)
+	require.Equal(t, "current_state", empty.Items[0].Coverage)
+	require.NotEqual(t, jobs.Complete, empty.Items[0].State, "a configured source without a completed observation is unknown, not complete")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- m.Run(ctx, func(context.Context, jobs.Job) error {
+			return &jobs.InputError{Code: "source_unavailable", Unavailable: true}
+		})
+	}()
+	require.Eventually(t, func() bool {
+		current, getErr := m.Get(job.ID)
+		return getErr == nil && current.State == jobs.Incomplete
+	}, time.Second, time.Millisecond)
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+
+	after := request(h, "GET", "/coverage", "", testToken)
+	require.Equal(t, http.StatusOK, after.Code)
+	var page struct {
+		Items []coverageView `json:"items"`
+	}
+	require.NoError(t, json.Unmarshal(after.Body.Bytes(), &page))
+	require.Len(t, page.Items, 1)
+	require.Equal(t, "https://offline.example", page.Items[0].PDS)
+	require.Equal(t, jobs.Incomplete, page.Items[0].State)
+	require.Equal(t, "current_state", page.Items[0].Coverage)
+	require.Equal(t, "source_unavailable", page.Items[0].ErrorCode)
+	require.NotContains(t, after.Body.String(), "historical")
+}
+
 func TestCoverageSelectionPaginationAndSummary(t *testing.T) {
 	created := time.Date(2026, time.September, 15, 12, 0, 0, 0, time.UTC)
 	jobsList := []jobs.Job{
