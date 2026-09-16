@@ -61,7 +61,7 @@ netsync-out/
 /administration/test-results/
 /administration/playwright-report/
 
-# Disposable Plan 001 acceptance state and generated fixture credentials.
+# Disposable acceptance state and generated fixture credentials.
 /tests/acceptance/results/
 /tests/acceptance/.env
 

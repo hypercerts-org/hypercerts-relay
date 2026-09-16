@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Plan 001 disposable acceptance entry point. It owns only tests/acceptance/results.
+# TECH-594 disposable acceptance entry point. It owns only tests/acceptance/results.
 set -euo pipefail
 
 case_id=${1:-}
 if [[ $# -ne 1 || "$case_id" != "T01" ]]; then
   printf '%s\n' 'usage: ./tests/acceptance/run T01' >&2
-  printf '%s\n' 'T15-core is intentionally not implemented by Plan 001 and must fail.' >&2
+  printf '%s\n' 'T15-core is intentionally not implemented by TECH-634 and must fail.' >&2
   exit 64
 fi
 

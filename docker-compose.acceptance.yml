@@ -1,4 +1,4 @@
-# Self-contained, disposable Plan 001 T01 topology.
+# Self-contained, disposable TECH-594 T01 topology.
 #
 # The runner writes an ignored environment file and invokes this manifest. It
 # deliberately has no Cloudflare, public DNS, Railway, or production endpoint.
