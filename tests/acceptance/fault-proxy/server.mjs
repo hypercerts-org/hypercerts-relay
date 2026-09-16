@@ -72,7 +72,11 @@ function validFaults(value) {
 
 function targetDID(pathname) {
   const parts = pathname.split('?', 1)[0].split('/').filter(Boolean)
-  return parts.at(-1) ?? ''
+  try {
+    return decodeURIComponent(parts.at(-1) ?? '')
+  } catch {
+    return ''
+  }
 }
 
 function selectedUpstream(value) {
