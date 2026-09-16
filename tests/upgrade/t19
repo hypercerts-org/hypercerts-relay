@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# Fully disposable copied-state forward-upgrade and restore qualification.
+set -euo pipefail
+
+if [[ $# -ne 1 || "$1" != "T19" ]]; then
+	printf '%s\n' 'usage: ./tests/upgrade/t19 T19' >&2
+	exit 64
+fi
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+# Plan 007 is the selected, rate-policy-capable predecessor. Plan 009 is the
+# selected candidate: Rainbow is intentionally deferred, so it has no runtime
+# state in this qualification.
+predecessor_input=${T19_PREDECESSOR_REVISION:-58d0d26b}
+candidate_input=${T19_CANDIDATE_REVISION:-2d8b9535}
+predecessor=$(git -C "$root" rev-parse "${predecessor_input}^{commit}")
+candidate=$(git -C "$root" rev-parse "${candidate_input}^{commit}")
+
+if ! git -C "$root" merge-base --is-ancestor "$predecessor" "$candidate"; then
+	printf 'T19 requires a forward candidate: %s is not an ancestor of %s\n' "$predecessor" "$candidate" >&2
+	exit 64
+fi
+
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/hypercerts-t19.XXXXXX")
+old_tree="$scratch/predecessor"
+new_tree="$scratch/candidate"
+state="$scratch/state"
+snapshot="$scratch/snapshot"
+restored="$scratch/restored"
+evidence_dir=${T19_RESULTS_DIR:-"$root/tests/acceptance/results"}
+mkdir -p "$evidence_dir"
+evidence=$(mktemp -d "$evidence_dir/T19.XXXXXX")
+
+cleanup() {
+	status=$?
+	git -C "$root" worktree remove --force "$old_tree" >/dev/null 2>&1 || true
+	git -C "$root" worktree remove --force "$new_tree" >/dev/null 2>&1 || true
+	rm -rf "$scratch"
+	exit "$status"
+}
+trap cleanup EXIT INT TERM
+
+git -C "$root" worktree add --detach "$old_tree" "$predecessor" >/dev/null
+git -C "$root" worktree add --detach "$new_tree" "$candidate" >/dev/null
+
+install_helpers() {
+	local tree=$1
+	mkdir -p "$tree/cmd/t19-relay-state" "$tree/jetstream/cmd/t19-state"
+	cp "$root/tests/upgrade/t19-relay-state.go.tmpl" "$tree/cmd/t19-relay-state/main.go"
+	cp "$root/tests/upgrade/t19-jetstream-state.go.tmpl" "$tree/jetstream/cmd/t19-state/main.go"
+}
+install_helpers "$old_tree"
+install_helpers "$new_tree"
+
+# Seed only through the predecessor's real persistence owners. Copy the entire
+# stopped-state bundle after every store has closed; copying a live database or
+# Pebble directory would be an invalid restore claim.
+GOCACHE="${GOCACHE:-/tmp/hypercerts-relay-go-cache}" go -C "$old_tree" run ./cmd/t19-relay-state --mode seed --data-dir "$state/relay" >"$evidence/predecessor-relay.json"
+GOCACHE="${GOCACHE:-/tmp/hypercerts-relay-go-cache}" go -C "$old_tree/jetstream" run ./cmd/t19-state --mode seed --data-dir "$state/jetstream" >"$evidence/predecessor-jetstream.json"
+cp -a "$state" "$snapshot"
+cp -a "$snapshot" "$restored"
+
+# The candidate must open and validate both the direct forward state and an
+# independently copied restore. These checks fail on a schema/format mismatch,
+# a missing archive record, a changed policy/job/source coordinate, or cursor
+# loss; they do not merely prove that images build.
+GOCACHE="${GOCACHE:-/tmp/hypercerts-relay-go-cache}" go -C "$new_tree" run ./cmd/t19-relay-state --mode verify --data-dir "$state/relay" >"$evidence/forward-relay.json"
+GOCACHE="${GOCACHE:-/tmp/hypercerts-relay-go-cache}" go -C "$new_tree/jetstream" run ./cmd/t19-state --mode verify --data-dir "$state/jetstream" >"$evidence/forward-jetstream.json"
+GOCACHE="${GOCACHE:-/tmp/hypercerts-relay-go-cache}" go -C "$new_tree" run ./cmd/t19-relay-state --mode verify --data-dir "$restored/relay" >"$evidence/restore-relay.json"
+GOCACHE="${GOCACHE:-/tmp/hypercerts-relay-go-cache}" go -C "$new_tree/jetstream" run ./cmd/t19-state --mode verify --data-dir "$restored/jetstream" >"$evidence/restore-jetstream.json"
+
+python3 - "$evidence/manifest.json" "$predecessor" "$candidate" <<'PY'
+import json
+import sys
+
+path, predecessor, candidate = sys.argv[1:]
+json.dump({
+    "selector": "T19",
+    "predecessor": predecessor,
+    "candidate": candidate,
+    "mode": "forward_upgrade_and_restore_only",
+    "state": {
+        "relay": ["raw_crawl_event", "source", "recovery_receipt", "rate_policy", "durable_cursor"],
+        "jetstream": ["sealed_selected_archive", "collection_policy", "backfill_jobs", "upstream_cursor"],
+    },
+    "excluded": [
+        "Rainbow (deferred from initial launch)",
+        "live Railway/PostgreSQL snapshot service",
+        "capacity, lag, RPO, RTO, and production recovery-SLA measurements",
+        "binary rollback after migration",
+    ],
+}, open(path, "w", encoding="utf-8"), sort_keys=True, indent=2)
+PY
+
+printf 'T19 passed: copied predecessor state %s opened under forward candidate %s and under an independent restore copy. Evidence: %s\n' "$predecessor" "$candidate" "$evidence"
