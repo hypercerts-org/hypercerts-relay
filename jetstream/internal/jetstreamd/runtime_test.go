@@ -347,6 +347,54 @@ func TestClose_CancelsAndDrainsRunBeforeClosingStores(t *testing.T) {
 	require.Nil(t, rt.metaStore, "Close must close the store only after Run drains")
 }
 
+func TestValidateRelayControlURLTransport(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		url     string
+		railway bool
+		valid   bool
+	}{
+		{name: "HTTPS", url: "https://relay.example", valid: true},
+		{name: "HTTPS trailing slash", url: "https://relay.example/", valid: true},
+		{name: "loopback hostname HTTP", url: "http://localhost:2470", valid: true},
+		{name: "loopback IPv4 HTTP", url: "http://127.0.0.2:2470", valid: true},
+		{name: "loopback IPv6 HTTP", url: "http://[::1]:2470", valid: true},
+		{name: "Railway private HTTP", url: "http://relay.railway.internal:2470", railway: true, valid: true},
+		{name: "Railway private HTTP disabled", url: "http://relay.railway.internal:2470"},
+		{name: "public HTTP", url: "http://relay.example"},
+		{name: "nested Railway hostname", url: "http://relay.internal.railway.internal"},
+		{name: "Railway suffix impersonation", url: "http://relay.railway.internal.example"},
+		{name: "embedded credentials", url: "https://token@relay.example"},
+		{name: "path", url: "https://relay.example/control"},
+		{name: "query", url: "https://relay.example?next=elsewhere"},
+		{name: "fragment", url: "https://relay.example#fragment"},
+		{name: "non HTTP scheme", url: "ftp://relay.example"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateRelayControlURL(test.url, test.railway)
+			if test.valid {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestBuildEnablesRailwayRelayControlHTTPOnlyWithStartupOptIn(t *testing.T) {
+	opts := testOptions(t)
+	opts.RelayControlURL = "http://relay.railway.internal:2470"
+	opts.RelayControlToken = "fixture-service-credential-32-bytes-minimum"
+	t.Setenv("HC_RAILWAY_STARTUP", "")
+	_, err := Build(t.Context(), opts)
+	require.ErrorContains(t, err, "requires HTTPS")
+
+	t.Setenv("HC_RAILWAY_STARTUP", "1")
+	rt, err := Build(t.Context(), opts)
+	require.NoError(t, err)
+	require.NoError(t, rt.Close(t.Context()))
+}
+
 func testOptions(t *testing.T) Options {
 	t.Helper()
 	return Options{

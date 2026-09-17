@@ -131,52 +131,94 @@ func Open(db *store.Store, policy *selection.Manager) (*Manager, error) {
 	if policy == nil {
 		return nil, errors.New("jobs require collection policy")
 	}
-	m := &Manager{db: db, policy: policy, data: data{Sources: map[string]bool{}, SourceRevisions: map[string]uint64{}, Jobs: map[string]Job{}, SnapshotRejections: map[string]SnapshotRejection{}}}
-	b, closer, err := db.Get([]byte(stateKey))
-	if errors.Is(err, store.ErrNotFound) {
-		return m, nil
-	}
+	m := &Manager{db: db, policy: policy}
+	persisted, found, err := readPersistedData(db)
 	if err != nil {
 		return nil, err
 	}
-	defer closer.Close()
-	if err := json.Unmarshal(b, &m.data); err != nil {
+	if !found {
+		m.data = emptyData()
+		return m, nil
+	}
+	if err := restorePersistedData(&persisted); err != nil {
 		return nil, err
 	}
-	if m.data.Sources == nil || m.data.Jobs == nil {
-		return nil, errors.New("invalid persisted job state")
-	}
-	if m.data.SourceRevisions == nil {
-		m.data.SourceRevisions = map[string]uint64{}
-	}
-	// hypercerts: Older job documents predate the direct-PDS rejection ledger.
-	if m.data.SnapshotRejections == nil {
-		m.data.SnapshotRejections = map[string]SnapshotRejection{}
-	}
-	for key, rejection := range m.data.SnapshotRejections {
-		if !validSnapshotRejection(rejection) || key != snapshotRejectionStoredKey(rejection.PDS, rejection.PolicyRevision, rejection.DID, rejection.ListedRevision, rejection.Kind) {
-			return nil, errors.New("invalid persisted snapshot rejection")
-		}
-	}
-	trimSnapshotRejections(m.data.SnapshotRejections)
-	for id, job := range m.data.Jobs {
-		if job.ID != id || job.CompletedRepos == nil || job.Policy.Revision == 0 {
-			return nil, errors.New("invalid persisted job")
-		}
-		switch job.State {
-		case Running:
-			job.State = Pending
-			m.data.Jobs[id] = job
-		case Pending, Complete, Failed, Canceled, Incomplete:
-		default:
-			return nil, errors.New("invalid job status")
-		}
-	}
-	m.data.migrateActionReceipts()
+	m.data = persisted
 	if err := m.save(m.data); err != nil {
 		return nil, err
 	}
 	return m, nil
+}
+
+func emptyData() data {
+	return data{
+		Sources:            map[string]bool{},
+		SourceRevisions:    map[string]uint64{},
+		Jobs:               map[string]Job{},
+		SnapshotRejections: map[string]SnapshotRejection{},
+	}
+}
+
+func readPersistedData(db *store.Store) (data, bool, error) {
+	b, closer, err := db.Get([]byte(stateKey))
+	if errors.Is(err, store.ErrNotFound) {
+		return data{}, false, nil
+	}
+	if err != nil {
+		return data{}, false, err
+	}
+	defer closer.Close()
+	persisted := emptyData()
+	if err := json.Unmarshal(b, &persisted); err != nil {
+		return data{}, false, err
+	}
+	return persisted, true, nil
+}
+
+func restorePersistedData(persisted *data) error {
+	if persisted.Sources == nil || persisted.Jobs == nil {
+		return errors.New("invalid persisted job state")
+	}
+	ensureSourceRevisions(persisted)
+	// hypercerts: Older job documents predate the direct-PDS rejection ledger.
+	if persisted.SnapshotRejections == nil {
+		persisted.SnapshotRejections = map[string]SnapshotRejection{}
+	}
+	if err := validateSnapshotRejectionLedger(persisted.SnapshotRejections); err != nil {
+		return err
+	}
+	trimSnapshotRejections(persisted.SnapshotRejections)
+	if err := resumePersistedJobs(persisted.Jobs); err != nil {
+		return err
+	}
+	persisted.migrateActionReceipts()
+	return nil
+}
+
+func validateSnapshotRejectionLedger(rejections map[string]SnapshotRejection) error {
+	for key, rejection := range rejections {
+		if !validSnapshotRejection(rejection) || key != snapshotRejectionStoredKey(rejection.PDS, rejection.PolicyRevision, rejection.DID, rejection.ListedRevision, rejection.Kind) {
+			return errors.New("invalid persisted snapshot rejection")
+		}
+	}
+	return nil
+}
+
+func resumePersistedJobs(jobs map[string]Job) error {
+	for id, job := range jobs {
+		if job.ID != id || job.CompletedRepos == nil || job.Policy.Revision == 0 {
+			return errors.New("invalid persisted job")
+		}
+		if job.State == Running {
+			job.State = Pending
+			jobs[id] = job
+			continue
+		}
+		if job.State != Pending && job.State != Complete && job.State != Failed && job.State != Canceled && job.State != Incomplete {
+			return errors.New("invalid job status")
+		}
+	}
+	return nil
 }
 
 func normalizeSource(raw string) (string, error) {
@@ -400,11 +442,8 @@ func (m *Manager) RequestOnce(raw, reason, requestID string) (Job, error) {
 // RequestOnceWithSourceRevision binds lifecycle/quota intent to the Relay
 // source version observed by the control plane.
 func (m *Manager) RequestOnceWithSourceRevision(raw, reason, requestID string, sourceRevision uint64) (Job, error) {
-	if len(requestID) > 128 {
-		return Job{}, ErrInvalidInput
-	}
-	if reason != "quota_recovery" && reason != "backfill" {
-		return Job{}, fmt.Errorf("%w: unsupported job reason", ErrInvalidInput)
+	if err := validateRequest(reason, requestID); err != nil {
+		return Job{}, err
 	}
 	pds, err := normalizeSource(raw)
 	if err != nil {
@@ -415,34 +454,70 @@ func (m *Manager) RequestOnceWithSourceRevision(raw, reason, requestID string, s
 	if sourceRevision > 0 && sourceRevision < m.data.SourceRevisions[pds] {
 		return Job{}, ErrConflict
 	}
-	if id, ok := m.data.Requests[requestID]; requestID != "" && ok {
-		existing := m.data.Jobs[id]
-		if existing.PDS != pds || existing.Reason != reason || sourceRevisionConflict(existing.SourceRevision, sourceRevision) {
-			return Job{}, ErrConflict
-		}
-		return clone(existing), nil
+	if existing, found, err := m.requestReceipt(pds, reason, requestID, sourceRevision); found {
+		return existing, err
 	}
 	if !m.data.Sources[pds] {
 		return Job{}, ErrConflict
 	}
 	next := clone(m.data)
-	ensureSourceRevisions(&next)
-	advanced := sourceRevision > 0 && sourceRevision > next.SourceRevisions[pds]
-	if sourceRevision > 0 {
-		next.SourceRevisions[pds] = sourceRevision
-	}
+	advanced := advanceSourceRevision(&next, pds, sourceRevision)
 	if advanced {
 		m.cancelStaleSourceJobs(&next, pds, sourceRevision)
 	}
-	j := requestJob(next, pds, reason, m.policy.Current(), next.SourceRevisions[pds])
-	remembered, err := m.rememberRequest(next, j, requestID)
+	job := requestJob(next, pds, reason, m.policy.Current(), next.SourceRevisions[pds])
+	remembered, err := m.rememberRequest(next, job, requestID)
 	if err != nil {
 		return Job{}, err
 	}
-	if advanced && m.cancel != nil && m.runningID != "" && m.data.Jobs[m.runningID].PDS == pds && m.data.Jobs[m.runningID].SourceRevision != sourceRevision {
-		m.cancel()
+	if advanced {
+		m.cancelStaleRunningSourceJob(pds, sourceRevision)
 	}
 	return remembered, nil
+}
+
+func validateRequest(reason, requestID string) error {
+	if len(requestID) > 128 {
+		return ErrInvalidInput
+	}
+	if reason != "quota_recovery" && reason != "backfill" {
+		return fmt.Errorf("%w: unsupported job reason", ErrInvalidInput)
+	}
+	return nil
+}
+
+func (m *Manager) requestReceipt(pds, reason, requestID string, sourceRevision uint64) (Job, bool, error) {
+	if requestID == "" {
+		return Job{}, false, nil
+	}
+	id, ok := m.data.Requests[requestID]
+	if !ok {
+		return Job{}, false, nil
+	}
+	existing := m.data.Jobs[id]
+	if existing.PDS != pds || existing.Reason != reason || sourceRevisionConflict(existing.SourceRevision, sourceRevision) {
+		return Job{}, true, ErrConflict
+	}
+	return clone(existing), true, nil
+}
+
+func advanceSourceRevision(next *data, pds string, sourceRevision uint64) bool {
+	ensureSourceRevisions(next)
+	advanced := sourceRevision > next.SourceRevisions[pds]
+	if sourceRevision > 0 {
+		next.SourceRevisions[pds] = sourceRevision
+	}
+	return advanced
+}
+
+func (m *Manager) cancelStaleRunningSourceJob(pds string, sourceRevision uint64) {
+	if m.cancel == nil || m.runningID == "" {
+		return
+	}
+	running := m.data.Jobs[m.runningID]
+	if running.PDS == pds && running.SourceRevision != sourceRevision {
+		m.cancel()
+	}
 }
 
 func sourceRevisionConflict(stored, requested uint64) bool {
