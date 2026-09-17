@@ -1,13 +1,18 @@
 package main
 
 import (
-	"github.com/stretchr/testify/require"
+	"bytes"
+	"encoding/json"
+	"io"
 	"log/slog"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestPrivateControlAuthenticationAndSourceLifecycle(t *testing.T) {
@@ -32,6 +37,79 @@ func TestPrivateControlAuthenticationAndSourceLifecycle(t *testing.T) {
 	require.Equal(t, 400, call("PUT", "/hypercerts/v1/limits", `{"scope":"global","eventsPerSecond":0}`, "Bearer "+token).Code)
 	require.Equal(t, 200, call("PUT", "/hypercerts/v1/limits", `{"scope":"global","eventsPerSecond":10}`, "Bearer "+token).Code)
 	require.Contains(t, call("GET", "/hypercerts/v1/limits", "", "Bearer "+token).Body.String(), `"eventsPerSecond":10`)
+}
+
+// TestRecoveryReceiptAcceptance proves the Relay receiver only. The submitted
+// coordinate is synthetic: Plan 006 owns proving a completed Jetstream job
+// actually submits it after its durable boundary.
+func TestRecoveryReceiptAcceptance(t *testing.T) {
+	svc, r, _ := newSourceHandlerService(t)
+	r.HostChecker = &countingHostChecker{}
+	token := strings.Repeat("x", 32)
+	handler, err := svc.controlHandler(token)
+	require.NoError(t, err)
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+	call := func(method, path string, value any, authenticated bool) (int, []byte) {
+		t.Helper()
+		body, err := json.Marshal(value)
+		require.NoError(t, err)
+		req, err := http.NewRequest(method, server.URL+path, bytes.NewReader(body))
+		require.NoError(t, err)
+		req.Header.Set("Content-Type", "application/json")
+		if authenticated {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		response, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		defer response.Body.Close()
+		result, err := io.ReadAll(response.Body)
+		require.NoError(t, err)
+		return response.StatusCode, result
+	}
+
+	type sourceView struct {
+		Revision         uint64 `json:"Revision"`
+		RecoveryRequired bool   `json:"RecoveryRequired"`
+	}
+	decodeSource := func(body []byte) sourceView {
+		t.Helper()
+		var source sourceView
+		require.NoError(t, json.Unmarshal(body, &source))
+		return source
+	}
+
+	status, body := call("PUT", "/hypercerts/v1/source", map[string]string{"pds": "https://receipt-control.example", "state": "enabled"}, true)
+	require.Equal(t, http.StatusOK, status, string(body))
+	first := decodeSource(body)
+	require.True(t, first.RecoveryRequired)
+	receipt := map[string]any{
+		"pds":             "https://receipt-control.example",
+		"sourceRevision":  first.Revision,
+		"policyRevision":  2,
+		"jobId":           "0123456789abcdef0123456789abcdef",
+		"durableBoundary": "completed:2026-09-16T12:00:00Z",
+	}
+	status, _ = call("POST", "/hypercerts/v1/source/recovery-receipt", receipt, false)
+	require.Equal(t, http.StatusUnauthorized, status)
+	status, body = call("POST", "/hypercerts/v1/source/recovery-receipt", receipt, true)
+	require.Equal(t, http.StatusOK, status, string(body))
+	require.False(t, decodeSource(body).RecoveryRequired)
+
+	status, body = call("PUT", "/hypercerts/v1/source", map[string]string{"pds": "https://receipt-control.example", "state": "disabled"}, true)
+	require.Equal(t, http.StatusOK, status, string(body))
+	require.True(t, decodeSource(body).RecoveryRequired)
+	status, body = call("PUT", "/hypercerts/v1/source", map[string]string{"pds": "https://receipt-control.example", "state": "enabled"}, true)
+	require.Equal(t, http.StatusOK, status, string(body))
+	current := decodeSource(body)
+	require.True(t, current.RecoveryRequired)
+	status, _ = call("POST", "/hypercerts/v1/source/recovery-receipt", receipt, true)
+	require.Equal(t, http.StatusConflict, status)
+	receipt["sourceRevision"] = current.Revision
+	receipt["durableBoundary"] = "completed:2026-09-16T12:01:00Z"
+	status, body = call("POST", "/hypercerts/v1/source/recovery-receipt", receipt, true)
+	require.Equal(t, http.StatusOK, status, string(body))
+	require.False(t, decodeSource(body).RecoveryRequired)
 }
 
 // Launched only by the cross-language management acceptance harness.

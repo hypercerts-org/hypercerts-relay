@@ -4,6 +4,8 @@
 archive/live test for [TECH-594](https://linear.app/hypercerts/issue/TECH-594/connect-jetstream-v2-to-the-hypercerts-indigo-relay).
 `./tests/acceptance/run T15-core` owns the direct-PDS verification/restart matrix
 for [TECH-634](https://linear.app/hypercerts/issue/TECH-634/unify-jetstream-acquisition-verification-and-durability-fault-coverage).
+`./tests/acceptance/run T03-lifecycle` owns the local private-control lifecycle
+receipt seam for [TECH-637](https://linear.app/hypercerts/issue/TECH-637/persist-cross-service-recovery-receipts-for-admitted-pdss).
 Unknown selectors fail with exit 64.
 
 ## Topology
@@ -65,8 +67,15 @@ directory and removes containers and named volumes on exit.
 
 ```sh
 ./tests/acceptance/run T01
+./tests/acceptance/run T03-lifecycle
 ./tests/acceptance/run T15-core
 ```
+
+T03-lifecycle runs a dedicated local Relay private-control receiver test. It
+proves that a synthetic, bounded durable-completion coordinate clears only the
+matching admitted Relay source revision and that a stale coordinate is rejected.
+It does not start Jetstream or claim a successful Jetstream job; Plan 006 owns
+the private completion sender, job cancellation, and completion evidence.
 
 T15 creates a generated Jetstream control token only in the disposable acceptance
 environment. It is mounted as a file into Jetstream and the in-network driver;

@@ -134,8 +134,8 @@ func (r *Relay) MigrateDatabase() error {
 	if err := r.db.AutoMigrate(models.RejectedEvent{}); err != nil {
 		return err
 	}
-	// hypercerts: Preserve explicit source policy separately from runtime host status.
-	if err := r.db.AutoMigrate(models.Source{}, models.AccountSourceObservation{}); err != nil {
+	// hypercerts: Preserve source policy and the cross-service completion boundary separately from runtime host status.
+	if err := r.db.AutoMigrate(models.Source{}, models.RecoveryReceipt{}, models.AccountSourceObservation{}); err != nil {
 		return err
 	}
 	return r.db.Exec(`INSERT INTO source (host_id, state, revision, validation_status, recovery_required, last_operation)
