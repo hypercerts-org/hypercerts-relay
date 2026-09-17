@@ -24,6 +24,60 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func emitT04Record(t *testing.T, w *world.World, source, collection, key string) {
+	t.Helper()
+	frame, _, err := w.GenerateRecordOpForTest(t.Context(), 0, "create", collection, key)
+	require.NoError(t, err)
+	resp, err := http.Post(source+"/fixture/emit", "application/cbor", bytes.NewReader(frame))
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusNoContent, resp.StatusCode)
+}
+
+func startT04Runtime(t *testing.T, options Options) (*Runtime, *ingest.Writer, func()) {
+	t.Helper()
+	writers := make(chan *ingest.Writer, 1)
+	options.OnSteadyStateWriter = func(w *ingest.Writer) { writers <- w }
+	rt, err := Build(t.Context(), options)
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- rt.Run(ctx) }()
+	cleanup := sync.OnceFunc(func() { cancel(); <-done; require.NoError(t, rt.Close(context.Background())) })
+	t.Cleanup(cleanup)
+	ready, stop := context.WithTimeout(t.Context(), 10*time.Second)
+	defer stop()
+	require.NoError(t, rt.WaitSteadyState(ready))
+	select {
+	case writer := <-writers:
+		require.Eventually(t, func() bool { return rt.PublicAddr() != "" }, time.Second, time.Millisecond)
+		return rt, writer, cleanup
+	case <-ready.Done():
+		t.Fatal("writer unavailable")
+		return nil, nil, nil
+	}
+}
+
+func readT04Event(t *testing.T, ctx context.Context, received <-chan client.Event, errs <-chan error, key string) client.Event {
+	t.Helper()
+	for {
+		select {
+		case e := <-received:
+			if e.Commit != nil {
+				require.Equal(t, "app.bsky.feed.post", e.Commit.Collection, "archive/replay must never expose an excluded collection")
+				require.NotEqual(t, "excluded", e.Commit.Rkey)
+			}
+			if e.Commit != nil && e.Commit.Rkey == key {
+				return e
+			}
+		case err := <-errs:
+			require.NoError(t, err)
+		case <-ctx.Done():
+			t.Fatalf("missing %s", key)
+		}
+	}
+}
+
 // This crosses the real Indigo disk event manager/subscribeRepos handler,
 // Jetstream verification/storage/server, and the public archive-to-live client.
 func TestT04SelectionArchiveReplayRestartAndLive(t *testing.T) {
@@ -62,46 +116,15 @@ func TestT04SelectionArchiveReplayRestartAndLive(t *testing.T) {
 	options.CollectionSelection = true
 	options.InitialCollections = []string{"app.bsky.feed.post"}
 	options.LogOutput = io.Discard
-	emit := func(collection, key string) {
-		frame, _, err := w.GenerateRecordOpForTest(t.Context(), 0, "create", collection, key)
-		require.NoError(t, err)
-		resp, err := http.Post(source+"/fixture/emit", "application/cbor", bytes.NewReader(frame))
-		require.NoError(t, err)
-		defer resp.Body.Close()
-		require.Equal(t, http.StatusNoContent, resp.StatusCode)
-	}
-	start := func() (*Runtime, *ingest.Writer, func()) {
-		writers := make(chan *ingest.Writer, 1)
-		options.OnSteadyStateWriter = func(w *ingest.Writer) { writers <- w }
-		rt, err := Build(t.Context(), options)
-		require.NoError(t, err)
-		ctx, cancel := context.WithCancel(t.Context())
-		done := make(chan error, 1)
-		go func() { done <- rt.Run(ctx) }()
-		// Register before assertions: explicit restart and failed setup share cleanup.
-		cleanup := sync.OnceFunc(func() { cancel(); <-done; require.NoError(t, rt.Close(context.Background())) })
-		t.Cleanup(cleanup)
-		ready, stop := context.WithTimeout(t.Context(), 10*time.Second)
-		defer stop()
-		require.NoError(t, rt.WaitSteadyState(ready))
-		var writer *ingest.Writer
-		select {
-		case writer = <-writers:
-		case <-ready.Done():
-			t.Fatal("writer unavailable")
-		}
-		require.Eventually(t, func() bool { return rt.PublicAddr() != "" }, time.Second, time.Millisecond)
-		return rt, writer, cleanup
-	}
-	rt, writer, stop := start()
-	emit("app.bsky.feed.post", "archived")
+	rt, writer, stop := startT04Runtime(t, options)
+	emitT04Record(t, w, source, "app.bsky.feed.post", "archived")
 	require.Eventually(t, func() bool { return writer.NextSeq() > 1 }, 10*time.Second, 10*time.Millisecond)
 	require.NoError(t, writer.DrainDurability(t.Context()))
 	beforeExcluded, err := live.LoadUpstreamCursor(rt.metaStore, live.CursorKey)
 	require.NoError(t, err)
 	// The Relay remains a complete raw source. This excluded record is accepted
 	// upstream, but it must not acquire a Jetstream archive sequence.
-	emit("app.bsky.feed.like", "excluded")
+	emitT04Record(t, w, source, "app.bsky.feed.like", "excluded")
 	require.Eventually(t, func() bool {
 		cursor, loadErr := live.LoadUpstreamCursor(rt.metaStore, live.CursorKey)
 		return loadErr == nil && cursor > beforeExcluded
@@ -113,7 +136,7 @@ func TestT04SelectionArchiveReplayRestartAndLive(t *testing.T) {
 	cursor, err := live.LoadUpstreamCursor(rt.metaStore, live.CursorKey)
 	require.NoError(t, err)
 	stop()
-	rt, writer, stop = start()
+	rt, writer, stop = startT04Runtime(t, options)
 	defer stop()
 	restored, err := live.LoadUpstreamCursor(rt.metaStore, live.CursorKey)
 	require.NoError(t, err)
@@ -136,29 +159,11 @@ func TestT04SelectionArchiveReplayRestartAndLive(t *testing.T) {
 			}
 		}
 	}()
-	read := func(key string) client.Event {
-		for {
-			select {
-			case e := <-received:
-				if e.Commit != nil {
-					require.Equal(t, "app.bsky.feed.post", e.Commit.Collection, "archive/replay must never expose an excluded collection")
-					require.NotEqual(t, "excluded", e.Commit.Rkey)
-				}
-				if e.Commit != nil && e.Commit.Rkey == key {
-					return e
-				}
-			case err := <-errs:
-				require.NoError(t, err)
-			case <-ctx.Done():
-				t.Fatalf("missing %s", key)
-			}
-		}
-	}
-	archived := read("archived")
+	archived := readT04Event(t, ctx, received, errs, "archived")
 	// The client records page completion after yielding its final batch.
 	require.Eventually(t, func() bool { return consumer.Stats().Pages > 0 }, time.Second, time.Millisecond, "consumer must read the archive planner")
-	emit("app.bsky.feed.post", "live")
-	latest := read("live")
+	emitT04Record(t, w, source, "app.bsky.feed.post", "live")
+	latest := readT04Event(t, ctx, received, errs, "live")
 	require.Greater(t, latest.Seq, archived.Seq)
 	consumer.Close()
 	cancel()
@@ -166,7 +171,7 @@ func TestT04SelectionArchiveReplayRestartAndLive(t *testing.T) {
 	resumed, err := client.Subscribe("http://"+rt.PublicAddr(), client.WithLiveCursor(latest.Seq), client.WithBatchSize(1))
 	require.NoError(t, err)
 	defer resumed.Close()
-	emit("app.bsky.feed.post", "reconnected")
+	emitT04Record(t, w, source, "app.bsky.feed.post", "reconnected")
 	resumeCtx, resumeCancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer resumeCancel()
 	found := false
