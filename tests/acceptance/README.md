@@ -12,6 +12,9 @@ snapshot, and bounded control-view evidence for Plan 006. They use the real
 Jetstream job/control owners, not a placeholder process.
 `./tests/acceptance/run T04`, `T07`, and `T15-selection` own the executable
 selected-record storage evidence for [TECH-595](https://linear.app/hypercerts/issue/TECH-595/store-only-enabled-record-collections-in-jetstream-v2).
+`./tests/acceptance/run T10`, `T11`, and `T12` own current-state coverage and
+provenance wording, single-active-process raw-frame rate admission/restart, and
+bounded rate-policy telemetry evidence for [TECH-602](https://linear.app/hypercerts/issue/TECH-602/manage-global-and-pds-specific-relay-rate-limits).
 Unknown selectors fail with exit 64.
 
 ## Topology
@@ -82,6 +85,9 @@ directory and removes containers and named volumes on exit.
 ./tests/acceptance/run T07
 ./tests/acceptance/run T08
 ./tests/acceptance/run T09
+./tests/acceptance/run T10
+./tests/acceptance/run T11
+./tests/acceptance/run T12
 ./tests/acceptance/run T15-core
 ./tests/acceptance/run T15-selection
 ```
