@@ -26,7 +26,8 @@ var (
 )
 
 const (
-	sourceHostIDPredicate = "host_id = ?"
+	sourceHostIDPredicate   = "host_id = ?"
+	sourceHostnamePredicate = "hostname = ?"
 
 	defaultSourcePageLimit = 100
 	maxSourcePageLimit     = 1_000
@@ -175,7 +176,7 @@ func (r *Relay) AddSource(ctx context.Context, rawURL string) (*SourceView, erro
 
 // ensureSourceHost loads or creates the host within the caller's source transaction.
 func (r *Relay) ensureSourceHost(tx *gorm.DB, host *models.Host, hostname string, noSSL bool) error {
-	err := tx.Where("hostname = ?", hostname).First(host).Error
+	err := tx.Where(sourceHostnamePredicate, hostname).First(host).Error
 	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 		return fmt.Errorf("loading source host: %w", err)
 	}
@@ -355,7 +356,7 @@ func (r *Relay) AcknowledgeSourceRecovery(ctx context.Context, input RecoveryRec
 	defer r.sourcesLk.Unlock()
 
 	var host models.Host
-	if err := r.db.WithContext(ctx).Where("hostname = ?", hostname).First(&host).Error; err != nil {
+	if err := r.db.WithContext(ctx).Where(sourceHostnamePredicate, hostname).First(&host).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, ErrSourceNotFound
 		}
@@ -413,8 +414,8 @@ func validRecoveryReceiptInput(input RecoveryReceiptInput) bool {
 
 // validRecoveryCoordinate excludes whitespace and opaque payload text while
 // leaving the durable job implementation free to choose a stable identifier.
-func validRecoveryCoordinate(value string, max int) bool {
-	if len(value) == 0 || len(value) > max {
+func validRecoveryCoordinate(value string, maximum int) bool {
+	if len(value) == 0 || len(value) > maximum {
 		return false
 	}
 	for _, r := range value {
@@ -859,7 +860,7 @@ func (r *Relay) InspectSource(ctx context.Context, rawURL string) (*SourceView, 
 	r.sourcesLk.Lock()
 	defer r.sourcesLk.Unlock()
 	var host models.Host
-	if err := r.db.WithContext(ctx).Where("hostname = ?", hostname).First(&host).Error; err != nil {
+	if err := r.db.WithContext(ctx).Where(sourceHostnamePredicate, hostname).First(&host).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, ErrSourceNotFound
 		}
