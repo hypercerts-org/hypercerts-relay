@@ -78,9 +78,8 @@ func readT04Event(t *testing.T, ctx context.Context, received <-chan client.Even
 	}
 }
 
-// This crosses the real Indigo disk event manager/subscribeRepos handler,
-// Jetstream verification/storage/server, and the public archive-to-live client.
-func TestT04SelectionArchiveReplayRestartAndLive(t *testing.T) {
+func newT04Fixture(t *testing.T) (*world.World, string, Options) {
+	t.Helper()
 	bin := filepath.Join(t.TempDir(), "relay-source")
 	build := exec.CommandContext(t.Context(), "go", "build", "-o", bin, "./tests/jetstream-source")
 	build.Dir = "../../.."
@@ -89,33 +88,32 @@ func TestT04SelectionArchiveReplayRestartAndLive(t *testing.T) {
 	fixtureDir := t.TempDir()
 	addressFile := filepath.Join(fixtureDir, "address")
 	proc := exec.CommandContext(t.Context(), bin, "--data-dir", fixtureDir, "--address-file", addressFile)
-	proc.Stdout = io.Discard
-	proc.Stderr = io.Discard
+	proc.Stdout, proc.Stderr = io.Discard, io.Discard
 	require.NoError(t, proc.Start())
-	defer func() { _ = proc.Process.Kill(); _ = proc.Wait() }()
+	t.Cleanup(func() { _ = proc.Process.Kill(); _ = proc.Wait() })
 	var source string
 	require.Eventually(t, func() bool { b, e := os.ReadFile(addressFile); source = string(b); return e == nil && source != "" }, 10*time.Second, 10*time.Millisecond)
 	cfg := world.DefaultConfig()
-	cfg.DataDir = t.TempDir()
-	cfg.Accounts = 1
-	cfg.PDSHosts = 1
-	cfg.InitialRecordsMax = 0
+	cfg.DataDir, cfg.Accounts, cfg.PDSHosts, cfg.InitialRecordsMax = t.TempDir(), 1, 1, 0
 	w, err := world.New(t.Context(), cfg)
 	require.NoError(t, err)
-	defer w.Close()
-	_, err = w.EnsureSeed()
-	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, w.Close()) })
+	require.NoError(t, func() error { _, err := w.EnsureSeed(); return err }())
 	require.NoError(t, w.Bootstrap(t.Context(), slog.New(slog.NewTextHandler(io.Discard, nil))))
 	require.NoError(t, w.AttachRuntime(rand.New(rand.NewPCG(1, 2)), fanout.New(64)))
 	pds := httptest.NewServer(nil)
 	pds.Config.Handler = simhttp.NewHandler(w, pds.URL)
-	defer pds.Close()
+	t.Cleanup(pds.Close)
 	options := testOptions(t)
-	options.RelayURL = source
-	options.PLCURL = pds.URL
-	options.CollectionSelection = true
-	options.InitialCollections = []string{"app.bsky.feed.post"}
-	options.LogOutput = io.Discard
+	options.RelayURL, options.PLCURL = source, pds.URL
+	options.CollectionSelection, options.InitialCollections, options.LogOutput = true, []string{"app.bsky.feed.post"}, io.Discard
+	return w, source, options
+}
+
+// This crosses the real Indigo disk event manager/subscribeRepos handler,
+// Jetstream verification/storage/server, and the public archive-to-live client.
+func TestT04SelectionArchiveReplayRestartAndLive(t *testing.T) {
+	w, source, options := newT04Fixture(t)
 	rt, writer, stop := startT04Runtime(t, options)
 	emitT04Record(t, w, source, "app.bsky.feed.post", "archived")
 	require.Eventually(t, func() bool { return writer.NextSeq() > 1 }, 10*time.Second, 10*time.Millisecond)
