@@ -85,6 +85,9 @@ directory and removes containers and named volumes on exit.
 ./tests/acceptance/run T07
 ./tests/acceptance/run T08
 ./tests/acceptance/run T09
+./tests/acceptance/run T10
+./tests/acceptance/run T11
+./tests/acceptance/run T12
 ./tests/acceptance/run T15-core
 ./tests/acceptance/run T15-selection
 ```
