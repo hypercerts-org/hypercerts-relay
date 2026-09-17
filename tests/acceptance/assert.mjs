@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises'
 
 function fail(message) {
-  throw new Error(`T01 assertion failed: ${message}`)
+  throw new Error(`acceptance assertion failed: ${message}`)
 }
 
 async function readJSON(path) {
@@ -123,6 +123,21 @@ function assertSeedReady(events, bootstrap) {
   assertExpected(events, bootstrap, 'combined archive prefix', null, true, 'seed')
 }
 
+async function assertT15Archive(events, phase) {
+  if (!phase?.valid?.did || !phase.valid.rkey || !phase?.identity?.did || !phase.identity.rkey ||
+    !phase?.source?.did || !phase.source.rkey || !phase?.invalid?.did || !phase.invalid.rkey) {
+    fail('T15 phase artifact is missing record coordinates')
+  }
+  // A direct-PDS snapshot materializes the current selected record as an update.
+  for (const [label, record] of [['valid', phase.valid], ['identity retry', phase.identity], ['source retry', phase.source]]) {
+    const selected = events.filter((event) => event.did === record.did && event.kind === 'commit' &&
+      event.commit?.operation === 'update' && event.commit?.collection === 'app.bsky.feed.post' && event.commit?.rkey === record.rkey)
+    if (selected.length !== 1) fail(`T15 archive expected exactly one selected ${label} record, got ${selected.length}`)
+  }
+  const invalid = events.filter((event) => event.did === phase.invalid.did && event.kind === 'commit' && event.commit?.rkey === phase.invalid.rkey)
+  if (invalid.length !== 0) fail(`T15 archive contains invalid-signature record (${invalid.length} events)`)
+}
+
 async function assertCombined(events, bootstrap, snapshotPath, livePath) {
   if (!snapshotPath || !livePath) fail('combined requires snapshot.json and live.json')
   const snapshot = await readJSON(snapshotPath)
@@ -146,7 +161,7 @@ async function assertCombined(events, bootstrap, snapshotPath, livePath) {
 async function main() {
   const [mode, bootstrapPath, eventPath, snapshotPath, livePath] = process.argv.slice(2)
   if (!mode || !bootstrapPath || !eventPath) {
-    throw new Error('usage: assert.mjs archive|seed-ready|combined bootstrap.json events.ndjson [snapshot.json live.json]')
+    throw new Error('usage: assert.mjs archive|seed-ready|combined|t15-archive input.json events.ndjson [snapshot.json live.json]')
   }
   const bootstrap = await readJSON(bootstrapPath)
   const events = await readEvents(eventPath)
@@ -164,6 +179,11 @@ async function main() {
 
   if (mode === 'combined') {
     await assertCombined(events, bootstrap, snapshotPath, livePath)
+    return
+  }
+
+  if (mode === 't15-archive') {
+    await assertT15Archive(events, bootstrap)
     return
   }
 

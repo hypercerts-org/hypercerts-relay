@@ -5,6 +5,7 @@ package control
 import (
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -21,6 +22,12 @@ import (
 const Prefix = "/hypercerts/v1"
 
 const sourcesPath = Prefix + "/sources"
+
+const (
+	maxSnapshotRejectionAfterLength = 8 << 10
+	maxSnapshotRejectionPDSFilters  = 200
+	maxSnapshotRejectionPDSLength   = 2048
+)
 
 type Handler struct {
 	jobs   *jobs.Manager
@@ -46,6 +53,7 @@ func New(token string, manager *jobs.Manager, policy *selection.Manager) (*Handl
 	h.mux.HandleFunc("POST "+sourcesPath, h.addSource)
 	h.mux.HandleFunc("DELETE "+sourcesPath, h.removeSource)
 	h.mux.HandleFunc("GET "+Prefix+"/jobs", h.listJobs)
+	h.mux.HandleFunc("GET "+Prefix+"/snapshot-rejections", h.listSnapshotRejections)
 	h.mux.HandleFunc("GET "+Prefix+"/coverage", h.listCoverage)
 	h.mux.HandleFunc("GET "+Prefix+"/jobs/{id}", h.getJob)
 	h.mux.HandleFunc("POST "+Prefix+"/jobs", h.requestJob)
@@ -291,6 +299,154 @@ func coverageSummaryPage(items []coverageView, next string) struct {
 		Items      []coverageSummaryView `json:"items"`
 		NextCursor string                `json:"nextCursor,omitempty"`
 	}{summaries, next}
+}
+
+// rejectionView deliberately contains only the bounded, non-payload fields in
+// a durable snapshot rejection. It must not expose the ledger's storage keys.
+type rejectionView struct {
+	PDS            string    `json:"pds"`
+	PolicyRevision uint64    `json:"policyRevision"`
+	DID            string    `json:"did"`
+	ListedRevision string    `json:"listedRevision"`
+	Kind           string    `json:"kind"`
+	Code           string    `json:"code"`
+	RejectedAt     time.Time `json:"rejectedAt"`
+}
+
+type rejectionCursor rejectionView
+
+func rejectionCursorFor(view rejectionView) string {
+	encoded, _ := json.Marshal(rejectionCursor(view))
+	return base64.RawURLEncoding.EncodeToString(encoded)
+}
+
+func parseRejectionCursor(value string) (rejectionCursor, bool) {
+	if value == "" {
+		return rejectionCursor{}, true
+	}
+	// Bound encoded input before base64 decoding can allocate its output.
+	if len(value) > maxSnapshotRejectionAfterLength {
+		return rejectionCursor{}, false
+	}
+	encoded, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil {
+		return rejectionCursor{}, false
+	}
+	var cursor rejectionCursor
+	if json.Unmarshal(encoded, &cursor) != nil || cursor.PDS == "" || cursor.PolicyRevision == 0 || cursor.DID == "" || cursor.ListedRevision == "" || cursor.Kind == "" || cursor.Code == "" || cursor.RejectedAt.IsZero() {
+		return rejectionCursor{}, false
+	}
+	return cursor, true
+}
+
+func compareRejection(a, b rejectionView) int {
+	for _, values := range [][2]string{{a.PDS, b.PDS}, {a.DID, b.DID}, {a.ListedRevision, b.ListedRevision}, {a.Kind, b.Kind}} {
+		if comparison := strings.Compare(values[0], values[1]); comparison != 0 {
+			return comparison
+		}
+	}
+	if a.PolicyRevision < b.PolicyRevision {
+		return -1
+	}
+	if a.PolicyRevision > b.PolicyRevision {
+		return 1
+	}
+	return 0
+}
+
+func snapshotRejectionView(rejection jobs.SnapshotRejection) rejectionView {
+	return rejectionView{PDS: rejection.PDS, PolicyRevision: rejection.PolicyRevision, DID: rejection.DID, ListedRevision: rejection.ListedRevision, Kind: rejection.Kind, Code: rejection.Code, RejectedAt: rejection.RejectedAt}
+}
+
+type snapshotRejectionListOptions struct {
+	limit        int
+	after        rejectionCursor
+	hasAfter     bool
+	requestedPDS map[string]struct{}
+}
+
+func parseSnapshotRejectionListOptions(r *http.Request) (snapshotRejectionListOptions, string) {
+	query := r.URL.Query()
+	limit := 100
+	if raw := query.Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > 200 {
+			return snapshotRejectionListOptions{}, "invalid_limit"
+		}
+		limit = n
+	}
+	rawAfter := query.Get("after")
+	cursor, ok := parseRejectionCursor(rawAfter)
+	if !ok {
+		return snapshotRejectionListOptions{}, "invalid_cursor"
+	}
+	requestedPDS, ok := snapshotRejectionPDSFilters(query["pds"])
+	if !ok {
+		return snapshotRejectionListOptions{}, "invalid_pds"
+	}
+	return snapshotRejectionListOptions{limit: limit, after: cursor, hasAfter: rawAfter != "", requestedPDS: requestedPDS}, ""
+}
+
+func snapshotRejectionViews(rejections []jobs.SnapshotRejection, requestedPDS map[string]struct{}) []rejectionView {
+	all := make([]rejectionView, 0)
+	for _, rejection := range rejections {
+		if len(requestedPDS) > 0 {
+			if _, found := requestedPDS[rejection.PDS]; !found {
+				continue
+			}
+		}
+		all = append(all, snapshotRejectionView(rejection))
+	}
+	sort.Slice(all, func(i, j int) bool { return compareRejection(all[i], all[j]) < 0 })
+	return all
+}
+
+func pageSnapshotRejectionViews(all []rejectionView, after rejectionCursor, hasAfter bool, limit int) ([]rejectionView, string) {
+	out := make([]rejectionView, 0, limit)
+	for _, rejection := range all {
+		if hasAfter && compareRejection(rejection, rejectionView(after)) <= 0 {
+			continue
+		}
+		if len(out) == limit {
+			return out, rejectionCursorFor(out[len(out)-1])
+		}
+		out = append(out, rejection)
+	}
+	return out, ""
+}
+
+func (h *Handler) listSnapshotRejections(w http.ResponseWriter, r *http.Request) {
+	options, errorCode := parseSnapshotRejectionListOptions(r)
+	if errorCode != "" {
+		reply(w, 400, map[string]string{"error": errorCode})
+		return
+	}
+	all := snapshotRejectionViews(h.jobs.ListSnapshotRejections(), options.requestedPDS)
+	out, next := pageSnapshotRejectionViews(all, options.after, options.hasAfter, options.limit)
+	reply(w, 200, struct {
+		Rejections []rejectionView `json:"rejections"`
+		NextCursor string          `json:"nextCursor,omitempty"`
+	}{out, next})
+}
+
+func snapshotRejectionPDSFilters(values []string) (map[string]struct{}, bool) {
+	// Validate the repeated query values before allocating a map sized by
+	// caller-controlled input.
+	if len(values) > maxSnapshotRejectionPDSFilters {
+		return nil, false
+	}
+	for _, pds := range values {
+		if len(pds) > maxSnapshotRejectionPDSLength {
+			return nil, false
+		}
+	}
+	requestedPDS := make(map[string]struct{}, len(values))
+	for _, pds := range values {
+		if pds != "" {
+			requestedPDS[pds] = struct{}{}
+		}
+	}
+	return requestedPDS, true
 }
 
 func (h *Handler) listJobs(w http.ResponseWriter, r *http.Request) {

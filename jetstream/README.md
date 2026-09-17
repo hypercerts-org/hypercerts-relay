@@ -189,6 +189,7 @@ All paths below start with `/hypercerts/v1`:
 | `DELETE /sources` | Same body; cancels acquisition without deleting the archive. |
 | `POST /jobs` | `{"pds":"https://pds.example","reason":"backfill","requestId":"optional-idempotency-key"}` or reason `quota_recovery`; the same nonempty request ID returns its prior job, while unkeyed duplicate active work is reused and a later terminal recovery creates fresh work. |
 | `GET /jobs?limit=100&after=<cursor>` | Sorted page, maximum 200 jobs, optional `nextCursor`. Concurrent additions may require a fresh listing. |
+| `GET /snapshot-rejections?limit=100&after=<cursor>` | The most recent 1,000 bounded non-payload direct-PDS snapshot rejections, with optional repeated exact `pds` filters. Older rejections are evicted. Returns origin, policy/listed revisions, DID, kind/code and timestamp; never CAR bytes, records, tokens or storage keys. |
 | `GET /coverage?limit=100&after=<pds>` | Latest current-state job per PDS, sorted and paginated by PDS with optional exact `pds` filter. |
 | `GET /jobs/{id}` | Durable state, progress, attempt count, and coverage. |
 | `POST /jobs/{id}/cancel` | Cancels pending/running work. |
@@ -224,3 +225,21 @@ side effect. Job history and receipts share the persisted job-state document, so
 its size and rewrite cost grow with operator activity. Monitor metadata volume and
 command latency. Receipt pruning requires an agreed journal retry cutoff and an
 atomic migration to per-key storage; arbitrary age/count eviction is not safe.
+
+## Disposable T15-core acceptance evidence
+
+`../tests/acceptance/run T15-core` uses the acceptance-tag image plus
+`JETSTREAM_ACCEPTANCE_PRIVATE_HOSTS=true`, the same two-part private-fixture gate
+as T01. It mounts a generated control-token file into the private Docker-network
+listener (`JETSTREAM_DEBUG_ADDR`); no control port is published to the host. The
+in-network driver adds `https://pds-a.test` through `/hypercerts/v1/sources`, then
+uses jobs/retry and `snapshot-rejections` to retain sanitized phase evidence.
+
+Its default-pass-through Node fault proxy can target PLC DID resolution with a
+5xx, PDS `listRepos` with a 5xx, or replace a selected DID document's signing key.
+The run restarts Jetstream before identity and source retries, then after the
+invalid-signature rejection. It asserts valid selected archive materialization,
+transient incomplete/no-rejection outcomes followed by same-job completion, and
+one restart-durable non-payload `verification_failed` rejection with no archive
+row for the invalid record. Artifacts are evidence only when a command run exits
+successfully; generated credentials are removed during cleanup.

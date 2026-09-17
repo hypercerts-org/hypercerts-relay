@@ -2,6 +2,8 @@ package jobs
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,7 +13,11 @@ import (
 )
 
 func newManager(t *testing.T, dir string) (*Manager, *store.Store) {
-	db, err := store.Open(dir, nil)
+	return newManagerWithOptions(t, dir)
+}
+
+func newManagerWithOptions(t *testing.T, dir string, opts ...store.Option) (*Manager, *store.Store) {
+	db, err := store.Open(dir, nil, opts...)
 	require.NoError(t, err)
 	policy, err := selection.Open(db, []string{"app.bsky.feed.post"})
 	require.NoError(t, err)
@@ -195,6 +201,128 @@ func TestNoopActionReceiptsDoNotChangeLaterJobState(t *testing.T) {
 	require.NoError(t, m.Retry(job.ID))
 	require.NoError(t, m.TransitionOnce(job.ID, Canceled, "cancel-current"))
 	require.Equal(t, Pending, m.List()[0].State, "a repeated receipt must not cancel a later retry")
+}
+
+func TestSnapshotRejectionBoundsUntrustedSourcePositions(t *testing.T) {
+	dir := t.TempDir()
+	m, db := newManager(t, dir)
+	defer db.Close()
+
+	const pds = "https://pds.example"
+	const did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
+	const revision = "3l3qo2vutsw2b"
+	normal, err := m.recordSnapshotRejection(pds, 1, did, revision, directPDSSnapshotRejectionKind, "verification_failed")
+	require.NoError(t, err)
+	require.Equal(t, pds, normal.PDS)
+	require.Equal(t, did, normal.DID)
+	require.Equal(t, revision, normal.ListedRevision)
+
+	oversizedPDS := "https://" + strings.Repeat("p", maxSnapshotRejectionPDSLength) + ".example"
+	noncanonicalDID := "DID:PLC:NOT-CANONICAL"
+	noncanonicalRevision := strings.Repeat("x", 4096)
+	bounded, err := m.recordSnapshotRejection(oversizedPDS, 1, noncanonicalDID, noncanonicalRevision, directPDSSnapshotRejectionKind, "verification_failed")
+	require.NoError(t, err)
+	require.Equal(t, snapshotRejectionDigest(oversizedPDS), bounded.PDS)
+	require.Equal(t, snapshotRejectionDigest(noncanonicalDID), bounded.DID)
+	require.Equal(t, snapshotRejectionDigest(noncanonicalRevision), bounded.ListedRevision)
+	require.NotContains(t, bounded.PDS, oversizedPDS)
+	require.NotContains(t, bounded.DID, noncanonicalDID)
+	require.NotContains(t, bounded.ListedRevision, noncanonicalRevision)
+
+	again, err := m.recordSnapshotRejection(oversizedPDS, 1, noncanonicalDID, noncanonicalRevision, directPDSSnapshotRejectionKind, "invalid_repository")
+	require.NoError(t, err)
+	require.Equal(t, bounded, again, "the bounded position must retain its first verdict")
+	found, ok := m.lookupSnapshotRejection(oversizedPDS, 1, noncanonicalDID, noncanonicalRevision, directPDSSnapshotRejectionKind)
+	require.True(t, ok)
+	require.Equal(t, bounded, found)
+
+	require.NoError(t, db.Close())
+	m, db = newManager(t, dir)
+	defer db.Close()
+	found, ok = m.lookupSnapshotRejection(oversizedPDS, 1, noncanonicalDID, noncanonicalRevision, directPDSSnapshotRejectionKind)
+	require.True(t, ok)
+	require.Equal(t, bounded, found)
+}
+
+func TestSnapshotRejectionsRetainRecentBoundedLedgerAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	m, db := newManager(t, dir)
+
+	const pds = "https://pds.example"
+	base := time.Now().UTC().Add(-time.Hour)
+	seeded := make(map[string]SnapshotRejection, maxSnapshotRejections)
+	var oldestKey string
+	for i := range maxSnapshotRejections {
+		rejection := SnapshotRejection{
+			PDS:            pds,
+			PolicyRevision: 1,
+			DID:            snapshotRejectionDigest(fmt.Sprintf("seed-did-%d", i)),
+			ListedRevision: snapshotRejectionDigest(fmt.Sprintf("seed-revision-%d", i)),
+			Kind:           directPDSSnapshotRejectionKind,
+			Code:           "verification_failed",
+			RejectedAt:     base.Add(time.Duration(i) * time.Second),
+		}
+		key := snapshotRejectionStoredKey(rejection.PDS, rejection.PolicyRevision, rejection.DID, rejection.ListedRevision, rejection.Kind)
+		seeded[key] = rejection
+		if i == 0 {
+			oldestKey = key
+		}
+	}
+	m.data.SnapshotRejections = seeded
+	require.NoError(t, m.save(m.data))
+
+	latest, err := m.recordSnapshotRejection(pds, 1, "did:plc:latest", "3l3qo2vutsw2b", directPDSSnapshotRejectionKind, "verification_failed")
+	require.NoError(t, err)
+	latestKey := snapshotRejectionStoredKey(latest.PDS, latest.PolicyRevision, latest.DID, latest.ListedRevision, latest.Kind)
+	require.Len(t, m.ListSnapshotRejections(), maxSnapshotRejections)
+	_, foundOldest := m.data.SnapshotRejections[oldestKey]
+	require.False(t, foundOldest, "the oldest ledger entry must be evicted at the retention cap")
+	_, foundLatest := m.data.SnapshotRejections[latestKey]
+	require.True(t, foundLatest)
+
+	require.NoError(t, db.Close())
+	m, db = newManager(t, dir)
+	defer db.Close()
+	require.Len(t, m.ListSnapshotRejections(), maxSnapshotRejections)
+	_, foundOldest = m.data.SnapshotRejections[oldestKey]
+	require.False(t, foundOldest)
+	_, foundLatest = m.data.SnapshotRejections[latestKey]
+	require.True(t, foundLatest)
+}
+
+func TestSnapshotRejectionsPersistIdempotently(t *testing.T) {
+	dir := t.TempDir()
+	m, db := newManager(t, dir)
+	// Simulate a document from before the rejection ledger migration.
+	legacy := clone(m.data)
+	legacy.SnapshotRejections = nil
+	require.NoError(t, m.save(legacy))
+	require.NoError(t, db.Close())
+	m, db = newManager(t, dir)
+	require.Empty(t, m.ListSnapshotRejections())
+
+	rejection, err := m.recordSnapshotRejection("https://pds.example", 1, "did:plc:test", "3l3qo2vutsw2b", directPDSSnapshotRejectionKind, "verification_failed")
+	require.NoError(t, err)
+	again, err := m.recordSnapshotRejection("https://pds.example", 1, "did:plc:test", "3l3qo2vutsw2b", directPDSSnapshotRejectionKind, "invalid_repository")
+	require.NoError(t, err)
+	require.Equal(t, rejection, again, "the first durable verdict is idempotent")
+	found, ok := m.lookupSnapshotRejection("https://pds.example", 1, "did:plc:test", "3l3qo2vutsw2b", directPDSSnapshotRejectionKind)
+	require.True(t, ok)
+	require.Equal(t, rejection, found)
+	_, ok = m.lookupSnapshotRejection("https://pds.example", 1, "did:plc:test", "3l3qo2vutsw2c", directPDSSnapshotRejectionKind)
+	require.False(t, ok, "a changed listing revision requires a fresh snapshot")
+	listed := m.ListSnapshotRejections()
+	require.Equal(t, []SnapshotRejection{rejection}, listed)
+	listed[0].Code = "mutated"
+	require.Equal(t, rejection, m.ListSnapshotRejections()[0], "the read model must not expose durable state")
+	require.NoError(t, db.Close())
+
+	m, db = newManager(t, dir)
+	defer db.Close()
+	found, ok = m.lookupSnapshotRejection("https://pds.example", 1, "did:plc:test", "3l3qo2vutsw2b", directPDSSnapshotRejectionKind)
+	require.True(t, ok)
+	require.Equal(t, rejection, found)
+	require.Equal(t, []SnapshotRejection{rejection}, m.ListSnapshotRejections())
 }
 
 func TestReceiptNamespacesAndLegacyMigration(t *testing.T) {
