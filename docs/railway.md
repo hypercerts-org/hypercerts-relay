@@ -17,6 +17,12 @@ provider-specific copies.
 | Jetstream | `jetstream/Dockerfile` | nested module `/jetstream` | 8080 | 6060 when configured |
 | Administration | `administration/Dockerfile` | repository root `/` | 3000 | authenticated `/api/v1` on the same port |
 
+The initial launch service set is Relay, Jetstream, and Administration.
+Rainbow remains buildable from its canonical Dockerfile, but is deferred from
+that service set while [TECH-635](https://linear.app/hypercerts/issue/TECH-635/validate-rainbow-raw-stream-recovery-and-retention)
+is backlog work. Do not provision, expose, or make a raw-consumer recovery claim
+for Rainbow until its activation evidence is complete.
+
 For Jetstream, the Dockerfile path relative to its service Root Directory is
 `Dockerfile`. The other paths are relative to the repository root. Jetstream retains
 its distroless runtime and module-local build context.
@@ -35,11 +41,12 @@ It also rejects tracked Railway configuration files in this public repository.
 
 ## Runtime storage and networking contracts
 
-Each component has local state that needs its own persistent storage. Relay stores
-raw replay events; Rainbow stores its replay buffer and cursor; Jetstream stores
-its archive and Pebble metadata; administration stores its SQLite journal and OAuth
-state. Run one writer per local store. Configure actual volume identities, placement,
-capacity and backups privately.
+Each selected running component has local state that needs its own persistent
+storage. Relay stores raw replay events; Jetstream stores its archive and Pebble
+metadata; administration stores its SQLite journal and OAuth state. Run one
+writer per local store. Rainbow's replay buffer and cursor are not part of the
+initial launch because Rainbow is not a launch service. Configure actual volume
+identities, placement, capacity and backups privately.
 
 Relay supports PostgreSQL or SQLite for metadata. Its documentation recommends
 PostgreSQL for nontrivial deployments; PostgreSQL does not replace the raw-event
