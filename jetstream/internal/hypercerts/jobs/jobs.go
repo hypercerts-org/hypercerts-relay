@@ -417,7 +417,7 @@ func (m *Manager) RequestOnceWithSourceRevision(raw, reason, requestID string, s
 	}
 	if id, ok := m.data.Requests[requestID]; requestID != "" && ok {
 		existing := m.data.Jobs[id]
-		if existing.PDS != pds || existing.Reason != reason {
+		if existing.PDS != pds || existing.Reason != reason || sourceRevisionConflict(existing.SourceRevision, sourceRevision) {
 			return Job{}, ErrConflict
 		}
 		return clone(existing), nil
@@ -443,6 +443,10 @@ func (m *Manager) RequestOnceWithSourceRevision(raw, reason, requestID string, s
 		m.cancel()
 	}
 	return remembered, nil
+}
+
+func sourceRevisionConflict(stored, requested uint64) bool {
+	return stored != 0 && requested != 0 && stored != requested
 }
 
 func (m *Manager) cancelStaleSourceJobs(next *data, pds string, sourceRevision uint64) {
@@ -817,7 +821,7 @@ func (m *Manager) CheckpointInventory(id, cursor string, entries map[string]stri
 	}
 	for did, rev := range entries {
 		if existing, ok := inv.Entries[did]; ok && existing != rev {
-			return ErrInvalidInput
+			return &InputError{Code: "invalid_listing"}
 		}
 		inv.Entries[did] = rev
 	}
