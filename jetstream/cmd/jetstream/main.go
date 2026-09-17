@@ -54,7 +54,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -431,39 +430,35 @@ func serveCommand() *cli.Command {
 	}
 }
 
-func serveOptionsFromCommand(cmd *cli.Command) (jetstreamd.Options, error) {
-	// hypercerts: Read a bounded secret without printing its contents on errors.
-	var controlToken string
-	if path := cmd.String("control-token-file"); path != "" {
-		file, err := os.Open(path)
-		if err != nil {
-			return jetstreamd.Options{}, errors.New("cannot open control token file")
-		}
-		contents, err := io.ReadAll(io.LimitReader(file, 4097))
-		file.Close()
-		if err != nil || len(contents) > 4096 {
-			return jetstreamd.Options{}, errors.New("cannot read bounded control token file")
-		}
-		controlToken = strings.TrimSpace(string(contents))
-		if len(controlToken) < 32 {
-			return jetstreamd.Options{}, errors.New("control token must contain at least 32 bytes")
-		}
+func readControlTokenFile(path, name string) (string, error) {
+	if path == "" {
+		return "", nil
 	}
-	var relayControlToken string
-	if path := cmd.String("relay-control-token-file"); path != "" {
-		file, err := os.Open(path)
-		if err != nil {
-			return jetstreamd.Options{}, errors.New("cannot open relay control token file")
-		}
-		contents, err := io.ReadAll(io.LimitReader(file, 4097))
-		file.Close()
-		if err != nil || len(contents) > 4096 {
-			return jetstreamd.Options{}, errors.New("cannot read bounded relay control token file")
-		}
-		relayControlToken = strings.TrimSpace(string(contents))
-		if len(relayControlToken) < 32 {
-			return jetstreamd.Options{}, errors.New("relay control token must contain at least 32 bytes")
-		}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("cannot open %s token file", name)
+	}
+	defer file.Close()
+	contents, err := io.ReadAll(io.LimitReader(file, 4097))
+	if err != nil || len(contents) > 4096 {
+		return "", fmt.Errorf("cannot read bounded %s token file", name)
+	}
+	token := strings.TrimSpace(string(contents))
+	if len(token) < 32 {
+		return "", fmt.Errorf("%s token must contain at least 32 bytes", name)
+	}
+	return token, nil
+}
+
+func serveOptionsFromCommand(cmd *cli.Command) (jetstreamd.Options, error) {
+	// hypercerts: Read bounded secrets without printing their contents on errors.
+	controlToken, err := readControlTokenFile(cmd.String("control-token-file"), "control")
+	if err != nil {
+		return jetstreamd.Options{}, err
+	}
+	relayControlToken, err := readControlTokenFile(cmd.String("relay-control-token-file"), "relay control")
+	if err != nil {
+		return jetstreamd.Options{}, err
 	}
 	backfillRepos, err := parseBackfillRepos(cmd.String("backfill-repos"))
 	if err != nil {
