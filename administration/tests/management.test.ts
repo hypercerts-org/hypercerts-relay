@@ -21,6 +21,7 @@ test(
       );
     const temp = mkdtempSync(join(tmpdir(), "management-acceptance-"));
     const compile = promisify(execFile);
+    const goEnv = { ...process.env, GOCACHE: join(temp, "go-cache") };
     const fixtures = [
       { name: "relay", cwd: resolve(".."), pkg: "./cmd/relay" },
       {
@@ -38,6 +39,7 @@ test(
           ["test", "-c", "-o", join(temp, name + ".test"), pkg],
           {
             cwd,
+            env: goEnv,
             timeout: 300000,
             signal: t.signal,
             maxBuffer: 2 * 1024 * 1024,
@@ -51,7 +53,7 @@ test(
       const child = spawn(
         join(temp, name + ".test"),
         ["-test.run=^TestControlPlaneAcceptanceFixture$", "-test.count=1"],
-        { cwd, env: { ...process.env, CONTROL_ACCEPTANCE_READY: ready } },
+        { cwd, env: { ...goEnv, CONTROL_ACCEPTANCE_READY: ready } },
       );
       child.stdout.on("data", (b) => (output += b));
       child.stderr.on("data", (b) => (output += b));
