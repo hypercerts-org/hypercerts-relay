@@ -9,7 +9,7 @@
     "check": "svelte-check --tsconfig ./tsconfig.json && tsc --noEmit",
     "test": "CONTROL_GO_BINARY=\"$(command -v go)\" tsx --test tests/*.test.ts",
     "test:components": "vitest run",
-    "test:browser": "playwright test",
+    "test:browser": "CONTROL_GO_BINARY=\"$(command -v go)\" playwright test",
     "prebuild": "node scripts/prepare-fonts.mjs",
     "predev": "node scripts/prepare-fonts.mjs"
   },

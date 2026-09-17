@@ -50,10 +50,7 @@ export async function startControlFixtures(): Promise<ControlFixtures> {
       "CONTROL_GO_BINARY must identify an absolute Go executable path",
     );
   const dir = mkdtempSync(join(tmpdir(), "admin-control-fixture-"));
-  const env = {
-    ...process.env,
-    GOCACHE: process.env.GOCACHE ?? "/tmp/hypercerts-relay-go-cache",
-  };
+  const env = { ...process.env, GOCACHE: join(dir, "go-cache") };
   const compile = promisify(execFile);
   const specs = [
     { name: "relay", cwd: resolve(".."), pkg: "./cmd/relay" },
