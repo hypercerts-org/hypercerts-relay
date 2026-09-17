@@ -110,6 +110,36 @@ func newT04Fixture(t *testing.T) (*world.World, string, Options) {
 	return w, source, options
 }
 
+func replayT04ArchiveAndLive(t *testing.T, rt *Runtime, w *world.World, source string) client.Event {
+	t.Helper()
+	consumer, err := client.Subscribe("http://"+rt.PublicAddr(), client.WithAfterSeq(0), client.WithBatchSize(1))
+	require.NoError(t, err)
+	defer consumer.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	received := make(chan client.Event, 4)
+	errs := make(chan error, 1)
+	go forwardT04Events(ctx, consumer, received, errs)
+	archived := readT04Event(t, ctx, received, errs, "archived")
+	require.Eventually(t, func() bool { return consumer.Stats().Pages > 0 }, time.Second, time.Millisecond, "consumer must read the archive planner")
+	emitT04Record(t, w, source, "app.bsky.feed.post", "live")
+	latest := readT04Event(t, ctx, received, errs, "live")
+	require.Greater(t, latest.Seq, archived.Seq)
+	return latest
+}
+
+func forwardT04Events(ctx context.Context, consumer *client.Client, received chan<- client.Event, errs chan<- error) {
+	for batch, err := range consumer.Events(ctx) {
+		if err != nil {
+			errs <- err
+			return
+		}
+		for _, event := range batch.Events() {
+			received <- event
+		}
+	}
+}
+
 // This crosses the real Indigo disk event manager/subscribeRepos handler,
 // Jetstream verification/storage/server, and the public archive-to-live client.
 func TestT04SelectionArchiveReplayRestartAndLive(t *testing.T) {
@@ -139,32 +169,7 @@ func TestT04SelectionArchiveReplayRestartAndLive(t *testing.T) {
 	restored, err := live.LoadUpstreamCursor(rt.metaStore, live.CursorKey)
 	require.NoError(t, err)
 	require.Equal(t, cursor, restored)
-	consumer, err := client.Subscribe("http://"+rt.PublicAddr(), client.WithAfterSeq(0), client.WithBatchSize(1))
-	require.NoError(t, err)
-	defer consumer.Close()
-	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
-	defer cancel()
-	received := make(chan client.Event, 4)
-	errs := make(chan error, 1)
-	go func() {
-		for batch, err := range consumer.Events(ctx) {
-			if err != nil {
-				errs <- err
-				return
-			}
-			for _, ev := range batch.Events() {
-				received <- ev
-			}
-		}
-	}()
-	archived := readT04Event(t, ctx, received, errs, "archived")
-	// The client records page completion after yielding its final batch.
-	require.Eventually(t, func() bool { return consumer.Stats().Pages > 0 }, time.Second, time.Millisecond, "consumer must read the archive planner")
-	emitT04Record(t, w, source, "app.bsky.feed.post", "live")
-	latest := readT04Event(t, ctx, received, errs, "live")
-	require.Greater(t, latest.Seq, archived.Seq)
-	consumer.Close()
-	cancel()
+	latest := replayT04ArchiveAndLive(t, rt, w, source)
 	// A new consumer resumes from its saved cursor and receives the next live record.
 	resumed, err := client.Subscribe("http://"+rt.PublicAddr(), client.WithLiveCursor(latest.Seq), client.WithBatchSize(1))
 	require.NoError(t, err)
