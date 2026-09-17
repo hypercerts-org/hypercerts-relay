@@ -202,13 +202,7 @@ func (r *Relay) waitRateCapacity(ctx context.Context, hostname string) error {
 			r.rates.mu.Unlock()
 			return nil
 		}
-		for _, b := range buckets {
-			b.waiting++
-			if _, recorded := waited[b]; !recorded {
-				b.waitedFrames++
-				waited[b] = struct{}{}
-			}
-		}
+		recordRateWait(buckets, waited)
 		changed := r.rates.changed
 		r.rates.mu.Unlock()
 		timer := time.NewTimer(max(delay, time.Millisecond))
@@ -223,6 +217,17 @@ func (r *Relay) waitRateCapacity(ctx context.Context, hostname string) error {
 			b.waiting--
 		}
 		r.rates.mu.Unlock()
+	}
+}
+
+func recordRateWait(buckets []*rateBucket, waited map[*rateBucket]struct{}) {
+	for _, b := range buckets {
+		b.waiting++
+		if _, recorded := waited[b]; recorded {
+			continue
+		}
+		b.waitedFrames++
+		waited[b] = struct{}{}
 	}
 }
 
@@ -320,7 +325,9 @@ func (r *Relay) requireRateAdmission(ctx context.Context) error {
 // generation cannot admit a frame after it is fenced.
 func (r *Relay) lockRateAdmission() (func(), error) {
 	if !r.Config.RequireRateAdmission {
-		return func() {}, nil
+		return func() {
+			// No rate-admission lock is held when the policy is disabled.
+		}, nil
 	}
 	r.admission.mu.RLock()
 	holder := r.admission.holder
