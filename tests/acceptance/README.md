@@ -15,6 +15,11 @@ selected-record storage evidence for [TECH-595](https://linear.app/hypercerts/is
 `./tests/acceptance/run T10`, `T11`, and `T12` own current-state coverage and
 provenance wording, single-active-process raw-frame rate admission/restart, and
 bounded rate-policy telemetry evidence for [TECH-602](https://linear.app/hypercerts/issue/TECH-602/manage-global-and-pds-specific-relay-rate-limits).
+`./tests/acceptance/run T19` owns the fully disposable copied-state
+forward-upgrade and restore-only qualification. It proves selected Relay and
+Jetstream durable coordinates survive both a forward candidate open and an
+independent restored copy; it does not claim a production Railway snapshot,
+capacity budget, live blue/green cutover, or binary rollback.
 Unknown selectors fail with exit 64.
 
 ## Topology
@@ -90,6 +95,7 @@ directory and removes containers and named volumes on exit.
 ./tests/acceptance/run T12
 ./tests/acceptance/run T15-core
 ./tests/acceptance/run T15-selection
+./tests/acceptance/run T19
 ```
 
 T04 runs the real owned Relay-to-Jetstream archive/replay/restart path with one
