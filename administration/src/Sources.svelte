@@ -278,7 +278,7 @@
           </div>
           <div>
             <dt>Current-state coverage</dt>
-            <dd>{jetstreamStats.coverage.replaceAll("_", " ")}<small>{jetstreamStats.historyComplete ? "Historical coverage complete" : "Current snapshot only; historical coverage is not complete."}</small></dd>
+            <dd>{jetstreamStats.coverage.replaceAll("_", " ")}<small>Current snapshot only; historical coverage is unknown.</small></dd>
           </div>
         {/if}
         {#if coverage}

@@ -398,7 +398,7 @@ func TestPDSProcessorPersistsPermanentSnapshotRejectionWithoutProgress(t *testin
 	require.Equal(t, "invalid_repository", first.ErrorCode)
 	require.Empty(t, first.CompletedRepos)
 	require.Empty(t, first.Cursor)
-	require.False(t, first.TotalReposKnown)
+	require.True(t, first.TotalReposKnown, "the frozen inventory denominator is published before repository processing")
 	require.Len(t, m.ListSnapshotRejections(), 1)
 
 	require.NoError(t, m.Retry(job.ID))
@@ -476,7 +476,7 @@ func TestPDSProcessorPermanentRejectionDoesNotAdvanceMultiPageInventory(t *testi
 	require.Equal(t, int64(1), downloads.Load(), "a changed listed position requires a fresh download")
 	mu.Lock()
 	defer mu.Unlock()
-	require.Equal(t, []string{"", "", ""}, cursors, "the cursor must never advance past the rejected first page")
+	require.Equal(t, []string{"", "", "", next}, cursors, "the retry completes the frozen inventory before processing its entries")
 }
 
 func TestPDSProcessorRejectsMalformedListingDIDBeforeDownload(t *testing.T) {

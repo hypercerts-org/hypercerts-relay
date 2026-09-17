@@ -49,11 +49,8 @@ limit produces explicit incomplete coverage. Malformed or unverifiable input
 fails. Neither result is completion. Cancellation and policy/source changes must
 not allow obsolete work to report success.
 
-`historyComplete` is transitional baseline state only: it is always false and
-does not communicate a useful operator choice. [TECH-597](https://linear.app/hypercerts/issue/TECH-597/expose-jetstream-backfill-progress-and-coverage)
-removes it from persisted job state, Jetstream control responses, administration
-contracts/UI, tests and documentation. Until then, no client may treat the field
-as historical proof.
+Jobs report only `current_state` coverage. They never claim historical event
+completeness or PDS attribution outside the completed snapshot boundary.
 
 ## Acceptance mapping
 
@@ -93,7 +90,6 @@ content digests, not source content, credentials, or payloads. Retained
 per-phase artifacts are evidence of a run, not a claim that a run passed unless
 the command exit/result says so.
 
-[TECH-597](https://linear.app/hypercerts/issue/TECH-597/expose-jetstream-backfill-progress-and-coverage)
-also owns the compatibility test for reading older persisted job JSON while no
-longer emitting `historyComplete`. [TECH-635](https://linear.app/hypercerts/issue/TECH-635/validate-rainbow-raw-stream-recovery-and-retention)
+The job reader accepts older persisted JSON which contains fields no longer
+emitted by the control API. [TECH-635](https://linear.app/hypercerts/issue/TECH-635/validate-rainbow-raw-stream-recovery-and-retention)
 owns complete-topology recovery evidence.

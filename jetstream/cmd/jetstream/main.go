@@ -54,7 +54,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -213,6 +212,8 @@ func serveCommand() *cli.Command {
 			// hypercerts: Explicit source origins schedule quiet-PDS backfill.
 			// hypercerts: Credentials come from mounted files, never command-line values.
 			&cli.StringFlag{Name: "control-token-file", Usage: "Mounted secret file for the private service API; requires debug-addr", Sources: cli.EnvVars("JETSTREAM_CONTROL_TOKEN_FILE")},
+			&cli.StringFlag{Name: "relay-control-url", Usage: "Private Relay control base URL used only for completed recovery receipts", Sources: cli.EnvVars("JETSTREAM_RELAY_CONTROL_URL")},
+			&cli.StringFlag{Name: "relay-control-token-file", Usage: "Mounted Relay private-control credential for recovery receipts", Sources: cli.EnvVars("JETSTREAM_RELAY_CONTROL_TOKEN_FILE")},
 			&cli.StringSliceFlag{Name: "pds-sources", Usage: "Initial admitted direct-PDS HTTPS origins to backfill; comma-separated", Sources: cli.EnvVars("JETSTREAM_PDS_SOURCES")},
 			// hypercerts: Seed new archives with bundled record NSIDs unless explicitly overridden.
 			&cli.StringSliceFlag{Name: "collections", Usage: "Initial exact collection NSIDs, overriding the bundled seed; empty stores no records. Existing persisted policy wins.", Sources: cli.EnvVars("JETSTREAM_COLLECTIONS")},
@@ -429,23 +430,35 @@ func serveCommand() *cli.Command {
 	}
 }
 
+func readControlTokenFile(path, name string) (string, error) {
+	if path == "" {
+		return "", nil
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("cannot open %s token file", name)
+	}
+	defer file.Close()
+	contents, err := io.ReadAll(io.LimitReader(file, 4097))
+	if err != nil || len(contents) > 4096 {
+		return "", fmt.Errorf("cannot read bounded %s token file", name)
+	}
+	token := strings.TrimSpace(string(contents))
+	if len(token) < 32 {
+		return "", fmt.Errorf("%s token must contain at least 32 bytes", name)
+	}
+	return token, nil
+}
+
 func serveOptionsFromCommand(cmd *cli.Command) (jetstreamd.Options, error) {
-	// hypercerts: Read a bounded secret without printing its contents on errors.
-	var controlToken string
-	if path := cmd.String("control-token-file"); path != "" {
-		file, err := os.Open(path)
-		if err != nil {
-			return jetstreamd.Options{}, errors.New("cannot open control token file")
-		}
-		contents, err := io.ReadAll(io.LimitReader(file, 4097))
-		file.Close()
-		if err != nil || len(contents) > 4096 {
-			return jetstreamd.Options{}, errors.New("cannot read bounded control token file")
-		}
-		controlToken = strings.TrimSpace(string(contents))
-		if len(controlToken) < 32 {
-			return jetstreamd.Options{}, errors.New("control token must contain at least 32 bytes")
-		}
+	// hypercerts: Read bounded secrets without printing their contents on errors.
+	controlToken, err := readControlTokenFile(cmd.String("control-token-file"), "control")
+	if err != nil {
+		return jetstreamd.Options{}, err
+	}
+	relayControlToken, err := readControlTokenFile(cmd.String("relay-control-token-file"), "relay control")
+	if err != nil {
+		return jetstreamd.Options{}, err
 	}
 	backfillRepos, err := parseBackfillRepos(cmd.String("backfill-repos"))
 	if err != nil {
@@ -480,6 +493,8 @@ func serveOptionsFromCommand(cmd *cli.Command) (jetstreamd.Options, error) {
 		InitialPDSSources:              cmd.StringSlice("pds-sources"),
 		InitialCollections:             initialCollections,
 		RelayURL:                       cmd.String("relay-url"),
+		RelayControlURL:                cmd.String("relay-control-url"),
+		RelayControlToken:              relayControlToken,
 		PLCURL:                         cmd.String("plc-url"),
 		OTelServiceName:                cmd.String("otel-service-name"),
 		LogLevel:                       cmd.String("log-level"),

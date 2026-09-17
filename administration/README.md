@@ -141,8 +141,8 @@ Unavailable services remain incomplete until an explicit retry. Source removal
 stops acquisition without deleting archives. Job progress remains owned by Jetstream.
 
 Coverage is a page of PDS/policy results with the exact selected collections, job
-ID, progress and incomplete reason. A completed current snapshot has
-`historyComplete: false`; historical PDS attribution is explicitly unknown.
+ID, progress and incomplete reason. Historical PDS attribution is explicitly
+unknown; a completed current snapshot is not a historical event-completeness claim.
 Sources without jobs have unknown coverage. The Sources table presents the
 initial Jetstream inventory totals and processed repositories for the latest job
 beside Relay-observed accounts. Its compact coverage enrichment has a three-second

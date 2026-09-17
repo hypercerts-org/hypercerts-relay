@@ -170,7 +170,7 @@ test(
       jobs.jobs.find((job) => job.id === jobID)?.state,
       "incomplete",
     );
-    assert.ok(jobs.jobs.every((j) => !j.historyComplete));
+    assert.ok(jobs.jobs.every((j) => j.coverage === "current_state"));
     assert.ok(jobs.jobs.some((j) => j.state === "incomplete"));
     await services.call("relay", "/source", "PUT", {
       pds: "https://relay-only.example",

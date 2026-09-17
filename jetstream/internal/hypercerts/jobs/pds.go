@@ -34,15 +34,69 @@ func (p PDSProcessor) Run(ctx context.Context, job Job) error {
 		return inputFailure(ctx, "identity_unavailable")
 	}
 	client := p.client(job)
+	if !job.TotalReposKnown {
+		if err := p.enumerateInventory(ctx, client, &job); err != nil {
+			return err
+		}
+		var err error
+		job, err = p.Manager.Get(job.ID)
+		if err != nil {
+			return err
+		}
+	}
+	return p.processFrozenInventory(ctx, client, job)
+}
+
+// enumerateInventory performs exactly one checkpointed listRepos traversal for
+// a job. It persists only validated active DID/revision coordinates; repository
+// acquisition starts after the terminal page makes the denominator durable.
+func (p PDSProcessor) enumerateInventory(ctx context.Context, client *atmossync.Client, job *Job) error {
 	for page, err := range client.ListRepos(ctx, 100, job.Cursor) {
 		if err != nil {
 			return inputFailure(ctx, "source_unavailable")
 		}
-		if err := p.processPage(ctx, client, &job, page); err != nil {
+		entries := make(map[string]string)
+		for _, entry := range page.Entries {
+			if !entry.Active {
+				continue
+			}
+			if err := p.validateListedSnapshot(job, entry); err != nil {
+				return err
+			}
+			if previous, exists := entries[string(entry.DID)]; exists && previous != entry.Rev {
+				return &InputError{Code: "invalid_listing"}
+			}
+			entries[string(entry.DID)] = entry.Rev
+		}
+		if err := p.Manager.CheckpointInventory(job.ID, page.NextCursor, entries, page.NextCursor == ""); err != nil {
+			return err
+		}
+		job.Cursor = page.NextCursor
+		job.EnumeratedRepos += len(entries)
+		if page.NextCursor == "" {
+			job.TotalReposKnown = true
+		}
+	}
+	if !job.TotalReposKnown {
+		if err := p.Manager.CheckpointInventory(job.ID, job.Cursor, nil, true); err != nil {
 			return err
 		}
 	}
-	return p.completeEnumeration(job)
+	return nil
+}
+
+func (p PDSProcessor) processFrozenInventory(ctx context.Context, client *atmossync.Client, job Job) error {
+	entries, err := p.Manager.Inventory(job.ID)
+	if err != nil {
+		return err
+	}
+	for _, frozen := range entries {
+		entry := atmossync.ListReposEntry{DID: atmos.DID(frozen.DID), Rev: frozen.Revision, Active: true}
+		if _, err := p.processActiveEntry(ctx, client, &job, entry); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (p PDSProcessor) client(job Job) *atmossync.Client {

@@ -328,7 +328,6 @@ function jobEvidence(value) {
     cursor: value.cursor,
     errorCode: value.errorCode ?? '',
     coverage: value.coverage,
-    historyComplete: value.historyComplete,
   }
 }
 

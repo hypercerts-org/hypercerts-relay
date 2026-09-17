@@ -102,7 +102,6 @@ test("coverage preserves Jetstream's reason independently of its error code", as
         errorCode: "source_unavailable",
         createdAt: "2026-09-15T00:00:00.000Z",
         coverage: "current_state",
-        historyComplete: false,
       },
     ],
     nextCursor: "next-page",

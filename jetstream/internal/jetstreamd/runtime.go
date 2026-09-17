@@ -4,18 +4,23 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/bluesky-social/jetstream/internal/hypercerts/control"
-	"github.com/bluesky-social/jetstream/internal/hypercerts/jobs"
-	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
+	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/hypercerts/control"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/jobs"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 	identcache "github.com/bluesky-social/jetstream/internal/identity"
 	"github.com/bluesky-social/jetstream/internal/importer"
 	"github.com/bluesky-social/jetstream/internal/ingest"
@@ -85,6 +90,15 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	// hypercerts: Reject an ineffective profiling request before opening persistent state.
 	if opts.EnablePprof && opts.DebugAddr == "" && opts.DebugListener == nil {
 		return nil, errors.New("profiling requires a private debug listener")
+	}
+	if (opts.RelayControlURL == "") != (opts.RelayControlToken == "") {
+		return nil, errors.New("relay control URL and token must be configured together")
+	}
+	// hypercerts: Never send recovery bearer credentials to public plaintext HTTP.
+	if opts.RelayControlURL != "" {
+		if err := validateRelayControlURL(opts.RelayControlURL, os.Getenv("HC_RAILWAY_STARTUP") == "1"); err != nil {
+			return nil, err
+		}
 	}
 	if opts.SegmentCacheMaxAge < 0 {
 		return nil, fmt.Errorf("serve: --segment-cache-max-age must be >= 0 (SegmentCacheMaxAge must be >= 0), got %s", opts.SegmentCacheMaxAge)
@@ -485,6 +499,10 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	// hypercerts: Snapshots use the same identity directory and direct-PDS HTTP client.
 	if rt.BackfillJobs != nil {
 		rt.jobProcessor = jobs.PDSProcessor{Manager: rt.BackfillJobs, HTTPClient: xrpcClient.HTTPClient.Val(), Directory: directory, Reconcile: orch.ReconcileSnapshot}.Run
+		if opts.RelayControlURL != "" {
+			receiver := jobs.RelayReceiptSender{URL: opts.RelayControlURL, Token: opts.RelayControlToken, Client: xrpcClient.HTTPClient.Val()}
+			rt.BackfillJobs.SetReceiptSender(receiver.Send)
+		}
 	}
 
 	// Timestamp-import job manager (design §8 M6). Always constructed so the
@@ -653,6 +671,36 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	rt.server = srv
 
 	return rt, nil
+}
+
+var railwayPrivateHostname = regexp.MustCompile(`^[a-z0-9-]+\.railway\.internal$`)
+
+func validateRelayControlURL(raw string, railwayPrivateNetwork bool) error {
+	controlURL, err := url.Parse(raw)
+	if err != nil || strings.Contains(raw, "#") || !isControlOrigin(controlURL) {
+		return errors.New("relay control URL must be an HTTP(S) origin without credentials, path, query, or fragment")
+	}
+	switch strings.ToLower(controlURL.Scheme) {
+	case "https":
+		return nil
+	case "http":
+		if allowedControlHTTPHost(controlURL.Hostname(), railwayPrivateNetwork) {
+			return nil
+		}
+	}
+	return errors.New("relay control URL requires HTTPS except loopback or enabled Railway private HTTP")
+}
+
+func isControlOrigin(controlURL *url.URL) bool {
+	return controlURL != nil && controlURL.Host != "" && controlURL.User == nil && (controlURL.Path == "" || controlURL.Path == "/") && controlURL.RawPath == "" && controlURL.RawQuery == "" && !controlURL.ForceQuery && controlURL.Fragment == ""
+}
+
+func allowedControlHTTPHost(hostname string, railwayPrivateNetwork bool) bool {
+	hostname = strings.ToLower(hostname)
+	if hostname == "localhost" || net.ParseIP(hostname).IsLoopback() {
+		return true
+	}
+	return railwayPrivateNetwork && railwayPrivateHostname.MatchString(hostname)
 }
 
 // PublicAddr returns the bound public listener address, or "" before Run binds.

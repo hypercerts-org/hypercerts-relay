@@ -3,8 +3,8 @@
 set -euo pipefail
 
 case_id=${1:-}
-if [[ $# -ne 1 || ( "$case_id" != "T01" && "$case_id" != "T03-lifecycle" && "$case_id" != "T04" && "$case_id" != "T07" && "$case_id" != "T15-core" && "$case_id" != "T15-selection" ) ]]; then
-	printf '%s\n' 'usage: ./tests/acceptance/run T01|T03-lifecycle|T04|T07|T15-core|T15-selection' >&2
+if [[ $# -ne 1 || ( "$case_id" != "T01" && "$case_id" != "T02" && "$case_id" != "T03-lifecycle" && "$case_id" != "T03-jobs" && "$case_id" != "T04" && "$case_id" != "T05" && "$case_id" != "T06" && "$case_id" != "T07" && "$case_id" != "T08" && "$case_id" != "T09" && "$case_id" != "T15-core" && "$case_id" != "T15-selection" ) ]]; then
+	printf '%s\n' 'usage: ./tests/acceptance/run T01|T02|T03-lifecycle|T03-jobs|T04|T05|T06|T07|T08|T09|T15-core|T15-selection' >&2
 	exit 64
 fi
 
@@ -15,6 +15,23 @@ if [[ "$case_id" == "T03-lifecycle" ]]; then
 		GOCACHE="${GOCACHE:-/tmp/hypercerts-relay-go-cache}" go test -mod=readonly -count=1 ./cmd/relay -run '^TestRecoveryReceiptAcceptance$'
 	)
 	printf '%s\n' 'T03-lifecycle passed: the private Relay receipt receiver accepts only a current admitted source revision and rejects a stale acknowledgement. Jetstream completion proof remains Plan 006.'
+	exit 0
+fi
+
+if [[ "$case_id" == "T02" || "$case_id" == "T03-jobs" || "$case_id" == "T05" || "$case_id" == "T06" || "$case_id" == "T08" || "$case_id" == "T09" ]]; then
+	case "$case_id" in
+		T02) package=./internal/hypercerts/jobs test_name='^TestPDSProcessorCountsOneResumableInventory$' ;;
+		T03-jobs) package=./internal/hypercerts/jobs test_name='^(TestCompletedRecoveryReceiptRetriesAfterRestart|TestSourceRevisionAdvanceCancelsInFlightJobAndSurvivesRestart)$' ;;
+		T05) package=./internal/hypercerts/jobs test_name='^TestJobsPolicyAtomicSchedulingAndCancellation$' ;;
+		T06) package=./internal/hypercerts/jobs test_name='^TestJobsCrashResumeAndUnavailableCoverage$' ;;
+		T08) package=./internal/hypercerts/jobs test_name='^TestPDSProcessorPersistsPermanentSnapshotRejectionWithoutProgress$' ;;
+		T09) package=./internal/hypercerts/control test_name='^TestPrivateSnapshotRejectionsView$' ;;
+	esac
+	(
+		cd "$root/jetstream"
+		GOCACHE="${GOCACHE:-/tmp/hypercerts-relay-go-cache}" go test -mod=readonly -count=1 "$package" -run "$test_name"
+	)
+	printf '%s\n' "$case_id passed: durable current-state job evidence completed. Historical completeness is not claimed."
 	exit 0
 fi
 
