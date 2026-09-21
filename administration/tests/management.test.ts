@@ -117,6 +117,21 @@ test(
       assert.equal(result.state, "applied", JSON.stringify(result));
       return result;
     }
+    async function waitForBackfillWorkers() {
+      const deadline = Date.now() + 10_000;
+      for (;;) {
+        const jobs = await services.jobs();
+        if (
+          jobs.jobs.every(
+            (job) => job.state !== "pending" && job.state !== "running",
+          )
+        )
+          return;
+        if (Date.now() >= deadline)
+          assert.fail("fixture backfill workers did not settle");
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    }
     await apply({
       kind: "source",
       pds: "https://pds.example",
@@ -150,6 +165,10 @@ test(
       "/source?pds=https%3A%2F%2Fpds.example",
     );
     assert.equal(observed.AccountQuota.Limit, 250);
+    // The fixture worker deliberately completes each backfill as unavailable.
+    // Wait for that independent work before changing its policy, so this test
+    // does not depend on a concurrent transition inside the owner process.
+    await waitForBackfillWorkers();
     await apply({
       kind: "collections",
       expectedRevision: 1,
