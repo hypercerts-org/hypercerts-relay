@@ -19,14 +19,17 @@ import (
 )
 
 const (
-	pds          = "upgrade-state.example"
-	sourceRev    = uint64(7)
-	relayCursor  = int64(4242)
-	globalRate   = int64(17)
-	sourceRate   = int64(9)
-	policyRev    = uint64(2)
-	completionID = "0123456789abcdef0123456789abcdef"
-	rawDID       = "did:plc:upgraderawstate"
+	pds             = "upgrade-state.example"
+	sourceRev       = uint64(7)
+	relayCursor     = int64(4242)
+	globalRate      = int64(17)
+	sourceRate      = int64(9)
+	policyRev       = uint64(2)
+	completionID    = "0123456789abcdef0123456789abcdef"
+	durableBoundary = "complete:4242"
+	rawDID          = "did:plc:upgraderawstate"
+	rawActive       = true
+	rawTime         = "2026-09-16T00:00:00Z"
 )
 
 type staticUIDs struct{}
@@ -68,7 +71,7 @@ func seed(dataDir string, db *gorm.DB, svc *relay.Relay) {
 	if err := db.Create(&source).Error; err != nil {
 		fatal("seed Relay source: %v", err)
 	}
-	receipt := models.RecoveryReceipt{PDS: "https://" + pds, HostID: host.ID, SourceRevision: sourceRev, PolicyRevision: policyRev, JobID: completionID, DurableBoundary: "complete:4242"}
+	receipt := models.RecoveryReceipt{PDS: "https://" + pds, HostID: host.ID, SourceRevision: sourceRev, PolicyRevision: policyRev, JobID: completionID, DurableBoundary: durableBoundary}
 	if err := db.Create(&receipt).Error; err != nil {
 		fatal("seed Relay receipt: %v", err)
 	}
@@ -86,7 +89,7 @@ func seed(dataDir string, db *gorm.DB, svc *relay.Relay) {
 		fatal("open Relay raw store: %v", err)
 	}
 	persist.SetUidSource(staticUIDs{})
-	if err := persist.Persist(ctx, &stream.XRPCStreamEvent{RepoAccount: &atproto.SyncSubscribeRepos_Account{Active: true, Did: rawDID, Seq: relayCursor, Time: "2026-09-16T00:00:00Z"}}); err != nil {
+	if err := persist.Persist(ctx, &stream.XRPCStreamEvent{RepoAccount: &atproto.SyncSubscribeRepos_Account{Active: rawActive, Did: rawDID, Seq: relayCursor, Time: rawTime}}); err != nil {
 		fatal("seed Relay raw event: %v", err)
 	}
 	if err := persist.Shutdown(ctx); err != nil {
@@ -108,6 +111,9 @@ func verify(dataDir string, db *gorm.DB, svc *relay.Relay) {
 	if err := db.Where("pds = ? AND source_revision = ? AND policy_revision = ? AND job_id = ?", "https://"+pds, sourceRev, policyRev, completionID).First(&receipt).Error; err != nil {
 		fatal("open persisted recovery receipt: %v", err)
 	}
+	if receipt.DurableBoundary != durableBoundary {
+		fatal("recovery receipt assertion failed: durableBoundary=%q", receipt.DurableBoundary)
+	}
 	policies, _, err := svc.ListRatePolicies(ctx, "")
 	if err != nil {
 		fatal("list persisted rate policies: %v", err)
@@ -126,7 +132,7 @@ func verify(dataDir string, db *gorm.DB, svc *relay.Relay) {
 	persist.SetUidSource(staticUIDs{})
 	var rawEvents int
 	err = persist.Playback(ctx, 0, func(event *stream.XRPCStreamEvent) error {
-		if event.RepoAccount == nil || event.RepoAccount.Did != rawDID {
+		if event.RepoAccount == nil || event.RepoAccount.Did != rawDID || event.RepoAccount.Active != rawActive || event.RepoAccount.Seq != relayCursor || event.RepoAccount.Time != rawTime {
 			return fmt.Errorf("unexpected restored raw event")
 		}
 		rawEvents++

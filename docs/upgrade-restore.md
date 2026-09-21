@@ -3,9 +3,9 @@
 This runbook qualifies the initial launch contract: **forward upgrades only**.
 After a state migration, binary rollback is not supported; recover with a
 consistent restore. The data that must be retained is the crawled/Jetstream
-archive and its aligned durable cursor positions. Relay and administration
-state may be rebuilt or accepted as lost only after that preservation boundary
-has been checked.
+archive and its aligned durable cursor positions, Relay raw crawl and source
+state, and the authorized administration database state. A valid restore keeps
+those owners together so source admission can be verified before it resumes.
 
 ## Before a release candidate
 
