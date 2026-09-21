@@ -12,7 +12,7 @@ import (
 
 	blocks "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
-	"github.com/ipld/go-car"
+	car "github.com/ipld/go-car/v2"
 )
 
 var ErrNoRoot = errors.New("CAR file missing root CID")
@@ -23,18 +23,18 @@ func LoadRepoFromCAR(ctx context.Context, r io.Reader) (*Commit, *Repo, error) {
 	//bs := blockstore.NewBlockstore(datastore.NewMapDatastore())
 	bs := NewTinyBlockstore()
 
-	cr, err := car.NewCarReader(r)
+	cr, err := car.NewBlockReader(r)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	if cr.Header.Version != 1 {
-		return nil, nil, fmt.Errorf("unsupported CAR file version: %d", cr.Header.Version)
+	if cr.Version != 1 {
+		return nil, nil, fmt.Errorf("unsupported CAR file version: %d", cr.Version)
 	}
-	if len(cr.Header.Roots) < 1 {
+	if len(cr.Roots) < 1 {
 		return nil, nil, fmt.Errorf("CAR file missing root CID")
 	}
-	commitCID := cr.Header.Roots[0]
+	commitCID := cr.Roots[0]
 
 	for {
 		blk, err := cr.Next()
@@ -80,17 +80,17 @@ func LoadRepoFromCAR(ctx context.Context, r io.Reader) (*Commit, *Repo, error) {
 // LoadCommitFromCAR is like LoadRepoFromCAR() but filters to only return the commit object.
 // Also returns the commit CID.
 func LoadCommitFromCAR(ctx context.Context, r io.Reader) (*Commit, *cid.Cid, error) {
-	cr, err := car.NewCarReader(r)
+	cr, err := car.NewBlockReader(r)
 	if err != nil {
 		return nil, nil, err
 	}
-	if cr.Header.Version != 1 {
-		return nil, nil, fmt.Errorf("unsupported CAR file version: %d", cr.Header.Version)
+	if cr.Version != 1 {
+		return nil, nil, fmt.Errorf("unsupported CAR file version: %d", cr.Version)
 	}
-	if len(cr.Header.Roots) < 1 {
+	if len(cr.Roots) < 1 {
 		return nil, nil, ErrNoRoot
 	}
-	commitCID := cr.Header.Roots[0]
+	commitCID := cr.Roots[0]
 	var commitBlock blocks.Block
 	for {
 		blk, err := cr.Next()

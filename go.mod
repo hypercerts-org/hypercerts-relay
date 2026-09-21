@@ -28,7 +28,6 @@ require (
 	github.com/ipfs/go-ipld-cbor v0.1.0
 	github.com/ipfs/go-ipld-format v0.6.0
 	github.com/ipfs/go-libipfs v0.7.0
-	github.com/ipld/go-car v0.6.1-0.20230509095817-92d28eb23ba4
 	github.com/ipld/go-car/v2 v2.13.1
 	github.com/joho/godotenv v1.5.1
 	github.com/labstack/echo/v4 v4.15.4
