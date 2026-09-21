@@ -96,6 +96,24 @@ func TestRecoveryReceiptAcceptance(t *testing.T) {
 	require.Equal(t, http.StatusOK, status, string(body))
 	require.False(t, decodeSource(body).RecoveryRequired)
 
+	advance := map[string]any{
+		"pds":            "https://receipt-control.example",
+		"sourceRevision": first.Revision,
+		"policyRevision": 3,
+	}
+	status, _ = call("POST", "/hypercerts/v1/source/recovery-policy", advance, false)
+	require.Equal(t, http.StatusUnauthorized, status)
+	status, body = call("POST", "/hypercerts/v1/source/recovery-policy", advance, true)
+	require.Equal(t, http.StatusOK, status, string(body))
+	require.True(t, decodeSource(body).RecoveryRequired)
+	status, _ = call("POST", "/hypercerts/v1/source/recovery-receipt", receipt, true)
+	require.Equal(t, http.StatusConflict, status)
+	receipt["policyRevision"] = 3
+	receipt["jobId"] = "abcdef0123456789abcdef0123456789"
+	status, body = call("POST", "/hypercerts/v1/source/recovery-receipt", receipt, true)
+	require.Equal(t, http.StatusOK, status, string(body))
+	require.False(t, decodeSource(body).RecoveryRequired)
+
 	status, body = call("PUT", "/hypercerts/v1/source", map[string]string{"pds": "https://receipt-control.example", "state": "disabled"}, true)
 	require.Equal(t, http.StatusOK, status, string(body))
 	require.True(t, decodeSource(body).RecoveryRequired)

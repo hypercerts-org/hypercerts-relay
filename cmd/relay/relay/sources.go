@@ -84,6 +84,14 @@ type RecoveryReceiptInput struct {
 	DurableBoundary string
 }
 
+// RecoveryPolicyAdvanceInput is the private Jetstream-to-Relay transition
+// which arms an admitted source for a newly durable collection policy.
+type RecoveryPolicyAdvanceInput struct {
+	PDS            string
+	SourceRevision uint64
+	PolicyRevision uint64
+}
+
 // SourceAccountView keeps historical source observation distinct from current
 // account placement. A zero CurrentHostID means no current account row exists.
 type SourceAccountView struct {
@@ -369,7 +377,7 @@ func (r *Relay) AcknowledgeSourceRecovery(ctx context.Context, input RecoveryRec
 	if err != nil {
 		return nil, err
 	}
-	if source.State != models.SourceStateEnabled || source.Revision != input.SourceRevision {
+	if source.State != models.SourceStateEnabled || source.Revision != input.SourceRevision || (source.RecoveryPolicyRevision != 0 && source.RecoveryPolicyRevision != input.PolicyRevision) {
 		return nil, ErrRecoveryReceiptConflict
 	}
 
@@ -402,6 +410,60 @@ func (r *Relay) AcknowledgeSourceRecovery(ctx context.Context, input RecoveryRec
 		return nil, err
 	}
 	source.RecoveryRequired = false
+	return r.sourceViewLocked(ctx, source, sourceHost)
+}
+
+// AdvanceSourceRecoveryPolicy durably records the Jetstream policy revision
+// which is entitled to complete a source recovery. The advance and re-arm are
+// one Relay transaction, so an older receipt either wins before the advance
+// (and is re-armed) or loses after it.
+func (r *Relay) AdvanceSourceRecoveryPolicy(ctx context.Context, input RecoveryPolicyAdvanceInput) (*SourceView, error) {
+	if input.SourceRevision == 0 || input.PolicyRevision == 0 {
+		return nil, ErrInvalidRecoveryReceipt
+	}
+	hostname, noSSL, err := ParseHostname(input.PDS)
+	if err != nil {
+		return nil, ErrInvalidRecoveryReceipt
+	}
+
+	r.sourcesLk.Lock()
+	defer r.sourcesLk.Unlock()
+
+	var host models.Host
+	if err := r.db.WithContext(ctx).Where(sourceHostnamePredicate, hostname).First(&host).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrSourceNotFound
+		}
+		return nil, fmt.Errorf("loading policy source host: %w", err)
+	}
+	if host.NoSSL != noSSL {
+		return nil, ErrInvalidRecoveryReceipt
+	}
+	source, sourceHost, err := r.sourceAndHostLocked(ctx, host.ID)
+	if err != nil {
+		return nil, err
+	}
+	if source.State != models.SourceStateEnabled || source.Revision != input.SourceRevision || input.PolicyRevision < source.RecoveryPolicyRevision {
+		return nil, ErrRecoveryReceiptConflict
+	}
+	if input.PolicyRevision > source.RecoveryPolicyRevision {
+		if err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			result := tx.Model(&models.Source{}).
+				Where("host_id = ? AND revision = ? AND state = ? AND recovery_policy_revision < ?", source.HostID, input.SourceRevision, models.SourceStateEnabled, input.PolicyRevision).
+				Updates(map[string]any{"recovery_policy_revision": input.PolicyRevision, "recovery_required": true})
+			if result.Error != nil {
+				return fmt.Errorf("advancing source recovery policy: %w", result.Error)
+			}
+			if result.RowsAffected != 1 {
+				return ErrRecoveryReceiptConflict
+			}
+			return nil
+		}); err != nil {
+			return nil, err
+		}
+		source.RecoveryPolicyRevision = input.PolicyRevision
+		source.RecoveryRequired = true
+	}
 	return r.sourceViewLocked(ctx, source, sourceHost)
 }
 

@@ -47,6 +47,10 @@ type Source struct {
 	// durable boundary. Relay lifecycle changes never clear it.
 	// Creation paths explicitly require recovery; preserve a completed boundary's false value.
 	RecoveryRequired bool `gorm:"column:recovery_required;not null" json:"recoveryRequired"`
+	// RecoveryPolicyRevision is the latest Jetstream collection-policy
+	// revision that may clear RecoveryRequired. Zero preserves pre-mirror
+	// source rows until Jetstream advances their policy through the private seam.
+	RecoveryPolicyRevision uint64 `gorm:"column:recovery_policy_revision;not null;default:0" json:"-"`
 }
 
 func (Source) TableName() string {

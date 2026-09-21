@@ -42,6 +42,7 @@ const (
 var ErrConflict = errors.New("job or source state conflict")
 var ErrNotFound = errors.New("job not found")
 var ErrInvalidInput = errors.New("invalid job input")
+var ErrPolicyMirrorRequired = errors.New("Relay policy mirror is required for a Relay-bound source")
 var ErrReceiptStale = errors.New("recovery receipt rejected as stale")
 var ErrReceiptSourceMissing = errors.New("recovery receipt source no longer exists")
 
@@ -113,19 +114,24 @@ type data struct {
 	SnapshotRejections map[string]SnapshotRejection `json:"snapshotRejections"`
 }
 type Manager struct {
-	mu            sync.Mutex
-	db            *store.Store
-	policy        *selection.Manager
-	data          data
-	cancel        context.CancelFunc
-	running       bool
-	runningID     string
-	receiptSender ReceiptSender
+	mu             sync.Mutex
+	db             *store.Store
+	policy         *selection.Manager
+	data           data
+	cancel         context.CancelFunc
+	running        bool
+	runningID      string
+	receiptSender  ReceiptSender
+	policyAdvancer PolicyAdvanceSender
 }
 
 // ReceiptSender submits a completed job's bounded recovery coordinate to the
 // Relay owner. It is nil when no private Relay control seam is configured.
 type ReceiptSender func(context.Context, Job) error
+
+// PolicyAdvanceSender records a new Jetstream policy revision with Relay
+// before that policy is allowed to create recovery work locally.
+type PolicyAdvanceSender func(context.Context, string, uint64, uint64) error
 
 func Open(db *store.Store, policy *selection.Manager) (*Manager, error) {
 	if policy == nil {
@@ -397,9 +403,35 @@ func (m *Manager) RemoveSource(raw string) error {
 	}
 	return nil
 }
-func (m *Manager) SetPolicy(expected uint64, collections []string) (selection.Policy, error) {
+func (m *Manager) SetPolicy(ctx context.Context, expected uint64, collections []string) (selection.Policy, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	collections, err := selection.Normalize(collections)
+	if err != nil {
+		return selection.Policy{}, err
+	}
+	current := m.policy.Current()
+	if expected != current.Revision {
+		return selection.Policy{}, selection.ErrRevision
+	}
+	if slices.Equal(collections, current.Collections) {
+		return current, nil
+	}
+	if expected == ^uint64(0) {
+		return selection.Policy{}, errors.New("collection policy revision exhausted")
+	}
+	for _, pds := range orderedEnabledSources(m.data.Sources) {
+		sourceRevision := m.data.SourceRevisions[pds]
+		if sourceRevision == 0 {
+			continue
+		}
+		if m.policyAdvancer == nil {
+			return selection.Policy{}, ErrPolicyMirrorRequired
+		}
+		if err := m.policyAdvancer(ctx, pds, sourceRevision, expected+1); err != nil {
+			return selection.Policy{}, fmt.Errorf("advance Relay recovery policy for %s: %w", pds, err)
+		}
+	}
 	next := clone(m.data)
 	ensureSourceRevisions(&next)
 	policy, err := m.policy.Update(expected, collections, func(policy selection.Policy, b *pebble.Batch) error {
@@ -657,6 +689,25 @@ func (m *Manager) SetReceiptSender(sender ReceiptSender) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.receiptSender = sender
+}
+
+// SetPolicyAdvanceSender configures the private Relay mirror which must
+// acknowledge a newer policy before Jetstream commits it.
+func (m *Manager) SetPolicyAdvanceSender(sender PolicyAdvanceSender) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.policyAdvancer = sender
+}
+
+func orderedEnabledSources(sources map[string]bool) []string {
+	result := make([]string, 0, len(sources))
+	for pds, enabled := range sources {
+		if enabled {
+			result = append(result, pds)
+		}
+	}
+	slices.Sort(result)
+	return result
 }
 
 // snapshotRejectionPosition bounds untrusted source/listing coordinates before
@@ -1085,9 +1136,30 @@ func (m *Manager) flushReceipts(ctx context.Context) error {
 	pending := make([]Job, 0)
 	now := time.Now().UTC()
 	if sender != nil {
+		currentPolicyRevision := m.policy.Current().Revision
+		next := clone(m.data)
+		changed := false
 		for _, job := range m.data.Jobs {
-			if job.State == Complete && job.ReceiptPending && !job.ReceiptRetryAt.After(now) {
-				pending = append(pending, clone(job))
+			if job.State == Complete && job.ReceiptPending {
+				if job.Policy.Revision != currentPolicyRevision {
+					// A policy change has already created current-policy work. Do not
+					// let its superseded predecessor acknowledge Relay recovery.
+					job.ReceiptPending = false
+					job.ReceiptRetryAt = time.Time{}
+					job.ReceiptError = "policy_superseded"
+					next.Jobs[job.ID] = job
+					changed = true
+					continue
+				}
+				if !job.ReceiptRetryAt.After(now) {
+					pending = append(pending, clone(job))
+				}
+			}
+		}
+		if changed {
+			if err := m.commit(next); err != nil {
+				m.mu.Unlock()
+				return err
 			}
 		}
 	}

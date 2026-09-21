@@ -7,16 +7,23 @@ reconciliation, checkpoints and current-state coverage. Relay source admission
 and lifecycle remain Relay-owned. A [TECH-637 recovery receipt](https://linear.app/hypercerts/issue/TECH-637/persist-cross-service-recovery-receipts-for-admitted-pdss)
 must bridge those owners before Relay clears a source recovery requirement.
 
-After persisting a successful job completion, Jetstream's Plan 006 executor
-submits Relay's
+Before Jetstream commits a changed collection policy, its executor first
+advances Relay's durable expected policy revision for every enabled source over
+the private control seam. Relay atomically records that revision and re-arms
+`RecoveryRequired`. If Relay cannot persist an advance, Jetstream rejects the
+policy change; it does not create policy work that an older receipt could
+acknowledge. After persisting a successful job completion, Jetstream submits Relay's
 `POST /hypercerts/v1/source/recovery-receipt` with the exact admitted PDS,
 Relay source revision, Jetstream policy revision, job ID, and bounded durable
 completion boundary. Relay persists that composite receipt and clears
-`RecoveryRequired` only while the enabled source still has that exact revision.
-Stale, removed, or disabled sources reject the acknowledgement. Plan 006 owns
-the private sender and completion proof; a submitted job is not itself a
-receipt. The endpoint is a trusted internal Jetstream-to-Relay control seam,
-not an administration or browser API.
+`RecoveryRequired` only while the enabled source still has that exact source
+and mirrored policy revision. An old receipt and a policy advance serialize at
+Relay: if the receipt arrives first, the advance re-arms recovery; if the
+advance arrives first, the receipt is rejected. Stale, removed, or disabled
+sources reject the acknowledgement. Plan 006 owns the private sender and
+completion proof; a submitted job is not itself a receipt. These endpoints are
+trusted internal Jetstream-to-Relay control seams, not administration or browser
+APIs.
 
 The private Jetstream interface provides:
 

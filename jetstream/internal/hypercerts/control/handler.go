@@ -125,7 +125,7 @@ func (h *Handler) setPolicy(w http.ResponseWriter, r *http.Request) {
 		reply(w, 400, map[string]string{"error": "invalid_collections"})
 		return
 	}
-	policy, err := h.jobs.SetPolicy(input.ExpectedRevision, *input.Collections)
+	policy, err := h.jobs.SetPolicy(r.Context(), input.ExpectedRevision, *input.Collections)
 	if err != nil {
 		failure(w, err)
 		return

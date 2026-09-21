@@ -19,6 +19,49 @@ type RelayReceiptSender struct {
 	Client *http.Client
 }
 
+// AdvancePolicy durably re-arms Relay recovery for the next Jetstream policy
+// revision before Jetstream commits that policy locally.
+func (s RelayReceiptSender) AdvancePolicy(ctx context.Context, pds string, sourceRevision, policyRevision uint64) error {
+	payload, err := json.Marshal(struct {
+		PDS            string `json:"pds"`
+		SourceRevision uint64 `json:"sourceRevision"`
+		PolicyRevision uint64 `json:"policyRevision"`
+	}{pds, sourceRevision, policyRevision})
+	if err != nil {
+		return err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(s.URL, "/")+"/hypercerts/v1/source/recovery-policy", bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Authorization", "Bearer "+s.Token)
+	request.Header.Set("Content-Type", "application/json")
+	client := s.Client
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second}
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return fmt.Errorf("advance recovery policy: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		if response.StatusCode == http.StatusNotFound {
+			var failure struct {
+				Error string `json:"error"`
+			}
+			if err := json.NewDecoder(io.LimitReader(response.Body, 4096)).Decode(&failure); err == nil && failure.Error == "source_not_found" {
+				return ErrReceiptSourceMissing
+			}
+		}
+		if response.StatusCode == http.StatusConflict {
+			return ErrReceiptStale
+		}
+		return fmt.Errorf("advance recovery policy: relay returned %d", response.StatusCode)
+	}
+	return nil
+}
+
 func (s RelayReceiptSender) Send(ctx context.Context, job Job) error {
 	if job.SourceRevision == 0 {
 		return nil

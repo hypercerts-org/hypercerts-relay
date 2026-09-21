@@ -38,6 +38,7 @@ func (s *Service) controlHandler(token string) (http.Handler, error) {
 		controlResult(w, view, err)
 	})
 	mux.HandleFunc("PUT /hypercerts/v1/source", s.controlSetSource)
+	mux.HandleFunc("POST /hypercerts/v1/source/recovery-policy", s.controlAdvanceRecoveryPolicy)
 	mux.HandleFunc("POST /hypercerts/v1/source/recovery-receipt", s.controlAcknowledgeRecovery)
 	mux.HandleFunc("PUT /hypercerts/v1/source/quota", func(w http.ResponseWriter, r *http.Request) {
 		var input struct {
@@ -106,6 +107,25 @@ func (s *Service) controlSetSource(w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 		view, err = s.relay.SetSourceState(r.Context(), view.HostID, view.Revision, input.State)
 	}
+	controlResult(w, view, err)
+}
+
+// controlAdvanceRecoveryPolicy is the private policy-currentness seam. It
+// durably re-arms Relay recovery before Jetstream commits newer policy work.
+func (s *Service) controlAdvanceRecoveryPolicy(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		PDS            string `json:"pds"`
+		SourceRevision uint64 `json:"sourceRevision"`
+		PolicyRevision uint64 `json:"policyRevision"`
+	}
+	if !controlDecode(w, r, &input) {
+		return
+	}
+	view, err := s.relay.AdvanceSourceRecoveryPolicy(r.Context(), relay.RecoveryPolicyAdvanceInput{
+		PDS:            input.PDS,
+		SourceRevision: input.SourceRevision,
+		PolicyRevision: input.PolicyRevision,
+	})
 	controlResult(w, view, err)
 }
 

@@ -502,6 +502,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		if opts.RelayControlURL != "" {
 			receiver := jobs.RelayReceiptSender{URL: opts.RelayControlURL, Token: opts.RelayControlToken, Client: xrpcClient.HTTPClient.Val()}
 			rt.BackfillJobs.SetReceiptSender(receiver.Send)
+			rt.BackfillJobs.SetPolicyAdvanceSender(receiver.AdvancePolicy)
 		}
 	}
 

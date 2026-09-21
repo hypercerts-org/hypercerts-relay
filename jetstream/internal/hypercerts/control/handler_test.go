@@ -101,7 +101,7 @@ func seedSnapshotRejections(t *testing.T, manager *jobs.Manager, dids []string, 
 	}
 	run(job)
 	if nextPolicy {
-		_, err = manager.SetPolicy(1, []string{})
+		_, err = manager.SetPolicy(t.Context(), 1, []string{})
 		require.NoError(t, err)
 		var replacement jobs.Job
 		for _, candidate := range manager.List() {

@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -37,7 +38,7 @@ func TestJobsPolicyAtomicSchedulingAndCancellation(t *testing.T) {
 	again, err := m.AddSource("https://pds.example/")
 	require.NoError(t, err)
 	require.Equal(t, j.ID, again.ID)
-	policy, err := m.SetPolicy(1, []string{"app.bsky.feed.like", "app.bsky.feed.post"})
+	policy, err := m.SetPolicy(t.Context(), 1, []string{"app.bsky.feed.like", "app.bsky.feed.post"})
 	require.NoError(t, err)
 	require.Equal(t, uint64(2), policy.Revision)
 	all := m.List()
@@ -50,7 +51,7 @@ func TestJobsPolicyAtomicSchedulingAndCancellation(t *testing.T) {
 			require.Equal(t, "https://pds.example", j.PDS)
 		}
 	}
-	_, err = m.SetPolicy(1, nil)
+	_, err = m.SetPolicy(t.Context(), 1, nil)
 	require.ErrorIs(t, err, selection.ErrRevision)
 	require.ErrorIs(t, m.Retry(j.ID), ErrConflict)
 	require.NoError(t, m.RemoveSource("https://pds.example"))
@@ -282,6 +283,85 @@ func TestStaleRecoveryReceiptIsTerminalWithoutStoppingJobs(t *testing.T) {
 	require.ErrorIs(t, <-done, context.Canceled)
 }
 
+func TestSupersededPolicyJobDoesNotSubmitRecoveryReceipt(t *testing.T) {
+	m, db := newManager(t, t.TempDir())
+	defer db.Close()
+	job, err := m.AddSourceWithRevision("https://pds.example", 4)
+	require.NoError(t, err)
+	m.SetReceiptSender(func(context.Context, Job) error { return errors.New("temporary receipt failure") })
+	m.SetPolicyAdvanceSender(func(context.Context, string, uint64, uint64) error { return nil })
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- m.Run(ctx, func(context.Context, Job) error { return nil }) }()
+	require.Eventually(t, func() bool {
+		current, getErr := m.Get(job.ID)
+		return getErr == nil && current.State == Complete && current.ReceiptPending
+	}, time.Second, time.Millisecond)
+
+	_, err = m.SetPolicy(t.Context(), m.policy.Current().Revision, []string{"app.bsky.feed.like", "app.bsky.feed.post"})
+	require.NoError(t, err)
+	receipts := make(chan Job, 1)
+	m.SetReceiptSender(func(_ context.Context, received Job) error {
+		receipts <- received
+		return nil
+	})
+	require.Eventually(t, func() bool {
+		current, getErr := m.Get(job.ID)
+		return getErr == nil && current.State == Complete && !current.ReceiptPending && current.ReceiptError == "policy_superseded"
+	}, time.Second, time.Millisecond)
+	require.Never(t, func() bool {
+		select {
+		case received := <-receipts:
+			return received.ID == job.ID
+		default:
+			return false
+		}
+	}, 200*time.Millisecond, time.Millisecond)
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+}
+
+func TestPolicyChangeRequiresRelayRecoveryMirror(t *testing.T) {
+	m, db := newManager(t, t.TempDir())
+	defer db.Close()
+	_, err := m.AddSourceWithRevision("https://pds.example", 4)
+	require.NoError(t, err)
+	_, err = m.SetPolicy(t.Context(), 1, []string{"app.bsky.feed.like", "app.bsky.feed.post"})
+	require.ErrorIs(t, err, ErrPolicyMirrorRequired)
+	require.Equal(t, uint64(1), m.policy.Current().Revision)
+
+	var advanced []struct {
+		pds            string
+		sourceRevision uint64
+		policyRevision uint64
+	}
+	m.SetPolicyAdvanceSender(func(_ context.Context, pds string, sourceRevision, policyRevision uint64) error {
+		advanced = append(advanced, struct {
+			pds            string
+			sourceRevision uint64
+			policyRevision uint64
+		}{pds, sourceRevision, policyRevision})
+		return nil
+	})
+	policy, err := m.SetPolicy(t.Context(), 1, []string{"app.bsky.feed.like", "app.bsky.feed.post"})
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), policy.Revision)
+	require.Equal(t, []struct {
+		pds            string
+		sourceRevision uint64
+		policyRevision uint64
+	}{{"https://pds.example", 4, 2}}, advanced)
+
+	m.SetPolicyAdvanceSender(func(context.Context, string, uint64, uint64) error { return errors.New("relay unavailable") })
+	_, err = m.SetPolicy(t.Context(), 2, []string{"app.bsky.actor.profile", "app.bsky.feed.like", "app.bsky.feed.post"})
+	require.ErrorContains(t, err, "advance Relay recovery policy")
+	require.Equal(t, uint64(2), m.policy.Current().Revision)
+	for _, job := range m.List() {
+		require.NotEqual(t, uint64(3), job.Policy.Revision)
+	}
+}
+
 func TestMissingRecoveryReceiptSourceIsTerminalWithoutStoppingJobs(t *testing.T) {
 	m, db := newManager(t, t.TempDir())
 	defer db.Close()
@@ -309,6 +389,26 @@ func TestRelayReceiptSenderClassifiesMissingSource(t *testing.T) {
 	defer relay.Close()
 	err := (RelayReceiptSender{URL: relay.URL, Token: "fixture-service-credential-32-bytes-minimum", Client: relay.Client()}).Send(t.Context(), Job{ID: "job-1", PDS: "https://pds.example", SourceRevision: 1, Policy: selection.Policy{Revision: 1}})
 	require.ErrorIs(t, err, ErrReceiptSourceMissing)
+}
+
+func TestRelayReceiptSenderAdvancesRecoveryPolicy(t *testing.T) {
+	relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, http.MethodPost, r.Method)
+		require.Equal(t, "/hypercerts/v1/source/recovery-policy", r.URL.Path)
+		var input struct {
+			PDS            string `json:"pds"`
+			SourceRevision uint64 `json:"sourceRevision"`
+			PolicyRevision uint64 `json:"policyRevision"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&input))
+		require.Equal(t, "https://pds.example", input.PDS)
+		require.Equal(t, uint64(4), input.SourceRevision)
+		require.Equal(t, uint64(2), input.PolicyRevision)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer relay.Close()
+	err := (RelayReceiptSender{URL: relay.URL, Token: "fixture-service-credential-32-bytes-minimum", Client: relay.Client()}).AdvancePolicy(t.Context(), "https://pds.example", 4, 2)
+	require.NoError(t, err)
 }
 
 func TestRelayReceiptSenderRetriesAmbiguousNotFoundResponses(t *testing.T) {
