@@ -1118,7 +1118,7 @@ func (m *Manager) finishJob(ctx context.Context, id string, processErr error) er
 	job := next.Jobs[id]
 	job.FinishedAt = time.Now().UTC()
 	job.State = state
-	if state == Complete && job.SourceRevision != 0 && m.receiptSender != nil {
+	if state == Complete && job.SourceRevision != 0 {
 		// This flag is written in the same durable job record as Complete, so a
 		// process loss after local success replays the acknowledgement on restart.
 		job.ReceiptPending = true
