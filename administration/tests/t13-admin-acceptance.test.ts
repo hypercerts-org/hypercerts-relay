@@ -95,7 +95,11 @@ test(
       headers: { Cookie: sessionCookie },
     });
     assert.equal(sessionResponse.status, 200);
-    const session = (await sessionResponse.json()) as { csrf: string };
+    const session = (await sessionResponse.json()) as {
+      did: string;
+      csrf: string;
+    };
+    assert.equal(session.did, did);
 
     const operation = { kind: "limit", scope: "global", eventsPerSecond: 17 };
     const rejectedHeaders: Record<string, string>[] = [
