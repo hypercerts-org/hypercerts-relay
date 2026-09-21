@@ -22,25 +22,11 @@ type RelayReceiptSender struct {
 // AdvancePolicy durably re-arms Relay recovery for the next Jetstream policy
 // revision before Jetstream commits that policy locally.
 func (s RelayReceiptSender) AdvancePolicy(ctx context.Context, pds string, sourceRevision, policyRevision uint64) error {
-	payload, err := json.Marshal(struct {
+	response, err := s.post(ctx, "recovery-policy", struct {
 		PDS            string `json:"pds"`
 		SourceRevision uint64 `json:"sourceRevision"`
 		PolicyRevision uint64 `json:"policyRevision"`
 	}{pds, sourceRevision, policyRevision})
-	if err != nil {
-		return err
-	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(s.URL, "/")+"/hypercerts/v1/source/recovery-policy", bytes.NewReader(payload))
-	if err != nil {
-		return err
-	}
-	request.Header.Set("Authorization", "Bearer "+s.Token)
-	request.Header.Set("Content-Type", "application/json")
-	client := s.Client
-	if client == nil {
-		client = &http.Client{Timeout: 10 * time.Second}
-	}
-	response, err := client.Do(request)
 	if err != nil {
 		return fmt.Errorf("advance recovery policy: %w", err)
 	}
@@ -66,27 +52,13 @@ func (s RelayReceiptSender) Send(ctx context.Context, job Job) error {
 	if job.SourceRevision == 0 {
 		return nil
 	}
-	payload, err := json.Marshal(struct {
+	response, err := s.post(ctx, "recovery-receipt", struct {
 		PDS             string `json:"pds"`
 		SourceRevision  uint64 `json:"sourceRevision"`
 		PolicyRevision  uint64 `json:"policyRevision"`
 		JobID           string `json:"jobId"`
 		DurableBoundary string `json:"durableBoundary"`
 	}{job.PDS, job.SourceRevision, job.Policy.Revision, job.ID, "current_state_complete"})
-	if err != nil {
-		return err
-	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(s.URL, "/")+"/hypercerts/v1/source/recovery-receipt", bytes.NewReader(payload))
-	if err != nil {
-		return err
-	}
-	request.Header.Set("Authorization", "Bearer "+s.Token)
-	request.Header.Set("Content-Type", "application/json")
-	client := s.Client
-	if client == nil {
-		client = &http.Client{Timeout: 10 * time.Second}
-	}
-	response, err := client.Do(request)
 	if err != nil {
 		return fmt.Errorf("submit recovery receipt: %w", err)
 	}
@@ -107,4 +79,22 @@ func (s RelayReceiptSender) Send(ctx context.Context, job Job) error {
 		return fmt.Errorf("submit recovery receipt: relay returned %d", response.StatusCode)
 	}
 	return nil
+}
+
+func (s RelayReceiptSender) post(ctx context.Context, endpoint string, value any) (*http.Response, error) {
+	payload, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(s.URL, "/")+"/hypercerts/v1/source/"+endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	request.Header.Set("Authorization", "Bearer "+s.Token)
+	request.Header.Set("Content-Type", "application/json")
+	client := s.Client
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second}
+	}
+	return client.Do(request)
 }
