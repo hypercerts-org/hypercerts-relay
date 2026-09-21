@@ -2,9 +2,25 @@
 
 `./tests/acceptance/run T01` owns the disposable two-PDS Relay → Jetstream
 archive/live test for [TECH-594](https://linear.app/hypercerts/issue/TECH-594/connect-jetstream-v2-to-the-hypercerts-indigo-relay).
-It rejects every other selector, including `T15-core`, until
-[TECH-634](https://linear.app/hypercerts/issue/TECH-634/unify-jetstream-acquisition-verification-and-durability-fault-coverage)
-implements that case.
+`./tests/acceptance/run T15-core` owns the direct-PDS verification/restart matrix
+for [TECH-634](https://linear.app/hypercerts/issue/TECH-634/unify-jetstream-acquisition-verification-and-durability-fault-coverage).
+`./tests/acceptance/run T03-lifecycle` owns the local private-control lifecycle
+receipt seam for [TECH-637](https://linear.app/hypercerts/issue/TECH-637/persist-cross-service-recovery-receipts-for-admitted-pdss).
+`./tests/acceptance/run T02`, `T03-jobs`, `T05`, `T06`, `T08`, and `T09` own
+the durable direct-PDS inventory, receipt retry, cancellation/restart, invalid
+snapshot, and bounded control-view evidence for Plan 006. They use the real
+Jetstream job/control owners, not a placeholder process.
+`./tests/acceptance/run T04`, `T07`, and `T15-selection` own the executable
+selected-record storage evidence for [TECH-595](https://linear.app/hypercerts/issue/TECH-595/store-only-enabled-record-collections-in-jetstream-v2).
+`./tests/acceptance/run T10`, `T11`, and `T12` own current-state coverage and
+provenance wording, single-active-process raw-frame rate admission/restart, and
+bounded rate-policy telemetry evidence for [TECH-602](https://linear.app/hypercerts/issue/TECH-602/manage-global-and-pds-specific-relay-rate-limits).
+`./tests/acceptance/run T19` owns the fully disposable copied-state
+forward-upgrade and restore-only qualification. It proves selected Relay and
+Jetstream durable coordinates survive both a forward candidate open and an
+independent restored copy; it does not claim a production Railway snapshot,
+capacity budget, live blue/green cutover, or binary rollback.
+Unknown selectors fail with exit 64.
 
 ## Topology
 
@@ -12,8 +28,12 @@ implements that case.
 
 ```text
 PDS A + PDS B → Caddy internal TLS → acceptance-tag Relay → Jetstream v2 → public client
-                         ↑
-                  local @did-plc/server
+                     ↓                    ↑                 ↑
+            default-pass-through          │          private Docker-only control
+                 fault proxy               │
+                     ↓                     │
+              local @did-plc/server        │
+                                            └── T15 direct-PDS source/jobs
 ```
 
 The PDS containers are official upstream images. Caddy creates an ephemeral local
@@ -26,7 +46,13 @@ retain their public-address SSRF transport.
 
 The local PLC process uses upstream `@did-plc/server` with its mock test database.
 It is intentionally limited to the disposable run: it is not a production PLC,
-not durable outside the run, and not exposed outside Docker.
+not durable outside the run, and not exposed outside Docker. Caddy sends the PLC
+and PDS fixture origins through a Docker-internal Node proxy that passes requests
+through unless T15 configures a target. The proxy can return a 5xx for one DID's
+PLC resolution, return a 5xx for one PDS `listRepos`, or substitute a target DID
+signing key in its PLC document. Its Docker-internal status endpoint returns
+only bounded per-route hit counters and the last matched route; it does not log
+or return request/response payloads.
 
 The runner admits two PDS origins through Relay's private source interface and,
 for each PDS, creates an account plus one selected `app.bsky.feed.post` record
@@ -55,14 +81,64 @@ directory and removes containers and named volumes on exit.
 
 ```sh
 ./tests/acceptance/run T01
+./tests/acceptance/run T02
+./tests/acceptance/run T03-lifecycle
+./tests/acceptance/run T03-jobs
+./tests/acceptance/run T04
+./tests/acceptance/run T05
+./tests/acceptance/run T06
+./tests/acceptance/run T07
+./tests/acceptance/run T08
+./tests/acceptance/run T09
+./tests/acceptance/run T10
+./tests/acceptance/run T11
+./tests/acceptance/run T12
+./tests/acceptance/run T15-core
+./tests/acceptance/run T15-selection
+./tests/acceptance/run T19
 ```
 
-The command prints its results directory. It retains bounded client/Compose logs,
-source revisions, sanitized driver output, archive snapshot, and consumer output
-there for verification evidence. The generated credential file is removed during
-cleanup; Docker containers and named volumes are also removed. A nonzero result
-is an observed failure, not a skipped case.
+T04 runs the real owned Relay-to-Jetstream archive/replay/restart path with one
+selected and one excluded record. T07 proves that an empty policy still persists
+protocol markers and source progress across restart, while selected deletes remain
+archive events. T15-selection inspects every durable file produced by the direct-PDS
+bootstrap and retry paths for an excluded fixture payload. These selectors do not
+claim raw Relay/Rainbow retention is selected-only: raw frame stores retain their
+documented time window, and direct-PDS CAR input is permitted only in process memory.
+
+T03-lifecycle runs a dedicated local Relay private-control receiver test. It
+proves that a synthetic, bounded durable-completion coordinate clears only the
+matching admitted Relay source revision and that a stale coordinate is rejected.
+It does not start Jetstream or claim a successful Jetstream job; Plan 006 owns
+the private completion sender, job cancellation, and completion evidence.
+
+T15 creates a generated Jetstream control token only in the disposable acceptance
+environment. It is mounted as a file into Jetstream and the in-network driver;
+its private listener has no host port and the token is removed with the generated
+environment file. It does not enable the control listener in normal builds or
+runtime configuration.
+
+Before every T15 private control request, including requests in retry phases after
+a Jetstream restart, the driver authenticates and polls `GET /hypercerts/v1/policy`.
+It does not use a public root-route response (which may be 404) as readiness.
+T15 records sanitized phase artifacts for: a valid source/job and selected archive
+coordinates/count; targeted transient identity and source faults with their
+bounded proxy hit evidence and incomplete/no-rejection outcomes; the same job IDs
+completing after Jetstream restart/retry; and the restart-durable invalid-signature
+rejection plus archive exclusion assertion. The command prints its results
+directory. It retains the base revision and `executed-tree.json`, whose dirty
+manifest contains only paths/statuses and SHA-256 content digests for the tree
+that ran; it contains no file contents, credentials, or record payloads. T15
+archive client output, stderr, and snapshot response are temporary and deleted
+immediately after the archive assertion and sanitized coordinate/count summary.
+The generated credential file is removed during cleanup; Docker containers and
+named volumes are also removed. A nonzero result is an observed failure, not a
+skipped case.
 
 No Cloudflare, Railway, public DNS, external PLC, or running deployment is used.
-Rainbow is intentionally absent from T01; [TECH-635](https://linear.app/hypercerts/issue/TECH-635/validate-rainbow-raw-stream-recovery-and-retention)
-owns its persistence/recovery validation.
+Rainbow is intentionally absent from the initial launch and this fixture. There
+are no initial-launch raw-stream consumers, so no `T15-rainbow` or `T16`
+selector is registered. [TECH-635](https://linear.app/hypercerts/issue/TECH-635/validate-rainbow-raw-stream-recovery-and-retention)
+remains backlog work and must prove its persistence/recovery activation gates
+before a Rainbow selector is added. See
+[the launch topology contract](../../docs/contracts/launch-topology.md).

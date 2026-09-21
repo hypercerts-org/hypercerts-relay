@@ -47,6 +47,26 @@ source cursor, and an upstream replay gap requires the current-state recovery
 path. There is no HTTP 429 contract for a PDS firehose connection. Fairness is
 best-effort, and multi-active/distributed Relay enforcement is out of scope.
 
+Before Relay opens source sockets it acquires a renewable singleton database
+lease. A second Relay using the same database must fail admission rather than
+divide the process-local global bucket; graceful shutdown releases the lease and
+an expired lease can be recovered after a failed process. Lease acquire and
+renewal use database time; each successful operation establishes a conservative
+process-local monotonic deadline. Source-socket startup and every redial check
+that fence, while raw-frame reservation holds it through token decrement without
+a per-frame database write. Lease loss, deadline expiry, or graceful release
+cancels existing source sockets before a replacement takes over.
+`/hypercerts/v1/limits`
+reports bounded per-policy admitted-frame, waited-frame and waiting-connection
+counters with `single_active_relay_process` / `process_local_since_start`
+scope labels. Those counters and token balances reset on a new active process;
+the configured policy does not.
+
+Jetstream coverage remains current-state evidence only. A configured or pending
+source is not complete, unavailable acquisition remains incomplete, and the
+administration API labels historical PDS attribution `unknown` rather than
+assigning old archive data to a currently observed host.
+
 ## Acceptance mapping
 
 | Management operation | Owner and required evidence |

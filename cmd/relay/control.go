@@ -38,6 +38,8 @@ func (s *Service) controlHandler(token string) (http.Handler, error) {
 		controlResult(w, view, err)
 	})
 	mux.HandleFunc("PUT /hypercerts/v1/source", s.controlSetSource)
+	mux.HandleFunc("POST /hypercerts/v1/source/recovery-policy", s.controlAdvanceRecoveryPolicy)
+	mux.HandleFunc("POST /hypercerts/v1/source/recovery-receipt", s.controlAcknowledgeRecovery)
 	mux.HandleFunc("PUT /hypercerts/v1/source/quota", func(w http.ResponseWriter, r *http.Request) {
 		var input struct {
 			PDS           string `json:"pds"`
@@ -108,6 +110,49 @@ func (s *Service) controlSetSource(w http.ResponseWriter, r *http.Request) {
 	controlResult(w, view, err)
 }
 
+// controlAdvanceRecoveryPolicy is the private policy-currentness seam. It
+// durably re-arms Relay recovery before Jetstream commits newer policy work.
+func (s *Service) controlAdvanceRecoveryPolicy(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		PDS            string `json:"pds"`
+		SourceRevision uint64 `json:"sourceRevision"`
+		PolicyRevision uint64 `json:"policyRevision"`
+	}
+	if !controlDecode(w, r, &input) {
+		return
+	}
+	view, err := s.relay.AdvanceSourceRecoveryPolicy(r.Context(), relay.RecoveryPolicyAdvanceInput{
+		PDS:            input.PDS,
+		SourceRevision: input.SourceRevision,
+		PolicyRevision: input.PolicyRevision,
+	})
+	controlResult(w, view, err)
+}
+
+// controlAcknowledgeRecovery is a private service-to-service completion seam.
+// Jetstream submits it only after its matching job result is durable; browser
+// callers never receive this interface.
+func (s *Service) controlAcknowledgeRecovery(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		PDS             string `json:"pds"`
+		SourceRevision  uint64 `json:"sourceRevision"`
+		PolicyRevision  uint64 `json:"policyRevision"`
+		JobID           string `json:"jobId"`
+		DurableBoundary string `json:"durableBoundary"`
+	}
+	if !controlDecode(w, r, &input) {
+		return
+	}
+	view, err := s.relay.AcknowledgeSourceRecovery(r.Context(), relay.RecoveryReceiptInput{
+		PDS:             input.PDS,
+		SourceRevision:  input.SourceRevision,
+		PolicyRevision:  input.PolicyRevision,
+		JobID:           input.JobID,
+		DurableBoundary: input.DurableBoundary,
+	})
+	controlResult(w, view, err)
+}
+
 func controlReply(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -128,6 +173,10 @@ func controlResult(w http.ResponseWriter, value any, err error) {
 		status, code = 404, "source_not_found"
 	case errors.Is(err, relay.ErrSourceRevisionConflict):
 		status, code = 409, "revision_conflict"
+	case errors.Is(err, relay.ErrRecoveryReceiptConflict):
+		status, code = 409, "recovery_receipt_conflict"
+	case errors.Is(err, relay.ErrInvalidRecoveryReceipt):
+		status, code = 400, "invalid_recovery_receipt"
 	case errors.Is(err, relay.ErrInvalidSourceURL), errors.Is(err, relay.ErrInvalidSourceState):
 		status, code = 400, "invalid_source"
 	case errors.Is(err, relay.ErrSourceValidationFailed), errors.Is(err, relay.ErrSourceDomainBanned):

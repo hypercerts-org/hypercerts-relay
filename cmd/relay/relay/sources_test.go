@@ -30,12 +30,135 @@ func newSourceRelay(t *testing.T) (*Relay, sourceTestDB) {
 	require.NoError(t, db.AutoMigrate(
 		&models.DomainBan{},
 		&models.Source{},
+		&models.RecoveryReceipt{},
 		&models.Account{},
 		&models.AccountSourceObservation{},
 	))
 	r.Config = *DefaultRelayConfig()
 	r.HostChecker = NewMockHostChecker()
 	return r, sourceTestDB{DB: db}
+}
+
+func TestRecoveryReceiptRequiresCurrentEnabledSourceRevision(t *testing.T) {
+	ctx := context.Background()
+	r, db := newSourceRelay(t)
+	host := &models.Host{Hostname: "recovery.example.com", Status: models.HostStatusActive}
+	require.NoError(t, db.Create(host))
+	require.NoError(t, db.Create(&models.Source{
+		HostID:                 host.ID,
+		State:                  models.SourceStateEnabled,
+		Revision:               3,
+		ValidationStatus:       models.SourceValidationPassed,
+		RecoveryRequired:       true,
+		RecoveryPolicyRevision: 9,
+	}))
+
+	receipt := RecoveryReceiptInput{
+		PDS:             "https://recovery.example.com",
+		SourceRevision:  3,
+		PolicyRevision:  9,
+		JobID:           "0123456789abcdef0123456789abcdef",
+		DurableBoundary: "completed:2026-09-16T12:00:00Z",
+	}
+	acknowledged, err := r.AcknowledgeSourceRecovery(ctx, receipt)
+	require.NoError(t, err)
+	require.False(t, acknowledged.RecoveryRequired)
+
+	// Retrying the exact delivery is safe and does not add a second receipt.
+	acknowledged, err = r.AcknowledgeSourceRecovery(ctx, receipt)
+	require.NoError(t, err)
+	require.False(t, acknowledged.RecoveryRequired)
+	var count int64
+	require.NoError(t, db.Model(&models.RecoveryReceipt{}).Count(&count).Error)
+	require.Equal(t, int64(1), count)
+
+	// A lifecycle revision invalidates the previous receipt and re-arms recovery.
+	disabled, err := r.SetSourceState(ctx, host.ID, acknowledged.Revision, models.SourceStateDisabled)
+	require.NoError(t, err)
+	require.True(t, disabled.RecoveryRequired)
+	_, err = r.AcknowledgeSourceRecovery(ctx, receipt)
+	require.ErrorIs(t, err, ErrRecoveryReceiptConflict)
+
+	enabled, err := r.SetSourceState(ctx, host.ID, disabled.Revision, models.SourceStateEnabled)
+	require.NoError(t, err)
+	require.True(t, enabled.RecoveryRequired)
+	_, err = r.AcknowledgeSourceRecovery(ctx, receipt)
+	require.ErrorIs(t, err, ErrRecoveryReceiptConflict)
+
+	receipt.SourceRevision = enabled.Revision
+	receipt.DurableBoundary = "completed:2026-09-16T12:01:00Z"
+	acknowledged, err = r.AcknowledgeSourceRecovery(ctx, receipt)
+	require.NoError(t, err)
+	require.False(t, acknowledged.RecoveryRequired)
+}
+
+func TestRecoveryPolicyAdvanceRearmsAndRejectsOlderReceipt(t *testing.T) {
+	ctx := context.Background()
+	r, db := newSourceRelay(t)
+	host := &models.Host{Hostname: "policy-receipt.example.com", Status: models.HostStatusActive}
+	require.NoError(t, db.Create(host))
+	require.NoError(t, db.Create(&models.Source{
+		HostID:                 host.ID,
+		State:                  models.SourceStateEnabled,
+		Revision:               3,
+		ValidationStatus:       models.SourceValidationPassed,
+		RecoveryRequired:       false,
+		RecoveryPolicyRevision: 1,
+	}))
+
+	advanced, err := r.AdvanceSourceRecoveryPolicy(ctx, RecoveryPolicyAdvanceInput{
+		PDS:            "https://policy-receipt.example.com",
+		SourceRevision: 3,
+		PolicyRevision: 2,
+	})
+	require.NoError(t, err)
+	require.True(t, advanced.RecoveryRequired)
+
+	_, err = r.AcknowledgeSourceRecovery(ctx, RecoveryReceiptInput{
+		PDS:             "https://policy-receipt.example.com",
+		SourceRevision:  3,
+		PolicyRevision:  1,
+		JobID:           "0123456789abcdef0123456789abcdef",
+		DurableBoundary: "current_state_complete",
+	})
+	require.ErrorIs(t, err, ErrRecoveryReceiptConflict)
+
+	acknowledged, err := r.AcknowledgeSourceRecovery(ctx, RecoveryReceiptInput{
+		PDS:             "https://policy-receipt.example.com",
+		SourceRevision:  3,
+		PolicyRevision:  2,
+		JobID:           "abcdef0123456789abcdef0123456789",
+		DurableBoundary: "current_state_complete",
+	})
+	require.NoError(t, err)
+	require.False(t, acknowledged.RecoveryRequired)
+
+	_, err = r.AdvanceSourceRecoveryPolicy(ctx, RecoveryPolicyAdvanceInput{
+		PDS:            "https://policy-receipt.example.com",
+		SourceRevision: 3,
+		PolicyRevision: 1,
+	})
+	require.ErrorIs(t, err, ErrRecoveryReceiptConflict)
+}
+
+func TestRecoveryReceiptRejectsMalformedOrStaleCoordinates(t *testing.T) {
+	ctx := context.Background()
+	r, db := newSourceRelay(t)
+	host := &models.Host{Hostname: "receipt-input.example.com", Status: models.HostStatusActive}
+	require.NoError(t, db.Create(host))
+	require.NoError(t, db.Create(&models.Source{HostID: host.ID, State: models.SourceStateEnabled, Revision: 2, ValidationStatus: models.SourceValidationPassed, RecoveryRequired: true}))
+
+	_, err := r.AcknowledgeSourceRecovery(ctx, RecoveryReceiptInput{PDS: "https://receipt-input.example.com", SourceRevision: 2, PolicyRevision: 1, JobID: "job id", DurableBoundary: "complete"})
+	require.ErrorIs(t, err, ErrInvalidRecoveryReceipt)
+	_, err = r.AcknowledgeSourceRecovery(ctx, RecoveryReceiptInput{PDS: "https://receipt-input.example.com", SourceRevision: 1, PolicyRevision: 1, JobID: "job-1", DurableBoundary: "complete"})
+	require.ErrorIs(t, err, ErrRecoveryReceiptConflict)
+
+	var source models.Source
+	require.NoError(t, db.Where("host_id = ?", host.ID).First(&source).Error)
+	require.True(t, source.RecoveryRequired)
+	var count int64
+	require.NoError(t, db.Model(&models.RecoveryReceipt{}).Count(&count).Error)
+	require.Zero(t, count)
 }
 
 func TestListSourcesIncludesQuietHostsAndBoundsPage(t *testing.T) {

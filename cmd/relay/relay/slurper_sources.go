@@ -37,3 +37,14 @@ func (s *Slurper) StopSource(ctx context.Context, hostname string) error {
 		return sub.finishErr
 	}
 }
+
+// CancelSources closes active source contexts without waiting for their
+// schedulers. Lease fencing calls this from a scheduler path, where waiting for
+// source completion would deadlock the connection that must be canceled.
+func (s *Slurper) CancelSources() {
+	s.subsLk.Lock()
+	defer s.subsLk.Unlock()
+	for _, sub := range s.subs {
+		sub.cancel()
+	}
+}

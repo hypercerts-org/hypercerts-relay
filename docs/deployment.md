@@ -1,7 +1,7 @@
 # Build and deployment source
 
 `hypercerts-org/hypercerts-relay` contains Relay, Rainbow, and the nested Jetstream
-module. Build all three from the same reviewed repository revision.
+module. Buildable components use the same reviewed repository revision.
 
 | Component | Go build directory and command | Image build from repository root | Runtime entry point |
 |---|---|---|---|
@@ -9,10 +9,16 @@ module. Build all three from the same reviewed repository revision.
 | Rainbow | root: `go build ./cmd/rainbow` | `docker build -f cmd/rainbow/Dockerfile .` | `rainbow` |
 | Jetstream | `jetstream/`: `go build ./cmd/jetstream` | `docker build -f jetstream/Dockerfile jetstream` | `jetstream serve` |
 
+The initial Railway launch service set is Relay, Jetstream, and Administration.
+Rainbow remains buildable but is excluded from launch pending the deferred
+[TECH-635](https://linear.app/hypercerts/issue/TECH-635/validate-rainbow-raw-stream-recovery-and-retention)
+raw-stream recovery evidence. It must not be exposed or described as a launch
+consumer path before that work is complete.
+
 Jetstream consumes the owned Relay through `JETSTREAM_RELAY_URL` and stores its
-archive and metadata under `JETSTREAM_DATA_DIR`. Each stateful component needs its
-own persistent data directory. Rainbow is the optional raw-stream fan-out path;
-consumers of retained collections connect to Jetstream's archive/live interfaces.
+archive and metadata under `JETSTREAM_DATA_DIR`. Each launch stateful component
+needs its own persistent data directory. Consumers of retained collections connect
+to Jetstream's archive/live interfaces; Rainbow is not in that launch path.
 
 The deployment target is **Railway**. Public container and runtime
 contracts are documented in [the Railway runbook](railway.md). Infrastructure as

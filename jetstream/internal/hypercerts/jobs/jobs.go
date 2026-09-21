@@ -18,6 +18,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/cockroachdb/pebble"
+	"github.com/jcalabro/atmos"
 )
 
 type State string
@@ -31,16 +32,28 @@ const (
 	Complete   State = "complete"
 )
 const stateKey = "hypercerts/backfill-jobs"
+const inventoryKeyPrefix = "hypercerts/backfill-job-inventory/"
+
+const (
+	receiptRetryBase = time.Second
+	receiptRetryMax  = time.Minute
+)
 
 var ErrConflict = errors.New("job or source state conflict")
 var ErrNotFound = errors.New("job not found")
 var ErrInvalidInput = errors.New("invalid job input")
+var ErrPolicyMirrorRequired = errors.New("Relay policy mirror is required for a Relay-bound source")
+var ErrReceiptStale = errors.New("recovery receipt rejected as stale")
+var ErrReceiptSourceMissing = errors.New("recovery receipt source no longer exists")
 
 type Job struct {
-	ID             string            `json:"id"`
-	PDS            string            `json:"pds"`
-	Policy         selection.Policy  `json:"policy"`
-	Reason         string            `json:"reason"`
+	ID     string           `json:"id"`
+	PDS    string           `json:"pds"`
+	Policy selection.Policy `json:"policy"`
+	Reason string           `json:"reason"`
+	// SourceRevision is the Relay lifecycle revision this job is allowed to
+	// acknowledge after it reaches its durable current-state boundary.
+	SourceRevision uint64            `json:"sourceRevision,omitempty"`
 	State          State             `json:"state"`
 	Attempts       int               `json:"attempts"`
 	CompletedRepos map[string]string `json:"completedRepos"`
@@ -55,62 +68,163 @@ type Job struct {
 	StartedAt       time.Time `json:"startedAt,omitempty"`
 	FinishedAt      time.Time `json:"finishedAt,omitempty"`
 	Coverage        string    `json:"coverage"`
-	HistoryComplete bool      `json:"historyComplete"`
+	ReceiptPending  bool      `json:"receiptPending,omitempty"`
+	ReceiptAttempts int       `json:"receiptAttempts,omitempty"`
+	ReceiptRetryAt  time.Time `json:"receiptRetryAt,omitempty"`
+	ReceiptError    string    `json:"receiptError,omitempty"`
 }
+
+// inventory is kept under a per-job key instead of inside the job-state
+// document. It freezes one accepted listRepos traversal before repository
+// downloads begin, without making every page rewrite every other job.
+type inventory struct {
+	Entries map[string]string `json:"entries"`
+}
+
+// SnapshotRejection is durable, bounded non-payload metadata for a direct-PDS
+// snapshot that is permanently invalid under the listed policy revision.
+type SnapshotRejection struct {
+	PDS            string    `json:"pds"`
+	PolicyRevision uint64    `json:"policyRevision"`
+	DID            string    `json:"did"`
+	ListedRevision string    `json:"listedRevision"`
+	Kind           string    `json:"kind"`
+	Code           string    `json:"code"`
+	RejectedAt     time.Time `json:"rejectedAt"`
+}
+
+const (
+	directPDSSnapshotRejectionKind   = "direct_pds_snapshot"
+	snapshotRejectionDigestPrefix    = "sha256:"
+	maxSnapshotRejectionPDSLength    = 2048
+	snapshotRejectionDigestHexLength = sha256.Size * 2
+	maxSnapshotRejections            = 1000
+)
+
+// hypercerts: Direct-PDS snapshot rejections are separate from job outcomes so
+// retries can acknowledge the same permanently invalid listed revision without
+// downloading or materializing it again.
 type data struct {
-	Actions     map[string]string `json:"actions,omitempty"`
-	Requests    map[string]string `json:"requests,omitempty"`
-	Initialized bool              `json:"initialized"`
-	Sources     map[string]bool   `json:"sources"`
-	Jobs        map[string]Job    `json:"jobs"`
+	Actions            map[string]string            `json:"actions,omitempty"`
+	Requests           map[string]string            `json:"requests,omitempty"`
+	Initialized        bool                         `json:"initialized"`
+	Sources            map[string]bool              `json:"sources"`
+	SourceRevisions    map[string]uint64            `json:"sourceRevisions,omitempty"`
+	Jobs               map[string]Job               `json:"jobs"`
+	SnapshotRejections map[string]SnapshotRejection `json:"snapshotRejections"`
 }
 type Manager struct {
-	mu        sync.Mutex
-	db        *store.Store
-	policy    *selection.Manager
-	data      data
-	cancel    context.CancelFunc
-	running   bool
-	runningID string
+	mu             sync.Mutex
+	db             *store.Store
+	policy         *selection.Manager
+	data           data
+	cancel         context.CancelFunc
+	running        bool
+	runningID      string
+	receiptSender  ReceiptSender
+	policyAdvancer PolicyAdvanceSender
 }
+
+// ReceiptSender submits a completed job's bounded recovery coordinate to the
+// Relay owner. It is nil when no private Relay control seam is configured.
+type ReceiptSender func(context.Context, Job) error
+
+// PolicyAdvanceSender records a new Jetstream policy revision with Relay
+// before that policy is allowed to create recovery work locally.
+type PolicyAdvanceSender func(context.Context, string, uint64, uint64) error
 
 func Open(db *store.Store, policy *selection.Manager) (*Manager, error) {
 	if policy == nil {
 		return nil, errors.New("jobs require collection policy")
 	}
-	m := &Manager{db: db, policy: policy, data: data{Sources: map[string]bool{}, Jobs: map[string]Job{}}}
-	b, closer, err := db.Get([]byte(stateKey))
-	if errors.Is(err, store.ErrNotFound) {
-		return m, nil
-	}
+	m := &Manager{db: db, policy: policy}
+	persisted, found, err := readPersistedData(db)
 	if err != nil {
 		return nil, err
 	}
-	defer closer.Close()
-	if err := json.Unmarshal(b, &m.data); err != nil {
+	if !found {
+		m.data = emptyData()
+		return m, nil
+	}
+	if err := restorePersistedData(&persisted); err != nil {
 		return nil, err
 	}
-	if m.data.Sources == nil || m.data.Jobs == nil {
-		return nil, errors.New("invalid persisted job state")
-	}
-	for id, job := range m.data.Jobs {
-		if job.ID != id || job.CompletedRepos == nil || job.Policy.Revision == 0 {
-			return nil, errors.New("invalid persisted job")
-		}
-		switch job.State {
-		case Running:
-			job.State = Pending
-			m.data.Jobs[id] = job
-		case Pending, Complete, Failed, Canceled, Incomplete:
-		default:
-			return nil, errors.New("invalid job status")
-		}
-	}
-	m.data.migrateActionReceipts()
+	m.data = persisted
 	if err := m.save(m.data); err != nil {
 		return nil, err
 	}
 	return m, nil
+}
+
+func emptyData() data {
+	return data{
+		Sources:            map[string]bool{},
+		SourceRevisions:    map[string]uint64{},
+		Jobs:               map[string]Job{},
+		SnapshotRejections: map[string]SnapshotRejection{},
+	}
+}
+
+func readPersistedData(db *store.Store) (data, bool, error) {
+	b, closer, err := db.Get([]byte(stateKey))
+	if errors.Is(err, store.ErrNotFound) {
+		return data{}, false, nil
+	}
+	if err != nil {
+		return data{}, false, err
+	}
+	defer closer.Close()
+	persisted := emptyData()
+	if err := json.Unmarshal(b, &persisted); err != nil {
+		return data{}, false, err
+	}
+	return persisted, true, nil
+}
+
+func restorePersistedData(persisted *data) error {
+	if persisted.Sources == nil || persisted.Jobs == nil {
+		return errors.New("invalid persisted job state")
+	}
+	ensureSourceRevisions(persisted)
+	// hypercerts: Older job documents predate the direct-PDS rejection ledger.
+	if persisted.SnapshotRejections == nil {
+		persisted.SnapshotRejections = map[string]SnapshotRejection{}
+	}
+	if err := validateSnapshotRejectionLedger(persisted.SnapshotRejections); err != nil {
+		return err
+	}
+	trimSnapshotRejections(persisted.SnapshotRejections)
+	if err := resumePersistedJobs(persisted.Jobs); err != nil {
+		return err
+	}
+	persisted.migrateActionReceipts()
+	return nil
+}
+
+func validateSnapshotRejectionLedger(rejections map[string]SnapshotRejection) error {
+	for key, rejection := range rejections {
+		if !validSnapshotRejection(rejection) || key != snapshotRejectionStoredKey(rejection.PDS, rejection.PolicyRevision, rejection.DID, rejection.ListedRevision, rejection.Kind) {
+			return errors.New("invalid persisted snapshot rejection")
+		}
+	}
+	return nil
+}
+
+func resumePersistedJobs(jobs map[string]Job) error {
+	for id, job := range jobs {
+		if job.ID != id || job.CompletedRepos == nil || job.Policy.Revision == 0 {
+			return errors.New("invalid persisted job")
+		}
+		if job.State == Running {
+			job.State = Pending
+			jobs[id] = job
+			continue
+		}
+		if job.State != Pending && job.State != Complete && job.State != Failed && job.State != Canceled && job.State != Incomplete {
+			return errors.New("invalid job status")
+		}
+	}
+	return nil
 }
 
 func normalizeSource(raw string) (string, error) {
@@ -131,6 +245,12 @@ func clone[T any](value T) T {
 	_ = json.Unmarshal(b, &out)
 	return out
 }
+
+func ensureSourceRevisions(next *data) {
+	if next.SourceRevisions == nil {
+		next.SourceRevisions = map[string]uint64{}
+	}
+}
 func (m *Manager) save(next data) error {
 	b, err := json.Marshal(next)
 	if err != nil {
@@ -145,9 +265,51 @@ func (m *Manager) commit(next data) error {
 	m.data = next
 	return nil
 }
-func newJob(pds string, policy selection.Policy, reason string) Job {
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\n%d\n%s", pds, policy.Revision, reason)))
-	return Job{ID: hex.EncodeToString(sum[:16]), PDS: pds, Policy: policy, Reason: reason, State: Pending, CompletedRepos: map[string]string{}, CreatedAt: time.Now().UTC(), Coverage: "current_state", HistoryComplete: false}
+
+func jobInventoryKey(id string) []byte { return []byte(inventoryKeyPrefix + id) }
+
+func (m *Manager) readInventory(id string) (inventory, error) {
+	b, closer, err := m.db.Get(jobInventoryKey(id))
+	if errors.Is(err, store.ErrNotFound) {
+		return inventory{Entries: map[string]string{}}, nil
+	}
+	if err != nil {
+		return inventory{}, err
+	}
+	defer closer.Close()
+	var out inventory
+	if err := json.Unmarshal(b, &out); err != nil || out.Entries == nil {
+		return inventory{}, errors.New("invalid persisted job inventory")
+	}
+	return out, nil
+}
+
+func (m *Manager) commitInventory(next data, id string, inv inventory) error {
+	encodedState, err := json.Marshal(next)
+	if err != nil {
+		return err
+	}
+	encodedInventory, err := json.Marshal(inv)
+	if err != nil {
+		return err
+	}
+	batch := m.db.NewBatch()
+	defer batch.Close()
+	if err := batch.Set([]byte(stateKey), encodedState, nil); err != nil {
+		return err
+	}
+	if err := batch.Set(jobInventoryKey(id), encodedInventory, nil); err != nil {
+		return err
+	}
+	if err := m.db.Commit(batch, store.SyncWrites); err != nil {
+		return err
+	}
+	m.data = next
+	return nil
+}
+func newJob(pds string, policy selection.Policy, reason string, sourceRevision uint64) Job {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\n%d\n%s\n%d", pds, policy.Revision, reason, sourceRevision)))
+	return Job{ID: hex.EncodeToString(sum[:16]), PDS: pds, Policy: policy, Reason: reason, SourceRevision: sourceRevision, State: Pending, CompletedRepos: map[string]string{}, CreatedAt: time.Now().UTC(), Coverage: "current_state"}
 }
 
 // SeedSources applies CLI configuration once; stale environment cannot revive a removed source.
@@ -158,13 +320,14 @@ func (m *Manager) SeedSources(sources []string) error {
 		return nil
 	}
 	next := clone(m.data)
+	ensureSourceRevisions(&next)
 	for _, raw := range sources {
 		pds, err := normalizeSource(raw)
 		if err != nil {
 			return err
 		}
 		next.Sources[pds] = true
-		j := newJob(pds, m.policy.Current(), "source_added")
+		j := newJob(pds, m.policy.Current(), "source_added", next.SourceRevisions[pds])
 		next.Jobs[j.ID] = j
 	}
 	next.Initialized = true
@@ -174,6 +337,12 @@ func (m *Manager) SeedSources(sources []string) error {
 // AddSource admits an explicit direct-PDS acquisition target and schedules its
 // current-state job without waiting for any live relay event.
 func (m *Manager) AddSource(raw string) (Job, error) {
+	return m.AddSourceWithRevision(raw, 0)
+}
+
+// AddSourceWithRevision remembers the Relay lifecycle coordinate that made an
+// explicitly admitted source eligible for a recovery acknowledgement.
+func (m *Manager) AddSourceWithRevision(raw string, sourceRevision uint64) (Job, error) {
 	pds, err := normalizeSource(raw)
 	if err != nil {
 		return Job{}, err
@@ -181,7 +350,18 @@ func (m *Manager) AddSource(raw string) (Job, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	next := clone(m.data)
-	job := newJob(pds, m.policy.Current(), "source_added")
+	ensureSourceRevisions(&next)
+	if sourceRevision > 0 && sourceRevision < next.SourceRevisions[pds] {
+		return Job{}, ErrConflict
+	}
+	advanced := sourceRevision > 0 && sourceRevision > next.SourceRevisions[pds]
+	if sourceRevision > 0 {
+		next.SourceRevisions[pds] = sourceRevision
+	}
+	if advanced {
+		m.cancelStaleSourceJobs(&next, pds, sourceRevision)
+	}
+	job := newJob(pds, m.policy.Current(), "source_added", next.SourceRevisions[pds])
 	if existing, ok := next.Jobs[job.ID]; ok && next.Sources[pds] {
 		return clone(existing), nil
 	}
@@ -189,6 +369,9 @@ func (m *Manager) AddSource(raw string) (Job, error) {
 	next.Jobs[job.ID] = job
 	if err := m.commit(next); err != nil {
 		return Job{}, err
+	}
+	if advanced && m.cancel != nil && m.runningID != "" && m.data.Jobs[m.runningID].PDS == pds && m.data.Jobs[m.runningID].SourceRevision != sourceRevision {
+		m.cancel()
 	}
 	return clone(job), nil
 }
@@ -220,10 +403,37 @@ func (m *Manager) RemoveSource(raw string) error {
 	}
 	return nil
 }
-func (m *Manager) SetPolicy(expected uint64, collections []string) (selection.Policy, error) {
+func (m *Manager) SetPolicy(ctx context.Context, expected uint64, collections []string) (selection.Policy, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	collections, err := selection.Normalize(collections)
+	if err != nil {
+		return selection.Policy{}, err
+	}
+	current := m.policy.Current()
+	if expected != current.Revision {
+		return selection.Policy{}, selection.ErrRevision
+	}
+	if slices.Equal(collections, current.Collections) {
+		return current, nil
+	}
+	if expected == ^uint64(0) {
+		return selection.Policy{}, errors.New("collection policy revision exhausted")
+	}
+	for _, pds := range orderedEnabledSources(m.data.Sources) {
+		sourceRevision := m.data.SourceRevisions[pds]
+		if sourceRevision == 0 {
+			continue
+		}
+		if m.policyAdvancer == nil {
+			return selection.Policy{}, ErrPolicyMirrorRequired
+		}
+		if err := m.policyAdvancer(ctx, pds, sourceRevision, expected+1); err != nil {
+			return selection.Policy{}, fmt.Errorf("advance Relay recovery policy for %s: %w", pds, err)
+		}
+	}
 	next := clone(m.data)
+	ensureSourceRevisions(&next)
 	policy, err := m.policy.Update(expected, collections, func(policy selection.Policy, b *pebble.Batch) error {
 		for id, j := range next.Jobs {
 			if j.State == Pending || j.State == Running {
@@ -235,7 +445,7 @@ func (m *Manager) SetPolicy(expected uint64, collections []string) (selection.Po
 		}
 		for pds, enabled := range next.Sources {
 			if enabled {
-				j := newJob(pds, policy, "policy_changed")
+				j := newJob(pds, policy, "policy_changed", next.SourceRevisions[pds])
 				next.Jobs[j.ID] = j
 			}
 		}
@@ -258,11 +468,14 @@ func (m *Manager) Request(raw, reason string) (Job, error) { return m.RequestOnc
 
 // RequestOnce durably deduplicates control-plane retries, including terminal jobs.
 func (m *Manager) RequestOnce(raw, reason, requestID string) (Job, error) {
-	if len(requestID) > 128 {
-		return Job{}, ErrInvalidInput
-	}
-	if reason != "quota_recovery" && reason != "backfill" {
-		return Job{}, fmt.Errorf("%w: unsupported job reason", ErrInvalidInput)
+	return m.RequestOnceWithSourceRevision(raw, reason, requestID, 0)
+}
+
+// RequestOnceWithSourceRevision binds lifecycle/quota intent to the Relay
+// source version observed by the control plane.
+func (m *Manager) RequestOnceWithSourceRevision(raw, reason, requestID string, sourceRevision uint64) (Job, error) {
+	if err := validateRequest(reason, requestID); err != nil {
+		return Job{}, err
 	}
 	pds, err := normalizeSource(raw)
 	if err != nil {
@@ -270,28 +483,98 @@ func (m *Manager) RequestOnce(raw, reason, requestID string) (Job, error) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if id, ok := m.data.Requests[requestID]; requestID != "" && ok {
-		existing := m.data.Jobs[id]
-		if existing.PDS != pds || existing.Reason != reason {
-			return Job{}, ErrConflict
-		}
-		return clone(existing), nil
+	if sourceRevision > 0 && sourceRevision < m.data.SourceRevisions[pds] {
+		return Job{}, ErrConflict
+	}
+	if existing, found, err := m.requestReceipt(pds, reason, requestID, sourceRevision); found {
+		return existing, err
 	}
 	if !m.data.Sources[pds] {
 		return Job{}, ErrConflict
 	}
 	next := clone(m.data)
-	j := requestJob(next, pds, reason, m.policy.Current())
-	return m.rememberRequest(next, j, requestID)
+	advanced := advanceSourceRevision(&next, pds, sourceRevision)
+	if advanced {
+		m.cancelStaleSourceJobs(&next, pds, sourceRevision)
+	}
+	job := requestJob(next, pds, reason, m.policy.Current(), next.SourceRevisions[pds])
+	remembered, err := m.rememberRequest(next, job, requestID)
+	if err != nil {
+		return Job{}, err
+	}
+	if advanced {
+		m.cancelStaleRunningSourceJob(pds, sourceRevision)
+	}
+	return remembered, nil
 }
 
-func requestJob(next data, pds, reason string, policy selection.Policy) Job {
+func validateRequest(reason, requestID string) error {
+	if len(requestID) > 128 {
+		return ErrInvalidInput
+	}
+	if reason != "quota_recovery" && reason != "backfill" {
+		return fmt.Errorf("%w: unsupported job reason", ErrInvalidInput)
+	}
+	return nil
+}
+
+func (m *Manager) requestReceipt(pds, reason, requestID string, sourceRevision uint64) (Job, bool, error) {
+	if requestID == "" {
+		return Job{}, false, nil
+	}
+	id, ok := m.data.Requests[requestID]
+	if !ok {
+		return Job{}, false, nil
+	}
+	existing := m.data.Jobs[id]
+	if existing.PDS != pds || existing.Reason != reason || sourceRevisionConflict(existing.SourceRevision, sourceRevision) {
+		return Job{}, true, ErrConflict
+	}
+	return clone(existing), true, nil
+}
+
+func advanceSourceRevision(next *data, pds string, sourceRevision uint64) bool {
+	ensureSourceRevisions(next)
+	advanced := sourceRevision > next.SourceRevisions[pds]
+	if sourceRevision > 0 {
+		next.SourceRevisions[pds] = sourceRevision
+	}
+	return advanced
+}
+
+func (m *Manager) cancelStaleRunningSourceJob(pds string, sourceRevision uint64) {
+	if m.cancel == nil || m.runningID == "" {
+		return
+	}
+	running := m.data.Jobs[m.runningID]
+	if running.PDS == pds && running.SourceRevision != sourceRevision {
+		m.cancel()
+	}
+}
+
+func sourceRevisionConflict(stored, requested uint64) bool {
+	return stored != 0 && requested != 0 && stored != requested
+}
+
+func (m *Manager) cancelStaleSourceJobs(next *data, pds string, sourceRevision uint64) {
+	for id, job := range next.Jobs {
+		if job.PDS != pds || (job.State != Pending && job.State != Running) || job.SourceRevision == sourceRevision {
+			continue
+		}
+		job.State = Canceled
+		job.ErrorCode = "source_revision_changed"
+		job.FinishedAt = time.Now().UTC()
+		next.Jobs[id] = job
+	}
+}
+
+func requestJob(next data, pds, reason string, policy selection.Policy, sourceRevision uint64) Job {
 	for _, existing := range next.Jobs {
 		if existing.PDS == pds && existing.Policy.Revision == policy.Revision && existing.Reason == reason && (existing.State == Pending || existing.State == Running) {
 			return existing
 		}
 	}
-	j := newJob(pds, policy, reason)
+	j := newJob(pds, policy, reason, sourceRevision)
 	if existing, ok := next.Jobs[j.ID]; ok {
 		if existing.State == Pending || existing.State == Running {
 			return existing
@@ -343,13 +626,27 @@ func (m *Manager) commitTransition(j Job, state State, requestID string) error {
 	if requestID != "" && (j.State == state || (state == Pending && j.State == Running)) {
 		return m.commit(next)
 	}
+	resetInventory := state == Pending && j.State == Failed
 	j.State = state
 	j.ErrorCode = ""
 	j.FinishedAt = time.Time{}
+	if resetInventory {
+		// A permanent listing/snapshot verdict may become valid only when the
+		// PDS exposes a changed revision. An explicit retry therefore starts a
+		// new frozen inventory rather than treating an old denominator as live.
+		j.Cursor = ""
+		j.EnumeratedRepos = 0
+		j.TotalRepos = 0
+		j.TotalReposKnown = false
+		j.CompletedRepos = map[string]string{}
+	}
 	if state == Canceled {
 		j.FinishedAt = time.Now().UTC()
 	}
 	next.Jobs[j.ID] = j
+	if resetInventory {
+		return m.commitInventory(next, j.ID, inventory{Entries: map[string]string{}})
+	}
 	if err := m.commit(next); err != nil {
 		return err
 	}
@@ -368,14 +665,217 @@ func (m *Manager) List() []Job {
 	slices.SortFunc(out, func(a, b Job) int { return strings.Compare(a.ID, b.ID) })
 	return out
 }
+
+// Get returns one durable job snapshot.
+func (m *Manager) Get(id string) (Job, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	job, ok := m.data.Jobs[id]
+	if !ok {
+		return Job{}, ErrNotFound
+	}
+	return clone(job), nil
+}
 func (m *Manager) Sources() map[string]bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return clone(m.data.Sources)
 }
+
+// SetReceiptSender configures the private Relay acknowledgement seam. The
+// sender is intentionally optional: standalone Jetstream remains usable, but
+// only jobs carrying a Relay source revision create a receipt obligation.
+func (m *Manager) SetReceiptSender(sender ReceiptSender) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.receiptSender = sender
+}
+
+// SetPolicyAdvanceSender configures the private Relay mirror which must
+// acknowledge a newer policy before Jetstream commits it.
+func (m *Manager) SetPolicyAdvanceSender(sender PolicyAdvanceSender) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.policyAdvancer = sender
+}
+
+func orderedEnabledSources(sources map[string]bool) []string {
+	result := make([]string, 0, len(sources))
+	for pds, enabled := range sources {
+		if enabled {
+			result = append(result, pds)
+		}
+	}
+	slices.Sort(result)
+	return result
+}
+
+// snapshotRejectionPosition bounds untrusted source/listing coordinates before
+// they enter the durable rejection ledger. Canonical PDS origins, DIDs, and
+// TIDs remain exact for operator correlation; every other value becomes a
+// fixed digest, never retained raw.
+func snapshotRejectionPosition(pds, did, listedRevision string) (string, string, string) {
+	return snapshotRejectionPDSPosition(pds), snapshotRejectionDIDPosition(did), snapshotRejectionRevisionPosition(listedRevision)
+}
+
+func snapshotRejectionPDSPosition(value string) string {
+	normalized, err := normalizeSource(value)
+	if err == nil && normalized == value && len(value) <= maxSnapshotRejectionPDSLength {
+		return value
+	}
+	return snapshotRejectionDigest(value)
+}
+
+func snapshotRejectionDIDPosition(value string) string {
+	if _, err := atmos.ParseDID(value); err == nil {
+		return value
+	}
+	return snapshotRejectionDigest(value)
+}
+
+func snapshotRejectionRevisionPosition(value string) string {
+	if _, err := atmos.ParseTID(value); err == nil {
+		return value
+	}
+	return snapshotRejectionDigest(value)
+}
+
+func snapshotRejectionDigest(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return snapshotRejectionDigestPrefix + hex.EncodeToString(sum[:])
+}
+
+func validSnapshotRejectionDigest(value string) bool {
+	if len(value) != len(snapshotRejectionDigestPrefix)+snapshotRejectionDigestHexLength || !strings.HasPrefix(value, snapshotRejectionDigestPrefix) {
+		return false
+	}
+	decoded, err := hex.DecodeString(strings.TrimPrefix(value, snapshotRejectionDigestPrefix))
+	return err == nil && hex.EncodeToString(decoded) == strings.TrimPrefix(value, snapshotRejectionDigestPrefix)
+}
+
+func validSnapshotRejectionPDSPosition(value string) bool {
+	if validSnapshotRejectionDigest(value) {
+		return true
+	}
+	normalized, err := normalizeSource(value)
+	return err == nil && normalized == value && len(value) <= maxSnapshotRejectionPDSLength
+}
+
+func validSnapshotRejectionDIDPosition(value string) bool {
+	if validSnapshotRejectionDigest(value) {
+		return true
+	}
+	_, err := atmos.ParseDID(value)
+	return err == nil
+}
+
+func validSnapshotRejectionRevisionPosition(value string) bool {
+	if validSnapshotRejectionDigest(value) {
+		return true
+	}
+	_, err := atmos.ParseTID(value)
+	return err == nil
+}
+
+func snapshotRejectionStoredKey(pds string, policyRevision uint64, did, listedRevision, kind string) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\n%d\n%s\n%s\n%s", pds, policyRevision, did, listedRevision, kind)))
+	return hex.EncodeToString(sum[:])
+}
+
+func validSnapshotRejection(rejection SnapshotRejection) bool {
+	return validSnapshotRejectionPDSPosition(rejection.PDS) && rejection.PolicyRevision != 0 && validSnapshotRejectionDIDPosition(rejection.DID) && validSnapshotRejectionRevisionPosition(rejection.ListedRevision) && rejection.Kind == directPDSSnapshotRejectionKind && len(rejection.Code) > 0 && len(rejection.Code) <= 64 && !rejection.RejectedAt.IsZero()
+}
+
+// lookupSnapshotRejection returns only an exact listed snapshot decision. A
+// changed listed revision deliberately requires a fresh download and verdict.
+func (m *Manager) lookupSnapshotRejection(pds string, policyRevision uint64, did, listedRevision, kind string) (SnapshotRejection, bool) {
+	pds, did, listedRevision = snapshotRejectionPosition(pds, did, listedRevision)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rejection, ok := m.data.SnapshotRejections[snapshotRejectionStoredKey(pds, policyRevision, did, listedRevision, kind)]
+	return rejection, ok
+}
+
+// ListSnapshotRejections provides deterministic, bounded non-payload
+// inspection for private control-plane callers. It returns value copies, never
+// the durable ledger map.
+func (m *Manager) ListSnapshotRejections() []SnapshotRejection {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	type keyedRejection struct {
+		key       string
+		rejection SnapshotRejection
+	}
+	keyed := make([]keyedRejection, 0, len(m.data.SnapshotRejections))
+	for key, rejection := range m.data.SnapshotRejections {
+		keyed = append(keyed, keyedRejection{key: key, rejection: rejection})
+	}
+	slices.SortFunc(keyed, func(a, b keyedRejection) int {
+		return strings.Compare(a.key, b.key)
+	})
+	out := make([]SnapshotRejection, len(keyed))
+	for i, item := range keyed {
+		out[i] = item.rejection
+	}
+	return out
+}
+
+// recordSnapshotRejection synchronously persists an exact permanent verdict.
+// Repeating the same key returns its original bounded metadata unchanged.
+func (m *Manager) recordSnapshotRejection(pds string, policyRevision uint64, did, listedRevision, kind, code string) (SnapshotRejection, error) {
+	pds, did, listedRevision = snapshotRejectionPosition(pds, did, listedRevision)
+	rejection := SnapshotRejection{PDS: pds, PolicyRevision: policyRevision, DID: did, ListedRevision: listedRevision, Kind: kind, Code: code, RejectedAt: time.Now().UTC()}
+	if !validSnapshotRejection(rejection) {
+		return SnapshotRejection{}, ErrInvalidInput
+	}
+	key := snapshotRejectionStoredKey(pds, policyRevision, did, listedRevision, kind)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if existing, ok := m.data.SnapshotRejections[key]; ok {
+		return existing, nil
+	}
+	next := m.data
+	next.SnapshotRejections = cloneSnapshotRejections(m.data.SnapshotRejections)
+	next.SnapshotRejections[key] = rejection
+	trimSnapshotRejections(next.SnapshotRejections)
+	if err := m.commit(next); err != nil {
+		return SnapshotRejection{}, err
+	}
+	return rejection, nil
+}
+
+func cloneSnapshotRejections(source map[string]SnapshotRejection) map[string]SnapshotRejection {
+	cloned := make(map[string]SnapshotRejection, len(source)+1)
+	for key, rejection := range source {
+		cloned[key] = rejection
+	}
+	return cloned
+}
+
+// trimSnapshotRejections retains recent durable verdicts without allowing a
+// single JSON state document to grow with every rejected listing. Equal
+// timestamps use the stored-key order so eviction is deterministic.
+func trimSnapshotRejections(rejections map[string]SnapshotRejection) {
+	for len(rejections) > maxSnapshotRejections {
+		delete(rejections, oldestSnapshotRejectionKey(rejections))
+	}
+}
+
+func oldestSnapshotRejectionKey(rejections map[string]SnapshotRejection) string {
+	var oldestKey string
+	var oldest SnapshotRejection
+	for key, rejection := range rejections {
+		if oldestKey == "" || rejection.RejectedAt.Before(oldest.RejectedAt) || (rejection.RejectedAt.Equal(oldest.RejectedAt) && key < oldestKey) {
+			oldestKey = key
+			oldest = rejection
+		}
+	}
+	return oldestKey
+}
+
 func (m *Manager) active(id string) bool {
 	j, ok := m.data.Jobs[id]
-	return ok && j.State == Running && m.data.Sources[j.PDS] && j.Policy.Revision == m.policy.Current().Revision
+	return ok && j.State == Running && m.data.Sources[j.PDS] && j.Policy.Revision == m.policy.Current().Revision && (m.data.SourceRevisions[j.PDS] == 0 || j.SourceRevision == m.data.SourceRevisions[j.PDS])
 }
 
 // Apply holds the policy/source cancellation boundary through the archive write.
@@ -431,6 +931,69 @@ func (m *Manager) CheckpointEnumeration(id, cursor string, active int, complete 
 	return m.commit(next)
 }
 
+// CheckpointInventory records one validated listRepos page and advances its
+// cursor atomically with the job state. The caller must finish this one scan
+// before it starts repository downloads, making the published denominator a
+// frozen current-state snapshot rather than a moving PDS census.
+func (m *Manager) CheckpointInventory(id, cursor string, entries map[string]string, complete bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.active(id) {
+		return ErrConflict
+	}
+	inv, err := m.readInventory(id)
+	if err != nil {
+		return err
+	}
+	for did, rev := range entries {
+		if existing, ok := inv.Entries[did]; ok && existing != rev {
+			return &InputError{Code: "invalid_listing"}
+		}
+		inv.Entries[did] = rev
+	}
+	next := clone(m.data)
+	job := next.Jobs[id]
+	job.Cursor = cursor
+	job.EnumeratedRepos = len(inv.Entries)
+	if complete {
+		job.TotalRepos = len(inv.Entries)
+		job.TotalReposKnown = true
+	}
+	next.Jobs[id] = job
+	return m.commitInventory(next, id, inv)
+}
+
+// Inventory returns the frozen, active listing in DID order. It is available
+// only after the terminal listRepos page is durable.
+func (m *Manager) Inventory(id string) ([]ListedRepository, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	job, ok := m.data.Jobs[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	if !job.TotalReposKnown {
+		return nil, ErrConflict
+	}
+	inv, err := m.readInventory(id)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ListedRepository, 0, len(inv.Entries))
+	for did, rev := range inv.Entries {
+		out = append(out, ListedRepository{DID: did, Revision: rev})
+	}
+	slices.SortFunc(out, func(a, b ListedRepository) int { return strings.Compare(a.DID, b.DID) })
+	return out, nil
+}
+
+// ListedRepository is a validated direct-PDS snapshot coordinate frozen for a
+// single job. It deliberately excludes CAR data and listing-only metadata.
+type ListedRepository struct {
+	DID      string
+	Revision string
+}
+
 func (m *Manager) Checkpoint(id, did, rev, cursor string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -472,6 +1035,9 @@ func (m *Manager) Run(ctx context.Context, process Processor) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if err := m.flushReceipts(ctx); err != nil {
+			return err
+		}
 		worked, err := m.runNext(ctx, process)
 		if err != nil {
 			return err
@@ -509,6 +1075,17 @@ func (m *Manager) claimNextLocked() (Job, error) {
 		if job.State != Pending {
 			continue
 		}
+		if current := m.data.SourceRevisions[job.PDS]; current > 0 && job.SourceRevision != current {
+			next := clone(m.data)
+			job.State = Canceled
+			job.ErrorCode = "source_revision_changed"
+			job.FinishedAt = time.Now().UTC()
+			next.Jobs[job.ID] = job
+			if err := m.commit(next); err != nil {
+				return Job{}, err
+			}
+			continue
+		}
 		next := clone(m.data)
 		job.State = Running
 		job.Attempts++
@@ -541,11 +1118,111 @@ func (m *Manager) finishJob(ctx context.Context, id string, processErr error) er
 	job := next.Jobs[id]
 	job.FinishedAt = time.Now().UTC()
 	job.State = state
+	if state == Complete && job.SourceRevision != 0 {
+		// This flag is written in the same durable job record as Complete, so a
+		// process loss after local success replays the acknowledgement on restart.
+		job.ReceiptPending = true
+	}
 	if code != "" {
 		job.ErrorCode = code
 	}
 	next.Jobs[id] = job
 	return m.commit(next)
+}
+
+func (m *Manager) flushReceipts(ctx context.Context) error {
+	m.mu.Lock()
+	sender := m.receiptSender
+	pending := make([]Job, 0)
+	now := time.Now().UTC()
+	if sender != nil {
+		currentPolicyRevision := m.policy.Current().Revision
+		next := clone(m.data)
+		changed := false
+		for _, job := range m.data.Jobs {
+			if job.State == Complete && job.ReceiptPending {
+				if job.Policy.Revision != currentPolicyRevision {
+					// A policy change has already created current-policy work. Do not
+					// let its superseded predecessor acknowledge Relay recovery.
+					job.ReceiptPending = false
+					job.ReceiptRetryAt = time.Time{}
+					job.ReceiptError = "policy_superseded"
+					next.Jobs[job.ID] = job
+					changed = true
+					continue
+				}
+				if !job.ReceiptRetryAt.After(now) {
+					pending = append(pending, clone(job))
+				}
+			}
+		}
+		if changed {
+			if err := m.commit(next); err != nil {
+				m.mu.Unlock()
+				return err
+			}
+		}
+	}
+	m.mu.Unlock()
+	for _, job := range pending {
+		if err := sender(ctx, job); err != nil {
+			if err := m.recordReceiptFailure(job, err); err != nil {
+				return err
+			}
+			continue
+		}
+		m.mu.Lock()
+		next := clone(m.data)
+		current, ok := next.Jobs[job.ID]
+		if ok && current.State == Complete && current.ReceiptPending && current.SourceRevision == job.SourceRevision {
+			current.ReceiptPending = false
+			current.ReceiptRetryAt = time.Time{}
+			current.ReceiptError = ""
+			next.Jobs[job.ID] = current
+			if err := m.commit(next); err != nil {
+				m.mu.Unlock()
+				return err
+			}
+		}
+		m.mu.Unlock()
+	}
+	return nil
+}
+
+func (m *Manager) recordReceiptFailure(job Job, receiptErr error) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	next := clone(m.data)
+	current, ok := next.Jobs[job.ID]
+	if !ok || current.State != Complete || !current.ReceiptPending || current.SourceRevision != job.SourceRevision {
+		return nil
+	}
+	if errors.Is(receiptErr, ErrReceiptStale) {
+		current.ReceiptPending = false
+		current.ReceiptRetryAt = time.Time{}
+		current.ReceiptError = "stale_source_revision"
+	} else if errors.Is(receiptErr, ErrReceiptSourceMissing) {
+		current.ReceiptPending = false
+		current.ReceiptRetryAt = time.Time{}
+		current.ReceiptError = "source_not_found"
+	} else {
+		current.ReceiptAttempts++
+		current.ReceiptRetryAt = time.Now().UTC().Add(receiptBackoff(current.ReceiptAttempts))
+		current.ReceiptError = "relay_unavailable"
+	}
+	next.Jobs[job.ID] = current
+	return m.commit(next)
+}
+
+func receiptBackoff(attempts int) time.Duration {
+	delay := receiptRetryBase
+	for i := 1; i < attempts && delay < receiptRetryMax; i++ {
+		delay *= 2
+	}
+	if delay > receiptRetryMax {
+		return receiptRetryMax
+	}
+	return delay
 }
 
 func jobOutcome(err error) (State, string, error) {

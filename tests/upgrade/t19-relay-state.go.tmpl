@@ -1,0 +1,163 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/bluesky-social/indigo/api/atproto"
+	"github.com/bluesky-social/indigo/cmd/relay/relay"
+	"github.com/bluesky-social/indigo/cmd/relay/relay/models"
+	"github.com/bluesky-social/indigo/cmd/relay/stream"
+	"github.com/bluesky-social/indigo/cmd/relay/stream/persist/diskpersist"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
+)
+
+const (
+	pds             = "upgrade-state.example"
+	sourceRev       = uint64(7)
+	relayCursor     = int64(4242)
+	globalRate      = int64(17)
+	sourceRate      = int64(9)
+	policyRev       = uint64(2)
+	completionID    = "0123456789abcdef0123456789abcdef"
+	durableBoundary = "complete:4242"
+	rawDID          = "did:plc:upgraderawstate"
+	rawActive       = true
+	rawTime         = "2026-09-16T00:00:00Z"
+)
+
+type staticUIDs struct{}
+
+func (staticUIDs) DidToUid(context.Context, string) (uint64, error) { return 1, nil }
+
+func main() {
+	mode := flag.String("mode", "", "seed or verify")
+	dataDir := flag.String("data-dir", "", "Relay state directory")
+	flag.Parse()
+	if *dataDir == "" || (*mode != "seed" && *mode != "verify") {
+		fatal("usage: --mode seed|verify --data-dir DIR")
+	}
+	if err := os.MkdirAll(*dataDir, 0o755); err != nil {
+		fatal("create data directory: %v", err)
+	}
+	db, err := gorm.Open(sqlite.Open(filepath.Join(*dataDir, "relay.sqlite")), &gorm.Config{})
+	if err != nil {
+		fatal("open Relay database: %v", err)
+	}
+	svc, err := relay.NewRelay(db, nil, nil, nil)
+	if err != nil {
+		fatal("open Relay state: %v", err)
+	}
+	if *mode == "seed" {
+		seed(*dataDir, db, svc)
+	} else {
+		verify(*dataDir, db, svc)
+	}
+}
+
+func seed(dataDir string, db *gorm.DB, svc *relay.Relay) {
+	ctx := context.Background()
+	host := models.Host{Hostname: pds, Status: models.HostStatusActive, LastSeq: relayCursor}
+	if err := db.Create(&host).Error; err != nil {
+		fatal("seed Relay host: %v", err)
+	}
+	source := models.Source{HostID: host.ID, State: models.SourceStateEnabled, Revision: sourceRev, ValidationStatus: models.SourceValidationPassed}
+	if err := db.Create(&source).Error; err != nil {
+		fatal("seed Relay source: %v", err)
+	}
+	receipt := models.RecoveryReceipt{PDS: "https://" + pds, HostID: host.ID, SourceRevision: sourceRev, PolicyRevision: policyRev, JobID: completionID, DurableBoundary: durableBoundary}
+	if err := db.Create(&receipt).Error; err != nil {
+		fatal("seed Relay receipt: %v", err)
+	}
+	if _, err := svc.SetRatePolicy(ctx, "global", globalRate); err != nil {
+		fatal("seed global rate policy: %v", err)
+	}
+	if _, err := svc.SetRatePolicy(ctx, "https://"+pds, sourceRate); err != nil {
+		fatal("seed source rate policy: %v", err)
+	}
+	// The Relay raw store is a separate state owner from the SQLite policy
+	// database. Persist and close a real raw event before the harness copies the
+	// stopped state bundle, so a restore cannot claim only metadata survived.
+	persist, err := diskpersist.NewDiskPersistence(filepath.Join(dataDir, "events"), "", db, nil)
+	if err != nil {
+		fatal("open Relay raw store: %v", err)
+	}
+	persist.SetUidSource(staticUIDs{})
+	if err := persist.Persist(ctx, &stream.XRPCStreamEvent{RepoAccount: &atproto.SyncSubscribeRepos_Account{Active: rawActive, Did: rawDID, Seq: relayCursor, Time: rawTime}}); err != nil {
+		fatal("seed Relay raw event: %v", err)
+	}
+	if err := persist.Shutdown(ctx); err != nil {
+		fatal("close Relay raw store: %v", err)
+	}
+	printState("seed")
+}
+
+func verify(dataDir string, db *gorm.DB, svc *relay.Relay) {
+	ctx := context.Background()
+	view, err := svc.InspectSource(ctx, "https://"+pds)
+	if err != nil {
+		fatal("open persisted source: %v", err)
+	}
+	if view.Revision != sourceRev || view.LastDurableCursor != relayCursor || view.DesiredState != models.SourceStateEnabled || view.RecoveryRequired {
+		fatal("source assertion failed: revision=%d cursor=%d state=%s recoveryRequired=%t", view.Revision, view.LastDurableCursor, view.DesiredState, view.RecoveryRequired)
+	}
+	var receipt models.RecoveryReceipt
+	if err := db.Where("pds = ? AND source_revision = ? AND policy_revision = ? AND job_id = ?", "https://"+pds, sourceRev, policyRev, completionID).First(&receipt).Error; err != nil {
+		fatal("open persisted recovery receipt: %v", err)
+	}
+	if receipt.DurableBoundary != durableBoundary {
+		fatal("recovery receipt assertion failed: durableBoundary=%q", receipt.DurableBoundary)
+	}
+	policies, _, err := svc.ListRatePolicies(ctx, "")
+	if err != nil {
+		fatal("list persisted rate policies: %v", err)
+	}
+	rates := map[string]int64{}
+	for _, policy := range policies {
+		rates[policy.Scope] = policy.EventsPerSecond
+	}
+	if rates["global"] != globalRate || rates["https://"+pds] != sourceRate {
+		fatal("rate policy assertion failed: %v", rates)
+	}
+	persist, err := diskpersist.NewDiskPersistence(filepath.Join(dataDir, "events"), "", db, nil)
+	if err != nil {
+		fatal("open persisted Relay raw store: %v", err)
+	}
+	persist.SetUidSource(staticUIDs{})
+	var rawEvents int
+	err = persist.Playback(ctx, 0, func(event *stream.XRPCStreamEvent) error {
+		if event.RepoAccount == nil || event.RepoAccount.Did != rawDID || event.RepoAccount.Active != rawActive || event.RepoAccount.Seq != relayCursor || event.RepoAccount.Time != rawTime {
+			return fmt.Errorf("unexpected restored raw event")
+		}
+		rawEvents++
+		return nil
+	})
+	shutdownErr := persist.Shutdown(ctx)
+	if err != nil || shutdownErr != nil || rawEvents != 1 {
+		fatal("raw event assertion failed: events=%d playback=%v shutdown=%v", rawEvents, err, shutdownErr)
+	}
+	printState("verify")
+}
+
+func printState(mode string) {
+	value := map[string]any{
+		"component": "relay", "mode": mode, "pds": "https://" + pds,
+		"sourceRevision": sourceRev, "durableCursor": relayCursor,
+		"policyRevision": policyRev, "globalRate": globalRate, "sourceRate": sourceRate,
+		"recoveryReceipt": completionID, "checkedAt": time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	if err := json.NewEncoder(os.Stdout).Encode(value); err != nil {
+		fatal("write result: %v", err)
+	}
+}
+
+func fatal(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
+	os.Exit(1)
+}

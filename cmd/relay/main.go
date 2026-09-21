@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -38,6 +39,43 @@ func main() {
 	if err := run(os.Args); err != nil {
 		slog.Error("exiting process", "err", err.Error())
 		os.Exit(-1)
+	}
+}
+
+const shutdownErrorMessage = "error during shutdown"
+
+func monitorRateAdmission(ctx context.Context, r *relay.Relay, holder string, ttl time.Duration, admissionErr chan<- error, logger *slog.Logger) {
+	ticker := time.NewTicker(ttl / 3)
+	defer ticker.Stop()
+
+	failures := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			err := r.RenewRateAdmission(ctx, holder, ttl)
+			if err == nil {
+				failures = 0
+				continue
+			}
+			if errors.Is(err, relay.ErrRateAdmissionHeld) {
+				admissionErr <- err
+				return
+			}
+			failures++
+			logger.Warn("renewing rate admission failed", "err", err, "failures", failures)
+			if failures >= 2 {
+				admissionErr <- err
+				return
+			}
+		}
+	}
+}
+
+func logShutdownErrors(errs []error, logger *slog.Logger) {
+	for err := range errs {
+		logger.Error(shutdownErrorMessage, "err", err)
 	}
 }
 
@@ -370,6 +408,7 @@ func runRelay(ctx context.Context, cmd *cli.Command) error {
 	relayConfig.HostPerDayLimit = cmd.Int64("new-hosts-per-day-limit")
 	relayConfig.TrustedDomains = cmd.StringSlice("trusted-domains")
 	relayConfig.LenientSyncValidation = cmd.Bool("lenient-sync-validation")
+	relayConfig.RequireRateAdmission = true
 
 	svcConfig := DefaultServiceConfig()
 	svcConfig.AllowInsecureHosts = cmd.Bool("allow-insecure-hosts")
@@ -395,6 +434,18 @@ func runRelay(ctx context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
+	// hypercerts: D04 selects one active Relay process rather than a distributed
+	// limiter. Hold a renewable database lease before any source socket starts.
+	const rateAdmissionTTL = 30 * time.Second
+	rateAdmissionHolder := fmt.Sprintf("relay-%d-%d", os.Getpid(), time.Now().UnixNano())
+	if err := r.AcquireRateAdmission(ctx, rateAdmissionHolder, rateAdmissionTTL); err != nil {
+		return fmt.Errorf("acquiring single-process rate admission: %w", err)
+	}
+	defer func() {
+		if err := r.ReleaseRateAdmission(context.Background(), rateAdmissionHolder); err != nil {
+			logger.Warn("releasing rate admission", "err", err)
+		}
+	}()
 	svc, err := NewService(r, svcConfig)
 	if err != nil {
 		return err
@@ -430,6 +481,11 @@ func runRelay(ctx context.Context, cmd *cli.Command) error {
 		})
 	}
 	defer stopAlerts()
+
+	admissionCtx, cancelAdmission := context.WithCancel(ctx)
+	defer cancelAdmission()
+	admissionErr := make(chan error, 1)
+	go monitorRateAdmission(admissionCtx, r, rateAdmissionHolder, rateAdmissionTTL, admissionErr, logger)
 
 	// start metrics endpoint
 	go func() {
@@ -472,20 +528,18 @@ func runRelay(ctx context.Context, cmd *cli.Command) error {
 	case <-signals:
 		logger.Info("received shutdown signal")
 		stopAlerts()
-		errs := svc.Shutdown()
-		for err := range errs {
-			logger.Error("error during shutdown", "err", err)
-		}
+		logShutdownErrors(svc.Shutdown(), logger)
 	case err := <-svcErr:
 		if err != nil {
 			logger.Error("error during startup", "err", err)
 		}
 		logger.Info("shutting down")
 		stopAlerts()
-		errs := svc.Shutdown()
-		for err := range errs {
-			logger.Error("error during shutdown", "err", err)
-		}
+		logShutdownErrors(svc.Shutdown(), logger)
+	case err := <-admissionErr:
+		logger.Error("lost single-process rate admission; stopping source reads", "err", err)
+		stopAlerts()
+		logShutdownErrors(svc.Shutdown(), logger)
 	}
 
 	logger.Info("shutdown complete")

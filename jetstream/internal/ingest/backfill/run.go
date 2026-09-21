@@ -58,6 +58,8 @@ type Config struct {
 
 	BackfillRepos    []atmos.DID
 	IdentityResolver atmosidentity.Resolver
+	// hypercerts: optional identity verification for bootstrap and selected CARs.
+	Directory *atmosidentity.Directory
 
 	MaxRetries     int
 	RetryBaseDelay time.Duration
@@ -167,7 +169,7 @@ func Run(ctx context.Context, cfg Config) error {
 			logger.InfoContext(ctx, "starting selected repo backfill", "repos", len(cfg.BackfillRepos))
 			err := runSelectedRepos(runCtx, selectedReposConfig{
 				Repos: cfg.BackfillRepos, Store: st, Handler: handler,
-				SyncClient: relay, IdentityResolver: cfg.IdentityResolver, Metrics: cfg.Metrics,
+				SyncClient: relay, IdentityResolver: cfg.IdentityResolver, Directory: cfg.Directory, Metrics: cfg.Metrics,
 				MaxRetries: cfg.MaxRetries, RetryBaseDelay: cfg.RetryBaseDelay, RetryMaxDelay: cfg.RetryMaxDelay,
 				OnError: func(did atmos.DID, err error) {
 					if shouldLogBackfillError(err) {
@@ -191,8 +193,15 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 
 		var limited atomic.Bool
+		engineHandler := atmosbackfill.Handler(handler)
+		// hypercerts: keep direct-PDS signature verification at the handler
+		// boundary so a signature mismatch can refresh one stale DID cache entry
+		// before the engine records a permanent repository failure.
+		if cfg.Directory != nil {
+			engineHandler = verifiedBootstrapHandler{next: handler, directory: cfg.Directory}
+		}
 		engineOpts := atmosbackfill.Options{
-			Relay: relay, NewHostClient: gt.Some(newHostClient), Store: st.AtmosStore(), Handler: handler,
+			Relay: relay, NewHostClient: gt.Some(newHostClient), Store: st.AtmosStore(), Handler: engineHandler,
 			OnError: gt.Some(func(did atmos.DID, err error) {
 				if shouldLogBackfillError(err) {
 					logger.WarnContext(ctx, "repo failed", "did", string(did), "err", err)

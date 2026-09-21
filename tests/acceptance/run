@@ -3,19 +3,113 @@
 set -euo pipefail
 
 case_id=${1:-}
-if [[ $# -ne 1 || "$case_id" != "T01" ]]; then
-  printf '%s\n' 'usage: ./tests/acceptance/run T01' >&2
-  printf '%s\n' 'T15-core is intentionally not implemented by TECH-634 and must fail.' >&2
-  exit 64
+if [[ $# -ne 1 || ( "$case_id" != "T01" && "$case_id" != "T02" && "$case_id" != "T03-lifecycle" && "$case_id" != "T03-jobs" && "$case_id" != "T04" && "$case_id" != "T05" && "$case_id" != "T06" && "$case_id" != "T07" && "$case_id" != "T08" && "$case_id" != "T09" && "$case_id" != "T10" && "$case_id" != "T11" && "$case_id" != "T12" && "$case_id" != "T13" && "$case_id" != "T14" && "$case_id" != "T15-core" && "$case_id" != "T15-selection" && "$case_id" != "T19" ) ]]; then
+	printf '%s\n' 'usage: ./tests/acceptance/run T01|T02|T03-lifecycle|T03-jobs|T04|T05|T06|T07|T08|T09|T10|T11|T12|T13|T14|T15-core|T15-selection|T19' >&2
+	exit 64
 fi
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+if [[ "$case_id" == "T19" ]]; then
+	exec "$root/tests/upgrade/t19" T19
+fi
+
+if [[ "$case_id" == "T03-lifecycle" ]]; then
+	(
+		cd "$root"
+		GOCACHE="${GOCACHE:-/tmp/hypercerts-relay-go-cache}" go test -mod=readonly -count=1 ./cmd/relay -run '^TestRecoveryReceiptAcceptance$'
+	)
+	printf '%s\n' 'T03-lifecycle passed: the private Relay receipt receiver accepts only a current admitted source revision and rejects a stale acknowledgement. Jetstream completion proof remains Plan 006.'
+	exit 0
+fi
+
+if [[ "$case_id" == "T02" || "$case_id" == "T03-jobs" || "$case_id" == "T05" || "$case_id" == "T06" || "$case_id" == "T08" || "$case_id" == "T09" ]]; then
+	case "$case_id" in
+		T02) package=./internal/hypercerts/jobs test_name='^TestPDSProcessorCountsOneResumableInventory$' ;;
+		T03-jobs) package=./internal/hypercerts/jobs test_name='^(TestCompletedRecoveryReceiptRetriesAfterRestart|TestSourceRevisionAdvanceCancelsInFlightJobAndSurvivesRestart)$' ;;
+		T05) package=./internal/hypercerts/jobs test_name='^TestJobsPolicyAtomicSchedulingAndCancellation$' ;;
+		T06) package=./internal/hypercerts/jobs test_name='^TestJobsCrashResumeAndUnavailableCoverage$' ;;
+		T08) package=./internal/hypercerts/jobs test_name='^TestPDSProcessorPersistsPermanentSnapshotRejectionWithoutProgress$' ;;
+		T09) package=./internal/hypercerts/control test_name='^TestPrivateSnapshotRejectionsView$' ;;
+	esac
+	(
+		cd "$root/jetstream"
+		GOCACHE="${GOCACHE:-/tmp/hypercerts-relay-go-cache}" go test -mod=readonly -count=1 "$package" -run "$test_name"
+	)
+	printf '%s\n' "$case_id passed: durable current-state job evidence completed. Historical completeness is not claimed."
+	exit 0
+fi
+
+if [[ "$case_id" == "T04" || "$case_id" == "T07" || "$case_id" == "T15-selection" ]]; then
+	case "$case_id" in
+		T04) package=./internal/jetstreamd test_name='^TestT04SelectionArchiveReplayRestartAndLive$' ;;
+		T07) package=./internal/ingest/live test_name='^TestT07SelectionEmptyPolicyProgressMarkersDeletesAndRestart$' ;;
+		T15-selection) package=./internal/ingest/backfill test_name='^TestT15SelectionDirectPDSPermittedTemporaryStorage$' ;;
+	esac
+	(
+		cd "$root/jetstream"
+		GOCACHE="${GOCACHE:-/tmp/hypercerts-relay-go-cache}" go test -mod=readonly -count=1 "$package" -run "$test_name"
+	)
+	printf '%s\n' "$case_id passed: selected-record storage evidence completed. Raw Relay frames and in-memory direct-PDS CAR input remain explicitly permitted outside Jetstream durable materialization."
+	exit 0
+fi
+
+if [[ "$case_id" == "T10" ]]; then
+	(
+		cd "$root/jetstream"
+		GOCACHE="${GOCACHE:-/tmp/hypercerts-relay-go-cache}" go test -mod=readonly -count=1 ./internal/hypercerts/control -run '^TestT10CoverageTruthfulness$'
+	)
+	(
+		cd "$root/administration"
+		GOCACHE="${GOCACHE:-/tmp/hypercerts-relay-go-cache}" CONTROL_GO_BINARY="$(command -v go)" npm test
+	)
+	printf '%s\n' 'T10 passed: configured and unavailable sources remain unknown or current-state incomplete; historical PDS provenance is explicitly unknown.'
+	exit 0
+fi
+
+if [[ "$case_id" == "T11" || "$case_id" == "T12" ]]; then
+	case "$case_id" in
+		T11) test_name='^TestT11' ;;
+		T12) test_name='^TestT12' ;;
+	esac
+	(
+		cd "$root"
+		GOCACHE="${GOCACHE:-/tmp/hypercerts-relay-go-cache}" go test -mod=readonly -count=1 ./cmd/relay/relay -run "$test_name"
+	)
+	if [[ "$case_id" == "T11" ]]; then
+		printf '%s\n' 'T11 passed: one active Relay owns raw-frame admission; persisted global/per-PDS limits enforce one-second bursts and restart with a fresh local burst.'
+	else
+		printf '%s\n' 'T12 passed: policy measurements are bounded, process-local counters and rate-policy pages are capped at 100 items.'
+	fi
+	exit 0
+fi
+
+if [[ "$case_id" == "T13" ]]; then
+	(
+		cd "$root/administration"
+		CONTROL_GO_BINARY="$(command -v go)" ./node_modules/.bin/tsx --test tests/t13-admin-acceptance.test.ts
+	)
+	printf '%s\n' 'T13 passed: the documented local OAuth double proved DID authorization, CSRF, revocation and a durable operation through real loopback Relay control.'
+	exit 0
+fi
+
+if [[ "$case_id" == "T14" ]]; then
+	(
+		cd "$root/administration"
+		CONTROL_GO_BINARY="$(command -v go)" ./node_modules/.bin/playwright test tests/browser/operations.spec.ts --grep 'administrator operates|desktop and mobile'
+	)
+	printf '%s\n' 'T14 passed: accessible desktop and mobile browser workflows exercised the local OAuth double and real loopback Relay and Jetstream owners.'
+	exit 0
+fi
+
 mkdir -p "$root/tests/acceptance/results"
-run_dir=$(mktemp -d "$root/tests/acceptance/results/T01.XXXXXX")
-project="hc-t01-$(basename "$run_dir" | tr -cd '[:alnum:]' | tr '[:upper:]' '[:lower:]')"
+run_dir=$(mktemp -d "$root/tests/acceptance/results/${case_id}.XXXXXX")
+project="hc-$(basename "$run_dir" | tr -cd '[:alnum:]' | tr '[:upper:]' '[:lower:]')"
 env_file="$run_dir/.env"
 compose=(docker compose --project-name "$project" --env-file "$env_file" -f "$root/docker-compose.acceptance.yml")
 consumer_pid=''
+t15_archive_raw=''
+t15_archive_stderr=''
+t15_snapshot=''
 
 cleanup() {
   status=$?
@@ -24,7 +118,7 @@ cleanup() {
   "${compose[@]}" down --volumes --remove-orphans >>"$run_dir/compose.log" 2>&1 || true
   # The runner's generated file contains all ephemeral credentials. Keep only
   # sanitized evidence and source revisions in the retained result directory.
-  rm -f "$env_file"
+  rm -f "$env_file" "$t15_archive_raw" "$t15_archive_stderr" "$t15_snapshot"
   exit "$status"
 }
 trap cleanup EXIT INT TERM
@@ -41,6 +135,55 @@ sock = socket.socket()
 sock.bind(('127.0.0.1', 0))
 print(sock.getsockname()[1])
 sock.close()
+PY
+}
+write_executed_tree_manifest() {
+  python3 - "$root" "$run_dir/executed-tree.json" <<'PY'
+import hashlib
+import json
+import os
+import subprocess
+import sys
+
+root, output = sys.argv[1:]
+base = subprocess.check_output(["git", "-C", root, "rev-parse", "HEAD"], text=True).strip()
+status = subprocess.check_output(
+    ["git", "-C", root, "status", "--porcelain=v1", "-z", "--untracked-files=all"]
+)
+entries = []
+items = status.split(b"\0")
+index = 0
+while index < len(items) and items[index]:
+    item = items[index]
+    code = item[:2].decode("ascii")
+    path = item[3:].decode("utf-8", "surrogateescape")
+    index += 1
+    entry = {"path": path, "status": code}
+    if "R" in code or "C" in code:
+        entry["previousPath"] = items[index].decode("utf-8", "surrogateescape")
+        index += 1
+    full_path = os.path.join(root, path)
+    if os.path.islink(full_path):
+        entry["contentSHA256"] = hashlib.sha256(("symlink:" + os.readlink(full_path)).encode()).hexdigest()
+    elif os.path.isfile(full_path):
+        digest = hashlib.sha256()
+        with open(full_path, "rb") as source:
+            for chunk in iter(lambda: source.read(1 << 20), b""):
+                digest.update(chunk)
+        entry["contentSHA256"] = digest.hexdigest()
+    else:
+        entry["contentSHA256"] = None
+    entries.append(entry)
+
+encoded_entries = json.dumps(entries, sort_keys=True, separators=(",", ":")).encode()
+manifest = {
+    "baseRevision": base,
+    "dirty": entries,
+    "dirtyContentSHA256": hashlib.sha256(encoded_entries).hexdigest(),
+}
+with open(output, "w", encoding="utf-8") as destination:
+    json.dump(manifest, destination, sort_keys=True, separators=(",", ":"))
+    destination.write("\n")
 PY
 }
 wait_for_http() {
@@ -72,6 +215,7 @@ cat >"$env_file" <<EOF
 ACCEPTANCE_STATE_DIR=$run_dir
 JETSTREAM_HOST_PORT=$(free_port)
 RELAY_CONTROL_TOKEN=$(random_hex 32)
+JETSTREAM_CONTROL_TOKEN=$(random_hex 32)
 RELAY_ADMIN_PASSWORD=$(random_hex 24)
 PDS_A_JWT_SECRET=$(random_hex 32)
 PDS_A_ADMIN_PASSWORD=$(random_hex 24)
@@ -84,13 +228,83 @@ chmod 600 "$env_file"
 printf '%s\n' "run directory: $run_dir"
 git -C "$root" rev-parse HEAD >"$run_dir/relay-revision"
 git -C "$root/jetstream" rev-parse HEAD >"$run_dir/jetstream-revision"
+write_executed_tree_manifest
 
 "${compose[@]}" config --quiet
 "${compose[@]}" up --build --detach
 
 jetstream_port=$(awk -F= '$1 == "JETSTREAM_HOST_PORT" { print $2 }' "$env_file")
 jetstream_url="http://127.0.0.1:$jetstream_port"
-wait_for_http "$jetstream_url/" Jetstream
+if [[ "$case_id" == "T01" ]]; then
+  wait_for_http "$jetstream_url/" Jetstream
+fi
+
+if [[ "$case_id" == "T15-core" ]]; then
+  # Each phase writes sanitized job/rejection coordinates. The driver reads the
+  # control credential only from its mounted disposable secret file.
+  "${compose[@]}" exec --no-TTY driver node /app/driver.mjs t15-valid | tee "$run_dir/t15-valid.json"
+  "${compose[@]}" exec --no-TTY driver node /app/driver.mjs t15-identity-fault | tee "$run_dir/t15-identity-fault.json"
+  "${compose[@]}" restart jetstream
+  "${compose[@]}" exec --no-TTY driver node /app/driver.mjs t15-identity-retry | tee "$run_dir/t15-identity-retry.json"
+  "${compose[@]}" exec --no-TTY driver node /app/driver.mjs t15-source-fault | tee "$run_dir/t15-source-fault.json"
+  "${compose[@]}" restart jetstream
+  "${compose[@]}" exec --no-TTY driver node /app/driver.mjs t15-source-retry | tee "$run_dir/t15-source-retry.json"
+  "${compose[@]}" exec --no-TTY driver node /app/driver.mjs t15-invalid-signature | tee "$run_dir/t15-invalid-signature.json"
+  "${compose[@]}" restart jetstream
+  "${compose[@]}" exec --no-TTY driver node /app/driver.mjs t15-check-rejection | tee "$run_dir/t15-rejection.json"
+
+  curl --fail --silent --show-error --request POST "$jetstream_url/hypercerts/acceptance/seal"
+  t15_snapshot=$(mktemp "$run_dir/.t15-archive-snapshot.XXXXXX")
+  curl --fail --silent --show-error --request POST \
+    --header 'content-type: application/json' \
+    --data '{}' \
+    "$jetstream_url/xrpc/network.bsky.jetstream.planSnapshot" >"$t15_snapshot"
+  sealed=$(node -e 'const fs = require("fs"); const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8")).sealedTipSeq; process.stdout.write(Number.isSafeInteger(value) ? String(value) : "0")' "$t15_snapshot")
+  if (( sealed <= 0 )); then
+    printf '%s\n' 'T15-core did not produce a sealed archive boundary' >&2
+    exit 1
+  fi
+  # The archive client emits decoded record payloads. Keep that raw output only
+  # long enough to assert it, then retain a coordinate/count-only summary.
+  t15_archive_raw=$(mktemp "$run_dir/.t15-archive.ndjson.XXXXXX")
+  t15_archive_stderr=$(mktemp "$run_dir/.t15-archive.stderr.XXXXXX")
+  (
+    cd "$root/jetstream"
+    go run ./cmd/client \
+      --host "127.0.0.1:$jetstream_port" \
+      --after-seq 0 \
+      --before-seq "$sealed" \
+      --backfill-only \
+      --collection app.bsky.feed.post \
+      --batch-size 1 \
+      --zstd=false \
+      --print
+  ) >"$t15_archive_raw" 2>"$t15_archive_stderr"
+  "${compose[@]}" exec --no-TTY driver cat /state/t15-state.json >"$run_dir/t15-state.json"
+  node "$root/tests/acceptance/assert.mjs" t15-archive "$run_dir/t15-state.json" "$t15_archive_raw"
+  node - "$run_dir/t15-state.json" "$t15_snapshot" "$t15_archive_raw" "$run_dir/t15-archive-evidence.json" <<'NODE'
+const fs = require('fs')
+const [statePath, snapshotPath, archivePath, outputPath] = process.argv.slice(2)
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'))
+const snapshot = JSON.parse(fs.readFileSync(snapshotPath, 'utf8'))
+const events = fs.readFileSync(archivePath, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line))
+const matches = (did, rkey) => events.filter((event) => event.did === did && event.kind === 'commit' && event.commit?.rkey === rkey).length
+fs.writeFileSync(outputPath, `${JSON.stringify({
+  sealedTipSeq: snapshot.sealedTipSeq,
+  archiveEventCount: events.length,
+  valid: { did: state.valid.did, rkey: state.valid.rkey, matchingEvents: matches(state.valid.did, state.valid.rkey) },
+  identity: { did: state.identity.did, rkey: state.identity.rkey, matchingEvents: matches(state.identity.did, state.identity.rkey) },
+  source: { did: state.source.did, rkey: state.source.rkey, matchingEvents: matches(state.source.did, state.source.rkey) },
+  invalid: { did: state.invalid.did, rkey: state.invalid.rkey, matchingEvents: matches(state.invalid.did, state.invalid.rkey) },
+})}\n`)
+NODE
+  rm -f "$t15_archive_raw" "$t15_archive_stderr" "$t15_snapshot"
+  t15_archive_raw=''
+  t15_archive_stderr=''
+  t15_snapshot=''
+  printf '%s\n' 'T15-core passed: direct-PDS selection completed, transient identity/source faults recovered after restart, and an invalid signature was durably rejected without archive materialization.'
+  exit 0
+fi
 
 "${compose[@]}" exec --no-TTY driver node /app/driver.mjs bootstrap | tee "$run_dir/bootstrap.json"
 
@@ -100,7 +314,14 @@ wait_for_http "$jetstream_url/" Jetstream
 # resulting sealed boundary contains the complete seed phase.
 sealed=0
 for _ in $(seq 1 90); do
-  curl --fail --silent --show-error --request POST "$jetstream_url/hypercerts/acceptance/seal"
+  # The driver can finish its Relay-facing bootstrap before Jetstream has
+  # published its steady-state writer. The acceptance-only seal route returns
+  # 503 during that documented readiness window, so retry it with the archive
+  # assertion rather than failing before the loop can observe readiness.
+  if ! curl --fail --silent --show-error --request POST "$jetstream_url/hypercerts/acceptance/seal"; then
+    sleep 1
+    continue
+  fi
   curl --fail --silent --show-error --request POST \
     --header 'content-type: application/json' \
     --data '{}' \

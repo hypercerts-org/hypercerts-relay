@@ -17,6 +17,7 @@ import (
 	"github.com/cockroachdb/pebble"
 	"github.com/jcalabro/atmos"
 	atmosbackfill "github.com/jcalabro/atmos/backfill"
+	atmosidentity "github.com/jcalabro/atmos/identity"
 	atmosrepo "github.com/jcalabro/atmos/repo"
 	atmossync "github.com/jcalabro/atmos/sync"
 	"github.com/jcalabro/atmos/xrpc"
@@ -41,6 +42,8 @@ type RetryConfig struct {
 	Logger        *slog.Logger
 	Metrics       *Metrics
 	NewHostClient func(string) (*atmossync.Client, error)
+	// hypercerts: optional identity verification for retry complete CARs.
+	Directory *atmosidentity.Directory
 
 	// DropMetrics is the shared ingest validation-drop counter family,
 	// forwarded to the SegmentHandler. Optional.
@@ -456,6 +459,12 @@ func (r *retryRunner) download(ctx context.Context, cand retryCandidate) (*atmos
 	// identifies a different DID must not be resynced under cand.DID.
 	if rp.DID != cand.DID {
 		return nil, nil, host, viaFallback, fmt.Errorf("backfill: retry: getRepo DID mismatch: requested %s, CAR commit is %s", cand.DID, rp.DID)
+	}
+	// hypercerts: verify after complete-CAR and requested-DID checks, before
+	// retry resync materialization. A verification retry refreshes a stale
+	// cached signing key after rotation.
+	if err := verifyCompleteCommit(dlCtx, r.cfg.Directory, cand.DID, commit); err != nil {
+		return nil, nil, host, viaFallback, fmt.Errorf("backfill: retry: verify commit: %w", err)
 	}
 	return rp, commit, host, viaFallback, nil
 }

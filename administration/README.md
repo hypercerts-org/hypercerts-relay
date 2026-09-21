@@ -141,8 +141,8 @@ Unavailable services remain incomplete until an explicit retry. Source removal
 stops acquisition without deleting archives. Job progress remains owned by Jetstream.
 
 Coverage is a page of PDS/policy results with the exact selected collections, job
-ID, progress and incomplete reason. A completed current snapshot has
-`historyComplete: false`; historical PDS attribution is explicitly unknown.
+ID, progress and incomplete reason. Historical PDS attribution is explicitly
+unknown; a completed current snapshot is not a historical event-completeness claim.
 Sources without jobs have unknown coverage. The Sources table presents the
 initial Jetstream inventory totals and processed repositories for the latest job
 beside Relay-observed accounts. Its compact coverage enrichment has a three-second
@@ -184,10 +184,15 @@ npm run test:browser
 disposable databases. These fixtures simulate source validation and unavailable
 PDS acquisition; Relay and Jetstream's own suites cover their actual ingestion and
 backfill engines. Browser tests use the real control-plane HTTP API with explicit
-test-only OAuth/service doubles. They exercise operator flows and desktop/mobile
-accessibility; they are not a live external-PDS OAuth qualification. Production
-`server/main.ts` cannot select those doubles. The root verification scripts remain
-required for Go service changes.
+test-only OAuth double. T13 and T14 compile and launch the real loopback Relay
+and Jetstream private-control handlers; no browser test substitutes a service-owner
+API. The OAuth double only provides a deterministic local callback and is not a
+live external-PDS OAuth qualification. Production `server/main.ts` cannot select
+the double or fixture. T13 proves DID authorization, CSRF, session revocation and
+an administration journal entry that survives reopen; T14 proves accessible
+desktop/mobile browser workflows through those local owners. Run them with
+`./tests/acceptance/run T13` and `./tests/acceptance/run T14`. The root verification
+scripts remain required for Go service changes.
 
 ## Brand assets
 

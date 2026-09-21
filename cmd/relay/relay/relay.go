@@ -29,6 +29,7 @@ type Relay struct {
 	eventLocks [256]sync.Mutex
 	sourcesLk  sync.Mutex
 	rates      *ratePolicies // hypercerts: Durable source/global event admission policy.
+	admission  rateAdmissionState
 
 	// Management of Socket Consumers
 	consumersLk    sync.RWMutex
@@ -49,6 +50,9 @@ type RelayConfig struct {
 	LenientSyncValidation bool
 	TrustedDomains        []string
 	HostPerDayLimit       int64
+	// RequireRateAdmission fences source sockets and raw-frame admission to the
+	// process holding D04's renewable single-active Relay lease.
+	RequireRateAdmission bool
 
 	// If true, skip validation that messages for a given account (DID) are coming from the expected upstream host (PDS). Currently only used in tests; might be used for intermediate relays in the future.
 	SkipAccountHostCheck bool
@@ -102,6 +106,7 @@ func NewRelay(db *gorm.DB, evtman *eventmgr.EventManager, dir identity.Directory
 	}
 	slurpConfig := DefaultSlurperConfig()
 	slurpConfig.WaitRateCapacity = r.waitRateCapacity
+	slurpConfig.RequireRateAdmission = r.requireRateAdmission
 	slurpConfig.ConcurrencyPerHost = config.ConcurrencyPerHost
 
 	// register callbacks to persist cursors and host state in database
@@ -134,8 +139,8 @@ func (r *Relay) MigrateDatabase() error {
 	if err := r.db.AutoMigrate(models.RejectedEvent{}); err != nil {
 		return err
 	}
-	// hypercerts: Preserve explicit source policy separately from runtime host status.
-	if err := r.db.AutoMigrate(models.Source{}, models.AccountSourceObservation{}); err != nil {
+	// hypercerts: Preserve source policy and the cross-service completion boundary separately from runtime host status.
+	if err := r.db.AutoMigrate(models.Source{}, models.RecoveryReceipt{}, models.AccountSourceObservation{}); err != nil {
 		return err
 	}
 	return r.db.Exec(`INSERT INTO source (host_id, state, revision, validation_status, recovery_required, last_operation)

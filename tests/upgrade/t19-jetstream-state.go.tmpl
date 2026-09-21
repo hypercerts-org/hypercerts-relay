@@ -1,0 +1,149 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/bluesky-social/jetstream/internal/hypercerts/jobs"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
+	"github.com/bluesky-social/jetstream/internal/ingest/live"
+	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/segment"
+)
+
+const (
+	pds                = "https://upgrade-state.example"
+	sourceRev          = uint64(7)
+	cursor             = int64(4242)
+	archiveID          = "did:plc:upgradearchive"
+	archiveSeq         = uint64(1)
+	archiveWitnessedAt = int64(1)
+	archiveCollection  = "app.bsky.feed.post"
+	archiveRkey        = "upgrade"
+	archiveRev         = "3l3qo2vutsw2b"
+	archivePayload     = "\xa1\x61\x78\x01"
+)
+
+func main() {
+	mode := flag.String("mode", "", "seed or verify")
+	dataDir := flag.String("data-dir", "", "Jetstream state directory")
+	flag.Parse()
+	if *dataDir == "" || (*mode != "seed" && *mode != "verify") {
+		fatal("usage: --mode seed|verify --data-dir DIR")
+	}
+	if err := os.MkdirAll(*dataDir, 0o755); err != nil {
+		fatal("create data directory: %v", err)
+	}
+	if *mode == "seed" {
+		seed(*dataDir)
+	} else {
+		verify(*dataDir)
+	}
+}
+
+func seed(dataDir string) {
+	db, err := store.Open(dataDir, nil)
+	if err != nil {
+		fatal("open Jetstream metadata: %v", err)
+	}
+	policy, err := selection.Open(db, []string{"app.bsky.feed.post"})
+	if err != nil {
+		fatal("open collection policy: %v", err)
+	}
+	manager, err := jobs.Open(db, policy)
+	if err != nil {
+		fatal("open backfill jobs: %v", err)
+	}
+	if _, err := manager.AddSourceWithRevision(pds, sourceRev); err != nil {
+		fatal("seed direct-PDS source/job: %v", err)
+	}
+	if _, err := manager.SetPolicy(1, []string{"app.bsky.feed.like", "app.bsky.feed.post"}); err != nil {
+		fatal("seed collection policy/job transition: %v", err)
+	}
+	if err := live.SaveUpstreamCursor(db, live.CursorKey, cursor); err != nil {
+		fatal("seed upstream cursor: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		fatal("close Jetstream metadata: %v", err)
+	}
+
+	segments := filepath.Join(dataDir, "segments")
+	if err := os.MkdirAll(segments, 0o755); err != nil {
+		fatal("create archive directory: %v", err)
+	}
+	path := filepath.Join(segments, "seg_0000000001.jss")
+	writer, err := segment.New(segment.Config{Path: path, MaxEventsPerBlock: 1})
+	if err != nil {
+		fatal("open archive writer: %v", err)
+	}
+	if _, err := writer.Append(segment.Event{Seq: archiveSeq, WitnessedAt: archiveWitnessedAt, Kind: segment.KindCreate, DID: archiveID, Collection: archiveCollection, Rkey: archiveRkey, Rev: archiveRev, Payload: []byte(archivePayload)}); err != nil {
+		fatal("append selected archive event: %v", err)
+	}
+	if _, err := writer.Seal(); err != nil {
+		fatal("seal archive: %v", err)
+	}
+	printState("seed")
+}
+
+func verify(dataDir string) {
+	db, err := store.Open(dataDir, nil)
+	if err != nil {
+		fatal("open Jetstream metadata: %v", err)
+	}
+	defer db.Close()
+	policy, err := selection.Open(db, nil)
+	if err != nil {
+		fatal("open persisted collection policy: %v", err)
+	}
+	if got := policy.Current(); got.Revision != 2 || len(got.Collections) != 2 || got.Collections[0] != "app.bsky.feed.like" || got.Collections[1] != "app.bsky.feed.post" {
+		fatal("collection policy assertion failed: %+v", got)
+	}
+	manager, err := jobs.Open(db, policy)
+	if err != nil {
+		fatal("open persisted backfill jobs: %v", err)
+	}
+	var matching bool
+	for _, job := range manager.List() {
+		if job.PDS == pds && job.Policy.Revision == 2 && job.SourceRevision == sourceRev && job.State == jobs.Pending {
+			matching = true
+		}
+	}
+	if !matching {
+		fatal("backfill job assertion failed")
+	}
+	if got, err := live.LoadUpstreamCursor(db, live.CursorKey); err != nil || got != cursor {
+		fatal("upstream cursor assertion failed: cursor=%d err=%v", got, err)
+	}
+	reader, err := segment.Open(segment.ReaderConfig{Path: filepath.Join(dataDir, "segments", "seg_0000000001.jss")})
+	if err != nil {
+		fatal("open sealed archive: %v", err)
+	}
+	defer reader.Close()
+	events, err := reader.DecodeBlock(0)
+	if err != nil || len(events) != 1 || events[0].Seq != archiveSeq || events[0].WitnessedAt != archiveWitnessedAt || events[0].Kind != segment.KindCreate || events[0].DID != archiveID || events[0].Collection != archiveCollection || events[0].Rkey != archiveRkey || events[0].Rev != archiveRev || !bytes.Equal(events[0].Payload, []byte(archivePayload)) {
+		fatal("selected archive assertion failed: events=%+v err=%v", events, err)
+	}
+	printState("verify")
+}
+
+func printState(mode string) {
+	value := map[string]any{
+		"component": "jetstream", "mode": mode, "pds": pds,
+		"sourceRevision": sourceRev, "upstreamCursor": cursor,
+		"policyRevision": 2, "archiveDID": archiveID,
+		"checkedAt": time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	if err := json.NewEncoder(os.Stdout).Encode(value); err != nil {
+		fatal("write result: %v", err)
+	}
+}
+
+func fatal(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
+	os.Exit(1)
+}

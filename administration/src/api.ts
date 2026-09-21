@@ -36,7 +36,6 @@ export interface JetstreamSummary {
   totalReposKnown: boolean;
   createdAt: string;
   coverage: string;
-  historyComplete: boolean;
 }
 export interface Coverage {
   pds: string;
@@ -48,7 +47,6 @@ export interface Coverage {
   totalReposKnown: boolean;
   createdAt: string;
   reason: string | null;
-  historyComplete: boolean;
   historicalPDSAttribution: string;
   coverage: string;
 }

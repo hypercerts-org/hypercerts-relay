@@ -90,14 +90,13 @@ func TestHypercertsQuietPDSAndEnabledCollectionJobs(t *testing.T) {
 		}, 10*time.Second, 10*time.Millisecond, "jobs: %+v", rt.BackfillJobs.List())
 	}
 	waitJobs(1)
-	_, err = rt.BackfillJobs.SetPolicy(1, []string{"app.bsky.feed.post", "app.bsky.feed.like"})
+	_, err = rt.BackfillJobs.SetPolicy(t.Context(), 1, []string{"app.bsky.feed.post", "app.bsky.feed.like"})
 	require.NoError(t, err)
 	waitJobs(2)
 	for _, job := range rt.BackfillJobs.List() {
 		require.Equal(t, pds.URL, job.PDS)
 		require.Equal(t, "current_state", job.Coverage)
 		require.Len(t, job.CompletedRepos, 1)
-		require.False(t, job.HistoryComplete)
 	}
 	require.NoError(t, writer.ForceRotate(t.Context()))
 	consumer, err := client.Subscribe("http://"+rt.PublicAddr(), client.WithAfterSeq(0), client.WithSnapshotOnly(), client.WithBatchSize(1))

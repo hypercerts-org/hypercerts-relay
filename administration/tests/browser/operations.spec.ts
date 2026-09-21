@@ -100,7 +100,7 @@ test("administrator operates sources, collections, jobs, rates and revokes the s
   await page.getByLabel("Enabled PDS origin").fill("https://quiet.example");
   await page.getByRole("button", { name: "Submit backfill" }).click();
   await refresh(page);
-  await expect(page.getByText("source unavailable")).toBeVisible({
+  await expect(page.getByText("source unavailable").first()).toBeVisible({
     timeout: 12000,
   });
   await page.getByRole("link", { name: "PDS sources", exact: true }).click();

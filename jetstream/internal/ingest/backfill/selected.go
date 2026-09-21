@@ -23,8 +23,10 @@ type selectedReposConfig struct {
 	Handler          *SegmentHandler
 	SyncClient       *atmossync.Client
 	IdentityResolver atmosidentity.Resolver
-	Metrics          *Metrics
-	OnError          func(atmos.DID, error)
+	// hypercerts: optional identity verification for selected complete CARs.
+	Directory *atmosidentity.Directory
+	Metrics   *Metrics
+	OnError   func(atmos.DID, error)
 
 	MaxRetries     int
 	RetryBaseDelay time.Duration
@@ -130,6 +132,77 @@ func (r *selectedRunner) reportIdentityMetadataError(did atmos.DID, err error) {
 	if r.cfg.OnError != nil {
 		r.cfg.OnError(did, err)
 	}
+}
+
+// verifyCompleteCommit verifies a complete CAR against directory when supplied.
+// A cryptographic verification failure can be caused by a rotated signing key,
+// so it discards the cached identity for did and retries once in that case.
+// Resolver, identity, and malformed-commit failures do not mutate the cache.
+// A nil directory preserves the relay-trusted behavior for direct callers.
+func verifyCompleteCommit(ctx context.Context, directory *atmosidentity.Directory, did atmos.DID, commit *atmosrepo.Commit) error {
+	if directory == nil {
+		return nil
+	}
+	signatureFailed, err := verifyCompleteCommitOnce(ctx, directory, commit)
+	if err == nil {
+		return nil
+	}
+	if !signatureFailed {
+		return err
+	}
+	directory.Purge(ctx, did)
+	_, err = verifyCompleteCommitOnce(ctx, directory, commit)
+	return err
+}
+
+// verifiedBootstrapHandler verifies normal direct-PDS complete CARs before
+// handing them to the segment writer. Atmos v0.3.6 exposes only an all-or-
+// nothing engine verifier, so it cannot refresh a cached identity after a
+// signature failure. This adapter preserves the same one-refresh policy as
+// selected and retry backfill without allowing unverified materialization.
+type verifiedBootstrapHandler struct {
+	next      *SegmentHandler
+	directory *atmosidentity.Directory
+}
+
+func (h verifiedBootstrapHandler) HandleRepo(ctx context.Context, did atmos.DID, rp *atmosrepo.Repo, commit *atmosrepo.Commit) error {
+	if err := verifyCompleteCommit(ctx, h.directory, did, commit); err != nil {
+		return fmt.Errorf("backfill: verify bootstrap commit: %w", err)
+	}
+	return h.next.HandleRepo(ctx, did, rp, commit)
+}
+
+// verifyCompleteCommitOnce mirrors atmos's directory verification while
+// retaining whether the failure was specifically a validly encoded signature
+// that did not verify. That distinction prevents cache eviction for temporary
+// resolver errors and malformed CAR input.
+func verifyCompleteCommitOnce(ctx context.Context, directory *atmosidentity.Directory, commit *atmosrepo.Commit) (bool, error) {
+	if commit == nil {
+		return false, errors.New("backfill: missing commit")
+	}
+	did, err := atmos.ParseDID(commit.DID)
+	if err != nil {
+		return false, fmt.Errorf("backfill: invalid DID in commit: %w", err)
+	}
+	ident, err := directory.LookupDID(ctx, did)
+	if err != nil {
+		return false, fmt.Errorf("backfill: resolving DID %s: %w", did, err)
+	}
+	key, err := ident.PublicKey()
+	if err != nil {
+		return false, fmt.Errorf("backfill: getting public key for %s: %w", did, err)
+	}
+	if len(commit.Sig) != 64 {
+		return false, fmt.Errorf("backfill: invalid signature length for %s", did)
+	}
+	unsigned, err := commit.UnsignedBytes()
+	if err != nil {
+		return false, fmt.Errorf("backfill: encoding unsigned commit for %s: %w", did, err)
+	}
+	if err := key.HashAndVerify(unsigned, commit.Sig); err != nil {
+		return true, fmt.Errorf("backfill: signature verification failed for %s: %w", did, err)
+	}
+	return false, nil
 }
 
 // processRepo mirrors the atmos engine's two-budget retry loop (see
@@ -240,8 +313,10 @@ func selectedBackoffDelay(base, maxDelay time.Duration, attempt int, jitter jitt
 // tryRepo downloads via the relay SyncClient (302→PDS), parses, and
 // hands the repo to the handler. It returns the host the CAR came from
 // (post-redirect) so a failure can be attributed even though no identity
-// resolution happens on this path. Commit signatures are not verified
-// (this debug path mirrors the bootstrap engine's relay-trusted default).
+// resolution happens on this path.
+// hypercerts: Direct callers may omit Directory and retain relay-trusted
+// behavior; production wires the shared live-verifier directory through Config
+// so selected CARs are verified.
 func (r *selectedRunner) tryRepo(ctx context.Context, did atmos.DID) (string, error) {
 	body, host, err := r.cfg.SyncClient.GetRepoStreamHost(ctx, did, "")
 	if err != nil {
@@ -262,6 +337,12 @@ func (r *selectedRunner) tryRepo(ctx context.Context, did atmos.DID) (string, er
 	// engine's check, which this debug path bypasses.
 	if rp.DID != did {
 		return host, fmt.Errorf("backfill: selected: getRepo DID mismatch: requested %s, CAR commit is %s", did, rp.DID)
+	}
+	// hypercerts: verify after complete-CAR and requested-DID checks, before
+	// selected records are materialized. A verification retry refreshes a stale
+	// cached signing key after rotation.
+	if err := verifyCompleteCommit(ctx, r.cfg.Directory, did, commit); err != nil {
+		return host, fmt.Errorf("backfill: selected: verify commit: %w", err)
 	}
 	if err := r.cfg.Handler.HandleRepo(ctx, did, rp, commit); err != nil {
 		return host, err

@@ -21,6 +21,7 @@ test(
       );
     const temp = mkdtempSync(join(tmpdir(), "management-acceptance-"));
     const compile = promisify(execFile);
+    const goEnv = { ...process.env, GOCACHE: join(temp, "go-cache") };
     const fixtures = [
       { name: "relay", cwd: resolve(".."), pkg: "./cmd/relay" },
       {
@@ -38,6 +39,7 @@ test(
           ["test", "-c", "-o", join(temp, name + ".test"), pkg],
           {
             cwd,
+            env: goEnv,
             timeout: 300000,
             signal: t.signal,
             maxBuffer: 2 * 1024 * 1024,
@@ -45,13 +47,26 @@ test(
         ),
       ),
     );
-    async function fixture(name: string, cwd: string) {
+    async function fixture(
+      name: string,
+      cwd: string,
+      relayURL?: string,
+    ) {
       const ready = join(temp, name);
       let output = "";
       const child = spawn(
         join(temp, name + ".test"),
         ["-test.run=^TestControlPlaneAcceptanceFixture$", "-test.count=1"],
-        { cwd, env: { ...process.env, CONTROL_ACCEPTANCE_READY: ready } },
+        {
+          cwd,
+          env: {
+            ...goEnv,
+            CONTROL_ACCEPTANCE_READY: ready,
+            ...(relayURL === undefined
+              ? {}
+              : { CONTROL_ACCEPTANCE_RELAY_URL: relayURL }),
+          },
+        },
       );
       child.stdout.on("data", (b) => (output += b));
       child.stderr.on("data", (b) => (output += b));
@@ -81,8 +96,11 @@ test(
       }
       return readFileSync(ready, "utf8");
     }
-    const [relay, jetstream] = await Promise.all(
-      fixtures.map(({ name, cwd }) => fixture(name, cwd)),
+    const relay = await fixture(fixtures[0].name, fixtures[0].cwd);
+    const jetstream = await fixture(
+      fixtures[1].name,
+      fixtures[1].cwd,
+      relay,
     );
     const token = "fixture-service-credential-32-bytes-minimum";
     const services = new Services(
@@ -98,6 +116,21 @@ test(
       const result = store.operation(op.id)!;
       assert.equal(result.state, "applied", JSON.stringify(result));
       return result;
+    }
+    async function waitForBackfillWorkers() {
+      const deadline = Date.now() + 10_000;
+      for (;;) {
+        const jobs = await services.jobs();
+        if (
+          jobs.jobs.every(
+            (job) => job.state !== "pending" && job.state !== "running",
+          )
+        )
+          return;
+        if (Date.now() >= deadline)
+          assert.fail("fixture backfill workers did not settle");
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
     }
     await apply({
       kind: "source",
@@ -132,6 +165,10 @@ test(
       "/source?pds=https%3A%2F%2Fpds.example",
     );
     assert.equal(observed.AccountQuota.Limit, 250);
+    // The fixture worker deliberately completes each backfill as unavailable.
+    // Wait for that independent work before changing its policy, so this test
+    // does not depend on a concurrent transition inside the owner process.
+    await waitForBackfillWorkers();
     await apply({
       kind: "collections",
       expectedRevision: 1,
@@ -170,7 +207,7 @@ test(
       jobs.jobs.find((job) => job.id === jobID)?.state,
       "incomplete",
     );
-    assert.ok(jobs.jobs.every((j) => !j.historyComplete));
+    assert.ok(jobs.jobs.every((j) => j.coverage === "current_state"));
     assert.ok(jobs.jobs.some((j) => j.state === "incomplete"));
     await services.call("relay", "/source", "PUT", {
       pds: "https://relay-only.example",

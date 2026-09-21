@@ -2,6 +2,12 @@ package jobs
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,7 +17,11 @@ import (
 )
 
 func newManager(t *testing.T, dir string) (*Manager, *store.Store) {
-	db, err := store.Open(dir, nil)
+	return newManagerWithOptions(t, dir)
+}
+
+func newManagerWithOptions(t *testing.T, dir string, opts ...store.Option) (*Manager, *store.Store) {
+	db, err := store.Open(dir, nil, opts...)
 	require.NoError(t, err)
 	policy, err := selection.Open(db, []string{"app.bsky.feed.post"})
 	require.NoError(t, err)
@@ -28,7 +38,7 @@ func TestJobsPolicyAtomicSchedulingAndCancellation(t *testing.T) {
 	again, err := m.AddSource("https://pds.example/")
 	require.NoError(t, err)
 	require.Equal(t, j.ID, again.ID)
-	policy, err := m.SetPolicy(1, []string{"app.bsky.feed.like", "app.bsky.feed.post"})
+	policy, err := m.SetPolicy(t.Context(), 1, []string{"app.bsky.feed.like", "app.bsky.feed.post"})
 	require.NoError(t, err)
 	require.Equal(t, uint64(2), policy.Revision)
 	all := m.List()
@@ -41,7 +51,7 @@ func TestJobsPolicyAtomicSchedulingAndCancellation(t *testing.T) {
 			require.Equal(t, "https://pds.example", j.PDS)
 		}
 	}
-	_, err = m.SetPolicy(1, nil)
+	_, err = m.SetPolicy(t.Context(), 1, nil)
 	require.ErrorIs(t, err, selection.ErrRevision)
 	require.ErrorIs(t, m.Retry(j.ID), ErrConflict)
 	require.NoError(t, m.RemoveSource("https://pds.example"))
@@ -111,7 +121,7 @@ func TestJobsCrashResumeAndUnavailableCoverage(t *testing.T) {
 		done <- m.Run(ctx, func(context.Context, Job) error { return &InputError{Code: "source_unavailable", Unavailable: true} })
 	}()
 	require.Eventually(t, func() bool { return m.List()[0].State == Incomplete }, time.Second, time.Millisecond)
-	require.False(t, m.List()[0].HistoryComplete)
+	require.Equal(t, "current_state", m.List()[0].Coverage)
 	require.NoError(t, m.Retry(j.ID))
 	require.Eventually(t, func() bool { return m.List()[0].Attempts >= 3 }, time.Second, time.Millisecond)
 	cancel()
@@ -157,6 +167,272 @@ func TestJobsRepeatedQuotaRecoveryStartsFreshWork(t *testing.T) {
 	require.Empty(t, second.CompletedRepos)
 }
 
+func TestCompletedRecoveryReceiptRetriesAfterRestart(t *testing.T) {
+	dir := t.TempDir()
+	m, db := newManager(t, dir)
+	job, err := m.AddSourceWithRevision("https://pds.example", 7)
+	require.NoError(t, err)
+	m.SetReceiptSender(func(context.Context, Job) error { return errors.New("relay unavailable") })
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- m.Run(ctx, func(context.Context, Job) error { return nil }) }()
+	require.Eventually(t, func() bool {
+		current, getErr := m.Get(job.ID)
+		return getErr == nil && current.State == Complete && current.ReceiptPending && current.ReceiptAttempts == 1
+	}, time.Second, time.Millisecond)
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+	current, err := m.Get(job.ID)
+	require.NoError(t, err)
+	require.Equal(t, Complete, current.State)
+	require.True(t, current.ReceiptPending)
+	require.NoError(t, db.Close())
+
+	m, db = newManager(t, dir)
+	defer db.Close()
+	received := make(chan Job, 1)
+	m.SetReceiptSender(func(_ context.Context, receipt Job) error {
+		received <- receipt
+		return nil
+	})
+	ctx, cancel = context.WithCancel(t.Context())
+	done = make(chan error, 1)
+	go func() { done <- m.Run(ctx, func(context.Context, Job) error { return nil }) }()
+	receivedJob := <-received
+	require.Equal(t, uint64(7), receivedJob.SourceRevision)
+	require.Equal(t, Complete, receivedJob.State)
+	require.Eventually(t, func() bool {
+		stored, getErr := m.Get(job.ID)
+		return getErr == nil && !stored.ReceiptPending
+	}, time.Second, time.Millisecond)
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+}
+
+func TestSourceRevisionAdvanceCancelsInFlightJobAndSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	m, db := newManager(t, dir)
+	first, err := m.AddSourceWithRevision("https://pds.example", 1)
+	require.NoError(t, err)
+	started := make(chan struct{})
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- m.Run(ctx, func(jobCtx context.Context, _ Job) error {
+			select {
+			case <-started:
+			default:
+				close(started)
+			}
+			<-jobCtx.Done()
+			return jobCtx.Err()
+		})
+	}()
+	<-started
+	second, err := m.AddSourceWithRevision("https://pds.example", 2)
+	require.NoError(t, err)
+	require.NotEqual(t, first.ID, second.ID)
+	require.Eventually(t, func() bool {
+		old, oldErr := m.Get(first.ID)
+		return oldErr == nil && old.State == Canceled && old.ErrorCode == "source_revision_changed"
+	}, time.Second, time.Millisecond)
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+	require.NoError(t, db.Close())
+
+	m, db = newManager(t, dir)
+	defer db.Close()
+	old, err := m.Get(first.ID)
+	require.NoError(t, err)
+	require.Equal(t, Canceled, old.State)
+	current, err := m.Get(second.ID)
+	require.NoError(t, err)
+	require.Equal(t, Pending, current.State)
+	require.Equal(t, uint64(2), current.SourceRevision)
+}
+
+func TestLowerSourceRevisionIsRejectedForSourceAndQuotaRequests(t *testing.T) {
+	m, db := newManager(t, t.TempDir())
+	defer db.Close()
+	newest, err := m.AddSourceWithRevision("https://pds.example", 9)
+	require.NoError(t, err)
+	_, err = m.AddSourceWithRevision("https://pds.example", 8)
+	require.ErrorIs(t, err, ErrConflict)
+	_, err = m.RequestOnceWithSourceRevision("https://pds.example", "quota_recovery", "quota-old", 8)
+	require.ErrorIs(t, err, ErrConflict)
+	current, err := m.Get(newest.ID)
+	require.NoError(t, err)
+	require.Equal(t, uint64(9), current.SourceRevision)
+	require.Len(t, m.List(), 1, "delayed source and quota commands must not create jobs")
+}
+
+func TestStaleRecoveryReceiptIsTerminalWithoutStoppingJobs(t *testing.T) {
+	m, db := newManager(t, t.TempDir())
+	defer db.Close()
+	job, err := m.AddSourceWithRevision("https://pds.example", 4)
+	require.NoError(t, err)
+	m.SetReceiptSender(func(context.Context, Job) error { return ErrReceiptStale })
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- m.Run(ctx, func(context.Context, Job) error { return nil }) }()
+	require.Eventually(t, func() bool {
+		current, getErr := m.Get(job.ID)
+		return getErr == nil && current.State == Complete && !current.ReceiptPending && current.ReceiptError == "stale_source_revision"
+	}, time.Second, time.Millisecond)
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+}
+
+func TestSupersededPolicyJobDoesNotSubmitRecoveryReceipt(t *testing.T) {
+	m, db := newManager(t, t.TempDir())
+	defer db.Close()
+	job, err := m.AddSourceWithRevision("https://pds.example", 4)
+	require.NoError(t, err)
+	m.SetReceiptSender(func(context.Context, Job) error { return errors.New("temporary receipt failure") })
+	m.SetPolicyAdvanceSender(func(context.Context, string, uint64, uint64) error { return nil })
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- m.Run(ctx, func(context.Context, Job) error { return nil }) }()
+	require.Eventually(t, func() bool {
+		current, getErr := m.Get(job.ID)
+		return getErr == nil && current.State == Complete && current.ReceiptPending
+	}, time.Second, time.Millisecond)
+
+	_, err = m.SetPolicy(t.Context(), m.policy.Current().Revision, []string{"app.bsky.feed.like", "app.bsky.feed.post"})
+	require.NoError(t, err)
+	receipts := make(chan Job, 1)
+	m.SetReceiptSender(func(_ context.Context, received Job) error {
+		receipts <- received
+		return nil
+	})
+	require.Eventually(t, func() bool {
+		current, getErr := m.Get(job.ID)
+		return getErr == nil && current.State == Complete && !current.ReceiptPending && current.ReceiptError == "policy_superseded"
+	}, time.Second, time.Millisecond)
+	require.Never(t, func() bool {
+		select {
+		case received := <-receipts:
+			return received.ID == job.ID
+		default:
+			return false
+		}
+	}, 200*time.Millisecond, time.Millisecond)
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+}
+
+func TestPolicyChangeRequiresRelayRecoveryMirror(t *testing.T) {
+	m, db := newManager(t, t.TempDir())
+	defer db.Close()
+	_, err := m.AddSourceWithRevision("https://pds.example", 4)
+	require.NoError(t, err)
+	_, err = m.SetPolicy(t.Context(), 1, []string{"app.bsky.feed.like", "app.bsky.feed.post"})
+	require.ErrorIs(t, err, ErrPolicyMirrorRequired)
+	require.Equal(t, uint64(1), m.policy.Current().Revision)
+
+	var advanced []struct {
+		pds            string
+		sourceRevision uint64
+		policyRevision uint64
+	}
+	m.SetPolicyAdvanceSender(func(_ context.Context, pds string, sourceRevision, policyRevision uint64) error {
+		advanced = append(advanced, struct {
+			pds            string
+			sourceRevision uint64
+			policyRevision uint64
+		}{pds, sourceRevision, policyRevision})
+		return nil
+	})
+	policy, err := m.SetPolicy(t.Context(), 1, []string{"app.bsky.feed.like", "app.bsky.feed.post"})
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), policy.Revision)
+	require.Equal(t, []struct {
+		pds            string
+		sourceRevision uint64
+		policyRevision uint64
+	}{{"https://pds.example", 4, 2}}, advanced)
+
+	m.SetPolicyAdvanceSender(func(context.Context, string, uint64, uint64) error { return errors.New("relay unavailable") })
+	_, err = m.SetPolicy(t.Context(), 2, []string{"app.bsky.actor.profile", "app.bsky.feed.like", "app.bsky.feed.post"})
+	require.ErrorContains(t, err, "advance Relay recovery policy")
+	require.Equal(t, uint64(2), m.policy.Current().Revision)
+	for _, job := range m.List() {
+		require.NotEqual(t, uint64(3), job.Policy.Revision)
+	}
+}
+
+func TestMissingRecoveryReceiptSourceIsTerminalWithoutStoppingJobs(t *testing.T) {
+	m, db := newManager(t, t.TempDir())
+	defer db.Close()
+	job, err := m.AddSourceWithRevision("https://pds.example", 4)
+	require.NoError(t, err)
+	m.SetReceiptSender(func(context.Context, Job) error { return ErrReceiptSourceMissing })
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- m.Run(ctx, func(context.Context, Job) error { return nil }) }()
+	require.Eventually(t, func() bool {
+		current, getErr := m.Get(job.ID)
+		return getErr == nil && current.State == Complete && !current.ReceiptPending && current.ReceiptError == "source_not_found"
+	}, time.Second, time.Millisecond)
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+}
+
+func TestRelayReceiptSenderClassifiesMissingSource(t *testing.T) {
+	relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/hypercerts/v1/source/recovery-receipt", r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":"source_not_found"}`))
+	}))
+	defer relay.Close()
+	err := (RelayReceiptSender{URL: relay.URL, Token: "fixture-service-credential-32-bytes-minimum", Client: relay.Client()}).Send(t.Context(), Job{ID: "job-1", PDS: "https://pds.example", SourceRevision: 1, Policy: selection.Policy{Revision: 1}})
+	require.ErrorIs(t, err, ErrReceiptSourceMissing)
+}
+
+func TestRelayReceiptSenderAdvancesRecoveryPolicy(t *testing.T) {
+	relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, http.MethodPost, r.Method)
+		require.Equal(t, "/hypercerts/v1/source/recovery-policy", r.URL.Path)
+		var input struct {
+			PDS            string `json:"pds"`
+			SourceRevision uint64 `json:"sourceRevision"`
+			PolicyRevision uint64 `json:"policyRevision"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&input))
+		require.Equal(t, "https://pds.example", input.PDS)
+		require.Equal(t, uint64(4), input.SourceRevision)
+		require.Equal(t, uint64(2), input.PolicyRevision)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer relay.Close()
+	err := (RelayReceiptSender{URL: relay.URL, Token: "fixture-service-credential-32-bytes-minimum", Client: relay.Client()}).AdvancePolicy(t.Context(), "https://pds.example", 4, 2)
+	require.NoError(t, err)
+}
+
+func TestRelayReceiptSenderRetriesAmbiguousNotFoundResponses(t *testing.T) {
+	for _, response := range []struct {
+		name string
+		body string
+	}{
+		{name: "empty", body: ""},
+		{name: "html", body: "<html>not found</html>"},
+		{name: "generic json", body: `{"error":"not_found"}`},
+	} {
+		t.Run(response.name, func(t *testing.T) {
+			relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(response.body))
+			}))
+			defer relay.Close()
+			err := (RelayReceiptSender{URL: relay.URL, Token: "fixture-service-credential-32-bytes-minimum", Client: relay.Client()}).Send(t.Context(), Job{ID: "job-1", PDS: "https://pds.example", SourceRevision: 1, Policy: selection.Policy{Revision: 1}})
+			require.Error(t, err)
+			require.NotErrorIs(t, err, ErrReceiptSourceMissing)
+		})
+	}
+}
+
 func TestRequestReceiptSurvivesCompletionAndRestart(t *testing.T) {
 	dir := t.TempDir()
 	m, db := newManager(t, dir)
@@ -195,6 +471,128 @@ func TestNoopActionReceiptsDoNotChangeLaterJobState(t *testing.T) {
 	require.NoError(t, m.Retry(job.ID))
 	require.NoError(t, m.TransitionOnce(job.ID, Canceled, "cancel-current"))
 	require.Equal(t, Pending, m.List()[0].State, "a repeated receipt must not cancel a later retry")
+}
+
+func TestSnapshotRejectionBoundsUntrustedSourcePositions(t *testing.T) {
+	dir := t.TempDir()
+	m, db := newManager(t, dir)
+	defer db.Close()
+
+	const pds = "https://pds.example"
+	const did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
+	const revision = "3l3qo2vutsw2b"
+	normal, err := m.recordSnapshotRejection(pds, 1, did, revision, directPDSSnapshotRejectionKind, "verification_failed")
+	require.NoError(t, err)
+	require.Equal(t, pds, normal.PDS)
+	require.Equal(t, did, normal.DID)
+	require.Equal(t, revision, normal.ListedRevision)
+
+	oversizedPDS := "https://" + strings.Repeat("p", maxSnapshotRejectionPDSLength) + ".example"
+	noncanonicalDID := "DID:PLC:NOT-CANONICAL"
+	noncanonicalRevision := strings.Repeat("x", 4096)
+	bounded, err := m.recordSnapshotRejection(oversizedPDS, 1, noncanonicalDID, noncanonicalRevision, directPDSSnapshotRejectionKind, "verification_failed")
+	require.NoError(t, err)
+	require.Equal(t, snapshotRejectionDigest(oversizedPDS), bounded.PDS)
+	require.Equal(t, snapshotRejectionDigest(noncanonicalDID), bounded.DID)
+	require.Equal(t, snapshotRejectionDigest(noncanonicalRevision), bounded.ListedRevision)
+	require.NotContains(t, bounded.PDS, oversizedPDS)
+	require.NotContains(t, bounded.DID, noncanonicalDID)
+	require.NotContains(t, bounded.ListedRevision, noncanonicalRevision)
+
+	again, err := m.recordSnapshotRejection(oversizedPDS, 1, noncanonicalDID, noncanonicalRevision, directPDSSnapshotRejectionKind, "invalid_repository")
+	require.NoError(t, err)
+	require.Equal(t, bounded, again, "the bounded position must retain its first verdict")
+	found, ok := m.lookupSnapshotRejection(oversizedPDS, 1, noncanonicalDID, noncanonicalRevision, directPDSSnapshotRejectionKind)
+	require.True(t, ok)
+	require.Equal(t, bounded, found)
+
+	require.NoError(t, db.Close())
+	m, db = newManager(t, dir)
+	defer db.Close()
+	found, ok = m.lookupSnapshotRejection(oversizedPDS, 1, noncanonicalDID, noncanonicalRevision, directPDSSnapshotRejectionKind)
+	require.True(t, ok)
+	require.Equal(t, bounded, found)
+}
+
+func TestSnapshotRejectionsRetainRecentBoundedLedgerAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	m, db := newManager(t, dir)
+
+	const pds = "https://pds.example"
+	base := time.Now().UTC().Add(-time.Hour)
+	seeded := make(map[string]SnapshotRejection, maxSnapshotRejections)
+	var oldestKey string
+	for i := range maxSnapshotRejections {
+		rejection := SnapshotRejection{
+			PDS:            pds,
+			PolicyRevision: 1,
+			DID:            snapshotRejectionDigest(fmt.Sprintf("seed-did-%d", i)),
+			ListedRevision: snapshotRejectionDigest(fmt.Sprintf("seed-revision-%d", i)),
+			Kind:           directPDSSnapshotRejectionKind,
+			Code:           "verification_failed",
+			RejectedAt:     base.Add(time.Duration(i) * time.Second),
+		}
+		key := snapshotRejectionStoredKey(rejection.PDS, rejection.PolicyRevision, rejection.DID, rejection.ListedRevision, rejection.Kind)
+		seeded[key] = rejection
+		if i == 0 {
+			oldestKey = key
+		}
+	}
+	m.data.SnapshotRejections = seeded
+	require.NoError(t, m.save(m.data))
+
+	latest, err := m.recordSnapshotRejection(pds, 1, "did:plc:latest", "3l3qo2vutsw2b", directPDSSnapshotRejectionKind, "verification_failed")
+	require.NoError(t, err)
+	latestKey := snapshotRejectionStoredKey(latest.PDS, latest.PolicyRevision, latest.DID, latest.ListedRevision, latest.Kind)
+	require.Len(t, m.ListSnapshotRejections(), maxSnapshotRejections)
+	_, foundOldest := m.data.SnapshotRejections[oldestKey]
+	require.False(t, foundOldest, "the oldest ledger entry must be evicted at the retention cap")
+	_, foundLatest := m.data.SnapshotRejections[latestKey]
+	require.True(t, foundLatest)
+
+	require.NoError(t, db.Close())
+	m, db = newManager(t, dir)
+	defer db.Close()
+	require.Len(t, m.ListSnapshotRejections(), maxSnapshotRejections)
+	_, foundOldest = m.data.SnapshotRejections[oldestKey]
+	require.False(t, foundOldest)
+	_, foundLatest = m.data.SnapshotRejections[latestKey]
+	require.True(t, foundLatest)
+}
+
+func TestSnapshotRejectionsPersistIdempotently(t *testing.T) {
+	dir := t.TempDir()
+	m, db := newManager(t, dir)
+	// Simulate a document from before the rejection ledger migration.
+	legacy := clone(m.data)
+	legacy.SnapshotRejections = nil
+	require.NoError(t, m.save(legacy))
+	require.NoError(t, db.Close())
+	m, db = newManager(t, dir)
+	require.Empty(t, m.ListSnapshotRejections())
+
+	rejection, err := m.recordSnapshotRejection("https://pds.example", 1, "did:plc:test", "3l3qo2vutsw2b", directPDSSnapshotRejectionKind, "verification_failed")
+	require.NoError(t, err)
+	again, err := m.recordSnapshotRejection("https://pds.example", 1, "did:plc:test", "3l3qo2vutsw2b", directPDSSnapshotRejectionKind, "invalid_repository")
+	require.NoError(t, err)
+	require.Equal(t, rejection, again, "the first durable verdict is idempotent")
+	found, ok := m.lookupSnapshotRejection("https://pds.example", 1, "did:plc:test", "3l3qo2vutsw2b", directPDSSnapshotRejectionKind)
+	require.True(t, ok)
+	require.Equal(t, rejection, found)
+	_, ok = m.lookupSnapshotRejection("https://pds.example", 1, "did:plc:test", "3l3qo2vutsw2c", directPDSSnapshotRejectionKind)
+	require.False(t, ok, "a changed listing revision requires a fresh snapshot")
+	listed := m.ListSnapshotRejections()
+	require.Equal(t, []SnapshotRejection{rejection}, listed)
+	listed[0].Code = "mutated"
+	require.Equal(t, rejection, m.ListSnapshotRejections()[0], "the read model must not expose durable state")
+	require.NoError(t, db.Close())
+
+	m, db = newManager(t, dir)
+	defer db.Close()
+	found, ok = m.lookupSnapshotRejection("https://pds.example", 1, "did:plc:test", "3l3qo2vutsw2b", directPDSSnapshotRejectionKind)
+	require.True(t, ok)
+	require.Equal(t, rejection, found)
+	require.Equal(t, []SnapshotRejection{rejection}, m.ListSnapshotRejections())
 }
 
 func TestReceiptNamespacesAndLegacyMigration(t *testing.T) {

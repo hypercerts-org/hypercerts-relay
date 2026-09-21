@@ -124,11 +124,7 @@ export class Services {
   ): Promise<unknown> {
     switch (command.kind) {
       case "account_quota":
-        return this.call("relay", "/source/quota", "PUT", {
-          pds: command.pds,
-          expectedLimit: command.expectedLimit,
-          accountLimit: command.accountLimit,
-        });
+        return this.applyQuotaRecovery(command, id);
       case "source":
         return this.applySource(command, progress);
       case "collections": {
@@ -165,6 +161,28 @@ export class Services {
         });
     }
   }
+  private async applyQuotaRecovery(
+    command: Extract<Command, { kind: "account_quota" }>,
+    id: string,
+  ) {
+    const relay = await this.call<RelaySourceView>(
+      "relay",
+      "/source/quota",
+      "PUT",
+      {
+        pds: command.pds,
+        expectedLimit: command.expectedLimit,
+        accountLimit: command.accountLimit,
+      },
+    );
+    await this.call("jetstream", "/jobs", "POST", {
+      pds: command.pds,
+      reason: "quota_recovery",
+      requestId: id,
+      sourceRevision: relay.Revision,
+    });
+    return relay;
+  }
   private async applySource(
     command: Extract<Command, { kind: "source" }>,
     progress: (value: unknown) => void,
@@ -181,7 +199,7 @@ export class Services {
       }
       progress({ jetstream: { enabled: false } });
     }
-    const relay = await this.call("relay", "/source", "PUT", {
+    const relay = await this.call<RelaySourceView>("relay", "/source", "PUT", {
       pds: command.pds,
       state: command.state,
     });
@@ -193,10 +211,15 @@ export class Services {
       command.state === "enabled"
         ? await this.call("jetstream", "/sources", "POST", {
             pds: command.pds,
+            sourceRevision: relay.Revision,
           })
         : { enabled: false };
     return { relay, jetstream };
   }
+}
+
+interface RelaySourceView {
+  Revision: number;
 }
 
 interface CoverageSummaryPage {
@@ -210,7 +233,6 @@ interface CoverageSummaryPage {
     errorCode?: string;
     createdAt: string;
     coverage: string;
-    historyComplete: boolean;
   }[];
 }
 
@@ -227,7 +249,6 @@ interface CoveragePage {
     errorCode?: string;
     createdAt: string;
     coverage: string;
-    historyComplete: boolean;
   }[];
   nextCursor?: string;
 }
