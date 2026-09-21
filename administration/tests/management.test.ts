@@ -45,13 +45,26 @@ test(
         ),
       ),
     );
-    async function fixture(name: string, cwd: string) {
+    async function fixture(
+      name: string,
+      cwd: string,
+      relayURL?: string,
+    ) {
       const ready = join(temp, name);
       let output = "";
       const child = spawn(
         join(temp, name + ".test"),
         ["-test.run=^TestControlPlaneAcceptanceFixture$", "-test.count=1"],
-        { cwd, env: { ...process.env, CONTROL_ACCEPTANCE_READY: ready } },
+        {
+          cwd,
+          env: {
+            ...process.env,
+            CONTROL_ACCEPTANCE_READY: ready,
+            ...(relayURL === undefined
+              ? {}
+              : { CONTROL_ACCEPTANCE_RELAY_URL: relayURL }),
+          },
+        },
       );
       child.stdout.on("data", (b) => (output += b));
       child.stderr.on("data", (b) => (output += b));
@@ -81,8 +94,11 @@ test(
       }
       return readFileSync(ready, "utf8");
     }
-    const [relay, jetstream] = await Promise.all(
-      fixtures.map(({ name, cwd }) => fixture(name, cwd)),
+    const relay = await fixture(fixtures[0].name, fixtures[0].cwd);
+    const jetstream = await fixture(
+      fixtures[1].name,
+      fixtures[1].cwd,
+      relay,
     );
     const token = "fixture-service-credential-32-bytes-minimum";
     const services = new Services(

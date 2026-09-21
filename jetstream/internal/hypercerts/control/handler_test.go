@@ -364,7 +364,15 @@ func TestControlPlaneAcceptanceFixture(t *testing.T) {
 	if ready == "" {
 		t.Skip("cross-language fixture")
 	}
+	relayURL := os.Getenv("CONTROL_ACCEPTANCE_RELAY_URL")
+	if relayURL == "" {
+		t.Fatal("cross-language fixture requires a Relay control URL")
+	}
 	handler, manager := setup(t)
+	manager.SetPolicyAdvanceSender((jobs.RelayReceiptSender{
+		URL:   relayURL,
+		Token: testToken,
+	}).AdvancePolicy)
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() {
