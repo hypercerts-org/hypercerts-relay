@@ -36,7 +36,13 @@ const services = new Services(
   { url: fixtures.jetstreamURL, token: fixtures.token },
 );
 const worker = new Worker(store, services);
-const timer = setInterval(() => void worker.tick(), 50);
+const ticks = new Set<Promise<void>>();
+function tick() {
+  const pending = worker.tick();
+  ticks.add(pending);
+  void pending.finally(() => ticks.delete(pending)).catch(console.error);
+}
+const timer = setInterval(tick, 50);
 const server = createApp(
   store,
   services,
@@ -45,11 +51,17 @@ const server = createApp(
   resolve("dist"),
 ).listen(3188, "127.0.0.1");
 let stopping = false;
+function closeServer() {
+  return new Promise<void>((resolve, reject) => {
+    server.close((error) => (error ? reject(error) : resolve()));
+  });
+}
 async function shutdown() {
   if (stopping) return;
   stopping = true;
   clearInterval(timer);
-  server.close();
+  await Promise.allSettled(ticks);
+  await closeServer();
   store.close();
   await fixtures.close();
 }

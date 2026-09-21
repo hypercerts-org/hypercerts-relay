@@ -26,11 +26,14 @@ async function stopFixture(
   graceful: boolean,
 ) {
   if (child.exitCode !== null) return;
+  // Subscribe before signalling: a fixture that exits first would otherwise
+  // leave `once` waiting for an event that already fired.
+  const exited = once(child, "exit");
   if (graceful) writeFileSync(`${ready}.stop`, "", { mode: 0o600 });
   else child.kill("SIGTERM");
   const timeout = setTimeout(() => child.kill("SIGKILL"), 5000);
   try {
-    await once(child, "exit");
+    await exited;
   } finally {
     clearTimeout(timeout);
   }
