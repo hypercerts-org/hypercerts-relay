@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -16,10 +17,16 @@ import (
 )
 
 const (
-	pds       = "https://upgrade-state.example"
-	sourceRev = uint64(7)
-	cursor    = int64(4242)
-	archiveID = "did:plc:upgradearchive"
+	pds                = "https://upgrade-state.example"
+	sourceRev          = uint64(7)
+	cursor             = int64(4242)
+	archiveID          = "did:plc:upgradearchive"
+	archiveSeq         = uint64(1)
+	archiveWitnessedAt = int64(1)
+	archiveCollection  = "app.bsky.feed.post"
+	archiveRkey        = "upgrade"
+	archiveRev         = "3l3qo2vutsw2b"
+	archivePayload     = "\xa1\x61\x78\x01"
 )
 
 func main() {
@@ -74,7 +81,7 @@ func seed(dataDir string) {
 	if err != nil {
 		fatal("open archive writer: %v", err)
 	}
-	if _, err := writer.Append(segment.Event{Seq: 1, WitnessedAt: 1, Kind: segment.KindCreate, DID: archiveID, Collection: "app.bsky.feed.post", Rkey: "upgrade", Rev: "3l3qo2vutsw2b", Payload: []byte{0xa1, 0x61, 0x78, 0x01}}); err != nil {
+	if _, err := writer.Append(segment.Event{Seq: archiveSeq, WitnessedAt: archiveWitnessedAt, Kind: segment.KindCreate, DID: archiveID, Collection: archiveCollection, Rkey: archiveRkey, Rev: archiveRev, Payload: []byte(archivePayload)}); err != nil {
 		fatal("append selected archive event: %v", err)
 	}
 	if _, err := writer.Seal(); err != nil {
@@ -118,7 +125,7 @@ func verify(dataDir string) {
 	}
 	defer reader.Close()
 	events, err := reader.DecodeBlock(0)
-	if err != nil || len(events) != 1 || events[0].DID != archiveID || events[0].Collection != "app.bsky.feed.post" || len(events[0].Payload) == 0 {
+	if err != nil || len(events) != 1 || events[0].Seq != archiveSeq || events[0].WitnessedAt != archiveWitnessedAt || events[0].Kind != segment.KindCreate || events[0].DID != archiveID || events[0].Collection != archiveCollection || events[0].Rkey != archiveRkey || events[0].Rev != archiveRev || !bytes.Equal(events[0].Payload, []byte(archivePayload)) {
 		fatal("selected archive assertion failed: events=%+v err=%v", events, err)
 	}
 	printState("verify")
