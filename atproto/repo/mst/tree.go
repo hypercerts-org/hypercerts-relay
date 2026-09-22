@@ -5,9 +5,9 @@ import (
 	"errors"
 	"fmt"
 
+	blockstore "github.com/ipfs/boxo/blockstore" // hypercerts: replace incompatible legacy go-ipfs-blockstore dependency
 	blocks "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
-	blockstore "github.com/ipfs/go-ipfs-blockstore"
 )
 
 // High-level API for an MST, as a decoded in-memory data structure.
