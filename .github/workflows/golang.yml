@@ -2,9 +2,9 @@ name: Go
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev, production]
   pull_request:
-    branches: [main]
+    branches: [main, dev, production]
   merge_group:
 
 permissions:
