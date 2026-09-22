@@ -2,6 +2,12 @@ name: Release
 
 on:
   workflow_dispatch:
+    inputs:
+      tag_current_version:
+        description: Create the missing tag for the checked-out package version without opening a Changesets version pull request.
+        required: false
+        default: false
+        type: boolean
   pull_request:
     types: [closed]
     branches: [main]
@@ -14,7 +20,8 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request' &&
        github.event.pull_request.merged == true &&
-       github.event.pull_request.head.ref == 'changeset-release/main')
+       github.event.pull_request.head.ref == 'changeset-release/main' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -26,10 +33,10 @@ jobs:
         with:
           app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
           private-key: ${{ secrets.RELEASE_BOT_APP_PRIVATE_KEY }}
-      - name: Check out main
+      - name: Check out release target
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
-          ref: main
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.merge_commit_sha || github.sha }}
           token: ${{ steps.generate-token.outputs.token }}
           persist-credentials: true
           fetch-depth: 0
@@ -54,7 +61,11 @@ jobs:
         run: npm ci --ignore-scripts
       - name: Verify Relay and Rainbow
         run: ./scripts/verify.sh
+      - name: Create the current version tag
+        if: github.event_name == 'workflow_dispatch' && inputs.tag_current_version
+        run: npm run release
       - name: Create release pull request or tag release
+        if: github.event_name != 'workflow_dispatch' || !inputs.tag_current_version
         id: changesets
         uses: changesets/action@ae32849d5ba541f9ae29e40e22a623bc13562f51 # v2.1.2
         with:
@@ -62,9 +73,14 @@ jobs:
           version: npm run version-packages
           title: 'prepare for release'
           commit: 'chore: release'
-          createGithubReleases: true
+          createGithubReleases: false
         env:
           GITHUB_TOKEN: ${{ steps.generate-token.outputs.token }}
+      - name: Validate release tag and component versions
+        if: >-
+          (github.event_name == 'workflow_dispatch' && inputs.tag_current_version) ||
+          steps.changesets.outputs.published == 'true'
+        run: npm run check-component-versions -- --require-tag
       - name: Rename release pull request with version
         if: steps.changesets.outputs.pullRequestNumber != ''
         env:
