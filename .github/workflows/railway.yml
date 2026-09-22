@@ -1,8 +1,8 @@
 name: Verify container packaging
 on:
   pull_request:
-    branches: [main]
-    paths: ['.railway/**', '**/.railway/**', '**/railway.*', '.dockerignore', '**/*.go', '**/go.mod', '**/go.sum', 'administration/**', '**/Dockerfile', 'jetstream/.dockerignore', '.github/workflows/railway.yml']
+    branches: [main, dev, production]
+    paths: ['.railway/**', '**/.railway/**', '**/railway.*', '.dockerignore', '**/*.go', '**/go.mod', '**/go.sum', 'administration/**', '**/Dockerfile', 'jetstream/.dockerignore', '.github/workflows/railway.yml', '.github/workflows/publish-railway-images.yml']
   workflow_dispatch:
 permissions:
   contents: read

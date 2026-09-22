@@ -1,7 +1,7 @@
 name: Verify administration
 on:
   pull_request:
-    branches: [main]
+    branches: [main, dev, production]
     paths: ['administration/**', 'cmd/relay/**', 'jetstream/internal/hypercerts/**', '.github/workflows/administration.yml']
   workflow_dispatch:
 permissions:
