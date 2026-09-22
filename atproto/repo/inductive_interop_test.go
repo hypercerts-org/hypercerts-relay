@@ -8,9 +8,9 @@ import (
 
 	"github.com/bluesky-social/indigo/atproto/repo/mst"
 
+	blockstore "github.com/ipfs/boxo/blockstore" // hypercerts: replace incompatible legacy go-ipfs-blockstore dependency
 	"github.com/ipfs/go-cid"
 	"github.com/ipfs/go-datastore"
-	blockstore "github.com/ipfs/go-ipfs-blockstore"
 	"github.com/stretchr/testify/assert"
 )
 
