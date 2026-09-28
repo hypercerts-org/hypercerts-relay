@@ -37,7 +37,7 @@ require (
 	go.opentelemetry.io/otel/exporters/jaeger v1.14.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.38.0
 	go.opentelemetry.io/otel/sdk v1.44.0
-	go.uber.org/automaxprocs v1.5.3
+	go.uber.org/automaxprocs v1.6.0
 	golang.org/x/time v0.15.0
 	golang.org/x/xerrors v0.0.0-20240903120638-7835f813f4da
 	gorm.io/driver/postgres v1.5.7
