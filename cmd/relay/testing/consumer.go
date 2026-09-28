@@ -3,7 +3,6 @@ package testing
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"sync"
 	"time"
 
@@ -16,18 +15,22 @@ import (
 
 // testing helper which receives a set of firehose events
 type Consumer struct {
-	Host     string
-	Events   []*stream.XRPCStreamEvent
-	LastSeq  int64
-	Timeout  time.Duration
-	eventsLk sync.Mutex
-	cancel   func()
+	Host      string
+	Events    []*stream.XRPCStreamEvent
+	LastSeq   int64
+	Timeout   time.Duration
+	eventsLk  sync.Mutex
+	changed   chan struct{}
+	done      chan struct{}
+	streamErr error
+	cancel    func()
 }
 
 func NewConsumer(host string) *Consumer {
 	c := Consumer{
 		Host:    host,
 		Timeout: time.Second * 10,
+		changed: make(chan struct{}),
 	}
 	return &c
 }
@@ -35,35 +38,32 @@ func NewConsumer(host string) *Consumer {
 func (c *Consumer) eventCallbacks() *stream.RepoStreamCallbacks {
 	rsc := &stream.RepoStreamCallbacks{
 		RepoCommit: func(evt *comatproto.SyncSubscribeRepos_Commit) error {
-			c.eventsLk.Lock()
-			defer c.eventsLk.Unlock()
-			c.Events = append(c.Events, &stream.XRPCStreamEvent{RepoCommit: evt})
-			c.LastSeq = evt.Seq
+			c.appendEvent(&stream.XRPCStreamEvent{RepoCommit: evt}, evt.Seq)
 			return nil
 		},
 		RepoSync: func(evt *comatproto.SyncSubscribeRepos_Sync) error {
-			c.eventsLk.Lock()
-			defer c.eventsLk.Unlock()
-			c.Events = append(c.Events, &stream.XRPCStreamEvent{RepoSync: evt})
-			c.LastSeq = evt.Seq
+			c.appendEvent(&stream.XRPCStreamEvent{RepoSync: evt}, evt.Seq)
 			return nil
 		},
 		RepoIdentity: func(evt *comatproto.SyncSubscribeRepos_Identity) error {
-			c.eventsLk.Lock()
-			defer c.eventsLk.Unlock()
-			c.Events = append(c.Events, &stream.XRPCStreamEvent{RepoIdentity: evt})
-			c.LastSeq = evt.Seq
+			c.appendEvent(&stream.XRPCStreamEvent{RepoIdentity: evt}, evt.Seq)
 			return nil
 		},
 		RepoAccount: func(evt *comatproto.SyncSubscribeRepos_Account) error {
-			c.eventsLk.Lock()
-			defer c.eventsLk.Unlock()
-			c.Events = append(c.Events, &stream.XRPCStreamEvent{RepoAccount: evt})
-			c.LastSeq = evt.Seq
+			c.appendEvent(&stream.XRPCStreamEvent{RepoAccount: evt}, evt.Seq)
 			return nil
 		},
 	}
 	return rsc
+}
+
+func (c *Consumer) appendEvent(evt *stream.XRPCStreamEvent, seq int64) {
+	c.eventsLk.Lock()
+	defer c.eventsLk.Unlock()
+	c.Events = append(c.Events, evt)
+	c.LastSeq = seq
+	close(c.changed)
+	c.changed = make(chan struct{})
 }
 
 func (c *Consumer) Connect(ctx context.Context, cursor int) error {
@@ -74,17 +74,14 @@ func (c *Consumer) Connect(ctx context.Context, cursor int) error {
 	}
 
 	dialer := websocket.Dialer{}
-	conn, resp, err := dialer.Dial(u, nil)
+	conn, _, err := dialer.DialContext(ctx, u, nil)
 	if err != nil {
 		return err
 	}
 
-	if resp.StatusCode != 101 {
-		return fmt.Errorf("expected HTTP 101 for websocket: %d", resp.StatusCode)
-	}
-
 	ctx, cancel := context.WithCancel(ctx)
 	c.cancel = cancel
+	c.done = make(chan struct{})
 
 	go func() {
 		<-ctx.Done()
@@ -93,12 +90,13 @@ func (c *Consumer) Connect(ctx context.Context, cursor int) error {
 
 	seqScheduler := sequential.NewScheduler("test", c.eventCallbacks().EventHandler)
 	go func() {
-		if err := stream.HandleRepoStream(ctx, conn, seqScheduler, nil); err != nil {
-			slog.Debug("consumer failed processing event", "err", err)
-			cancel()
-		}
+		err := stream.HandleRepoStream(ctx, conn, seqScheduler, nil)
+		c.eventsLk.Lock()
+		c.streamErr = err
+		c.eventsLk.Unlock()
+		cancel()
+		close(c.done)
 	}()
-	time.Sleep(time.Millisecond * 2) // TODO: is this needed?
 	return nil
 }
 
@@ -112,6 +110,8 @@ func (c *Consumer) Clear() {
 	c.eventsLk.Lock()
 	defer c.eventsLk.Unlock()
 	c.Events = []*stream.XRPCStreamEvent{}
+	close(c.changed)
+	c.changed = make(chan struct{})
 }
 
 func (c *Consumer) Shutdown() {
@@ -120,17 +120,62 @@ func (c *Consumer) Shutdown() {
 	}
 }
 
-// connects to host and consumes 'count' events, then returns them. will try up to 'c.Timeout', and error if not enough events are seen
-//
-// cursor: pass -1 to consume from current
+// ConsumeEvents waits for count events after the last Clear and returns a stable snapshot.
 func (c *Consumer) ConsumeEvents(count int) ([]*stream.XRPCStreamEvent, error) {
-	// poll until we have enough events
-	start := time.Now()
-	for c.Count() < count {
-		if time.Since(start) > c.Timeout {
-			return nil, fmt.Errorf("test stream consumer timeout: %s", c.Timeout)
-		}
-		time.Sleep(time.Millisecond * 5)
+	if count < 0 {
+		return nil, fmt.Errorf("negative event count: %d", count)
 	}
-	return c.Events, nil
+	timer := time.NewTimer(c.Timeout)
+	defer timer.Stop()
+	for {
+		c.eventsLk.Lock()
+		seen := len(c.Events)
+		lastSeq := c.LastSeq
+		if seen >= count {
+			events := append([]*stream.XRPCStreamEvent(nil), c.Events...)
+			c.eventsLk.Unlock()
+			return events, nil
+		}
+		changed := c.changed
+		done := c.done
+		streamErr := c.streamErr
+		c.eventsLk.Unlock()
+
+		if streamErr != nil {
+			return nil, streamClosedError(seen, count, lastSeq, streamErr)
+		}
+		select {
+		case <-changed:
+		case <-done:
+			c.eventsLk.Lock()
+			streamErr = c.streamErr
+			seen = len(c.Events)
+			lastSeq = c.LastSeq
+			if seen >= count {
+				events := append([]*stream.XRPCStreamEvent(nil), c.Events...)
+				c.eventsLk.Unlock()
+				return events, nil
+			}
+			c.eventsLk.Unlock()
+			return nil, streamClosedError(seen, count, lastSeq, streamErr)
+		case <-timer.C:
+			c.eventsLk.Lock()
+			seen = len(c.Events)
+			lastSeq = c.LastSeq
+			if seen >= count {
+				events := append([]*stream.XRPCStreamEvent(nil), c.Events...)
+				c.eventsLk.Unlock()
+				return events, nil
+			}
+			c.eventsLk.Unlock()
+			return nil, fmt.Errorf("test stream consumer timeout after %s waiting for %d events (received %d, last seq %d)", c.Timeout, count, seen, lastSeq)
+		}
+	}
+}
+
+func streamClosedError(seen, count int, lastSeq int64, err error) error {
+	if err == nil {
+		return fmt.Errorf("test stream closed after %d/%d events (last seq %d)", seen, count, lastSeq)
+	}
+	return fmt.Errorf("test stream closed after %d/%d events (last seq %d): %w", seen, count, lastSeq, err)
 }

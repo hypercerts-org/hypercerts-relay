@@ -5,6 +5,7 @@
   import Collections from "./Collections.svelte";
   import Operations from "./Operations.svelte";
   import Limits from "./Limits.svelte";
+  import ArchiveKeys from "./ArchiveKeys.svelte";
   import State from "./State.svelte";
   import logo from "./brand/assets/logo/hypercerts.svg";
   import {
@@ -23,7 +24,7 @@
   const navigation = [
     { label: "", items: [["overview", "Overview"]] },
     { label: "Relay", items: [["sources", "PDS sources"], ["limits", "Rate limits"]] },
-    { label: "Jetstream", items: [["collections", "Collections"], ["jobs", "Backfill jobs"], ["coverage", "Coverage"]] },
+    { label: "Jetstream", items: [["collections", "Collections"], ["jobs", "Backfill jobs"], ["coverage", "Coverage"], ["archive-keys", "Consumer API keys"]] },
     { label: "Administration", items: [["audit", "Audit log"], ["manage-adminis", "Administrators"]] },
   ];
   const navigationItems = navigation.flatMap((group) => group.items);
@@ -45,6 +46,7 @@
     notice = "";
   let administrators: Administrator[] = [];
   let sourcesComponent: { refreshDetails: () => Promise<void> } | null = null;
+  let archiveKeysComponent: { refresh: () => Promise<void> } | null = null;
   let policyLoaded = false;
   let sources: Source[] = [],
     policy: Policy = { revision: 1, collections: [] },
@@ -95,6 +97,9 @@
         case "collections":
           policy = await api<Policy>("/policy");
           policyLoaded = true;
+          break;
+        case "archive-keys":
+          await archiveKeysComponent?.refresh();
           break;
         case "jobs": {
           const r = await api<{ jobs: Job[]; nextCursor?: string }>(
@@ -378,6 +383,10 @@
             {submit}
             {busy}
           />{/if}
+      {:else if screen === "archive-keys"}<ArchiveKeys
+          bind:this={archiveKeysComponent}
+          csrf={session.csrf}
+        />
       {:else if screen === "limits"}<Limits
           rows={limits}
           {globalLimits}
@@ -474,7 +483,7 @@
           >
         </section>
       {/if}
-      {#if !["overview", "collections", "audit"].includes(screen)}<nav
+      {#if !["overview", "collections", "archive-keys", "audit"].includes(screen)}<nav
           class="pagination"
           aria-label="Result pages"
         >

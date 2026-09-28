@@ -1,4 +1,12 @@
-import { ApiError, type Command, type Job, type Policy } from "./contracts.ts";
+import {
+  ApiError,
+  type ArchiveKey,
+  type ArchiveKeyInput,
+  type CreatedArchiveKey,
+  type Command,
+  type Job,
+  type Policy,
+} from "./contracts.ts";
 
 export interface ServiceConfig {
   url: string;
@@ -51,11 +59,16 @@ export class Services {
     } catch {
       throw new ApiError(503, `${service}_unavailable`);
     }
-    if (!response.ok)
+    if (!response.ok) {
+      const archiveError =
+        service === "jetstream" && path.startsWith("/archive-keys")
+          ? await remoteArchiveError(response)
+          : null;
       throw new ApiError(
         response.status >= 500 ? 503 : response.status,
-        `${service}_rejected_${response.status}`,
+        archiveError ?? `${service}_rejected_${response.status}`,
       );
+    }
     if (response.status === 204) return null as T;
     const reader = response.body!.getReader();
     let size = 0;
@@ -76,6 +89,24 @@ export class Services {
   }
   policy() {
     return this.call<Policy>("jetstream", "/policy");
+  }
+  archiveKeys() {
+    return this.call<{ keys: ArchiveKey[] }>("jetstream", "/archive-keys");
+  }
+  createArchiveKey(input: ArchiveKeyInput) {
+    return this.call<CreatedArchiveKey>(
+      "jetstream",
+      "/archive-keys",
+      "POST",
+      input,
+    );
+  }
+  revokeArchiveKey(id: string) {
+    return this.call<null>(
+      "jetstream",
+      `/archive-keys/${encodeURIComponent(id)}`,
+      "DELETE",
+    );
   }
   jobs(after = "", pds = "") {
     return this.call<{ jobs: Job[]; nextCursor?: string }>(
@@ -251,6 +282,41 @@ interface CoveragePage {
     coverage: string;
   }[];
   nextCursor?: string;
+}
+
+async function remoteArchiveError(response: Response): Promise<string | null> {
+  const reader = response.body?.getReader();
+  if (!reader) return null;
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.length;
+      if (size > 8192) return null;
+      chunks.push(value);
+    }
+    const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString());
+    if (
+      typeof parsed === "object" &&
+      parsed !== null &&
+      "error" in parsed &&
+      typeof parsed.error === "string" &&
+      [
+        "invalid_json",
+        "invalid_input",
+        "not_found",
+        "persistence_error",
+      ].includes(parsed.error)
+    )
+      return parsed.error;
+  } catch {
+    return null;
+  } finally {
+    await reader.cancel();
+  }
+  return null;
 }
 
 function allowedControlTransport(url: URL, railwayPrivateNetwork: boolean) {
