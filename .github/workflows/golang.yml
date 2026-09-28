@@ -1,4 +1,5 @@
 name: Go
+run-name: Verify Relay and Rainbow (${{ github.event_name }}) — ${{ (github.base_ref || github.event.merge_group.base_ref || github.ref_name) == 'dev' && 'staging' || (github.base_ref || github.event.merge_group.base_ref || github.ref_name) == 'refs/heads/dev' && 'staging' || github.base_ref || github.event.merge_group.base_ref || github.ref_name }}
 
 on:
   push:
@@ -69,6 +70,7 @@ jobs:
         run: go test ./cmd/relay/relay -run '^TestClaimDueAccountLimitAlertsRepeatsAfterInterval$'
 
   lint:
+    name: Lint Go
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
