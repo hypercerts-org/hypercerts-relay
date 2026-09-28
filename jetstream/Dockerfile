@@ -7,7 +7,7 @@ FROM --platform=$BUILDPLATFORM golang:1.26.6-bookworm AS build
 
 # Build-args set by `docker buildx build` (or stamped manually from CI).
 # VERSION/COMMIT/DATE are linked into internal/version via -ldflags.
-ARG VERSION=dev
+ARG VERSION=0.9.0
 ARG COMMIT=unknown
 ARG DATE=unknown
 # Empty for canonical images. The disposable acceptance Compose build sets
@@ -64,7 +64,7 @@ RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -buildvcs=false \
 # ──────────────────────────────────────────────────────────────────────────────
 FROM gcr.io/distroless/static-debian12:nonroot AS runtime
 
-ARG VERSION=dev
+ARG VERSION=0.9.0
 ARG COMMIT=unknown
 ARG DATE=unknown
 ARG SOURCE=https://github.com/bluesky-social/jetstream

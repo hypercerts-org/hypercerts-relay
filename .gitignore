@@ -40,6 +40,14 @@ test-coverage.out
 
 # Don't ignore this file itself, or other specific dotfiles
 !.gitignore
+!.agents/
+!.agents/skills/
+!.agents/skills/hypercerts-railway-release/
+!.agents/skills/hypercerts-railway-release/**
+!.agents/skills/hypercerts-railway-development/
+!.agents/skills/hypercerts-railway-development/**
+!.agents/skills/hypercerts-github-release/
+!.agents/skills/hypercerts-github-release/**
 !.github/
 !.golangci.yaml
 

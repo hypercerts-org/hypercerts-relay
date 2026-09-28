@@ -27,10 +27,9 @@ import (
 	"github.com/bluesky-social/indigo/cmd/relay/relay"
 	"github.com/bluesky-social/indigo/cmd/relay/stream/eventmgr"
 	"github.com/bluesky-social/indigo/cmd/relay/stream/persist/diskpersist"
+	"github.com/bluesky-social/indigo/hypercerts/version"
 	"github.com/bluesky-social/indigo/util/cliutil"
 	"github.com/bluesky-social/indigo/util/ssrf"
-
-	"github.com/earthboundkid/versioninfo/v2"
 	"github.com/urfave/cli/v3"
 	"gorm.io/plugin/opentelemetry/tracing"
 )
@@ -84,7 +83,7 @@ func run(args []string) error {
 	app := cli.Command{
 		Name:    "relay",
 		Usage:   "atproto relay daemon",
-		Version: versioninfo.Short(),
+		Version: version.Version,
 	}
 	app.Flags = []cli.Flag{
 		&cli.StringSliceFlag{
@@ -402,7 +401,7 @@ func runRelay(ctx context.Context, cmd *cli.Command) error {
 	}
 
 	relayConfig := relay.DefaultRelayConfig()
-	relayConfig.UserAgent = fmt.Sprintf("indigo-relay/%s (atproto-relay)", versioninfo.Short())
+	relayConfig.UserAgent = fmt.Sprintf("indigo-relay/%s (atproto-relay)", version.Version)
 	relayConfig.ConcurrencyPerHost = cmd.Int("host-concurrency")
 	relayConfig.DefaultRepoLimit = cmd.Int64("default-account-limit")
 	relayConfig.HostPerDayLimit = cmd.Int64("new-hosts-per-day-limit")

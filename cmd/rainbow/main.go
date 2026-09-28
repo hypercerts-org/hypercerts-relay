@@ -14,10 +14,9 @@ import (
 	_ "net/http/pprof"
 
 	"github.com/bluesky-social/indigo/events/pebblepersist"
+	"github.com/bluesky-social/indigo/hypercerts/version"
 	"github.com/bluesky-social/indigo/splitter"
 	"github.com/bluesky-social/indigo/util/svcutil"
-
-	"github.com/earthboundkid/versioninfo/v2"
 	"github.com/urfave/cli/v3"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -39,7 +38,7 @@ func run(args []string) error {
 	app := cli.Command{
 		Name:    "rainbow",
 		Usage:   "atproto firehose fan-out daemon",
-		Version: versioninfo.Short(),
+		Version: version.Version,
 		Action:  runSplitter,
 	}
 
@@ -186,7 +185,7 @@ func runSplitter(ctx context.Context, cmd *cli.Command) error {
 			CollectionDirHost: collectionDirHost,
 			CursorFile:        cmd.String("cursor-file"),
 			PebbleOptions:     &ppopts,
-			UserAgent:         fmt.Sprintf("rainbow/%s (atproto-relay)", versioninfo.Short()),
+			UserAgent:         fmt.Sprintf("rainbow/%s (atproto-relay)", version.Version),
 		}
 		spl, err = splitter.NewSplitter(conf, nextCrawlers)
 	} else {

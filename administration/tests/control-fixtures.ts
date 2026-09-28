@@ -75,31 +75,46 @@ export async function startControlFixtures(): Promise<ControlFixtures> {
         }),
       ),
     );
-    const readyFixtures = await Promise.all(
-      specs.map(async ({ name, cwd }) => {
-        const ready = join(dir, name);
-        const child = spawn(
-          join(dir, `${name}.test`),
-          ["-test.run=^TestControlPlaneAcceptanceFixture$", "-test.count=1"],
-          { cwd, env: { ...env, CONTROL_ACCEPTANCE_READY: ready } },
-        );
-        const fixture = { child, ready } satisfies FixtureProcess;
-        launched.push(fixture);
-        let output = "";
-        child.stdout?.on("data", (data) => (output += data));
-        child.stderr?.on("data", (data) => (output += data));
-        const deadline = Date.now() + 15_000;
-        while (!existsSync(ready)) {
-          if (child.exitCode !== null || Date.now() >= deadline) {
-            child.kill("SIGKILL");
-            throw new Error(output || `${name} control fixture did not start`);
-          }
-          await new Promise((resolve) => setTimeout(resolve, 50));
+    async function startFixture(
+      { name, cwd }: (typeof specs)[number],
+      relayURL?: string,
+    ) {
+      const ready = join(dir, name);
+      const child = spawn(
+        join(dir, `${name}.test`),
+        ["-test.run=^TestControlPlaneAcceptanceFixture$", "-test.count=1"],
+        {
+          cwd,
+          env: {
+            ...env,
+            CONTROL_ACCEPTANCE_READY: ready,
+            ...(relayURL === undefined
+              ? {}
+              : { CONTROL_ACCEPTANCE_RELAY_URL: relayURL }),
+          },
+        },
+      );
+      const fixture = { child, ready } satisfies FixtureProcess;
+      launched.push(fixture);
+      let output = "";
+      child.stdout?.on("data", (data) => (output += data));
+      child.stderr?.on("data", (data) => (output += data));
+      const deadline = Date.now() + 15_000;
+      while (!existsSync(ready)) {
+        if (child.exitCode !== null || Date.now() >= deadline) {
+          child.kill("SIGKILL");
+          throw new Error(output || `${name} control fixture did not start`);
         }
-        return fixture;
-      }),
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      return fixture;
+    }
+
+    const relay = await startFixture(specs[0]);
+    const jetstream = await startFixture(
+      specs[1],
+      readFileSync(relay.ready, "utf8"),
     );
-    const [relay, jetstream] = readyFixtures;
     return {
       relayURL: readFileSync(relay.ready, "utf8"),
       jetstreamURL: readFileSync(jetstream.ready, "utf8"),

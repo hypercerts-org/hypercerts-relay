@@ -50,7 +50,7 @@ Only a human may merge a pull request. Never push, fast-forward, reset, or force
 
 Run `./scripts/verify.sh` and `git diff --check` for Relay or Rainbow changes. The script excludes one documented local baseline test failure, while CI runs it separately as a visible non-blocking signal. Do not suppress additional tests without a documented observed behavior and removal condition.
 
-A release is a reviewed version tag and GitHub Release, created only through the manual workflow from `main` after `CHANGELOG.md` is updated. It is not authority to deploy or change a running relay.
+A release tag is created only through the manual workflow from `main` after `CHANGELOG.md` is updated. The `hypercerts-github-release` skill creates the GitHub Release with generated notes only after the workflow validates that tag against every component version. Neither action authorizes deployment or a change to a running relay.
 
 ## Railway packaging
 

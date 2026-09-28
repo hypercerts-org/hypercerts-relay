@@ -78,9 +78,9 @@ does not authorize provisioning or deployment.
 
 ## Releases
 
-The repository uses Changesets, consistent with other Hypercerts services. Add a named `.changeset/` file for an operator-visible change; the `Release` workflow opens a version pull request from `main`, and its merge creates the tag and GitHub Release. Do not hand-edit `CHANGELOG.md` or tag a release. The workflow does not deploy a service, publish a container, or alter a running relay.
+The repository uses Changesets, consistent with other Hypercerts services. Add a named `.changeset/` file for an operator-visible change; the `Release` workflow opens a version pull request from `main`, and its merge creates and validates the source tag. Use the `hypercerts-github-release` skill to create the GitHub Release with generated notes from that validated tag. Do not hand-edit `CHANGELOG.md` or tag a release. The workflow and skill do not deploy a service, publish a container, or alter a running relay.
 
-See `RELEASING.md` and the `writing-changesets` project skill for release notes, version selection, and correction procedures.
+See `RELEASING.md`, the `writing-changesets` project skill, and the `hypercerts-github-release` project skill for release notes, version selection, tag validation, and correction procedures.
 
 ## Safety
 

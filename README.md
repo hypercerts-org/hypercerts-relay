@@ -74,7 +74,7 @@ Do not infer production defaults from those commands. Deployment configuration, 
 
 ## Releases
 
-Releases use Changesets, like the other maintained Hypercerts services. Add a named release note for an operator-visible change, then run the `Release` workflow from `main`. It opens a reviewed version pull request; merging that pull request creates the version tag and GitHub Release. It does not publish a container image or claim a deployment.
+Releases use Changesets, like the other maintained Hypercerts services. Add a named release note for an operator-visible change, then run the `Release` workflow from `main`. It opens a reviewed version pull request; merging that pull request creates and validates the version tag against Relay, Rainbow, Jetstream, and Administration. Use the `hypercerts-github-release` skill to create the GitHub Release with generated notes from that tag. Neither step publishes a container image or claims a deployment.
 
 See [RELEASING.md](RELEASING.md) for the exact process and rollback guidance.
 
@@ -85,6 +85,9 @@ See [RELEASING.md](RELEASING.md) for the exact process and rollback guidance.
 - [RELEASING.md](RELEASING.md) — release preparation, workflow behavior, and corrections.
 - [CHANGELOG.md](CHANGELOG.md) — Hypercerts Relay release history.
 - [`.agents/skills/hypercerts-relay/SKILL.md`](.agents/skills/hypercerts-relay/SKILL.md) — focused repository guidance for work on the Relay and Rainbow fork.
+- [`.agents/skills/hypercerts-railway-release/SKILL.md`](.agents/skills/hypercerts-railway-release/SKILL.md) — immutable Railway staging and production promotion guidance.
+- [`.agents/skills/hypercerts-railway-development/SKILL.md`](.agents/skills/hypercerts-railway-development/SKILL.md) — isolated all-services Railway development-environment guidance.
+- [`.agents/skills/hypercerts-github-release/SKILL.md`](.agents/skills/hypercerts-github-release/SKILL.md) — source-tag and GitHub Release guidance.
 - [`jetstream/README.md`](jetstream/README.md) — Jetstream v2 provenance, maintenance, and local operation.
 - [`docs/contracts/`](docs/contracts/) — approved data, job, management, ownership, and [initial-launch topology](docs/contracts/launch-topology.md) contracts.
 

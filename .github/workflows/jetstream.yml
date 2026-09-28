@@ -1,7 +1,7 @@
 name: Verify Jetstream
 on:
   pull_request:
-    branches: [main]
+    branches: [main, dev, production]
     paths: ['jetstream/**', 'scripts/*jetstream*', '.hypercerts/jetstream-*', '.github/workflows/jetstream*.yml']
   workflow_dispatch:
 permissions:

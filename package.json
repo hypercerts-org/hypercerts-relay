@@ -1,14 +1,15 @@
 {
   "name": "hypercerts-relay",
-  "version": "0.0.0",
+  "version": "0.9.0",
   "description": "Hypercerts-maintained Indigo Relay and Rainbow fork",
   "private": true,
   "packageManager": "npm@11.8.0",
   "scripts": {
     "changeset": "changeset",
     "changeset:check": "changeset status",
-    "version-packages": "changeset version",
-    "release": "changeset tag"
+    "version-packages": "changeset version && node scripts/sync-component-versions.mjs",
+    "check-component-versions": "node scripts/check-component-versions.mjs",
+    "release": "node scripts/release.mjs"
   },
   "devDependencies": {
     "@changesets/changelog-github": "1.0.1",
