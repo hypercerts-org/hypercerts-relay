@@ -32,7 +32,20 @@ function setJsonVersion(path) {
 
 // npm lockfiles repeat the workspace package version under packages[""].
 function setLockfileRootVersion(path) {
-  replace(path, /(\s*"": \{\n\s*"name":\s*"[^"]+",\n)(?:\s*"version":\s*"[^"]+",\n)?/, `$1      "version": "${version}",\n`)
+  const file = resolve(root, path)
+  const source = readFileSync(file, 'utf8')
+  const packagesStart = source.indexOf('"packages": {')
+  const rootPackageStart = source.indexOf('"": {', packagesStart)
+  const rootNameStart = source.indexOf('"name":', rootPackageStart)
+  const rootNameEnd = source.indexOf('\n', rootNameStart)
+  const rootVersionStart = source.indexOf('"version":', rootNameEnd)
+  const rootVersionEnd = source.indexOf('\n', rootVersionStart)
+  const rootPackageEnd = source.indexOf('\n    }', rootPackageStart)
+  if (packagesStart === -1 || rootPackageStart === -1 || rootNameStart === -1 || rootNameEnd === -1 || rootVersionStart === -1 || rootVersionEnd === -1 || rootVersionStart > rootPackageEnd) {
+    throw new Error(`expected lockfile root version marker not found in ${path}`)
+  }
+  const indentation = source.slice(source.lastIndexOf('\n', rootVersionStart) + 1, rootVersionStart)
+  writeFileSync(file, `${source.slice(0, rootVersionStart)}${indentation}"version": "${version}",${source.slice(rootVersionEnd)}`)
 }
 
 // Keep Administration's manifest and both lockfiles aligned with the release.

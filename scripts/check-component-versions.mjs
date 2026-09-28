@@ -72,9 +72,9 @@ for (const path of ['cmd/relay/Dockerfile', 'cmd/rainbow/Dockerfile', 'jetstream
 // A tag is valid only when it identifies this exact checked-out release commit.
 if (requireTag && errors.length === 0) {
   try {
-    const gitOptions = { cwd: root, encoding: 'utf8', env: { ...process.env, PATH: '/usr/local/bin:/usr/bin:/bin' } }
-    const target = execFileSync('git', ['rev-parse', '--verify', `${tag}^{commit}`], gitOptions).trim()
-    const head = execFileSync('git', ['rev-parse', 'HEAD'], gitOptions).trim()
+    const gitOptions = { cwd: root, encoding: 'utf8' }
+    const target = execFileSync('/usr/bin/git', ['rev-parse', '--verify', `${tag}^{commit}`], gitOptions).trim()
+    const head = execFileSync('/usr/bin/git', ['rev-parse', 'HEAD'], gitOptions).trim()
     if (target !== head) errors.push(`${tag} points to ${target}, expected HEAD ${head}`)
   } catch {
     errors.push(`required tag ${tag} does not resolve to a commit`)
