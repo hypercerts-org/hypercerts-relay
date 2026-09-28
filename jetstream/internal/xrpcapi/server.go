@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/hypercerts/archivekeys"
 	"github.com/bluesky-social/jetstream/internal/manifest"
 	"github.com/jcalabro/atmos/xrpc"
 	"github.com/jcalabro/atmos/xrpcserver"
@@ -67,6 +68,7 @@ type Config struct {
 	Metrics     *Metrics
 	Tracer      trace.Tracer
 	Import      ImportConfig
+	ArchiveKeys *archivekeys.Manager
 
 	// Dictionary is the v2 subscribe compression dictionary served by
 	// getZstdDictionary. Empty Bytes leaves the endpoint unregistered.
@@ -80,15 +82,15 @@ func New(cfg Config) *Server {
 		logger = slog.Default()
 	}
 	s := &Server{src: cfg.Src, logger: logger, xrpc: &xrpcserver.Server{}}
-	s.xrpc.HandleQuery("network.bsky.jetstream.getSegment", withReady(cfg.Ready, &getSegmentHandler{
+	s.xrpc.HandleQuery("network.bsky.jetstream.getSegment", withArchiveKey(cfg.ArchiveKeys, true, withReady(cfg.Ready, &getSegmentHandler{
 		src: cfg.Src, logger: logger, cacheMaxAge: cfg.CacheMaxAge,
-	}))
-	s.xrpc.HandleQuery("network.bsky.jetstream.getBlock", withReady(cfg.Ready, &getBlockHandler{
+	})))
+	s.xrpc.HandleQuery("network.bsky.jetstream.getBlock", withArchiveKey(cfg.ArchiveKeys, true, withReady(cfg.Ready, &getBlockHandler{
 		src: cfg.Src, logger: logger, cacheMaxAge: cfg.CacheMaxAge,
 		metrics: cfg.Metrics, tracer: cfg.Tracer,
-	}))
+	})))
 	s.xrpc.HandleQuery("network.bsky.jetstream.listSegments", withReady(cfg.Ready, newListSegmentsHandler(cfg.Src)))
-	s.xrpc.HandleProcedure("network.bsky.jetstream.planSnapshot", withReady(cfg.Ready, newPlanSnapshotHandler(cfg.Src, cfg.Plan)))
+	s.xrpc.HandleProcedure("network.bsky.jetstream.planSnapshot", withArchiveKey(cfg.ArchiveKeys, false, withReady(cfg.Ready, newPlanSnapshotHandler(cfg.Src, cfg.Plan))))
 
 	// The v2 subscribe compression dictionary. Deliberately NOT behind the
 	// readiness gate: the artifact is compiled in and immutable, and a
@@ -134,6 +136,32 @@ func withReady(ready ReadyFunc, h xrpcserver.Handler) xrpcserver.Handler {
 				Message:    fmt.Sprintf("service not ready: %s", err.Error()),
 			}
 		}
+		return h.ServeXRPC(ctx, w, r)
+	})
+}
+
+// hypercerts: archive key enforcement is wired only when the operator enables
+// JETSTREAM_ARCHIVE_KEY_AUTH_ENABLED; a nil manager preserves the public API.
+func withArchiveKey(keys *archivekeys.Manager, chargeBytes bool, h xrpcserver.Handler) xrpcserver.Handler {
+	if keys == nil {
+		return h
+	}
+	return xrpcserver.HandlerFunc(func(ctx context.Context, w http.ResponseWriter, r *xrpcserver.Request) error {
+		w.Header().Set("Cache-Control", "private, no-store")
+		token, ok := bearerToken(r.HTTPReq)
+		if !ok {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="jetstream-archive"`)
+			return xrpcserver.AuthRequired("archive API key required")
+		}
+		id, err := keys.Authenticate(token)
+		if err == archivekeys.ErrUnauthorized {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="jetstream-archive"`)
+			return xrpcserver.AuthRequired("invalid archive API key")
+		}
+		if err != nil {
+			return xrpcserver.InternalError("archive key authorization failed")
+		}
+		w = &archiveQuotaGate{ResponseWriter: w, keys: keys, keyID: id, chargeBytes: chargeBytes}
 		return h.ServeXRPC(ctx, w, r)
 	})
 }

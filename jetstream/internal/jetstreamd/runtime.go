@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/hypercerts/archivekeys"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/control"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/jobs"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
@@ -87,6 +88,10 @@ type Runtime struct {
 // Build constructs the production service graph without starting listeners or
 // ingestion. Call Run to drive the graph, then Close during shutdown.
 func Build(ctx context.Context, opts Options) (*Runtime, error) {
+	// hypercerts: The archive must remain provisionable and revocable when auth is enabled.
+	if opts.ArchiveKeyAuthEnabled && opts.ControlToken == "" {
+		return nil, errors.New("archive key auth requires a private control token and listener")
+	}
 	// hypercerts: Reject an ineffective profiling request before opening persistent state.
 	if opts.EnablePprof && opts.DebugAddr == "" && opts.DebugListener == nil {
 		return nil, errors.New("profiling requires a private debug listener")
@@ -540,6 +545,15 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	}
 	rt.importer = importMgr
 
+	// hypercerts: Archive API-key auth remains opt-in until operators provision consumer keys.
+	var archiveKeys *archivekeys.Manager
+	if opts.ArchiveKeyAuthEnabled {
+		archiveKeys, err = archivekeys.Open(metaStore)
+		if err != nil {
+			return fail(fmt.Errorf("serve: open archive keys: %w", err))
+		}
+	}
+
 	// Status collector + handler are built here (after the import manager) so
 	// the status page can surface the current import job.
 	statusCollector, err := status.New(status.Options{
@@ -570,7 +584,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		if opts.DebugAddr == "" && opts.DebugListener == nil {
 			return fail(errors.New("control API requires a private debug listener"))
 		}
-		h, err := control.New(opts.ControlToken, rt.BackfillJobs, rt.CollectionPolicy)
+		h, err := control.NewWithArchiveKeys(opts.ControlToken, rt.BackfillJobs, rt.CollectionPolicy, archiveKeys)
 		if err != nil {
 			return fail(err)
 		}
@@ -656,8 +670,9 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 			MaxEntries:            opts.PlanMaxEntries,
 			WholeSegmentThreshold: opts.PlanWholeSegmentThreshold,
 		},
-		Metrics: xrpcMetrics,
-		Tracer:  obs.Tracer("xrpcapi"),
+		Metrics:     xrpcMetrics,
+		Tracer:      obs.Tracer("xrpcapi"),
+		ArchiveKeys: archiveKeys,
 		Import: xrpcapi.ImportConfig{
 			Manager: importMgr,
 			Token:   opts.TimestampImportToken,
