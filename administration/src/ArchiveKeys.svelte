@@ -119,6 +119,10 @@
     notice = "";
     try {
       await api<void>(`/archive-keys/${encodeURIComponent(id)}`, undefined, csrf, undefined, "DELETE");
+      const revokedAt = new Date().toISOString();
+      keys = keys.map((key) =>
+        key.id === id ? { ...key, revokedAt } : key,
+      );
       confirmingId = "";
       notice = "Consumer key revoked. Archive requests using it will be denied.";
       await refresh();

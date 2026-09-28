@@ -78,3 +78,23 @@ test("requires inline confirmation before revoking an active key", async () => {
   expect(call).toHaveBeenNthCalledWith(2, "/archive-keys/AbCdEfGhIjKl", undefined, "csrf-fixture", undefined, "DELETE");
   expect(screen.queryByRole("button", { name: "Revoke indexer" })).toBeNull();
 });
+
+
+test("keeps a successfully revoked key marked revoked when refresh fails", async () => {
+  const call = vi.mocked(api);
+  const key = {
+    id: "AbCdEfGhIjKl", name: "indexer", owner: "Data team",
+    requestsPerMinute: 60, archiveMegabytesPerMinute: 100,
+    createdAt: "2026-09-28T12:00:00Z",
+  };
+  call
+    .mockResolvedValueOnce({ keys: [key] })
+    .mockResolvedValueOnce(undefined)
+    .mockRejectedValueOnce(new Error("temporary refresh failure"));
+  render(ArchiveKeys, { csrf: "csrf-fixture" });
+  await waitFor(() => expect(screen.getByRole("button", { name: "Revoke indexer" })).toBeTruthy());
+  await fireEvent.click(screen.getByRole("button", { name: "Revoke indexer" }));
+  await fireEvent.click(screen.getByRole("button", { name: "Confirm revoke" }));
+  await waitFor(() => expect(screen.getByText("Revoked")).toBeTruthy());
+  expect(screen.getByText(/Could not load consumer keys/)).toBeTruthy();
+});
