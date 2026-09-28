@@ -7,7 +7,7 @@ import express, { type ErrorRequestHandler } from "express";
 import { z, ZodError } from "zod";
 import { join } from "node:path";
 import { Auth, type Session } from "./auth.ts";
-import { ApiError, command, origin } from "./contracts.ts";
+import { ApiError, archiveKeyInput, command, origin } from "./contracts.ts";
 import { Store } from "./store.ts";
 import { Services } from "./services.ts";
 import type { AdministratorProfile } from "./profile.ts";
@@ -186,6 +186,34 @@ export function createApp(
   app.get("/api/v1/policy", (_req, res) =>
     services.policy().then((v) => res.json(v)),
   );
+  app.get("/api/v1/archive-keys", (_req, res) =>
+    services.archiveKeys().then((v) => res.json(v)),
+  );
+  app.post("/api/v1/archive-keys", async (req, res) => {
+    const input = archiveKeyInput.parse(req.body);
+    const created = await services.createArchiveKey(input);
+    const { id, name, owner, requestsPerMinute, archiveMegabytesPerMinute } =
+      created.key;
+    store.audit((res.locals.session as Session).did, "archive_key_created", {
+      id,
+      name,
+      owner,
+      requestsPerMinute,
+      archiveMegabytesPerMinute,
+    });
+    res.status(201).json(created);
+  });
+  app.delete("/api/v1/archive-keys/:id", async (req, res) => {
+    const id = z
+      .string()
+      .regex(/^[A-Za-z0-9_-]{12}$/)
+      .parse(req.params.id);
+    await services.revokeArchiveKey(id);
+    store.audit((res.locals.session as Session).did, "archive_key_revoked", {
+      id,
+    });
+    res.status(204).end();
+  });
   app.get("/api/v1/jobs", (req, res) => {
     const p = page.parse(req.query);
     return services

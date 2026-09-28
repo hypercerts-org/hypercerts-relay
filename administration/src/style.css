@@ -525,15 +525,16 @@ footer {
   }
   .shell > aside nav {
     flex: none;
-    display: flex;
-    overflow: auto;
+    display: grid;
+    overflow: visible;
     margin: 1rem 0 0;
-    gap: 0.75rem;
+    gap: 0.35rem;
   }
-  .shell > aside nav .nav-group { margin: 0; display: flex; gap: 0.25rem; }
-  .shell > aside nav .nav-group p { display: none; }
+  .shell > aside nav .nav-group { margin: 0; display: flex; flex-wrap: wrap; gap: 0.15rem; }
+  .shell > aside nav .nav-group p { display: block; flex-basis: 100%; margin-top: 0.35rem; }
   .shell > aside nav a {
     white-space: nowrap;
+    min-height: 40px;
   }
   .account {
     margin-top: 1.25rem;

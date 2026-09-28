@@ -19,6 +19,7 @@ type Producer struct {
 	mux        *http.ServeMux
 	subs       []*Subscriber
 	subsLk     sync.Mutex
+	subReady   chan struct{}
 }
 
 type Subscriber struct {
@@ -31,6 +32,7 @@ func NewProducer() *Producer {
 	p := Producer{
 		BufferSize: 1024,
 		mux:        mux,
+		subReady:   make(chan struct{}),
 	}
 	mux.HandleFunc("GET /xrpc/com.atproto.sync.subscribeRepos", p.handleSubscribeRepos)
 	return &p
@@ -143,8 +145,20 @@ func (p *Producer) AddSubscriber(ctx context.Context) (<-chan *stream.XRPCStream
 	p.subsLk.Lock()
 	defer p.subsLk.Unlock()
 	p.subs = append(p.subs, sub)
+	if len(p.subs) == 1 {
+		close(p.subReady)
+	}
 
 	return sub.outgoing, nil
+}
+
+func (p *Producer) WaitForSubscriber(ctx context.Context) error {
+	select {
+	case <-p.subReady:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("waiting for test producer subscriber: %w", ctx.Err())
+	}
 }
 
 func (p *Producer) Emit(evt *stream.XRPCStreamEvent) error {

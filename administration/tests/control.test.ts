@@ -4,6 +4,7 @@ import { randomUUID, createHash } from "node:crypto";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createServer } from "node:http";
 import { Store } from "../server/store.ts";
 import { Worker } from "../server/worker.ts";
 import { Services } from "../server/services.ts";
@@ -54,9 +55,10 @@ async function fixture(t: TestContext, options: AppOptions = {}) {
     path: string,
     body?: unknown,
     headers: Record<string, string> = {},
+    method?: string,
   ) =>
     fetch(`http://127.0.0.1:${address.port}${path}`, {
-      method: body === undefined ? "GET" : "POST",
+      method: method ?? (body === undefined ? "GET" : "POST"),
       headers: {
         "Content-Type": "application/json",
         Cookie: `relay_session=${token}`,
@@ -85,6 +87,186 @@ test("status displays only configured public service origins", async (t) => {
     rainbow: "https://rainbow.example",
     jetstream: "https://jetstream.example",
   });
+});
+test("archive keys require an administrator, CSRF and bounded metadata", async (t) => {
+  const { request, services, store } = await fixture(t);
+  const seen: unknown[] = [];
+  services.archiveKeys = async () => ({ keys: [] });
+  services.createArchiveKey = async (input) => {
+    seen.push(input);
+    return {
+      key: {
+        id: "AbCdEfGhIjKl",
+        ...input,
+        createdAt: "2026-09-28T00:00:00Z",
+      },
+      token: "hck_secret_must_not_be_stored",
+    };
+  };
+  services.revokeArchiveKey = async (id) => {
+    seen.push(id);
+    return null;
+  };
+  const input = {
+    name: "  Staging consumer  ",
+    owner: "  Reporting team  ",
+    requestsPerMinute: 30,
+    archiveMegabytesPerMinute: 12,
+  };
+  assert.equal(
+    (await request("/api/v1/archive-keys", input, { Cookie: "" })).status,
+    401,
+  );
+  assert.equal(
+    (await request("/api/v1/archive-keys", input, { "X-CSRF-Token": "" }))
+      .status,
+    403,
+  );
+  assert.equal(
+    (await request("/api/v1/archive-keys", undefined, { Cookie: "" })).status,
+    401,
+  );
+  for (const bad of [
+    { ...input, owner: " " },
+    { ...input, requestsPerMinute: 0 },
+    { ...input, archiveMegabytesPerMinute: 1.5 },
+    { ...input, archiveMegabytesPerMinute: 100001 },
+    { ...input, token: "caller-chosen-secret" },
+  ])
+    assert.equal((await request("/api/v1/archive-keys", bad)).status, 400);
+  assert.deepEqual(seen, []);
+  const response = await request("/api/v1/archive-keys", input);
+  assert.equal(response.status, 201);
+  const created = await response.json();
+  assert.equal(created.token, "hck_secret_must_not_be_stored");
+  assert.deepEqual(seen, [
+    {
+      name: "Staging consumer",
+      owner: "Reporting team",
+      requestsPerMinute: 30,
+      archiveMegabytesPerMinute: 12,
+    },
+  ]);
+  assert.match(response.headers.get("Cache-Control")!, /no-store/);
+  assert.equal(store.page("operations", "", 50).items.length, 0);
+  assert.equal(
+    (
+      await request(
+        "/api/v1/archive-keys/AbCdEfGhIjKl",
+        undefined,
+        { "X-CSRF-Token": "" },
+        "DELETE",
+      )
+    ).status,
+    403,
+  );
+  assert.equal(
+    (await request("/api/v1/archive-keys/invalid!", undefined, {}, "DELETE"))
+      .status,
+    400,
+  );
+  assert.equal(
+    (
+      await request(
+        "/api/v1/archive-keys/AbCdEfGhIjKl",
+        undefined,
+        {},
+        "DELETE",
+      )
+    ).status,
+    204,
+  );
+  assert.deepEqual(seen[1], "AbCdEfGhIjKl");
+  const audit = store.page("audit", "", 50).items;
+  assert.deepEqual(
+    audit.map((row: any) => row.action),
+    ["archive_key_created", "archive_key_revoked"],
+  );
+  assert.doesNotMatch(JSON.stringify(audit), /hck_secret_must_not_be_stored/);
+});
+test("archive key service calls keep Jetstream paths and error codes", async (t) => {
+  const calls: {
+    method: string;
+    path: string;
+    authorization: string;
+    body: string;
+  }[] = [];
+  const server = createServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(Buffer.from(chunk));
+    calls.push({
+      method: req.method ?? "",
+      path: req.url ?? "",
+      authorization: req.headers.authorization ?? "",
+      body: Buffer.concat(chunks).toString(),
+    });
+    res.setHeader("Content-Type", "application/json");
+    if (req.method === "GET") {
+      res.end(JSON.stringify({ keys: [] }));
+    } else if (req.method === "POST") {
+      res.statusCode = 400;
+      res.end(JSON.stringify({ error: "invalid_input" }));
+    } else {
+      res.statusCode = 404;
+      res.end(JSON.stringify({ error: "not_found" }));
+    }
+  }).listen(0, "127.0.0.1");
+  await new Promise<void>((resolve) => server.once("listening", resolve));
+  t.after(() => server.close());
+  const address = server.address() as { port: number };
+  const services = new Services(
+    { url: "http://127.0.0.1:1", token: "relay-control-token" },
+    {
+      url: `http://127.0.0.1:${address.port}`,
+      token: "jetstream-control-token",
+    },
+  );
+  assert.deepEqual(await services.archiveKeys(), { keys: [] });
+  const input = {
+    name: "Consumer",
+    owner: "Team",
+    requestsPerMinute: 5,
+    archiveMegabytesPerMinute: 10,
+  };
+  await assert.rejects(
+    services.createArchiveKey(input),
+    (error: unknown) =>
+      error instanceof ApiError &&
+      error.status === 400 &&
+      error.code === "invalid_input",
+  );
+  await assert.rejects(
+    services.revokeArchiveKey("AbCdEfGhIjKl"),
+    (error: unknown) =>
+      error instanceof ApiError &&
+      error.status === 404 &&
+      error.code === "not_found",
+  );
+  assert.deepEqual(
+    calls.map(({ method, path, authorization }) => ({
+      method,
+      path,
+      authorization,
+    })),
+    [
+      {
+        method: "GET",
+        path: "/hypercerts/v1/archive-keys",
+        authorization: "Bearer jetstream-control-token",
+      },
+      {
+        method: "POST",
+        path: "/hypercerts/v1/archive-keys",
+        authorization: "Bearer jetstream-control-token",
+      },
+      {
+        method: "DELETE",
+        path: "/hypercerts/v1/archive-keys/AbCdEfGhIjKl",
+        authorization: "Bearer jetstream-control-token",
+      },
+    ],
+  );
+  assert.deepEqual(JSON.parse(calls[1].body), input);
 });
 test("T10 coverage preserves current-state limits, unknown historical provenance and Jetstream reason", async (t) => {
   const { request, services } = await fixture(t);
