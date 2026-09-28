@@ -194,6 +194,20 @@ strong {
   gap: 0.25rem;
   margin: 1.25rem 0 2rem;
 }
+.shell > aside nav .nav-group {
+  display: grid;
+  gap: 0.25rem;
+  margin-top: 0.75rem;
+}
+.shell > aside nav .nav-group p {
+  margin: 0 0 0.1rem;
+  padding: 0 0.8rem;
+  color: var(--color-ui-grey-dark);
+  font-size: var(--text-body-xs);
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
 .shell > aside nav a {
   padding: 0.65rem 0.8rem;
   font-size: var(--text-body-sm);
@@ -514,8 +528,10 @@ footer {
     display: flex;
     overflow: auto;
     margin: 1rem 0 0;
-    gap: 0.25rem;
+    gap: 0.75rem;
   }
+  .shell > aside nav .nav-group { margin: 0; display: flex; gap: 0.25rem; }
+  .shell > aside nav .nav-group p { display: none; }
   .shell > aside nav a {
     white-space: nowrap;
   }

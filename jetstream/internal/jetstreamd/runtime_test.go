@@ -85,6 +85,13 @@ func TestOptionsValidateRejectsNegativeSegmentCache(t *testing.T) {
 	require.ErrorContains(t, err, "SegmentCacheMaxAge must be >= 0")
 }
 
+func TestArchiveKeyAuthRequiresPrivateControl(t *testing.T) {
+	opts := testOptions(t)
+	opts.ArchiveKeyAuthEnabled = true
+	_, err := Build(t.Context(), opts)
+	require.ErrorContains(t, err, "archive key auth requires a private control token and listener")
+}
+
 func TestOptionsValidateRejectsNegativeBackfillFleetLimits(t *testing.T) {
 	t.Parallel()
 
