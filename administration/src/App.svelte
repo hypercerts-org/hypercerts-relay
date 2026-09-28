@@ -46,7 +46,6 @@
     notice = "";
   let administrators: Administrator[] = [];
   let sourcesComponent: { refreshDetails: () => Promise<void> } | null = null;
-  let archiveKeysComponent: { refresh: () => Promise<void> } | null = null;
   let policyLoaded = false;
   let sources: Source[] = [],
     policy: Policy = { revision: 1, collections: [] },
@@ -97,9 +96,6 @@
         case "collections":
           policy = await api<Policy>("/policy");
           policyLoaded = true;
-          break;
-        case "archive-keys":
-          await archiveKeysComponent?.refresh();
           break;
         case "jobs": {
           const r = await api<{ jobs: Job[]; nextCursor?: string }>(
@@ -383,10 +379,7 @@
             {submit}
             {busy}
           />{/if}
-      {:else if screen === "archive-keys"}<ArchiveKeys
-          bind:this={archiveKeysComponent}
-          csrf={session.csrf}
-        />
+      {:else if screen === "archive-keys"}<ArchiveKeys csrf={session.csrf} />
       {:else if screen === "limits"}<Limits
           rows={limits}
           {globalLimits}
