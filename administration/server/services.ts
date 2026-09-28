@@ -1,4 +1,12 @@
-import { ApiError, type Command, type Job, type Policy } from "./contracts.ts";
+import {
+  ApiError,
+  type ArchiveKey,
+  type ArchiveKeyInput,
+  type CreatedArchiveKey,
+  type Command,
+  type Job,
+  type Policy,
+} from "./contracts.ts";
 
 export interface ServiceConfig {
   url: string;
@@ -51,31 +59,28 @@ export class Services {
     } catch {
       throw new ApiError(503, `${service}_unavailable`);
     }
-    if (!response.ok)
-      throw new ApiError(
-        response.status >= 500 ? 503 : response.status,
-        `${service}_rejected_${response.status}`,
-      );
-    if (response.status === 204) return null as T;
-    const reader = response.body!.getReader();
-    let size = 0;
-    const chunks: Uint8Array[] = [];
-    try {
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        size += value.length;
-        if (size > 2_000_000)
-          throw new ApiError(502, "service_response_too_large");
-        chunks.push(value);
-      }
-    } finally {
-      await reader.cancel();
-    }
-    return JSON.parse(Buffer.concat(chunks).toString()) as T;
+    return controlResponse<T>(response, service, path);
   }
   policy() {
     return this.call<Policy>("jetstream", "/policy");
+  }
+  archiveKeys() {
+    return this.call<{ keys: ArchiveKey[] }>("jetstream", "/archive-keys");
+  }
+  createArchiveKey(input: ArchiveKeyInput) {
+    return this.call<CreatedArchiveKey>(
+      "jetstream",
+      "/archive-keys",
+      "POST",
+      input,
+    );
+  }
+  revokeArchiveKey(id: string) {
+    return this.call<null>(
+      "jetstream",
+      `/archive-keys/${encodeURIComponent(id)}`,
+      "DELETE",
+    );
   }
   jobs(after = "", pds = "") {
     return this.call<{ jobs: Job[]; nextCursor?: string }>(
@@ -218,6 +223,50 @@ export class Services {
   }
 }
 
+async function controlResponse<T>(
+  response: Response,
+  service: "relay" | "jetstream",
+  path: string,
+): Promise<T> {
+  if (!response.ok) throw await controlError(response, service, path);
+  if (response.status === 204) return null as T;
+  return readControlBody<T>(response);
+}
+
+async function controlError(
+  response: Response,
+  service: "relay" | "jetstream",
+  path: string,
+): Promise<ApiError> {
+  const archiveError =
+    service === "jetstream" && path.startsWith("/archive-keys")
+      ? await remoteArchiveError(response)
+      : null;
+  return new ApiError(
+    response.status >= 500 ? 503 : response.status,
+    archiveError ?? `${service}_rejected_${response.status}`,
+  );
+}
+
+async function readControlBody<T>(response: Response): Promise<T> {
+  const reader = response.body!.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.length;
+      if (size > 2_000_000)
+        throw new ApiError(502, "service_response_too_large");
+      chunks.push(value);
+    }
+  } finally {
+    await reader.cancel();
+  }
+  return JSON.parse(Buffer.concat(chunks).toString()) as T;
+}
+
 interface RelaySourceView {
   Revision: number;
 }
@@ -251,6 +300,41 @@ interface CoveragePage {
     coverage: string;
   }[];
   nextCursor?: string;
+}
+
+async function remoteArchiveError(response: Response): Promise<string | null> {
+  const reader = response.body?.getReader();
+  if (!reader) return null;
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.length;
+      if (size > 8192) return null;
+      chunks.push(value);
+    }
+    const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString());
+    if (
+      typeof parsed === "object" &&
+      parsed !== null &&
+      "error" in parsed &&
+      typeof parsed.error === "string" &&
+      [
+        "invalid_json",
+        "invalid_input",
+        "not_found",
+        "persistence_error",
+      ].includes(parsed.error)
+    )
+      return parsed.error;
+  } catch {
+    return null;
+  } finally {
+    await reader.cancel();
+  }
+  return null;
 }
 
 function allowedControlTransport(url: URL, railwayPrivateNetwork: boolean) {

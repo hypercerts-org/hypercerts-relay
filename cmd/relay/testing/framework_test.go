@@ -29,6 +29,11 @@ func TestFramework(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Shutdown()
+	readyCtx, cancelReady := context.WithTimeout(ctx, c.Timeout)
+	defer cancelReady()
+	if err := p.WaitForSubscriber(readyCtx); err != nil {
+		t.Fatal(err)
+	}
 
 	h := "example.atbin.dev"
 	e1 := stream.XRPCStreamEvent{

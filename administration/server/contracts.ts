@@ -31,6 +31,24 @@ export const origin = z
     }
   });
 export const rate = z.number().int().min(1).max(1_000_000);
+export const archiveKeyInput = z
+  .object({
+    name: z.string().trim().min(1).max(120),
+    owner: z.string().trim().min(1).max(120),
+    requestsPerMinute: z.number().int().min(1).max(100_000),
+    archiveMegabytesPerMinute: z.number().int().min(1).max(100_000),
+  })
+  .strict();
+export type ArchiveKeyInput = z.infer<typeof archiveKeyInput>;
+export interface ArchiveKey extends ArchiveKeyInput {
+  id: string;
+  createdAt: string;
+  revokedAt?: string;
+}
+export interface CreatedArchiveKey {
+  key: ArchiveKey;
+  token: string;
+}
 export const command = z.discriminatedUnion("kind", [
   z
     .object({

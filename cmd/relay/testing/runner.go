@@ -10,6 +10,7 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"time"
 
 	"github.com/bluesky-social/indigo/atproto/identity"
 	"github.com/bluesky-social/indigo/cmd/relay/relay"
@@ -29,6 +30,22 @@ func (sr *SimpleRelay) handleSubscribeRepos(w http.ResponseWriter, r *http.Reque
 	err := sr.Relay.HandleSubscribeRepos(w, r, nil, "0.0.0.0")
 	if err != nil {
 		slog.Error("subscribeRepos", "err", err)
+	}
+}
+
+// WaitForConsumer waits until the Relay has installed its live event subscription.
+func (sr *SimpleRelay) WaitForConsumer(ctx context.Context) error {
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if len(sr.Relay.ListConsumers()) > 0 {
+			return nil
+		}
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for relay test consumer registration: %w", ctx.Err())
+		}
 	}
 }
 
@@ -160,6 +177,11 @@ func RunScenario(ctx context.Context, s *Scenario) error {
 	if err != nil {
 		return err
 	}
+	readyCtx, cancelReady := context.WithTimeout(ctx, 10*time.Second)
+	defer cancelReady()
+	if err := p.WaitForSubscriber(readyCtx); err != nil {
+		return err
+	}
 
 	c := NewConsumer(fmt.Sprintf("ws://localhost:%d", sr.Port))
 	err = c.Connect(ctx, -1)
@@ -167,6 +189,9 @@ func RunScenario(ctx context.Context, s *Scenario) error {
 		return err
 	}
 	defer c.Shutdown()
+	if err := sr.WaitForConsumer(readyCtx); err != nil {
+		return err
+	}
 
 	for i, msg := range s.Messages {
 		slog.Info("sending test message", "index", i)
