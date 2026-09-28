@@ -59,33 +59,7 @@ export class Services {
     } catch {
       throw new ApiError(503, `${service}_unavailable`);
     }
-    if (!response.ok) {
-      const archiveError =
-        service === "jetstream" && path.startsWith("/archive-keys")
-          ? await remoteArchiveError(response)
-          : null;
-      throw new ApiError(
-        response.status >= 500 ? 503 : response.status,
-        archiveError ?? `${service}_rejected_${response.status}`,
-      );
-    }
-    if (response.status === 204) return null as T;
-    const reader = response.body!.getReader();
-    let size = 0;
-    const chunks: Uint8Array[] = [];
-    try {
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        size += value.length;
-        if (size > 2_000_000)
-          throw new ApiError(502, "service_response_too_large");
-        chunks.push(value);
-      }
-    } finally {
-      await reader.cancel();
-    }
-    return JSON.parse(Buffer.concat(chunks).toString()) as T;
+    return controlResponse<T>(response, service, path);
   }
   policy() {
     return this.call<Policy>("jetstream", "/policy");
@@ -247,6 +221,50 @@ export class Services {
         : { enabled: false };
     return { relay, jetstream };
   }
+}
+
+async function controlResponse<T>(
+  response: Response,
+  service: "relay" | "jetstream",
+  path: string,
+): Promise<T> {
+  if (!response.ok) throw await controlError(response, service, path);
+  if (response.status === 204) return null as T;
+  return readControlBody<T>(response);
+}
+
+async function controlError(
+  response: Response,
+  service: "relay" | "jetstream",
+  path: string,
+): Promise<ApiError> {
+  const archiveError =
+    service === "jetstream" && path.startsWith("/archive-keys")
+      ? await remoteArchiveError(response)
+      : null;
+  return new ApiError(
+    response.status >= 500 ? 503 : response.status,
+    archiveError ?? `${service}_rejected_${response.status}`,
+  );
+}
+
+async function readControlBody<T>(response: Response): Promise<T> {
+  const reader = response.body!.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.length;
+      if (size > 2_000_000)
+        throw new ApiError(502, "service_response_too_large");
+      chunks.push(value);
+    }
+  } finally {
+    await reader.cancel();
+  }
+  return JSON.parse(Buffer.concat(chunks).toString()) as T;
 }
 
 interface RelaySourceView {
