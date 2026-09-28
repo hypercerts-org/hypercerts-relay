@@ -6,13 +6,13 @@
 
 import { readFileSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
+import { isSemver } from './semver.mjs'
 
 const root = resolve(import.meta.dirname, '..')
 const version = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')).version
 
 // Keep release tags and image metadata valid SemVer, including prereleases.
-const semver = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/
-if (!semver.test(version)) {
+if (!isSemver(version)) {
   throw new Error(`package.json has an invalid semantic version: ${version}`)
 }
 

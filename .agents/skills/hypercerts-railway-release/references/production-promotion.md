@@ -6,14 +6,18 @@ staged candidate tree. If the merge resolution changes the tree, stop: build and
 validate that exact result as a new staging candidate instead of rebuilding during
 production deployment.
 
-The workflow dispatches `hypercerts-promote-production` with the candidate and
-promotion revisions. The private infrastructure receiver must:
+The workflow dispatches `hypercerts-promote-production` with the candidate ID,
+candidate revision, promotion revision, and production ref. The private
+infrastructure receiver must:
 
-1. find the recorded successful staging receipt for the candidate revision;
-2. reject the event if any component digest, staging deployment, or required
+1. confirm the source repository's current `production` ref equals the supplied
+   promotion revision, rejecting stale events;
+2. find the recorded successful staging receipt for the candidate ID;
+3. queue and retry a promotion received before that receipt is successful;
+4. reject the event if any component digest, staging deployment, or required
    validation is missing;
-3. apply those exact `image@sha256:...` references to production; and
-4. wait for each submitted Railway deployment to reach `SUCCESS`.
+5. apply those exact `image@sha256:...` references to production; and
+6. wait for each submitted Railway deployment to reach `SUCCESS`.
 
 Production uses its own variables, PostgreSQL/volumes, domains, and approved
 credentials. The image is the same as staging, but state is never copied or

@@ -6,6 +6,7 @@
 import { execFileSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
+import { isSemver } from './semver.mjs'
 
 // --require-tag also requires the tag to resolve to the checked-out release
 // commit. --tag permits an explicit tag while still enforcing v<package version>.
@@ -28,8 +29,7 @@ function json(path) {
 
 const expected = json('package.json').version
 const errors = []
-const semver = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/
-if (!semver.test(expected)) errors.push(`package.json has an invalid semantic version: ${expected}`)
+if (!isSemver(expected)) errors.push(`package.json has an invalid semantic version: ${expected}`)
 const tag = tagArg ? tagArg.slice('--tag='.length) : `v${expected}`
 if (tag !== `v${expected}`) errors.push(`tag ${tag} does not match package.json version ${expected}`)
 
@@ -72,8 +72,9 @@ for (const path of ['cmd/relay/Dockerfile', 'cmd/rainbow/Dockerfile', 'jetstream
 // A tag is valid only when it identifies this exact checked-out release commit.
 if (requireTag && errors.length === 0) {
   try {
-    const target = execFileSync('git', ['rev-parse', '--verify', `${tag}^{commit}`], { cwd: root, encoding: 'utf8' }).trim()
-    const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim()
+    const gitOptions = { cwd: root, encoding: 'utf8', env: { ...process.env, PATH: '/usr/local/bin:/usr/bin:/bin' } }
+    const target = execFileSync('git', ['rev-parse', '--verify', `${tag}^{commit}`], gitOptions).trim()
+    const head = execFileSync('git', ['rev-parse', 'HEAD'], gitOptions).trim()
     if (target !== head) errors.push(`${tag} points to ${target}, expected HEAD ${head}`)
   } catch {
     errors.push(`required tag ${tag} does not resolve to a commit`)

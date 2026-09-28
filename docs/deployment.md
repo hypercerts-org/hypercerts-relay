@@ -37,10 +37,11 @@ files does not provision or qualify a running deployment.
 ## Immutable release candidates
 
 Merging to `dev` runs the `Publish Railway release candidate` workflow. It builds
-Relay, Jetstream, and Administration once, publishes a `sha-<commit>` GHCR tag for
-each, and sends their immutable OCI digest references to a private infrastructure
-repository. It does not contain Railway project bindings or deploy directly from
-this public repository.
+Relay, Jetstream, and Administration once, publishes a `sha-<commit>` candidate
+tag for each, and sends their immutable OCI digest references and candidate ID to
+a private infrastructure repository. A candidate tag that already exists stops the
+workflow: retries must not rebuild or replace a candidate. It does not contain
+Railway project bindings or deploy directly from this public repository.
 
 The staging GitHub Environment supplies `INFRA_REPOSITORY` and an
 `INFRA_DISPATCH_TOKEN` that may create a repository-dispatch event only on that
@@ -48,16 +49,21 @@ private receiver. It also supplies `ADMIN_PUBLIC_ORIGIN` plus optional
 `RELAY_PUBLIC_ORIGIN`, `RAINBOW_PUBLIC_ORIGIN`, and `JETSTREAM_PUBLIC_ORIGIN`.
 The receiver records the three digest references, the administration public-origin
 settings, and staging validation as a candidate receipt, then deploys those
-references to staging. Empty optional service origins are omitted.
+references to staging. Empty optional service origins are omitted. The receipt is
+keyed by the source repository and candidate ID, so its recorded OCI digests remain
+the only images eligible for promotion.
 
 Merging a pull request from `dev` to `production` dispatches a promotion only when
-the production merge tree equals the staged candidate tree. The private receiver
-must find a successful candidate receipt and deploy its recorded digest references
-to production. It must reject missing or mutable image references and must not
-rebuild from Git. Production GitHub Environment protection controls the separate
-production dispatch credential and supplies its own public-origin variables. The
-three service origins are display-only administration settings; they must never be
-private control/debug URLs, and a Rainbow URL does not authorize a Rainbow deploy.
+the current `production` head and merge tree equal the staged candidate tree. The
+private receiver must check that `production` still points to the supplied promotion
+revision before it deploys. It queues a promotion that arrives before staging
+succeeds, then promotes only the matching successful candidate receipt's recorded
+digest references. It must reject stale promotion revisions, missing or mutable
+image references, and must not rebuild from Git. Production GitHub Environment
+protection controls the separate production dispatch credential and supplies its
+own public-origin variables. The three service origins are display-only
+administration settings; they must never be private control/debug URLs, and a
+Rainbow URL does not authorize a Rainbow deploy.
 
 Candidate images retain only immutable `sha-<commit>` tags. The publishing workflow
 first rejects a mismatch between the root release version and the Relay/Rainbow,

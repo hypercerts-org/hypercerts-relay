@@ -1,9 +1,10 @@
 # Candidate staging
 
 Merging a reviewed pull request into `dev` starts `Publish Railway release
-candidate`. It builds each launch image once, pushes `sha-<commit>` tags to GHCR,
-captures the OCI digest, and dispatches `hypercerts-release-candidate` to the
-private infrastructure repository.
+candidate`. It builds each launch image once, pushes `sha-<commit>` candidate tags
+to GHCR, captures the OCI digest, and dispatches `hypercerts-release-candidate` to
+the private infrastructure repository. An existing candidate tag is a hard stop:
+do not rebuild or replace it on a retry.
 
 The staging GitHub Environment must contain:
 
@@ -20,7 +21,7 @@ control/debug origin as a public-service URL, and do not treat a Rainbow display
 URL as authorization to deploy Rainbow.
 
 The private receiver must store a candidate receipt keyed by source repository and
-commit. The receipt contains the three `image@sha256:...` values, staging
+candidate ID (`sha-<commit>`). The receipt contains the three `image@sha256:...` values, staging
 deployment IDs, and validation evidence. It deploys those digest references to
 the staging Railway environment; it must not rebuild from Git, resolve a mutable
 tag, or use a production volume or secret.

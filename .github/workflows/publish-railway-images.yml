@@ -19,11 +19,12 @@ jobs:
       contents: read
       packages: write
     outputs:
+      candidate_id: ${{ steps.images.outputs.candidate_id }}
       relay_image: ${{ steps.images.outputs.relay_image }}
       jetstream_image: ${{ steps.images.outputs.jetstream_image }}
       administration_image: ${{ steps.images.outputs.administration_image }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 24
@@ -44,6 +45,18 @@ jobs:
           VERSION="$(node -p "require('./package.json').version")"
           COMMIT="$GITHUB_SHA"
           DATE="$(date --utc +%Y-%m-%dT%H:%M:%SZ)"
+          CANDIDATE_ID="sha-$GITHUB_SHA"
+
+          candidate_exists() {
+            docker buildx imagetools inspect "$1:$CANDIDATE_ID" >/dev/null 2>&1
+          }
+
+          for component in relay jetstream administration; do
+            if candidate_exists "$IMAGE_PREFIX/$component"; then
+              echo "release candidate $CANDIDATE_ID already exists for $component; candidates cannot be rebuilt or overwritten" >&2
+              exit 1
+            fi
+          done
 
           build_component() {
             local component="$1"
@@ -64,7 +77,7 @@ jobs:
               --label "org.opencontainers.image.version=$VERSION" \
               --label "org.opencontainers.image.revision=$COMMIT" \
               --label "org.opencontainers.image.created=$DATE" \
-              --tag "$image:sha-$GITHUB_SHA" \
+              --tag "$image:$CANDIDATE_ID" \
               --metadata-file "$metadata" \
               --file "$dockerfile" \
               "$context"
@@ -82,6 +95,7 @@ jobs:
           administration_image="$(build_component administration . administration/Dockerfile)"
 
           {
+            printf 'candidate_id=%s\n' "$CANDIDATE_ID"
             printf 'relay_image=%s\n' "$relay_image"
             printf 'jetstream_image=%s\n' "$jetstream_image"
             printf 'administration_image=%s\n' "$administration_image"
@@ -102,6 +116,7 @@ jobs:
           RELAY_IMAGE: ${{ needs.publish-candidate.outputs.relay_image }}
           JETSTREAM_IMAGE: ${{ needs.publish-candidate.outputs.jetstream_image }}
           ADMINISTRATION_IMAGE: ${{ needs.publish-candidate.outputs.administration_image }}
+          CANDIDATE_ID: ${{ needs.publish-candidate.outputs.candidate_id }}
           ADMIN_PUBLIC_ORIGIN: ${{ vars.ADMIN_PUBLIC_ORIGIN }}
           RELAY_PUBLIC_ORIGIN: ${{ vars.RELAY_PUBLIC_ORIGIN }}
           RAINBOW_PUBLIC_ORIGIN: ${{ vars.RAINBOW_PUBLIC_ORIGIN }}
@@ -114,6 +129,7 @@ jobs:
           jq -n \
             --arg repository "$GITHUB_REPOSITORY" \
             --arg revision "$GITHUB_SHA" \
+            --arg candidate_id "$CANDIDATE_ID" \
             --arg relay "$RELAY_IMAGE" \
             --arg jetstream "$JETSTREAM_IMAGE" \
             --arg administration "$ADMINISTRATION_IMAGE" \
@@ -121,7 +137,7 @@ jobs:
             --arg relay_public_origin "$RELAY_PUBLIC_ORIGIN" \
             --arg rainbow_public_origin "$RAINBOW_PUBLIC_ORIGIN" \
             --arg jetstream_public_origin "$JETSTREAM_PUBLIC_ORIGIN" \
-            '{event_type: "hypercerts-release-candidate", client_payload: {source_repository: $repository, source_revision: $revision, images: {relay: $relay, jetstream: $jetstream, administration: $administration}, administration: {public_origin: $admin_public_origin, public_service_origins: ({relay: $relay_public_origin, rainbow: $rainbow_public_origin, jetstream: $jetstream_public_origin} | with_entries(select(.value != "")))}}}' \
+            '{event_type: "hypercerts-release-candidate", client_payload: {source_repository: $repository, source_revision: $revision, candidate_id: $candidate_id, images: {relay: $relay, jetstream: $jetstream, administration: $administration}, administration: {public_origin: $admin_public_origin, public_service_origins: ({relay: $relay_public_origin, rainbow: $rainbow_public_origin, jetstream: $jetstream_public_origin} | with_entries(select(.value != "")))}}}' \
             > dispatch.json
           curl --fail-with-body --silent --show-error \
             --request POST \
@@ -142,11 +158,11 @@ jobs:
       group: railway-production
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: production
           fetch-depth: 0
-      - name: Require the production tree to equal the staged candidate
+      - name: Require the current production tree to equal the staged candidate
         env:
           CANDIDATE_REVISION: ${{ github.event.pull_request.head.sha }}
           PROMOTION_REVISION: ${{ github.event.pull_request.merge_commit_sha }}
@@ -154,6 +170,10 @@ jobs:
           set -euo pipefail
           git cat-file -e "$CANDIDATE_REVISION^{tree}"
           git cat-file -e "$PROMOTION_REVISION^{tree}"
+          if [ "$(git rev-parse HEAD)" != "$PROMOTION_REVISION" ]; then
+            echo 'production advanced after this merge; refusing to promote a stale candidate' >&2
+            exit 1
+          fi
           if ! git diff --quiet "$CANDIDATE_REVISION" "$PROMOTION_REVISION"; then
             echo 'production merge differs from the staged dev candidate; build and validate that exact tree before promotion' >&2
             exit 1
@@ -164,6 +184,7 @@ jobs:
           INFRA_REPOSITORY: ${{ vars.INFRA_REPOSITORY }}
           CANDIDATE_REVISION: ${{ github.event.pull_request.head.sha }}
           PROMOTION_REVISION: ${{ github.event.pull_request.merge_commit_sha }}
+          CANDIDATE_ID: sha-${{ github.event.pull_request.head.sha }}
           ADMIN_PUBLIC_ORIGIN: ${{ vars.ADMIN_PUBLIC_ORIGIN }}
           RELAY_PUBLIC_ORIGIN: ${{ vars.RELAY_PUBLIC_ORIGIN }}
           RAINBOW_PUBLIC_ORIGIN: ${{ vars.RAINBOW_PUBLIC_ORIGIN }}
@@ -177,11 +198,13 @@ jobs:
             --arg repository "$GITHUB_REPOSITORY" \
             --arg candidate_revision "$CANDIDATE_REVISION" \
             --arg promotion_revision "$PROMOTION_REVISION" \
+            --arg candidate_id "$CANDIDATE_ID" \
+            --arg production_ref 'production' \
             --arg admin_public_origin "$ADMIN_PUBLIC_ORIGIN" \
             --arg relay_public_origin "$RELAY_PUBLIC_ORIGIN" \
             --arg rainbow_public_origin "$RAINBOW_PUBLIC_ORIGIN" \
             --arg jetstream_public_origin "$JETSTREAM_PUBLIC_ORIGIN" \
-            '{event_type: "hypercerts-promote-production", client_payload: {source_repository: $repository, candidate_revision: $candidate_revision, promotion_revision: $promotion_revision, administration: {public_origin: $admin_public_origin, public_service_origins: ({relay: $relay_public_origin, rainbow: $rainbow_public_origin, jetstream: $jetstream_public_origin} | with_entries(select(.value != "")))}}}' \
+            '{event_type: "hypercerts-promote-production", client_payload: {source_repository: $repository, candidate_revision: $candidate_revision, candidate_id: $candidate_id, promotion_revision: $promotion_revision, production_ref: $production_ref, administration: {public_origin: $admin_public_origin, public_service_origins: ({relay: $relay_public_origin, rainbow: $rainbow_public_origin, jetstream: $jetstream_public_origin} | with_entries(select(.value != "")))}}}' \
             > dispatch.json
           curl --fail-with-body --silent --show-error \
             --request POST \
