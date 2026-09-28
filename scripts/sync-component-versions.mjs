@@ -44,8 +44,7 @@ function setLockfileRootVersion(path) {
   if (packagesStart === -1 || rootPackageStart === -1 || rootNameStart === -1 || rootNameEnd === -1 || rootVersionStart === -1 || rootVersionEnd === -1 || rootVersionStart > rootPackageEnd) {
     throw new Error(`expected lockfile root version marker not found in ${path}`)
   }
-  const indentation = source.slice(source.lastIndexOf('\n', rootVersionStart) + 1, rootVersionStart)
-  writeFileSync(file, `${source.slice(0, rootVersionStart)}${indentation}"version": "${version}",${source.slice(rootVersionEnd)}`)
+  writeFileSync(file, `${source.slice(0, rootVersionStart)}"version": "${version}",${source.slice(rootVersionEnd)}`)
 }
 
 // Keep Administration's manifest and both lockfiles aligned with the release.
