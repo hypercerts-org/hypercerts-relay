@@ -212,6 +212,7 @@ func serveCommand() *cli.Command {
 			// hypercerts: Explicit source origins schedule quiet-PDS backfill.
 			// hypercerts: Credentials come from mounted files, never command-line values.
 			&cli.StringFlag{Name: "control-token-file", Usage: "Mounted secret file for the private service API; requires debug-addr", Sources: cli.EnvVars("JETSTREAM_CONTROL_TOKEN_FILE")},
+			&cli.BoolFlag{Name: "archive-key-auth-enabled", Usage: "Require managed bearer API keys for archive planning and downloads", Sources: cli.EnvVars("JETSTREAM_ARCHIVE_KEY_AUTH_ENABLED")},
 			&cli.StringFlag{Name: "relay-control-url", Usage: "Private Relay control base URL used only for completed recovery receipts", Sources: cli.EnvVars("JETSTREAM_RELAY_CONTROL_URL")},
 			&cli.StringFlag{Name: "relay-control-token-file", Usage: "Mounted Relay private-control credential for recovery receipts", Sources: cli.EnvVars("JETSTREAM_RELAY_CONTROL_TOKEN_FILE")},
 			&cli.StringSliceFlag{Name: "pds-sources", Usage: "Initial admitted direct-PDS HTTPS origins to backfill; comma-separated", Sources: cli.EnvVars("JETSTREAM_PDS_SOURCES")},
@@ -483,6 +484,7 @@ func serveOptionsFromCommand(cmd *cli.Command) (jetstreamd.Options, error) {
 
 	return jetstreamd.Options{
 		ControlToken:           controlToken,
+		ArchiveKeyAuthEnabled:  cmd.Bool("archive-key-auth-enabled"),
 		PublicAddr:             cmd.String("addr"),
 		DebugAddr:              cmd.String("debug-addr"),
 		EnablePprof:            cmd.Bool("enable-pprof"),
