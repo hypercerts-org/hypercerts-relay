@@ -15,6 +15,9 @@ jobs:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    concurrency:
+      group: railway-candidate-${{ github.sha }}
+      cancel-in-progress: false
     permissions:
       contents: read
       packages: write
@@ -47,16 +50,20 @@ jobs:
           DATE="$(date --utc +%Y-%m-%dT%H:%M:%SZ)"
           CANDIDATE_ID="sha-$GITHUB_SHA"
 
-          candidate_exists() {
-            docker buildx imagetools inspect "$1:$CANDIDATE_ID" >/dev/null 2>&1
+          existing_image() {
+            docker buildx imagetools inspect "$1:$CANDIDATE_ID" --format '{{.Digest}}' 2>/dev/null
           }
 
+          existing_count=0
           for component in relay jetstream administration; do
-            if candidate_exists "$IMAGE_PREFIX/$component"; then
-              echo "release candidate $CANDIDATE_ID already exists for $component; candidates cannot be rebuilt or overwritten" >&2
-              exit 1
+            if existing_image "$IMAGE_PREFIX/$component" >/dev/null; then
+              existing_count=$((existing_count + 1))
             fi
           done
+          if [ "$existing_count" -ne 0 ] && [ "$existing_count" -ne 3 ]; then
+            echo "release candidate $CANDIDATE_ID has a partial image set; refusing to rebuild or dispatch it" >&2
+            exit 1
+          fi
 
           build_component() {
             local component="$1"
@@ -90,9 +97,15 @@ jobs:
             printf '%s@%s' "$image" "$digest"
           }
 
-          relay_image="$(build_component relay . cmd/relay/Dockerfile)"
-          jetstream_image="$(build_component jetstream jetstream jetstream/Dockerfile)"
-          administration_image="$(build_component administration . administration/Dockerfile)"
+          if [ "$existing_count" -eq 3 ]; then
+            relay_image="$IMAGE_PREFIX/relay@$(existing_image "$IMAGE_PREFIX/relay")"
+            jetstream_image="$IMAGE_PREFIX/jetstream@$(existing_image "$IMAGE_PREFIX/jetstream")"
+            administration_image="$IMAGE_PREFIX/administration@$(existing_image "$IMAGE_PREFIX/administration")"
+          else
+            relay_image="$(build_component relay . cmd/relay/Dockerfile)"
+            jetstream_image="$(build_component jetstream jetstream jetstream/Dockerfile)"
+            administration_image="$(build_component administration . administration/Dockerfile)"
+          fi
 
           {
             printf 'candidate_id=%s\n' "$CANDIDATE_ID"

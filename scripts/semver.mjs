@@ -4,7 +4,7 @@
 function validIdentifier(identifier, { numericOnly = false } = {}) {
   if (identifier.length === 0) return false
   if (!/^[0-9A-Za-z-]+$/.test(identifier)) return false
-  return !numericOnly || identifier === '0' || identifier[0] !== '0'
+  return !numericOnly || !/^[0-9]+$/.test(identifier) || identifier === '0' || identifier[0] !== '0'
 }
 
 function validIdentifierList(value, options) {
@@ -23,5 +23,5 @@ export function isSemver(value) {
   if (prereleaseSeparator !== -1 && !validIdentifierList(prerelease, { numericOnly: true })) return false
 
   const coreParts = core.split('.')
-  return coreParts.length === 3 && coreParts.every((part) => validIdentifier(part, { numericOnly: true }))
+  return coreParts.length === 3 && coreParts.every((part) => /^(0|[1-9][0-9]*)$/.test(part))
 }
