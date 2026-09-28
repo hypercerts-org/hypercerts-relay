@@ -1,11 +1,9 @@
-name: Publish Railway release candidate
+name: Publish Railway candidate images
+run-name: Publish staging candidate images
 
 on:
   push:
     branches: [dev]
-  pull_request:
-    branches: [production]
-    types: [closed]
 
 permissions:
   contents: read
@@ -21,11 +19,6 @@ jobs:
     permissions:
       contents: read
       packages: write
-    outputs:
-      candidate_id: ${{ steps.images.outputs.candidate_id }}
-      relay_image: ${{ steps.images.outputs.relay_image }}
-      jetstream_image: ${{ steps.images.outputs.jetstream_image }}
-      administration_image: ${{ steps.images.outputs.administration_image }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
@@ -39,8 +32,10 @@ jobs:
         run: |
           set -euo pipefail
           printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
-      - name: Build and publish immutable release-candidate images
-        id: images
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver: docker-container
+      - name: Build and publish immutable candidate images
         env:
           IMAGE_PREFIX: ghcr.io/${{ github.repository }}
         run: |
@@ -61,7 +56,7 @@ jobs:
             fi
           done
           if [ "$existing_count" -ne 0 ] && [ "$existing_count" -ne 3 ]; then
-            echo "release candidate $CANDIDATE_ID has a partial image set; refusing to rebuild or dispatch it" >&2
+            echo "release candidate $CANDIDATE_ID has a partial image set; refusing to rebuild it" >&2
             exit 1
           fi
 
@@ -106,123 +101,3 @@ jobs:
             jetstream_image="$(build_component jetstream jetstream jetstream/Dockerfile)"
             administration_image="$(build_component administration . administration/Dockerfile)"
           fi
-
-          {
-            printf 'candidate_id=%s\n' "$CANDIDATE_ID"
-            printf 'relay_image=%s\n' "$relay_image"
-            printf 'jetstream_image=%s\n' "$jetstream_image"
-            printf 'administration_image=%s\n' "$administration_image"
-          } >> "$GITHUB_OUTPUT"
-
-  deploy-staging-candidate:
-    needs: publish-candidate
-    runs-on: ubuntu-latest
-    environment: staging
-    concurrency:
-      group: railway-staging
-      cancel-in-progress: true
-    steps:
-      - name: Dispatch immutable candidate to private infrastructure
-        env:
-          INFRA_DISPATCH_TOKEN: ${{ secrets.INFRA_DISPATCH_TOKEN }}
-          INFRA_REPOSITORY: ${{ vars.INFRA_REPOSITORY }}
-          RELAY_IMAGE: ${{ needs.publish-candidate.outputs.relay_image }}
-          JETSTREAM_IMAGE: ${{ needs.publish-candidate.outputs.jetstream_image }}
-          ADMINISTRATION_IMAGE: ${{ needs.publish-candidate.outputs.administration_image }}
-          CANDIDATE_ID: ${{ needs.publish-candidate.outputs.candidate_id }}
-          ADMIN_PUBLIC_ORIGIN: ${{ vars.ADMIN_PUBLIC_ORIGIN }}
-          RELAY_PUBLIC_ORIGIN: ${{ vars.RELAY_PUBLIC_ORIGIN }}
-          RAINBOW_PUBLIC_ORIGIN: ${{ vars.RAINBOW_PUBLIC_ORIGIN }}
-          JETSTREAM_PUBLIC_ORIGIN: ${{ vars.JETSTREAM_PUBLIC_ORIGIN }}
-        run: |
-          set -euo pipefail
-          test -n "$INFRA_REPOSITORY" || { echo 'staging variable INFRA_REPOSITORY is required' >&2; exit 1; }
-          test -n "$INFRA_DISPATCH_TOKEN" || { echo 'staging secret INFRA_DISPATCH_TOKEN is required' >&2; exit 1; }
-          test -n "$ADMIN_PUBLIC_ORIGIN" || { echo 'staging variable ADMIN_PUBLIC_ORIGIN is required' >&2; exit 1; }
-          jq -n \
-            --arg repository "$GITHUB_REPOSITORY" \
-            --arg revision "$GITHUB_SHA" \
-            --arg candidate_id "$CANDIDATE_ID" \
-            --arg relay "$RELAY_IMAGE" \
-            --arg jetstream "$JETSTREAM_IMAGE" \
-            --arg administration "$ADMINISTRATION_IMAGE" \
-            --arg admin_public_origin "$ADMIN_PUBLIC_ORIGIN" \
-            --arg relay_public_origin "$RELAY_PUBLIC_ORIGIN" \
-            --arg rainbow_public_origin "$RAINBOW_PUBLIC_ORIGIN" \
-            --arg jetstream_public_origin "$JETSTREAM_PUBLIC_ORIGIN" \
-            '{event_type: "hypercerts-release-candidate", client_payload: {source_repository: $repository, source_revision: $revision, candidate_id: $candidate_id, images: {relay: $relay, jetstream: $jetstream, administration: $administration}, administration: {public_origin: $admin_public_origin, public_service_origins: ({relay: $relay_public_origin, rainbow: $rainbow_public_origin, jetstream: $jetstream_public_origin} | with_entries(select(.value != "")))}}}' \
-            > dispatch.json
-          curl --fail-with-body --silent --show-error \
-            --request POST \
-            --header 'Accept: application/vnd.github+json' \
-            --header "Authorization: Bearer $INFRA_DISPATCH_TOKEN" \
-            --header 'X-GitHub-Api-Version: 2022-11-28' \
-            --data-binary @dispatch.json \
-            "https://api.github.com/repos/$INFRA_REPOSITORY/dispatches"
-
-  promote-production-candidate:
-    if: >-
-      github.event.pull_request.merged == true &&
-      github.event.pull_request.head.ref == 'dev' &&
-      github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ubuntu-latest
-    environment: production
-    concurrency:
-      group: railway-production
-      cancel-in-progress: false
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: production
-          fetch-depth: 0
-      - name: Require the current production tree to equal the staged candidate
-        env:
-          CANDIDATE_REVISION: ${{ github.event.pull_request.head.sha }}
-          PROMOTION_REVISION: ${{ github.event.pull_request.merge_commit_sha }}
-        run: |
-          set -euo pipefail
-          git cat-file -e "$CANDIDATE_REVISION^{tree}"
-          git cat-file -e "$PROMOTION_REVISION^{tree}"
-          if [ "$(git rev-parse HEAD)" != "$PROMOTION_REVISION" ]; then
-            echo 'production advanced after this merge; refusing to promote a stale candidate' >&2
-            exit 1
-          fi
-          if ! git diff --quiet "$CANDIDATE_REVISION" "$PROMOTION_REVISION"; then
-            echo 'production merge differs from the staged dev candidate; build and validate that exact tree before promotion' >&2
-            exit 1
-          fi
-      - name: Dispatch verified candidate promotion to private infrastructure
-        env:
-          INFRA_DISPATCH_TOKEN: ${{ secrets.INFRA_DISPATCH_TOKEN }}
-          INFRA_REPOSITORY: ${{ vars.INFRA_REPOSITORY }}
-          CANDIDATE_REVISION: ${{ github.event.pull_request.head.sha }}
-          PROMOTION_REVISION: ${{ github.event.pull_request.merge_commit_sha }}
-          CANDIDATE_ID: sha-${{ github.event.pull_request.head.sha }}
-          ADMIN_PUBLIC_ORIGIN: ${{ vars.ADMIN_PUBLIC_ORIGIN }}
-          RELAY_PUBLIC_ORIGIN: ${{ vars.RELAY_PUBLIC_ORIGIN }}
-          RAINBOW_PUBLIC_ORIGIN: ${{ vars.RAINBOW_PUBLIC_ORIGIN }}
-          JETSTREAM_PUBLIC_ORIGIN: ${{ vars.JETSTREAM_PUBLIC_ORIGIN }}
-        run: |
-          set -euo pipefail
-          test -n "$INFRA_REPOSITORY" || { echo 'production variable INFRA_REPOSITORY is required' >&2; exit 1; }
-          test -n "$INFRA_DISPATCH_TOKEN" || { echo 'production secret INFRA_DISPATCH_TOKEN is required' >&2; exit 1; }
-          test -n "$ADMIN_PUBLIC_ORIGIN" || { echo 'production variable ADMIN_PUBLIC_ORIGIN is required' >&2; exit 1; }
-          jq -n \
-            --arg repository "$GITHUB_REPOSITORY" \
-            --arg candidate_revision "$CANDIDATE_REVISION" \
-            --arg promotion_revision "$PROMOTION_REVISION" \
-            --arg candidate_id "$CANDIDATE_ID" \
-            --arg production_ref 'production' \
-            --arg admin_public_origin "$ADMIN_PUBLIC_ORIGIN" \
-            --arg relay_public_origin "$RELAY_PUBLIC_ORIGIN" \
-            --arg rainbow_public_origin "$RAINBOW_PUBLIC_ORIGIN" \
-            --arg jetstream_public_origin "$JETSTREAM_PUBLIC_ORIGIN" \
-            '{event_type: "hypercerts-promote-production", client_payload: {source_repository: $repository, candidate_revision: $candidate_revision, candidate_id: $candidate_id, promotion_revision: $promotion_revision, production_ref: $production_ref, administration: {public_origin: $admin_public_origin, public_service_origins: ({relay: $relay_public_origin, rainbow: $rainbow_public_origin, jetstream: $jetstream_public_origin} | with_entries(select(.value != "")))}}}' \
-            > dispatch.json
-          curl --fail-with-body --silent --show-error \
-            --request POST \
-            --header 'Accept: application/vnd.github+json' \
-            --header "Authorization: Bearer $INFRA_DISPATCH_TOKEN" \
-            --header 'X-GitHub-Api-Version: 2022-11-28' \
-            --data-binary @dispatch.json \
-            "https://api.github.com/repos/$INFRA_REPOSITORY/dispatches"

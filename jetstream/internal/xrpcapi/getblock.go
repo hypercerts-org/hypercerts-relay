@@ -134,12 +134,20 @@ func (h *getBlockHandler) ServeXRPC(ctx context.Context, w http.ResponseWriter, 
 	if rec.status == http.StatusOK {
 		served = rec.bytes
 	}
+	responseStatus := rec.status
+	if gate, ok := w.(*archiveQuotaGate); ok && gate.denied {
+		// hypercerts: The byte gate may replace ServeContent's success status
+		// with a quota response before any frame bytes are delivered.
+		result = resultError
+		served = 0
+		responseStatus = gate.status
+	}
 	if span != nil {
 		span.SetAttributes(attribute.String("result", result))
 		if result == resultOK {
 			span.SetStatus(codes.Ok, "")
 		} else {
-			span.SetStatus(codes.Error, fmt.Sprintf("http status %d", rec.status))
+			span.SetStatus(codes.Error, fmt.Sprintf("http status %d", responseStatus))
 		}
 	}
 	return nil

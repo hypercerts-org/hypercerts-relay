@@ -1,4 +1,5 @@
 name: Go
+run-name: Verify Relay and Rainbow (${{ github.event_name }}) — ${{ (github.base_ref || github.event.merge_group.base_ref || github.ref_name) == 'dev' && 'staging' || (github.base_ref || github.event.merge_group.base_ref || github.ref_name) == 'refs/heads/dev' && 'staging' || github.base_ref || github.event.merge_group.base_ref || github.ref_name }}
 
 on:
   push:
@@ -42,7 +43,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: Fetch the Changesets base branch
-        run: git fetch origin main:main
+        run: git fetch origin main
       - name: Set up Node.js
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
@@ -51,7 +52,7 @@ jobs:
       - name: Install release tooling
         run: npm ci --ignore-scripts
       - name: Validate Changesets
-        run: npm run changeset:check
+        run: npm run changeset:check -- --since=origin/main
 
   known-local-baseline-test:
     name: Track local baseline test
@@ -69,6 +70,7 @@ jobs:
         run: go test ./cmd/relay/relay -run '^TestClaimDueAccountLimitAlertsRepeatsAfterInterval$'
 
   lint:
+    name: Lint Go
     runs-on: ubuntu-latest
     steps:
       - name: Check out source

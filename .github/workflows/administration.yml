@@ -1,13 +1,15 @@
 name: Verify administration
+run-name: Verify administration (${{ github.event_name }}) — ${{ (github.base_ref || github.event.merge_group.base_ref || github.ref_name) == 'dev' && 'staging' || (github.base_ref || github.event.merge_group.base_ref || github.ref_name) == 'refs/heads/dev' && 'staging' || github.base_ref || github.event.merge_group.base_ref || github.ref_name }}
 on:
   pull_request:
     branches: [main, dev, production]
-    paths: ['administration/**', 'cmd/relay/**', 'jetstream/internal/hypercerts/**', '.github/workflows/administration.yml']
+  merge_group:
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
   verify:
+    name: Verify administration
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

@@ -5,6 +5,7 @@
   import Collections from "./Collections.svelte";
   import Operations from "./Operations.svelte";
   import Limits from "./Limits.svelte";
+  import ArchiveKeys from "./ArchiveKeys.svelte";
   import State from "./State.svelte";
   import logo from "./brand/assets/logo/hypercerts.svg";
   import {
@@ -21,21 +22,18 @@
     type Administrator,
   } from "./api";
   const navigation = [
-    ["overview", "Overview"],
-    ["sources", "PDS sources"],
-    ["collections", "Collections"],
-    ["jobs", "Backfill jobs"],
-    ["coverage", "Coverage"],
-    ["limits", "Rate limits"],
-    ["audit", "Audit log"],
-    ["manage-adminis", "Administrators"],
+    { label: "", items: [["overview", "Overview"]] },
+    { label: "Relay", items: [["sources", "PDS sources"], ["limits", "Rate limits"]] },
+    { label: "Jetstream", items: [["collections", "Collections"], ["jobs", "Backfill jobs"], ["coverage", "Coverage"], ["archive-keys", "Consumer API keys"]] },
+    { label: "Administration", items: [["audit", "Audit log"], ["manage-adminis", "Administrators"]] },
   ];
+  const navigationItems = navigation.flatMap((group) => group.items);
   const route = location.pathname.split("/")[1] || "overview";
   const screen = ["administrators", "administrations"].includes(route)
     ? "manage-adminis"
     : route === "changes"
       ? "audit"
-      : navigation.some(([key]) => key === route)
+      : navigationItems.some(([key]) => key === route)
         ? route
         : "overview";
   let session: (Administrator & { csrf: string; expires: number }) | null =
@@ -267,7 +265,7 @@
 
 <svelte:head
   ><title
-    >{navigation.find(([key]) => key === screen)?.[1]} · Hypercerts Relay</title
+    >{navigationItems.find(([key]) => key === screen)?.[1]} · Hypercerts Relay</title
   ></svelte:head
 >
 <a class="skip" href="#main">Skip to content</a>
@@ -310,10 +308,12 @@
       >
       <p class="product-label">Relay administration</p>
       <nav aria-label="Administration">
-        {#each navigation as [key, label]}<a
-            href={key === "overview" ? "/" : `/${key}`}
-            aria-current={screen === key ? "page" : undefined}>{label}</a
-          >{/each}
+        {#each navigation as group}
+          <div class:nav-group={Boolean(group.label)}>
+            {#if group.label}<p>{group.label}</p>{/if}
+            {#each group.items as [key, label]}<a href={key === "overview" ? "/" : `/${key}`} aria-current={screen === key ? "page" : undefined}>{label}</a>{/each}
+          </div>
+        {/each}
       </nav>
       <div class="account" aria-label="Signed-in account">
         <div class="account-identity">
@@ -379,6 +379,7 @@
             {submit}
             {busy}
           />{/if}
+      {:else if screen === "archive-keys"}<ArchiveKeys csrf={session.csrf} />
       {:else if screen === "limits"}<Limits
           rows={limits}
           {globalLimits}
@@ -475,7 +476,7 @@
           >
         </section>
       {/if}
-      {#if !["overview", "collections", "audit"].includes(screen)}<nav
+      {#if !["overview", "collections", "archive-keys", "audit"].includes(screen)}<nav
           class="pagination"
           aria-label="Result pages"
         >

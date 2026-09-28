@@ -48,6 +48,8 @@ type Options struct {
 	InitialPDSSources []string
 	// hypercerts: Private service credential, loaded from a mounted secret file by the CLI.
 	ControlToken string
+	// ArchiveKeyAuthEnabled enables Hypercerts archive key enforcement and the private key lifecycle API.
+	ArchiveKeyAuthEnabled bool
 	// hypercerts: The CLI always enables policy; initial collections apply only to new state.
 	CollectionSelection bool
 	InitialCollections  []string

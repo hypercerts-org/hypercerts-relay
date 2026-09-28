@@ -59,14 +59,30 @@ export interface Audit {
   operation: string | null;
   detail: Record<string, unknown>;
 }
+export interface ArchiveKey {
+  id: string;
+  name: string;
+  owner: string;
+  requestsPerMinute: number;
+  archiveMegabytesPerMinute: number;
+  createdAt: string;
+  revokedAt?: string | null;
+}
+export interface ArchiveKeyInput {
+  name: string;
+  owner: string;
+  requestsPerMinute: number;
+  archiveMegabytesPerMinute: number;
+}
 export async function api<T>(
   path: string,
   body?: unknown,
   csrf?: string,
   id?: string,
+  method?: "GET" | "POST" | "DELETE",
 ): Promise<T> {
   const response = await fetch(`/api/v1${path}`, {
-    method: body === undefined ? "GET" : "POST",
+    method: method ?? (body === undefined ? "GET" : "POST"),
     headers: {
       "Content-Type": "application/json",
       ...(csrf ? { "X-CSRF-Token": csrf } : {}),

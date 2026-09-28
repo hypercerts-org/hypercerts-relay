@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/hypercerts/archivekeys"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/jobs"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 )
@@ -30,21 +31,26 @@ const (
 )
 
 type Handler struct {
-	jobs   *jobs.Manager
-	policy *selection.Manager
-	token  [32]byte
-	mux    *http.ServeMux
+	jobs        *jobs.Manager
+	policy      *selection.Manager
+	token       [32]byte
+	mux         *http.ServeMux
+	archiveKeys *archivekeys.Manager
 }
 
 // New requires a nonempty service credential. Only mount on a private listener.
 func New(token string, manager *jobs.Manager, policy *selection.Manager) (*Handler, error) {
+	return NewWithArchiveKeys(token, manager, policy, nil)
+}
+
+func NewWithArchiveKeys(token string, manager *jobs.Manager, policy *selection.Manager, keys *archivekeys.Manager) (*Handler, error) {
 	if len(token) < 32 || strings.TrimSpace(token) != token {
 		return nil, errors.New("control token must contain at least 32 bytes and no surrounding whitespace")
 	}
 	if manager == nil || policy == nil {
 		return nil, errors.New("control interface requires managed collection policy and jobs")
 	}
-	h := &Handler{jobs: manager, policy: policy, token: sha256.Sum256([]byte(token)), mux: http.NewServeMux()}
+	h := &Handler{jobs: manager, policy: policy, archiveKeys: keys, token: sha256.Sum256([]byte(token)), mux: http.NewServeMux()}
 	h.mux.HandleFunc("GET "+Prefix+"/policy", func(w http.ResponseWriter, r *http.Request) { reply(w, http.StatusOK, h.policy.Current()) })
 	h.mux.HandleFunc("PUT "+Prefix+"/policy", h.setPolicy)
 	h.mux.HandleFunc("GET "+sourcesPath, func(w http.ResponseWriter, r *http.Request) {
@@ -59,6 +65,11 @@ func New(token string, manager *jobs.Manager, policy *selection.Manager) (*Handl
 	h.mux.HandleFunc("POST "+Prefix+"/jobs", h.requestJob)
 	h.mux.HandleFunc("POST "+Prefix+"/jobs/{id}/cancel", h.cancelJob)
 	h.mux.HandleFunc("POST "+Prefix+"/jobs/{id}/retry", h.retryJob)
+	if keys != nil {
+		h.mux.HandleFunc("GET "+Prefix+"/archive-keys", h.listArchiveKeys)
+		h.mux.HandleFunc("POST "+Prefix+"/archive-keys", h.createArchiveKey)
+		h.mux.HandleFunc("DELETE "+Prefix+"/archive-keys/{id}", h.revokeArchiveKey)
+	}
 	return h, nil
 }
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -541,4 +552,40 @@ type coverageSummaryView struct {
 
 func coverageSummary(view coverageView) coverageSummaryView {
 	return coverageSummaryView{PDS: view.PDS, JobID: view.JobID, State: view.State, CompletedRepos: view.CompletedRepos, TotalRepos: view.TotalRepos, TotalReposKnown: view.TotalReposKnown, ErrorCode: view.ErrorCode, CreatedAt: view.CreatedAt, Coverage: view.Coverage}
+}
+
+func (h *Handler) listArchiveKeys(w http.ResponseWriter, r *http.Request) {
+	reply(w, http.StatusOK, map[string]any{"keys": h.archiveKeys.List()})
+}
+func (h *Handler) createArchiveKey(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Name                      string `json:"name"`
+		Owner                     string `json:"owner"`
+		RequestsPerMinute         int    `json:"requestsPerMinute"`
+		ArchiveMegabytesPerMinute int    `json:"archiveMegabytesPerMinute"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	key, token, err := h.archiveKeys.Create(in.Name, in.Owner, in.RequestsPerMinute, in.ArchiveMegabytesPerMinute)
+	if err != nil {
+		if errors.Is(err, archivekeys.ErrInvalid) {
+			reply(w, http.StatusBadRequest, map[string]string{"error": "invalid_input"})
+		} else {
+			reply(w, http.StatusInternalServerError, map[string]string{"error": "persistence_error"})
+		}
+		return
+	}
+	reply(w, 201, map[string]any{"key": key, "token": token})
+}
+func (h *Handler) revokeArchiveKey(w http.ResponseWriter, r *http.Request) {
+	if err := h.archiveKeys.Revoke(r.PathValue("id")); err != nil {
+		if errors.Is(err, archivekeys.ErrNotFound) {
+			reply(w, http.StatusNotFound, map[string]string{"error": "not_found"})
+		} else {
+			reply(w, http.StatusInternalServerError, map[string]string{"error": "persistence_error"})
+		}
+		return
+	}
+	reply(w, 204, nil)
 }

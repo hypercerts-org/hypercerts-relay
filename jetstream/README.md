@@ -176,6 +176,47 @@ and return `Cache-Control: no-store`. Use TLS/private transport between services
 The public listener does not expose the API. This is a service contract for the
 separate administration control plane, not the OAuth administration UI.
 
+### Consumer archive keys (opt-in)
+
+`JETSTREAM_ARCHIVE_KEY_AUTH_ENABLED` defaults to `false`. Set it to `true` only
+with `JETSTREAM_CONTROL_TOKEN_FILE` and a private `JETSTREAM_DEBUG_ADDR`; startup
+rejects the enabled flag without private control access. The flag gates both
+archive-key management routes and bearer authentication on
+`planSnapshot`, `getSegment`, and `getBlock`. When disabled, these archive
+endpoints retain their existing public behavior and the key-management routes
+are absent. `subscribeEvents`, `listSegments`, and `getZstdDictionary` stay
+public. Enabling the flag before issuing a consumer key will make archive
+replay return 401 until a key is created.
+
+Use the private control credential to call these additional paths under
+`/hypercerts/v1`:
+
+| Method and path | Request / result |
+| --- | --- |
+| `GET /archive-keys` | Lists key IDs, names, owners, minute limits, creation times and optional revocation times. Never returns key secrets or hashes. |
+| `POST /archive-keys` | `{"name":"consumer name","owner":"team or person","requestsPerMinute":60,"archiveMegabytesPerMinute":100}`. Returns `201` with `key` metadata and a `token` shown only in this response. |
+| `DELETE /archive-keys/{id}` | Revokes the key immediately; repeated revocation returns `204`. Unknown IDs return `404`. |
+
+Names and owners are required free-form strings of at most 120 bytes. Both
+limits must be integers from 1 to 100,000. One archive MB is 1,000,000 bytes.
+The limits use independent UTC minute windows per key and reset at the next
+minute (and on process restart). A successful plan or segment/block body spends
+one request. Readiness failures, invalid or missing resources, 304 responses,
+and quota denials spend neither request nor byte budget. Successful segment and
+block downloads reserve the declared response length and one request together
+before body delivery; a Range response spends its selected byte count. A quota
+denial returns 429 with `Retry-After` until the next UTC minute. Missing,
+invalid, or revoked keys return 401 with `WWW-Authenticate`. An individual
+segment or block larger than a key's minute byte limit cannot be downloaded
+whole with that key; issue a larger limit or use Range requests where supported.
+
+The creation token is an opaque bearer secret. Store it in the consumer's
+secret manager and send it as `Authorization: Bearer <token>` for archive XRPC
+calls. The database stores only its SHA-256 digest. Revocation is durable;
+keys and their metadata survive restarts. Do not log or persist the one-time
+creation response body. The control API and consumer archive calls must be
+carried over private transport or TLS.
+
 When Jetstream must clear a Relay source's `RecoveryRequired` flag, configure
 both `JETSTREAM_RELAY_CONTROL_URL` and
 `JETSTREAM_RELAY_CONTROL_TOKEN_FILE`. The URL is the private Relay control
