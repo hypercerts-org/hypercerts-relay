@@ -602,14 +602,14 @@ func TestPDSProcessorStalledBodyIsIncompleteWithoutRejectionOrProgress(t *testin
 
 	runPDSProcessorUntilIncomplete(t, m, processor)
 	first := m.List()[0]
-	require.Equal(t, int64(1), downloads.Load())
+	require.Equal(t, int64(3), downloads.Load())
 	require.Empty(t, first.CompletedRepos)
 	require.Empty(t, first.Cursor)
 	require.Empty(t, m.ListSnapshotRejections())
 
 	require.NoError(t, m.Retry(job.ID))
 	runPDSProcessorUntilIncomplete(t, m, processor)
-	require.Equal(t, int64(2), downloads.Load(), "an incomplete body must be downloaded again on retry")
+	require.Equal(t, int64(6), downloads.Load(), "a stalled body is retried within each attempt and downloaded again after explicit retry")
 	second := m.List()[0]
 	require.Empty(t, second.CompletedRepos)
 	require.Empty(t, second.Cursor)
@@ -623,16 +623,164 @@ func TestPDSProcessorStalledBodyIsIncompleteWithoutRejectionOrProgress(t *testin
 	require.NotContains(t, output, `"http_status"`)
 }
 
+func TestPDSProcessorRetriesTransientGetRepoFailureAndCompletes(t *testing.T) {
+	const did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
+	key, err := atmoscrypto.GenerateP256()
+	require.NoError(t, err)
+	blockStore := mst.NewMemBlockStore()
+	snapshotRepo := &repo.Repo{DID: atmos.DID(did), Clock: atmos.NewTIDClock(0), Store: blockStore, Tree: mst.NewTree(blockStore)}
+	var car bytes.Buffer
+	require.NoError(t, snapshotRepo.ExportCAR(&car, key))
+	_, commit, err := repo.LoadCompleteFromCAR(bytes.NewReader(car.Bytes()))
+	require.NoError(t, err)
+
+	var getRepoAttempts atomic.Int64
+	pds := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/xrpc/com.atproto.sync.listRepos":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"repos":[{"did":"` + did + `","rev":"` + commit.Rev + `","head":"head","active":true}]}`))
+		case "/xrpc/com.atproto.sync.getRepo":
+			switch getRepoAttempts.Add(1) {
+			case 1:
+				http.Error(w, "temporary PDS rate limit", http.StatusTooManyRequests)
+				return
+			case 2:
+				http.Error(w, "temporary PDS failure", http.StatusServiceUnavailable)
+				return
+			}
+			w.Header().Set("Content-Type", "application/vnd.ipld.car")
+			_, _ = w.Write(car.Bytes())
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer pds.Close()
+
+	m, db := newManager(t, t.TempDir())
+	defer db.Close()
+	_, err = m.AddSource(pds.URL)
+	require.NoError(t, err)
+	directory := &identity.Directory{
+		Resolver: &snapshotIdentityResolver{responses: []snapshotIdentityResponse{{doc: snapshotDIDDocument(atmos.DID(did), key.PublicKey(), pds.URL)}}},
+		Cache:    identity.NewLRUCache(1, time.Hour),
+	}
+	directory.Cache.Set(t.Context(), "did:"+did, &identity.Identity{DID: atmos.DID(did), Services: map[string]identity.ServiceEndpoint{"atproto_pds": {URL: pds.URL}}})
+	var reconciled atomic.Int64
+	processor := PDSProcessor{
+		Manager: m, HTTPClient: pds.Client(), Directory: directory,
+		Reconcile: func(context.Context, ingest.Snapshot) error {
+			reconciled.Add(1)
+			return nil
+		},
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- m.Run(ctx, processor.Run) }()
+	require.Eventually(t, func() bool {
+		state := m.List()[0].State
+		return state == Complete || state == Incomplete || state == Failed
+	}, 2*time.Second, time.Millisecond)
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+
+	completed := m.List()[0]
+	require.Equal(t, Complete, completed.State, "a transient getRepo failure should recover within this attempt")
+	require.Equal(t, int64(3), getRepoAttempts.Load())
+	require.Equal(t, int64(1), reconciled.Load())
+	require.Equal(t, commit.Rev, completed.CompletedRepos[did])
+}
+
+func TestPDSProcessorRetryExhaustionPreservesEarlierRepositoryProgress(t *testing.T) {
+	const didA = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
+	const didB = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"
+	key, err := atmoscrypto.GenerateP256()
+	require.NoError(t, err)
+	blockStore := mst.NewMemBlockStore()
+	snapshotRepo := &repo.Repo{DID: atmos.DID(didA), Clock: atmos.NewTIDClock(0), Store: blockStore, Tree: mst.NewTree(blockStore)}
+	var car bytes.Buffer
+	require.NoError(t, snapshotRepo.ExportCAR(&car, key))
+	_, commit, err := repo.LoadCompleteFromCAR(bytes.NewReader(car.Bytes()))
+	require.NoError(t, err)
+
+	var didAAttempts, didBAttempts atomic.Int64
+	pds := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/xrpc/com.atproto.sync.listRepos":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"repos":[{"did":"` + didA + `","rev":"` + commit.Rev + `","head":"head-a","active":true},{"did":"` + didB + `","rev":"3l3qo2vutsw2c","head":"head-b","active":true}]}`))
+		case "/xrpc/com.atproto.sync.getRepo":
+			if r.URL.Query().Get("did") == didA {
+				didAAttempts.Add(1)
+				w.Header().Set("Content-Type", "application/vnd.ipld.car")
+				_, _ = w.Write(car.Bytes())
+				return
+			}
+			didBAttempts.Add(1)
+			http.Error(w, "temporary PDS failure", http.StatusServiceUnavailable)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer pds.Close()
+
+	m, db := newManager(t, t.TempDir())
+	defer db.Close()
+	_, err = m.AddSource(pds.URL)
+	require.NoError(t, err)
+	resolver := &snapshotIdentityResolver{responses: []snapshotIdentityResponse{
+		{doc: snapshotDIDDocument(atmos.DID(didA), key.PublicKey(), pds.URL)},
+		{doc: snapshotDIDDocument(atmos.DID(didB), key.PublicKey(), pds.URL)},
+	}}
+	directory := &identity.Directory{Resolver: resolver, Cache: identity.NewLRUCache(2, time.Hour)}
+	for _, did := range []string{didA, didB} {
+		directory.Cache.Set(t.Context(), "did:"+did, &identity.Identity{DID: atmos.DID(did), Services: map[string]identity.ServiceEndpoint{"atproto_pds": {URL: pds.URL}}})
+	}
+	var reconciled atomic.Int64
+	processor := PDSProcessor{
+		Manager: m, HTTPClient: pds.Client(), Directory: directory,
+		Reconcile: func(context.Context, ingest.Snapshot) error {
+			reconciled.Add(1)
+			return nil
+		},
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- m.Run(ctx, processor.Run) }()
+	require.Eventually(t, func() bool {
+		state := m.List()[0].State
+		return state == Complete || state == Incomplete || state == Failed
+	}, 2*time.Second, time.Millisecond)
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+
+	incomplete := m.List()[0]
+	require.Equal(t, Incomplete, incomplete.State)
+	require.Equal(t, "repository_unavailable", incomplete.ErrorCode)
+	require.True(t, incomplete.TotalReposKnown)
+	require.Equal(t, 2, incomplete.TotalRepos)
+	require.Equal(t, map[string]string{didA: commit.Rev}, incomplete.CompletedRepos,
+		"exhausting retries for the next repository must not erase prior durable progress or acknowledge the failed repository")
+	require.Equal(t, int64(1), didAAttempts.Load())
+	require.Equal(t, int64(3), didBAttempts.Load())
+	require.Equal(t, int64(1), reconciled.Load())
+	require.Empty(t, m.ListSnapshotRejections())
+}
+
 func TestPDSProcessorLogsGetRepoRequestHTTPFailure(t *testing.T) {
 	const did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
 	const revision = "3l3qo2vutsw2b"
 	const responseBody = `{"error":"fixture_private_code","message":"fixture private response text"}`
+	var getRepoAttempts atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/xrpc/com.atproto.sync.listRepos":
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"repos":[{"did":"` + did + `","rev":"` + revision + `","head":"head","active":true}]}`))
 		case "/xrpc/com.atproto.sync.getRepo":
+			getRepoAttempts.Add(1)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_, _ = w.Write([]byte(responseBody))
@@ -658,6 +806,7 @@ func TestPDSProcessorLogsGetRepoRequestHTTPFailure(t *testing.T) {
 	require.Contains(t, output, `"stage":"getRepo/request"`)
 	require.Contains(t, output, `"cause_class":"http"`)
 	require.Contains(t, output, `"repository_did":"`+did+`"`)
+	require.Equal(t, int64(3), getRepoAttempts.Load(), "503 responses are retried up to three total attempts")
 	require.Contains(t, output, `"http_status":503`)
 	require.NotContains(t, output, "fixture_private_code")
 	require.NotContains(t, output, "fixture private response text")
@@ -668,12 +817,14 @@ func TestPDSProcessorLogsGetRepoBodyReadFailure(t *testing.T) {
 	const revision = "3l3qo2vutsw2b"
 	car, err := os.ReadFile("../../corpus/testdata/repo.car")
 	require.NoError(t, err)
+	var getRepoAttempts atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/xrpc/com.atproto.sync.listRepos":
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"repos":[{"did":"` + did + `","rev":"` + revision + `","head":"head","active":true}]}`))
 		case "/xrpc/com.atproto.sync.getRepo":
+			getRepoAttempts.Add(1)
 			w.Header().Set("Content-Type", "application/vnd.ipld.car")
 			w.Header().Set("Content-Length", "9999999")
 			w.WriteHeader(http.StatusOK)
@@ -698,6 +849,7 @@ func TestPDSProcessorLogsGetRepoBodyReadFailure(t *testing.T) {
 	require.Equal(t, 1, strings.Count(output, `"level":"WARN"`))
 	require.Contains(t, output, `"job_id":"`+job.ID+`"`)
 	require.Contains(t, output, `"stage":"getRepo/body"`)
+	require.Equal(t, int64(3), getRepoAttempts.Load(), "failed response-body reads are retried within the bounded policy")
 	require.Contains(t, output, `"cause_class":"body_read"`)
 	require.Contains(t, output, `"repository_did":"`+did+`"`)
 	require.NotContains(t, output, `"http_status"`)
@@ -715,8 +867,10 @@ func TestPDSProcessorLogsGetRepoTransportFailure(t *testing.T) {
 		_, _ = w.Write([]byte(`{"repos":[{"did":"` + did + `","rev":"` + revision + `","head":"head","active":true}]}`))
 	}))
 	defer server.Close()
+	var getRepoAttempts atomic.Int64
 	transport := roundTripperFunc(func(r *http.Request) (*http.Response, error) {
 		if r.URL.Path == "/xrpc/com.atproto.sync.getRepo" {
+			getRepoAttempts.Add(1)
 			return nil, errors.New("fixture private transport detail")
 		}
 		return http.DefaultTransport.RoundTrip(r)
@@ -736,6 +890,7 @@ func TestPDSProcessorLogsGetRepoTransportFailure(t *testing.T) {
 	require.Equal(t, 1, strings.Count(output, `"level":"WARN"`))
 	require.Contains(t, output, `"job_id":"`+job.ID+`"`)
 	require.Contains(t, output, `"stage":"getRepo/request"`)
+	require.Equal(t, int64(3), getRepoAttempts.Load(), "transport failures exhaust only the three bounded fetch attempts")
 	require.Contains(t, output, `"cause_class":"transport"`)
 	require.Contains(t, output, `"repository_did":"`+did+`"`)
 	require.NotContains(t, output, `"http_status"`)

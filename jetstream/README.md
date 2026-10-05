@@ -151,12 +151,16 @@ running job from its persisted page/repository progress. A crash before progress
 acknowledgment may replay work safely.
 
 Coverage is explicitly `current_state`: a PDS snapshot cannot prove historical
-event completeness. Unavailable sources, changed
-DID hosting, stale snapshots, and the 64
-MiB per-repository input limit produce `incomplete`; malformed or unverifiable
-input produces `failed`. Both require an explicit retry. Local persistence
-failures stop the runtime without acknowledging completion. Each repository
-request has a two-minute deadline.
+event completeness. Direct `getRepo` requests retry transient HTTP 408, 429, and
+5xx responses, timeouts, transport failures, and non-EOF response-body read
+failures up to three total attempts, with 50 ms then 100 ms delays. Invalid or
+unverifiable snapshots are not retried. After transient attempts are exhausted,
+unavailable sources, changed DID hosting, stale snapshots, and the 64 MiB
+per-repository input limit produce `incomplete`; malformed or unverifiable
+input produces `failed`. Terminal `incomplete` and `failed` outcomes still
+require an explicit job retry. Local persistence failures stop the runtime
+without acknowledging completion. Each repository's fetch and reconciliation
+share a two-minute deadline.
 
 After a direct-PDS backfill attempt's `failed` or `incomplete` outcome is durably
 committed, Jetstream emits one structured `WARNING` with `job_id`, `stage`
