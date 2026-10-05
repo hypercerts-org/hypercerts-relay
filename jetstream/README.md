@@ -156,7 +156,18 @@ DID hosting, stale snapshots, and the 64
 MiB per-repository input limit produce `incomplete`; malformed or unverifiable
 input produces `failed`. Both require an explicit retry. Local persistence
 failures stop the runtime without acknowledging completion. Each repository
-request has a two-minute deadline. Reconciliation currently scans the archive
+request has a two-minute deadline.
+
+After a direct-PDS backfill attempt's `failed` or `incomplete` outcome is durably
+committed, Jetstream emits one structured `WARNING` with `job_id`, `stage`
+(`listRepos`, `getRepo/request`, or `getRepo/body`), and a bounded `cause_class`
+(`timeout`, `cancel`, `body_read`, `http`, `transport`, or `unknown`). The
+`repository_did` is included only when known, and `http_status` only for a typed
+HTTP response with a positive status. Warnings never include original error
+text, response bodies, URLs, or credentials. Canceled jobs and source/policy
+reconciliation churn do not emit these attempt warnings.
+
+Reconciliation currently scans the archive
 under its rewrite lock, so large archives can pause live appends during an
 individual repository reconciliation.
 

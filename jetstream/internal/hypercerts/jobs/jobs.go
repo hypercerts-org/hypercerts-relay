@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/url"
 	"slices"
@@ -1100,34 +1101,58 @@ func (m *Manager) claimNextLocked() (Job, error) {
 }
 
 func (m *Manager) finishJob(ctx context.Context, id string, processErr error) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.cancel = nil
-	m.runningID = ""
-	if err := ctx.Err(); err != nil {
-		return err
-	} // Persisted Running resumes on Open.
-	if !m.active(id) {
+	var failure *pdsAttemptFailure
+	var warningJobID string
+	err := func() error {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		m.cancel = nil
+		m.runningID = ""
+		if err := ctx.Err(); err != nil {
+			return err
+		} // Persisted Running resumes on Open.
+		if !m.active(id) {
+			return nil
+		}
+		state, code, err := jobOutcome(processErr)
+		if err != nil {
+			return err
+		} // Local persistence/invariant failures stop the runtime.
+		next := clone(m.data)
+		job := next.Jobs[id]
+		job.FinishedAt = time.Now().UTC()
+		job.State = state
+		if state == Complete && job.SourceRevision != 0 {
+			// This flag is written in the same durable job record as Complete, so a
+			// process loss after local success replays the acknowledgement on restart.
+			job.ReceiptPending = true
+		}
+		if code != "" {
+			job.ErrorCode = code
+		}
+		next.Jobs[id] = job
+		if err := m.commit(next); err != nil {
+			return err
+		}
+		if (state == Failed || state == Incomplete) && errors.As(processErr, &failure) {
+			warningJobID = m.data.Jobs[id].ID
+		}
 		return nil
-	}
-	state, code, err := jobOutcome(processErr)
+	}()
 	if err != nil {
 		return err
-	} // Local persistence/invariant failures stop the runtime.
-	next := clone(m.data)
-	job := next.Jobs[id]
-	job.FinishedAt = time.Now().UTC()
-	job.State = state
-	if state == Complete && job.SourceRevision != 0 {
-		// This flag is written in the same durable job record as Complete, so a
-		// process loss after local success replays the acknowledgement on restart.
-		job.ReceiptPending = true
 	}
-	if code != "" {
-		job.ErrorCode = code
+	if failure != nil {
+		fields := []any{"job_id", warningJobID, "stage", failure.stage, "cause_class", failure.causeClass}
+		if failure.repositoryDID != "" {
+			fields = append(fields, "repository_did", failure.repositoryDID)
+		}
+		if failure.causeClass == pdsCauseHTTP && failure.httpStatus > 0 {
+			fields = append(fields, "http_status", failure.httpStatus)
+		}
+		slog.Default().Warn("direct PDS backfill attempt failed or incomplete", fields...)
 	}
-	next.Jobs[id] = job
-	return m.commit(next)
+	return nil
 }
 
 func (m *Manager) flushReceipts(ctx context.Context) error {

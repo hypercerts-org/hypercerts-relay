@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -26,6 +28,39 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type synchronizedLogBuffer struct {
+	mu     sync.Mutex
+	buffer bytes.Buffer
+}
+
+func (b *synchronizedLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.Write(p)
+}
+
+func (b *synchronizedLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.String()
+}
+
+var defaultSlogCaptureMu sync.Mutex
+
+// Tests using this helper stay non-parallel because slog.Default is process-global.
+func captureDefaultLogs(t *testing.T) *synchronizedLogBuffer {
+	t.Helper()
+	defaultSlogCaptureMu.Lock()
+	previous := slog.Default()
+	output := &synchronizedLogBuffer{}
+	slog.SetDefault(slog.New(slog.NewJSONHandler(output, nil)))
+	t.Cleanup(func() {
+		slog.SetDefault(previous)
+		defaultSlogCaptureMu.Unlock()
+	})
+	return output
+}
+
 func TestPDSProcessorCountsOneResumableInventory(t *testing.T) {
 	const cursor = "page-two"
 	const didA = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
@@ -33,6 +68,7 @@ func TestPDSProcessorCountsOneResumableInventory(t *testing.T) {
 	const revA = "3l3qo2vutsw2b"
 	const revB = "3l3qo2vutsw2c"
 
+	logOutput := captureDefaultLogs(t)
 	var mu sync.Mutex
 	var cursors []string
 	pageTwoAttempts := 0
@@ -97,6 +133,15 @@ func TestPDSProcessorCountsOneResumableInventory(t *testing.T) {
 	complete := m.List()[0]
 	require.True(t, complete.TotalReposKnown)
 	require.Equal(t, 2, complete.TotalRepos)
+
+	logs := logOutput.String()
+	require.Equal(t, 1, strings.Count(logs, `"level":"WARN"`))
+	require.Contains(t, logs, `"job_id":"`+job.ID+`"`)
+	require.Contains(t, logs, `"stage":"listRepos"`)
+	require.Contains(t, logs, `"cause_class":"http"`)
+	require.Contains(t, logs, `"http_status":503`)
+	require.NotContains(t, logs, `"repository_did"`)
+	require.NotContains(t, logs, "fixture transient failure")
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -526,6 +571,7 @@ func TestPDSProcessorRejectsMalformedListingDIDBeforeDownload(t *testing.T) {
 func TestPDSProcessorStalledBodyIsIncompleteWithoutRejectionOrProgress(t *testing.T) {
 	const did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
 	const revision = "3l3qo2vutsw2b"
+	logs := captureDefaultLogs(t)
 	var downloads atomic.Int64
 	pds := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -568,6 +614,235 @@ func TestPDSProcessorStalledBodyIsIncompleteWithoutRejectionOrProgress(t *testin
 	require.Empty(t, second.CompletedRepos)
 	require.Empty(t, second.Cursor)
 	require.Empty(t, m.ListSnapshotRejections())
+
+	output := logs.String()
+	require.Equal(t, 2, strings.Count(output, `"level":"WARN"`))
+	require.Contains(t, output, `"stage":"getRepo/body"`)
+	require.Contains(t, output, `"cause_class":"timeout"`)
+	require.Contains(t, output, `"repository_did":"`+did+`"`)
+	require.NotContains(t, output, `"http_status"`)
+}
+
+func TestPDSProcessorLogsGetRepoRequestHTTPFailure(t *testing.T) {
+	const did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
+	const revision = "3l3qo2vutsw2b"
+	const responseBody = `{"error":"fixture_private_code","message":"fixture private response text"}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/xrpc/com.atproto.sync.listRepos":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"repos":[{"did":"` + did + `","rev":"` + revision + `","head":"head","active":true}]}`))
+		case "/xrpc/com.atproto.sync.getRepo":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(responseBody))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	logs := captureDefaultLogs(t)
+	m, db := newManager(t, t.TempDir())
+	defer db.Close()
+	job, err := m.AddSource(server.URL)
+	require.NoError(t, err)
+	directory := &identity.Directory{Cache: identity.NewLRUCache(1, time.Hour)}
+	directory.Cache.Set(t.Context(), "did:"+did, &identity.Identity{DID: atmos.DID(did), Services: map[string]identity.ServiceEndpoint{"atproto_pds": {URL: server.URL}}})
+	processor := PDSProcessor{Manager: m, HTTPClient: server.Client(), Directory: directory}
+
+	runPDSProcessorUntilIncomplete(t, m, processor)
+	output := logs.String()
+	require.Equal(t, 1, strings.Count(output, `"level":"WARN"`))
+	require.Contains(t, output, `"job_id":"`+job.ID+`"`)
+	require.Contains(t, output, `"stage":"getRepo/request"`)
+	require.Contains(t, output, `"cause_class":"http"`)
+	require.Contains(t, output, `"repository_did":"`+did+`"`)
+	require.Contains(t, output, `"http_status":503`)
+	require.NotContains(t, output, "fixture_private_code")
+	require.NotContains(t, output, "fixture private response text")
+}
+
+func TestPDSProcessorLogsGetRepoBodyReadFailure(t *testing.T) {
+	const did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
+	const revision = "3l3qo2vutsw2b"
+	car, err := os.ReadFile("../../corpus/testdata/repo.car")
+	require.NoError(t, err)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/xrpc/com.atproto.sync.listRepos":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"repos":[{"did":"` + did + `","rev":"` + revision + `","head":"head","active":true}]}`))
+		case "/xrpc/com.atproto.sync.getRepo":
+			w.Header().Set("Content-Type", "application/vnd.ipld.car")
+			w.Header().Set("Content-Length", "9999999")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(car)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	logs := captureDefaultLogs(t)
+	m, db := newManager(t, t.TempDir())
+	defer db.Close()
+	job, err := m.AddSource(server.URL)
+	require.NoError(t, err)
+	directory := &identity.Directory{Cache: identity.NewLRUCache(1, time.Hour)}
+	directory.Cache.Set(t.Context(), "did:"+did, &identity.Identity{DID: atmos.DID(did), Services: map[string]identity.ServiceEndpoint{"atproto_pds": {URL: server.URL}}})
+	processor := PDSProcessor{Manager: m, HTTPClient: server.Client(), Directory: directory}
+
+	runPDSProcessorUntilIncomplete(t, m, processor)
+	output := logs.String()
+	require.Equal(t, 1, strings.Count(output, `"level":"WARN"`))
+	require.Contains(t, output, `"job_id":"`+job.ID+`"`)
+	require.Contains(t, output, `"stage":"getRepo/body"`)
+	require.Contains(t, output, `"cause_class":"body_read"`)
+	require.Contains(t, output, `"repository_did":"`+did+`"`)
+	require.NotContains(t, output, `"http_status"`)
+}
+
+func TestPDSProcessorLogsGetRepoTransportFailure(t *testing.T) {
+	const did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
+	const revision = "3l3qo2vutsw2b"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/xrpc/com.atproto.sync.listRepos" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"repos":[{"did":"` + did + `","rev":"` + revision + `","head":"head","active":true}]}`))
+	}))
+	defer server.Close()
+	transport := roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/xrpc/com.atproto.sync.getRepo" {
+			return nil, errors.New("fixture private transport detail")
+		}
+		return http.DefaultTransport.RoundTrip(r)
+	})
+
+	logs := captureDefaultLogs(t)
+	m, db := newManager(t, t.TempDir())
+	defer db.Close()
+	job, err := m.AddSource(server.URL)
+	require.NoError(t, err)
+	directory := &identity.Directory{Cache: identity.NewLRUCache(1, time.Hour)}
+	directory.Cache.Set(t.Context(), "did:"+did, &identity.Identity{DID: atmos.DID(did), Services: map[string]identity.ServiceEndpoint{"atproto_pds": {URL: server.URL}}})
+	processor := PDSProcessor{Manager: m, HTTPClient: &http.Client{Transport: transport}, Directory: directory}
+
+	runPDSProcessorUntilIncomplete(t, m, processor)
+	output := logs.String()
+	require.Equal(t, 1, strings.Count(output, `"level":"WARN"`))
+	require.Contains(t, output, `"job_id":"`+job.ID+`"`)
+	require.Contains(t, output, `"stage":"getRepo/request"`)
+	require.Contains(t, output, `"cause_class":"transport"`)
+	require.Contains(t, output, `"repository_did":"`+did+`"`)
+	require.NotContains(t, output, `"http_status"`)
+	require.NotContains(t, output, "fixture private transport detail")
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestPDSProcessorDoesNotWarnWhenOutcomePersistenceFails(t *testing.T) {
+	const did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
+	const revision = "3l3qo2vutsw2b"
+	injected := errors.New("injected terminal outcome checkpoint failure")
+	fault := &store.KeyPrefixFault{Prefix: []byte(stateKey), Op: store.WriteOpSet, Ordinal: 3, Err: injected}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/xrpc/com.atproto.sync.listRepos":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"repos":[{"did":"` + did + `","rev":"` + revision + `","head":"head","active":true}]}`))
+		case "/xrpc/com.atproto.sync.getRepo":
+			http.Error(w, "fixture transient failure", http.StatusServiceUnavailable)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	logs := captureDefaultLogs(t)
+	m, db := newManagerWithOptions(t, t.TempDir(), store.WithFaultInjector(fault))
+	defer db.Close()
+	_, err := m.AddSource(server.URL)
+	require.NoError(t, err)
+	directory := &identity.Directory{Cache: identity.NewLRUCache(1, time.Hour)}
+	directory.Cache.Set(t.Context(), "did:"+did, &identity.Identity{DID: atmos.DID(did), Services: map[string]identity.ServiceEndpoint{"atproto_pds": {URL: server.URL}}})
+	processor := PDSProcessor{Manager: m, HTTPClient: server.Client(), Directory: directory}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	require.ErrorIs(t, m.Run(ctx, processor.Run), injected)
+	require.Equal(t, Running, m.List()[0].State)
+	require.True(t, m.List()[0].TotalReposKnown)
+	require.Zero(t, strings.Count(logs.String(), `"level":"WARN"`))
+}
+
+func TestPDSProcessorDoesNotWarnForCancellationOrReconciliation(t *testing.T) {
+	const did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
+	const revision = "3l3qo2vutsw2b"
+	for _, action := range []string{"cancel", "source_removed", "policy_changed"} {
+		t.Run(action, func(t *testing.T) {
+			started := make(chan struct{}, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/xrpc/com.atproto.sync.listRepos":
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{"repos":[{"did":"` + did + `","rev":"` + revision + `","head":"head","active":true}]}`))
+				case "/xrpc/com.atproto.sync.getRepo":
+					w.Header().Set("Content-Type", "application/vnd.ipld.car")
+					w.WriteHeader(http.StatusOK)
+					w.(http.Flusher).Flush()
+					select {
+					case started <- struct{}{}:
+					default:
+					}
+					<-r.Context().Done()
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+
+			logs := captureDefaultLogs(t)
+			m, db := newManager(t, t.TempDir())
+			defer db.Close()
+			job, err := m.AddSource(server.URL)
+			require.NoError(t, err)
+			directory := &identity.Directory{Cache: identity.NewLRUCache(1, time.Hour)}
+			directory.Cache.Set(t.Context(), "did:"+did, &identity.Identity{DID: atmos.DID(did), Services: map[string]identity.ServiceEndpoint{"atproto_pds": {URL: server.URL}}})
+			processor := PDSProcessor{Manager: m, HTTPClient: server.Client(), Directory: directory}
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- m.Run(ctx, processor.Run) }()
+			select {
+			case <-started:
+			case <-time.After(time.Second):
+				t.Fatal("getRepo request did not start")
+			}
+			switch action {
+			case "cancel":
+				err = m.Cancel(job.ID)
+			case "source_removed":
+				err = m.RemoveSource(server.URL)
+			case "policy_changed":
+				_, err = m.SetPolicy(t.Context(), job.Policy.Revision, []string{"app.bsky.feed.like"})
+			}
+			require.NoError(t, err)
+			require.Eventually(t, func() bool {
+				current, err := m.Get(job.ID)
+				return err == nil && current.State == Canceled
+			}, time.Second, time.Millisecond)
+			cancel()
+			require.ErrorIs(t, <-done, context.Canceled)
+			require.Zero(t, strings.Count(logs.String(), `"level":"WARN"`))
+		})
+	}
 }
 
 func TestPDSProcessorRejectionWritePrecedesOutcome(t *testing.T) {
