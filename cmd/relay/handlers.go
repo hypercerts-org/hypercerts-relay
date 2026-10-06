@@ -261,6 +261,7 @@ func (svc *Service) HandleHealthCheck(c echo.Context) error {
 	}
 }
 
+// hypercerts: Direct Relay homepage visitors to the maintained fork's Relay code.
 var homeMessage string = `
 .########..########.##..........###....##....##
 .##.....##.##.......##.........##.##....##..##.
@@ -270,7 +271,7 @@ var homeMessage string = `
 .##....##..##.......##.......##.....##....##...
 .##.....##.########.########.##.....##....##...
 
-This is an atproto [https://atproto.com] relay instance, running the 'relay' codebase [https://github.com/bluesky-social/indigo]
+This is an atproto [https://atproto.com] relay instance, running the 'relay' codebase [https://github.com/hypercerts-org/hypercerts-relay/tree/main/cmd/relay]
 
 The firehose WebSocket path is at:  /xrpc/com.atproto.sync.subscribeRepos
 `

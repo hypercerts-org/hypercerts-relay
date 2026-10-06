@@ -8,8 +8,9 @@ import (
 	"github.com/bluesky-social/jetstream/internal/version"
 )
 
+// hypercerts: Point the source link at this fork's maintained Jetstream runtime.
 const (
-	docsLink = "https://github.com/bluesky-social/jetstream"
+	docsLink = "https://github.com/hypercerts-org/hypercerts-relay/tree/main/jetstream"
 )
 
 var (
