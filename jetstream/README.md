@@ -151,25 +151,12 @@ running job from its persisted page/repository progress. A crash before progress
 acknowledgment may replay work safely.
 
 Coverage is explicitly `current_state`: a PDS snapshot cannot prove historical
-event completeness. Direct `getRepo` requests retry transient HTTP 408, 429, and
-5xx responses, timeouts, transport failures, and non-EOF response-body read
-failures up to three total attempts, with 50 ms then 100 ms delays. Invalid or
-unverifiable snapshots are not retried. After transient attempts are exhausted,
-unavailable sources, changed DID hosting, stale snapshots, and the 64 MiB
-per-repository input limit produce `incomplete`; malformed or unverifiable
-input produces `failed`. Terminal `incomplete` and `failed` outcomes still
-require an explicit job retry. Local persistence failures stop the runtime
+event completeness. Direct `getRepo` requests retry transient errors (excluding invalid snapshots) up to three times, with 50 ms then 100 ms delays. After retries are exhausted a status of`incomplete` will be reported unless there is a  malformed or unverifiable
+input which returns `failed`. An explicit job retry is required for these statuses. Local persistence failures stop the runtime
 without acknowledging completion. Each repository's fetch and reconciliation
 share a two-minute deadline.
 
-After a direct-PDS backfill attempt's `failed` or `incomplete` outcome is durably
-committed, Jetstream emits one structured `WARNING` with `job_id`, `stage`
-(`listRepos`, `getRepo/request`, or `getRepo/body`), and a bounded `cause_class`
-(`timeout`, `cancel`, `body_read`, `http`, `transport`, or `unknown`). The
-`repository_did` is included only when known, and `http_status` only for a typed
-HTTP response with a positive status. Warnings never include original error
-text, response bodies, URLs, or credentials. Canceled jobs and source/policy
-reconciliation churn do not emit these attempt warnings.
+Jetstream will emit a warning message containing details on the failure, optionally the repo did if is is known.
 
 Reconciliation currently scans the archive
 under its rewrite lock, so large archives can pause live appends during an
