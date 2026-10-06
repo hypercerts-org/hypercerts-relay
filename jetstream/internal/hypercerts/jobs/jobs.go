@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/url"
 	"slices"
@@ -1100,19 +1101,37 @@ func (m *Manager) claimNextLocked() (Job, error) {
 }
 
 func (m *Manager) finishJob(ctx context.Context, id string, processErr error) error {
+	failure, warningJobID, err := m.persistJobOutcome(ctx, id, processErr)
+	if err != nil {
+		return err
+	}
+	if failure != nil {
+		fields := []any{"job_id", warningJobID, "stage", failure.stage, "cause_class", failure.causeClass}
+		if failure.repositoryDID != "" {
+			fields = append(fields, "repository_did", failure.repositoryDID)
+		}
+		if failure.causeClass == pdsCauseHTTP && failure.httpStatus > 0 {
+			fields = append(fields, "http_status", failure.httpStatus)
+		}
+		slog.Default().Warn("direct PDS backfill attempt failed or incomplete", fields...)
+	}
+	return nil
+}
+
+func (m *Manager) persistJobOutcome(ctx context.Context, id string, processErr error) (*pdsAttemptFailure, string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.cancel = nil
 	m.runningID = ""
 	if err := ctx.Err(); err != nil {
-		return err
+		return nil, "", err
 	} // Persisted Running resumes on Open.
 	if !m.active(id) {
-		return nil
+		return nil, "", nil
 	}
 	state, code, err := jobOutcome(processErr)
 	if err != nil {
-		return err
+		return nil, "", err
 	} // Local persistence/invariant failures stop the runtime.
 	next := clone(m.data)
 	job := next.Jobs[id]
@@ -1127,7 +1146,15 @@ func (m *Manager) finishJob(ctx context.Context, id string, processErr error) er
 		job.ErrorCode = code
 	}
 	next.Jobs[id] = job
-	return m.commit(next)
+	if err := m.commit(next); err != nil {
+		return nil, "", err
+	}
+	var failure *pdsAttemptFailure
+	var warningJobID string
+	if (state == Failed || state == Incomplete) && errors.As(processErr, &failure) {
+		warningJobID = m.data.Jobs[id].ID
+	}
+	return failure, warningJobID, nil
 }
 
 func (m *Manager) flushReceipts(ctx context.Context) error {
