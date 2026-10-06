@@ -1,4 +1,5 @@
 name: Publish Railway candidate images
+run-name: Publish staging candidate images
 
 on:
   push:
