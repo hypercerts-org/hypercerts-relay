@@ -1,13 +1,15 @@
 name: Verify container packaging
+run-name: Verify container packaging (${{ github.event_name }}) — ${{ (github.base_ref || github.event.merge_group.base_ref || github.ref_name) == 'dev' && 'staging' || (github.base_ref || github.event.merge_group.base_ref || github.ref_name) == 'refs/heads/dev' && 'staging' || github.base_ref || github.event.merge_group.base_ref || github.ref_name }}
 on:
   pull_request:
     branches: [main, dev, production]
-    paths: ['.railway/**', '**/.railway/**', '**/railway.*', '.dockerignore', '**/*.go', '**/go.mod', '**/go.sum', 'administration/**', '**/Dockerfile', 'jetstream/.dockerignore', '.github/workflows/railway.yml', '.github/workflows/publish-railway-images.yml']
+  merge_group:
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
   repository-boundary:
+    name: Verify repository boundary
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -19,6 +21,7 @@ jobs:
           fi
       - run: git diff --check
   images:
+    name: Verify ${{ matrix.component }} container
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -66,3 +69,17 @@ jobs:
             -e HC_JETSTREAM_CONTROL_SECRET=deployment-fixture-credential-32-bytes \
             -e HC_ADMIN_ENCRYPTION_SECRET=deployment-fixture-credential-32-bytes \
             "hypercerts-${COMPONENT}:check" "$@"
+
+  required:
+    name: Verify container packaging
+    if: ${{ always() }}
+    needs: [repository-boundary, images]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require repository boundary and every container check to pass
+        env:
+          BOUNDARY_RESULT: ${{ needs.repository-boundary.result }}
+          IMAGES_RESULT: ${{ needs.images.result }}
+        run: |
+          test "$BOUNDARY_RESULT" = success
+          test "$IMAGES_RESULT" = success

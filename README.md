@@ -52,6 +52,26 @@ DID migration never admits or connects the resolved target automatically. Each o
 
 ## Development
 
+For branch rulesets on `main`, `dev` (staging), and `production`, require these
+GitHub Actions status checks:
+
+- `Verify Relay and Rainbow`
+- `Lint Go`
+- `Validate Changesets`
+- `Verify Jetstream`
+- `Verify administration`
+- `Verify container packaging`
+
+These checks run on every pull request to those branches and on merge queues.
+`Verify container packaging` requires the repository boundary check and all four
+container checks to succeed. Keep `Track local baseline test` non-blocking, and
+do not require image publishing, which runs only after a merge to staging.
+
+After changing check names, run the updated workflows successfully on a pull
+request before selecting the names in the ruleset. GitHub requires a successful
+check within the past seven days; see
+[troubleshooting required status checks](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks).
+
 Install Go 1.26.1 or the toolchain selected by `go.mod`. Relay links SQLite through CGO, so a working C compiler is also required.
 
 ```bash
