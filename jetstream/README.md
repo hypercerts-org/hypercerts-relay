@@ -151,12 +151,14 @@ running job from its persisted page/repository progress. A crash before progress
 acknowledgment may replay work safely.
 
 Coverage is explicitly `current_state`: a PDS snapshot cannot prove historical
-event completeness. Unavailable sources, changed
-DID hosting, stale snapshots, and the 64
-MiB per-repository input limit produce `incomplete`; malformed or unverifiable
-input produces `failed`. Both require an explicit retry. Local persistence
-failures stop the runtime without acknowledging completion. Each repository
-request has a two-minute deadline. Reconciliation currently scans the archive
+event completeness. Direct `getRepo` requests retry transient errors (excluding invalid snapshots) up to three times, with 50 ms then 100 ms delays. After retries are exhausted a status of`incomplete` will be reported unless there is a  malformed or unverifiable
+input which returns `failed`. An explicit job retry is required for these statuses. Local persistence failures stop the runtime
+without acknowledging completion. Each repository's fetch and reconciliation
+share a two-minute deadline.
+
+Jetstream will emit a warning message containing details on the failure, optionally the repo did if is is known.
+
+Reconciliation currently scans the archive
 under its rewrite lock, so large archives can pause live appends during an
 individual repository reconciliation.
 

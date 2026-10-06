@@ -5,7 +5,9 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"slices"
 	"time"
 
@@ -25,6 +27,69 @@ type PDSProcessor struct {
 	HTTPClient *http.Client
 	Directory  *identity.Directory
 	Reconcile  func(context.Context, ingest.Snapshot) error
+}
+
+const (
+	pdsStageListRepos      = "listRepos"
+	pdsStageGetRepoRequest = "getRepo/request"
+	pdsStageGetRepoBody    = "getRepo/body"
+
+	pdsCauseTimeout   = "timeout"
+	pdsCauseCanceled  = "cancel"
+	pdsCauseBodyRead  = "body_read"
+	pdsCauseHTTP      = "http"
+	pdsCauseTransport = "transport"
+	pdsCauseUnknown   = "unknown"
+)
+
+const (
+	pdsGetRepoMaxAttempts       = 3
+	pdsGetRepoRetryInitialDelay = 50 * time.Millisecond
+)
+
+type pdsAttemptFailure struct {
+	outcome       *InputError
+	cause         error
+	stage         string
+	causeClass    string
+	repositoryDID string
+	httpStatus    int
+}
+
+func (e *pdsAttemptFailure) Error() string { return e.outcome.Error() }
+
+func (e *pdsAttemptFailure) Unwrap() []error { return []error{e.outcome, e.cause} }
+
+func newPDSAttemptFailure(outcome *InputError, cause error, stage, repositoryDID string, bodyRead bool) *pdsAttemptFailure {
+	failure := &pdsAttemptFailure{
+		outcome:       outcome,
+		cause:         cause,
+		stage:         stage,
+		repositoryDID: repositoryDID,
+		causeClass:    pdsCauseUnknown,
+	}
+	var networkErr net.Error
+	networkTimeout := errors.As(cause, &networkErr) && networkErr.Timeout()
+	switch {
+	case errors.Is(cause, context.DeadlineExceeded) || networkTimeout:
+		failure.causeClass = pdsCauseTimeout
+	case errors.Is(cause, context.Canceled):
+		failure.causeClass = pdsCauseCanceled
+	case bodyRead:
+		failure.causeClass = pdsCauseBodyRead
+	default:
+		var responseErr *xrpc.Error
+		if errors.As(cause, &responseErr) && responseErr.StatusCode > 0 {
+			failure.causeClass = pdsCauseHTTP
+			failure.httpStatus = responseErr.StatusCode
+			break
+		}
+		var urlErr *url.Error
+		if errors.As(cause, &urlErr) || networkErr != nil {
+			failure.causeClass = pdsCauseTransport
+		}
+	}
+	return failure
 }
 
 func (p PDSProcessor) Run(ctx context.Context, job Job) error {
@@ -53,7 +118,7 @@ func (p PDSProcessor) Run(ctx context.Context, job Job) error {
 func (p PDSProcessor) enumerateInventory(ctx context.Context, client *atmossync.Client, job *Job) error {
 	for page, err := range client.ListRepos(ctx, 100, job.Cursor) {
 		if err != nil {
-			return inputFailure(ctx, "source_unavailable")
+			return newListReposAttemptFailure(ctx, err)
 		}
 		entries := make(map[string]string)
 		for _, entry := range page.Entries {
@@ -85,6 +150,15 @@ func (p PDSProcessor) enumerateInventory(ctx context.Context, client *atmossync.
 	return nil
 }
 
+func newListReposAttemptFailure(ctx context.Context, cause error) error {
+	outcome := inputFailure(ctx, "source_unavailable")
+	var input *InputError
+	if !errors.As(outcome, &input) {
+		return outcome
+	}
+	return newPDSAttemptFailure(input, cause, pdsStageListRepos, "", false)
+}
+
 func (p PDSProcessor) processFrozenInventory(ctx context.Context, client *atmossync.Client, job Job) error {
 	entries, err := p.Manager.Inventory(job.ID)
 	if err != nil {
@@ -104,6 +178,8 @@ func (p PDSProcessor) client(job Job) *atmossync.Client {
 	// not silently enroll a migration target or change coverage attribution.
 	httpClient := *p.HTTPClient
 	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	// Keep XRPC retries disabled: the processor applies a narrower retry policy
+	// only around direct getRepo fetches, not listRepos or snapshot validation.
 	return atmossync.NewClient(atmossync.Options{Client: &xrpc.Client{Host: job.PDS, HTTPClient: gt.Some(&httpClient), Retry: gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(1)})}, Directory: gt.Some(p.Directory)})
 }
 
@@ -235,7 +311,7 @@ func (p PDSProcessor) repository(ctx context.Context, client *atmossync.Client, 
 	if err := p.verifySource(ctx, entry.DID, job.PDS); err != nil {
 		return err
 	}
-	r, commit, err := fetchRepository(ctx, client, entry.DID)
+	r, commit, err := fetchRepositoryWithRetry(ctx, client, entry.DID)
 	if err != nil {
 		return err
 	}
@@ -253,6 +329,63 @@ func (p PDSProcessor) repository(ctx context.Context, client *atmossync.Client, 
 		return err
 	}
 	return p.Manager.Checkpoint(job.ID, string(entry.DID), commit.Rev, job.Cursor)
+}
+
+func fetchRepositoryWithRetry(ctx context.Context, client *atmossync.Client, did atmos.DID) (*repo.Repo, *repo.Commit, error) {
+	delay := pdsGetRepoRetryInitialDelay
+	for attempt := 1; attempt <= pdsGetRepoMaxAttempts; attempt++ {
+		r, commit, err := fetchRepository(ctx, client, did)
+		if err == nil || attempt == pdsGetRepoMaxAttempts || !retryablePDSGetRepoFailure(err) {
+			return r, commit, err
+		}
+
+		var failure *pdsAttemptFailure
+		if !errors.As(err, &failure) {
+			return nil, nil, err
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			if errors.Is(ctx.Err(), context.Canceled) {
+				return nil, nil, err
+			}
+			input := &InputError{Code: "repository_unavailable", Unavailable: true}
+			return nil, nil, newPDSAttemptFailure(input, ctx.Err(), failure.stage, string(did), failure.stage == pdsStageGetRepoBody)
+		case <-timer.C:
+		}
+		delay *= 2
+	}
+	return nil, nil, &InputError{Code: "repository_unavailable", Unavailable: true}
+}
+
+func retryablePDSGetRepoFailure(err error) bool {
+	var failure *pdsAttemptFailure
+	if !errors.As(err, &failure) || (failure.stage != pdsStageGetRepoRequest && failure.stage != pdsStageGetRepoBody) {
+		return false
+	}
+	if errors.Is(failure.cause, context.Canceled) {
+		return false
+	}
+	var responseErr *xrpc.Error
+	if errors.As(failure.cause, &responseErr) {
+		status := responseErr.StatusCode
+		return status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || (status >= 500 && status <= 599)
+	}
+	if errors.Is(failure.cause, context.DeadlineExceeded) {
+		return true
+	}
+	var networkErr net.Error
+	if errors.As(failure.cause, &networkErr) {
+		return true
+	}
+	var urlErr *url.Error
+	if errors.As(failure.cause, &urlErr) {
+		return true
+	}
+	// A non-EOF error from the getRepo response body is a failed transport
+	// read, not evidence that the CAR itself is malformed.
+	return failure.stage == pdsStageGetRepoBody
 }
 
 // repositoryReadErrors records a non-EOF getRepo body failure so it cannot
@@ -308,7 +441,8 @@ func verifySourceIdentity(ident *identity.Identity, pds string) error {
 func fetchRepository(ctx context.Context, client *atmossync.Client, did atmos.DID) (*repo.Repo, *repo.Commit, error) {
 	body, err := client.GetRepoStream(ctx, did, "")
 	if err != nil {
-		return nil, nil, &InputError{Code: "repository_unavailable", Unavailable: true}
+		input := &InputError{Code: "repository_unavailable", Unavailable: true}
+		return nil, nil, newPDSAttemptFailure(input, err, pdsStageGetRepoRequest, string(did), false)
 	}
 	defer body.Close()
 	// Bound transient full-CAR input. Exceeding the bound is explicit incomplete
@@ -323,7 +457,12 @@ func fetchRepository(ctx context.Context, client *atmossync.Client, did atmos.DI
 		return nil, nil, &InputError{Code: "repository_size_limit", Unavailable: true}
 	}
 	if ctx.Err() != nil || readErrors.err != nil {
-		return nil, nil, &InputError{Code: "repository_unavailable", Unavailable: true}
+		cause := readErrors.err
+		if contextCause := context.Cause(ctx); contextCause != nil {
+			cause = contextCause
+		}
+		input := &InputError{Code: "repository_unavailable", Unavailable: true}
+		return nil, nil, newPDSAttemptFailure(input, cause, pdsStageGetRepoBody, string(did), readErrors.err != nil)
 	}
 	if errors.Is(err, io.ErrUnexpectedEOF) {
 		return nil, nil, &InputError{Code: "repository_incomplete", Unavailable: true}
