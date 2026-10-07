@@ -17,6 +17,10 @@ import (
 const (
 	repositoryRetryPrefix = "hypercerts/backfill-repo-retry/"
 	pdsCooldownPrefix     = "hypercerts/backfill-pds-cooldown/"
+
+	maxRepositoryAttempts    = 3
+	repositoryRetryBaseDelay = time.Second
+	repositoryRetryMaxDelay  = 15 * time.Minute
 )
 
 // RepositoryRetryState is the derived or persisted state of one repository in
@@ -37,11 +41,13 @@ const (
 type RepositoryFailureCategory string
 
 const (
-	RepositoryFailureTimeout   RepositoryFailureCategory = "timeout"
-	RepositoryFailureTransport RepositoryFailureCategory = "transport"
-	RepositoryFailureBodyRead  RepositoryFailureCategory = "body_read"
-	RepositoryFailureHTTP      RepositoryFailureCategory = "http"
-	RepositoryFailureUnknown   RepositoryFailureCategory = "unknown"
+	RepositoryFailureTimeout     RepositoryFailureCategory = "timeout"
+	RepositoryFailureTransport   RepositoryFailureCategory = "transport"
+	RepositoryFailureBodyRead    RepositoryFailureCategory = "body_read"
+	RepositoryFailureHTTP        RepositoryFailureCategory = "http"
+	RepositoryFailureUnknown     RepositoryFailureCategory = "unknown"
+	RepositoryFailureInterrupted RepositoryFailureCategory = "interrupted"
+	RepositoryFailureRejected    RepositoryFailureCategory = "rejected"
 )
 
 // RepositoryFailureStage limits stored failure location to direct getRepo
@@ -59,6 +65,7 @@ type RepositoryRetryFailure struct {
 	Category   RepositoryFailureCategory `json:"category"`
 	HTTPStatus int                       `json:"httpStatus,omitempty"`
 	Stage      RepositoryFailureStage    `json:"stage"`
+	Code       string                    `json:"code,omitempty"`
 }
 
 // RepositoryRetry is the repository-local attempt state for one job's frozen
@@ -83,8 +90,9 @@ type PDSCooldown struct {
 }
 
 var (
-	ErrRepositoryCoolingDown = errors.New("PDS is in repository retry cooldown")
-	ErrRepositoryRetryNotDue = errors.New("repository retry deadline has not elapsed")
+	ErrRepositoryCoolingDown    = errors.New("PDS is in repository retry cooldown")
+	ErrRepositoryRetryNotDue    = errors.New("repository retry deadline has not elapsed")
+	ErrRepositoryRetryExhausted = errors.New("repository retry attempt budget is exhausted")
 )
 
 func repositoryRetryJobPrefix(jobID string) []byte {
@@ -211,6 +219,9 @@ func (m *Manager) BeginRepositoryAttempt(jobID, did string) (RepositoryRetry, er
 	}
 	if current.State == RepositoryRetryComplete || current.State == RepositoryRetryInFlight || current.State == RepositoryRetryUnresolved {
 		return RepositoryRetry{}, ErrConflict
+	}
+	if current.Attempts >= maxRepositoryAttempts {
+		return RepositoryRetry{}, ErrRepositoryRetryExhausted
 	}
 	if current.State == RepositoryRetryWait && current.RetryAt.After(time.Now()) {
 		return RepositoryRetry{}, ErrRepositoryRetryNotDue
@@ -342,6 +353,51 @@ func (m *Manager) CheckpointRepository(jobID, did, listedRevision, completedRevi
 	return m.commitRepositoryRetryBatch(next, true, nil, [][]byte{repositoryRetryKey(jobID, did)}, nil)
 }
 
+func (m *Manager) repositoryRetryDeleteKeysLocked(jobID string, unresolvedOnly bool) ([][]byte, error) {
+	prefix := repositoryRetryJobPrefix(jobID)
+	var inv inventory
+	var err error
+	var job Job
+	if unresolvedOnly {
+		job = m.data.Jobs[jobID]
+		inv, err = m.readInventory(jobID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	iter, err := m.db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: store.PrefixUpperBound(prefix)})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = iter.Close() }()
+	var deletes [][]byte
+	for iter.First(); iter.Valid(); iter.Next() {
+		var retry RepositoryRetry
+		if err := json.Unmarshal(iter.Value(), &retry); err != nil {
+			return nil, errors.New("invalid persisted repository retry state")
+		}
+		key := append([]byte(nil), iter.Key()...)
+		keyDID, err := decodeRepositoryRetryDID(prefix, key)
+		if err != nil || keyDID != retry.DID || retry.JobID != jobID || !validPersistedRepositoryRetry(retry) {
+			return nil, errors.New("invalid persisted repository retry state")
+		}
+		if unresolvedOnly {
+			listedRevision, exists := inv.Entries[retry.DID]
+			if !exists || listedRevision != retry.ListedRevision || retry.State != RepositoryRetryUnresolved {
+				continue
+			}
+			if _, complete := job.CompletedRepos[retry.DID]; complete {
+				continue
+			}
+		}
+		deletes = append(deletes, key)
+	}
+	if err := iter.Error(); err != nil {
+		return nil, err
+	}
+	return deletes, nil
+}
+
 // ResetUnresolvedRepositoryRetries deletes only unresolved rows for an eligible
 // non-running job. Deletion restores the implicit ready state and zeroes this
 // job/repository's attempt count; checkpointed repositories are never touched.
@@ -400,6 +456,38 @@ func unresolvedRepositoryRetryDeletes(iter *pebble.Iterator, jobID string, job J
 		return nil, err
 	}
 	return deletes, nil
+}
+
+// RecordPDSCooldown monotonically extends the active job's canonical PDS-origin
+// deadline without creating a repository retry row. The cooldown is synced
+// through the retry-state batch so all jobs for that origin observe it.
+func (m *Manager) RecordPDSCooldown(jobID string, until time.Time) error {
+	until = until.UTC()
+	if jobID == "" || !validRetryDeadline(until) || !until.After(time.Now().UTC()) {
+		return ErrInvalidInput
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	job, ok := m.data.Jobs[jobID]
+	if !ok {
+		return ErrNotFound
+	}
+	if !m.active(jobID) {
+		return ErrConflict
+	}
+	canonical, err := normalizeSource(job.PDS)
+	if err != nil || canonical != job.PDS {
+		return errors.New("invalid persisted job source")
+	}
+	existing, found, err := m.readPDSCooldownLocked(canonical)
+	if err != nil {
+		return err
+	}
+	if found && !until.After(existing.Until) {
+		return nil
+	}
+	cooldown := PDSCooldown{PDS: canonical, Until: until}
+	return m.commitRepositoryRetryBatch(m.data, false, nil, nil, &cooldown)
 }
 
 // GetPDSCooldown returns the canonical origin's persisted cooldown, including
@@ -492,6 +580,103 @@ func (m *Manager) repositoryResetEligibleLocked(job Job) bool {
 	return m.data.SourceRevisions[job.PDS] == 0 || job.SourceRevision == m.data.SourceRevisions[job.PDS]
 }
 
+func (m *Manager) pendingJobDueLocked(job Job, now time.Time) (time.Time, bool, error) {
+	cooldown, coolingDown, err := m.readPDSCooldownLocked(job.PDS)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	if !job.TotalReposKnown {
+		if coolingDown && cooldown.Until.After(now) {
+			return cooldown.Until, true, nil
+		}
+		return now, true, nil
+	}
+	inv, err := m.readInventory(job.ID)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	var earliest time.Time
+	for did, listedRevision := range inv.Entries {
+		if completedRevisionAtLeast(job.CompletedRepos[did], listedRevision) {
+			continue
+		}
+		retry, err := m.repositoryRetryLocked(job, did, listedRevision)
+		if err != nil {
+			return time.Time{}, false, err
+		}
+		var due time.Time
+		switch retry.State {
+		case RepositoryRetryReady, RepositoryRetryInFlight:
+			due = now
+		case RepositoryRetryWait:
+			due = retry.RetryAt
+		case RepositoryRetryUnresolved:
+			continue
+		default:
+			return time.Time{}, false, errors.New("invalid repository retry state")
+		}
+		if coolingDown && cooldown.Until.After(due) {
+			due = cooldown.Until
+		}
+		if earliest.IsZero() || due.Before(earliest) {
+			earliest = due
+		}
+	}
+	if earliest.IsZero() {
+		// Give the processor one pass to persist the terminal outcome for an
+		// inventory whose remaining entries are all already resolved.
+		return now, true, nil
+	}
+	return earliest, true, nil
+}
+
+func completedRevisionAtLeast(completed, listed string) bool {
+	completedTID, completedErr := atmos.ParseTID(completed)
+	listedTID, listedErr := atmos.ParseTID(listed)
+	return completedErr == nil && listedErr == nil && completedTID.Integer() >= listedTID.Integer()
+}
+
+func (m *Manager) nextWorkDelay() (time.Duration, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := time.Now().UTC()
+	var earliest time.Time
+	for _, job := range m.data.Jobs {
+		if job.State == Pending {
+			due, found, err := m.pendingJobDueLocked(job, now)
+			if err != nil {
+				return 0, false, err
+			}
+			if found && (earliest.IsZero() || due.Before(earliest)) {
+				earliest = due
+			}
+		}
+		if m.receiptSender != nil && job.State == Complete && job.ReceiptPending {
+			due := job.ReceiptRetryAt
+			if due.IsZero() || !due.After(now) {
+				return 0, true, nil
+			}
+			if earliest.IsZero() || due.Before(earliest) {
+				earliest = due
+			}
+		}
+	}
+	if earliest.IsZero() {
+		return 0, false, nil
+	}
+	return max(time.Until(earliest), 0), true, nil
+}
+
+func (m *Manager) signalScheduler() {
+	if m.wake == nil {
+		return
+	}
+	select {
+	case m.wake <- struct{}{}:
+	default:
+	}
+}
+
 func (m *Manager) commitRepositoryRetryBatch(next data, persistJob bool, retry *RepositoryRetry, deleteRetries [][]byte, cooldown *PDSCooldown) error {
 	batch := m.db.NewBatch()
 	defer func() { _ = batch.Close() }()
@@ -533,6 +718,7 @@ func (m *Manager) commitRepositoryRetryBatch(next data, persistJob bool, retry *
 	if persistJob {
 		m.data = next
 	}
+	m.signalScheduler()
 	return nil
 }
 
@@ -549,9 +735,10 @@ func decodeRepositoryRetryDID(prefix, key []byte) (string, error) {
 }
 
 func validRepositoryFailure(failure RepositoryRetryFailure) bool {
-	categoryValid := failure.Category == RepositoryFailureTimeout || failure.Category == RepositoryFailureTransport || failure.Category == RepositoryFailureBodyRead || failure.Category == RepositoryFailureHTTP || failure.Category == RepositoryFailureUnknown
+	categoryValid := failure.Category == RepositoryFailureTimeout || failure.Category == RepositoryFailureTransport || failure.Category == RepositoryFailureBodyRead || failure.Category == RepositoryFailureHTTP || failure.Category == RepositoryFailureUnknown || failure.Category == RepositoryFailureInterrupted || failure.Category == RepositoryFailureRejected
 	stageValid := failure.Stage == RepositoryFailureGetRepoRequest || failure.Stage == RepositoryFailureGetRepoBody
-	if !categoryValid || !stageValid {
+	codeValid := len(failure.Code) <= 64 && strings.Trim(failure.Code, "abcdefghijklmnopqrstuvwxyz0123456789_") == ""
+	if !categoryValid || !stageValid || !codeValid {
 		return false
 	}
 	if failure.Category == RepositoryFailureHTTP {

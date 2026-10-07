@@ -151,12 +151,42 @@ running job from its persisted page/repository progress. A crash before progress
 acknowledgment may replay work safely.
 
 Coverage is explicitly `current_state`: a PDS snapshot cannot prove historical
-event completeness. Direct `getRepo` requests retry transient errors (excluding invalid snapshots) up to three times, with 50 ms then 100 ms delays. After retries are exhausted a status of`incomplete` will be reported unless there is a  malformed or unverifiable
-input which returns `failed`. An explicit job retry is required for these statuses. Local persistence failures stop the runtime
-without acknowledging completion. Each repository's fetch and reconciliation
-share a two-minute deadline.
+event completeness. The manager durably schedules at most three `getRepo`
+attempts per job/repository retry cycle. Fallback delays use exponential backoff
+starting at one second, ±20% jitter, and a 15-minute cap. A valid `Retry-After`
+(delta seconds or HTTP date) or `RateLimit-Reset` (Unix seconds) extends the
+scheduled deadline; when both are valid, the later deadline wins. Server
+cooldowns are never shortened by the fallback cap. A 429 also persists a
+PDS-origin-wide cooldown, preventing requests from any job to that origin until
+the advertised deadline (or fallback deadline when no valid reset is supplied).
+A `listRepos` 429 ends that inventory attempt as `incomplete`; pagination is not
+automatically retried. The persisted cooldown still blocks other jobs for the
+same origin until its deadline, and an operator Retry can resume the inventory.
 
-Jetstream will emit a warning message containing details on the failure, optionally the repo did if is is known.
+A repository retry is one `getRepo` request; the downloader does not sleep or
+retry locally. The manager persists attempt-before-request, failure, and due
+state, then yields so work for other PDS origins can proceed. It retries 408,
+429, 5xx, transport/timeouts, and interrupted or truncated CAR bodies. CARs
+reaching the 64 MiB input cap remain unresolved, not permanently rejected, and
+require an explicit Retry to reacquire that coordinate. Invalid
+or unverifiable snapshots remain bounded permanent rejections and are not
+retried automatically. After the retry budget is exhausted, unresolved coverage
+is reported as `incomplete`; permanent snapshot rejection remains `failed`.
+Each repository's fetch and reconciliation share a two-minute deadline. Local
+persistence failures stop the runtime without acknowledging completion.
+
+An explicit Retry of an `incomplete` job grants unresolved repositories a fresh
+per-repository budget while preserving the frozen inventory and archive-backed
+completed checkpoints. Retrying a `failed` job refreshes its inventory and
+atomically clears retry rows from the discarded inventory, but retains completed
+revision checkpoints. Once the refreshed inventory is complete, checkpoints
+that are absent or older than their listed revision are discarded; a completed
+revision at or newer than the listing is skipped. The bounded rejection ledger
+remains effective for the same PDS/policy/DID/revision until that coordinate
+changes. Restart preserves retry deadlines and attempt counts; an interrupted
+`in_flight` attempt consumes its existing budget, and canceled jobs are not
+revived. These scheduling details are internal job behavior; no administration
+UI timing fields are introduced in this phase.
 
 Reconciliation currently scans the archive
 under its rewrite lock, so large archives can pause live appends during an

@@ -5,10 +5,13 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
 	"slices"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
@@ -42,54 +45,134 @@ const (
 	pdsCauseUnknown   = "unknown"
 )
 
-const (
-	pdsGetRepoMaxAttempts       = 3
-	pdsGetRepoRetryInitialDelay = 50 * time.Millisecond
-)
+type pdsResponseCaptureKey struct{}
+
+type pdsResponseCapture struct {
+	status int
+	header http.Header
+}
+
+type pdsResponseCaptureTransport struct{ base http.RoundTripper }
+
+func (t pdsResponseCaptureTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	response, err := base.RoundTrip(request)
+	if response != nil {
+		if capture, ok := request.Context().Value(pdsResponseCaptureKey{}).(*pdsResponseCapture); ok {
+			capture.status = response.StatusCode
+			capture.header = response.Header.Clone()
+		}
+	}
+	return response, err
+}
 
 type pdsAttemptFailure struct {
 	outcome       *InputError
-	cause         error
 	stage         string
 	causeClass    string
 	repositoryDID string
 	httpStatus    int
+	retryable     bool
+	retryAt       time.Time
 }
 
 func (e *pdsAttemptFailure) Error() string { return e.outcome.Error() }
 
-func (e *pdsAttemptFailure) Unwrap() []error { return []error{e.outcome, e.cause} }
+func (e *pdsAttemptFailure) Unwrap() error { return e.outcome }
 
-func newPDSAttemptFailure(outcome *InputError, cause error, stage, repositoryDID string, bodyRead bool) *pdsAttemptFailure {
-	failure := &pdsAttemptFailure{
-		outcome:       outcome,
-		cause:         cause,
-		stage:         stage,
-		repositoryDID: repositoryDID,
-		causeClass:    pdsCauseUnknown,
-	}
+type pdsJobOutcome struct {
+	input   *InputError
+	failure *pdsAttemptFailure
+}
+
+func (e *pdsJobOutcome) Error() string { return e.input.Error() }
+
+func (e *pdsJobOutcome) Unwrap() []error { return []error{e.input, e.failure} }
+
+func newPDSAttemptFailure(outcome *InputError, cause error, stage, repositoryDID string, bodyRead bool, capture *pdsResponseCapture) *pdsAttemptFailure {
+	failure := &pdsAttemptFailure{outcome: outcome, stage: stage, repositoryDID: repositoryDID, causeClass: pdsCauseUnknown}
 	var networkErr net.Error
 	networkTimeout := errors.As(cause, &networkErr) && networkErr.Timeout()
+	var responseErr *xrpc.Error
+	_ = errors.As(cause, &responseErr)
+	if capture != nil {
+		failure.retryAt = pdsServerRetryDeadline(capture.header, time.Now())
+	}
 	switch {
 	case errors.Is(cause, context.DeadlineExceeded) || networkTimeout:
 		failure.causeClass = pdsCauseTimeout
+		failure.retryable = true
 	case errors.Is(cause, context.Canceled):
 		failure.causeClass = pdsCauseCanceled
 	case bodyRead:
 		failure.causeClass = pdsCauseBodyRead
+		failure.retryable = true
+	case capture != nil && capture.status >= 400:
+		failure.causeClass = pdsCauseHTTP
+		failure.httpStatus = capture.status
+		failure.retryable = retryablePDSStatus(capture.status)
+	case responseErr != nil && responseErr.StatusCode > 0:
+		failure.causeClass = pdsCauseHTTP
+		failure.httpStatus = responseErr.StatusCode
+		failure.retryable = retryablePDSStatus(responseErr.StatusCode)
 	default:
-		var responseErr *xrpc.Error
-		if errors.As(cause, &responseErr) && responseErr.StatusCode > 0 {
-			failure.causeClass = pdsCauseHTTP
-			failure.httpStatus = responseErr.StatusCode
-			break
-		}
 		var urlErr *url.Error
 		if errors.As(cause, &urlErr) || networkErr != nil {
 			failure.causeClass = pdsCauseTransport
+			failure.retryable = true
 		}
 	}
 	return failure
+}
+
+func retryablePDSStatus(status int) bool {
+	return status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status >= 500 && status <= 599
+}
+
+func pdsServerRetryDeadline(headers http.Header, now time.Time) time.Time {
+	var latest time.Time
+	if reset := strings.TrimSpace(headers.Get("RateLimit-Reset")); reset != "" {
+		if unix, err := strconv.ParseInt(reset, 10, 64); err == nil {
+			candidate := time.Unix(unix, 0).UTC()
+			if validRetryDeadline(candidate) && candidate.After(now) {
+				latest = candidate
+			}
+		}
+	}
+	if value := strings.TrimSpace(headers.Get("Retry-After")); value != "" {
+		var candidate time.Time
+		maxSeconds := time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC).Unix() - now.Unix()
+		if seconds, err := strconv.ParseInt(value, 10, 64); err == nil && seconds >= 0 && seconds <= maxSeconds {
+			candidate = time.Unix(now.Unix()+seconds, int64(now.Nanosecond())).UTC()
+		} else if parsed, err := http.ParseTime(value); err == nil {
+			candidate = parsed.UTC()
+		}
+		if validRetryDeadline(candidate) && candidate.After(latest) {
+			latest = candidate
+		}
+	}
+	return latest
+}
+
+func repositoryRetryDeadline(attempt int, serverDeadline, now time.Time) time.Time {
+	delay := repositoryRetryBaseDelay
+	for step := 1; step < attempt && delay < repositoryRetryMaxDelay; step++ {
+		delay = min(delay*2, repositoryRetryMaxDelay)
+	}
+	// ±20% jitter keeps concurrent repository retries from synchronizing.
+	spread := int64(delay / 5)
+	if spread > 0 {
+		delay += time.Duration(rand.Int63n(spread*2+1) - spread)
+	}
+	delay = min(max(delay, time.Duration(1)), repositoryRetryMaxDelay)
+	deadline := now.Add(delay)
+	if serverDeadline.After(deadline) {
+		deadline = serverDeadline
+	}
+	return deadline.UTC()
 }
 
 func (p PDSProcessor) Run(ctx context.Context, job Job) error {
@@ -116,9 +199,19 @@ func (p PDSProcessor) Run(ctx context.Context, job Job) error {
 // a job. It persists only validated active DID/revision coordinates; repository
 // acquisition starts after the terminal page makes the denominator durable.
 func (p PDSProcessor) enumerateInventory(ctx context.Context, client *atmossync.Client, job *Job) error {
-	for page, err := range client.ListRepos(ctx, 100, job.Cursor) {
+	capture := &pdsResponseCapture{}
+	requestCtx := context.WithValue(ctx, pdsResponseCaptureKey{}, capture)
+	for page, err := range client.ListRepos(requestCtx, 100, job.Cursor) {
 		if err != nil {
-			return newListReposAttemptFailure(ctx, err)
+			failure := newListReposAttemptFailure(requestCtx, err, capture)
+			var attemptFailure *pdsAttemptFailure
+			if errors.As(failure, &attemptFailure) && attemptFailure.httpStatus == http.StatusTooManyRequests {
+				deadline := repositoryRetryDeadline(1, attemptFailure.retryAt, time.Now())
+				if err := p.Manager.RecordPDSCooldown(job.ID, deadline); err != nil {
+					return err
+				}
+			}
+			return failure
 		}
 		entries := make(map[string]string)
 		for _, entry := range page.Entries {
@@ -141,6 +234,8 @@ func (p PDSProcessor) enumerateInventory(ctx context.Context, client *atmossync.
 		if page.NextCursor == "" {
 			job.TotalReposKnown = true
 		}
+		capture.status = 0
+		capture.header = nil
 	}
 	if !job.TotalReposKnown {
 		if err := p.Manager.CheckpointInventory(job.ID, job.Cursor, nil, true); err != nil {
@@ -150,13 +245,13 @@ func (p PDSProcessor) enumerateInventory(ctx context.Context, client *atmossync.
 	return nil
 }
 
-func newListReposAttemptFailure(ctx context.Context, cause error) error {
+func newListReposAttemptFailure(ctx context.Context, cause error, capture *pdsResponseCapture) error {
 	outcome := inputFailure(ctx, "source_unavailable")
 	var input *InputError
 	if !errors.As(outcome, &input) {
 		return outcome
 	}
-	return newPDSAttemptFailure(input, cause, pdsStageListRepos, "", false)
+	return newPDSAttemptFailure(input, cause, pdsStageListRepos, "", false, capture)
 }
 
 func (p PDSProcessor) processFrozenInventory(ctx context.Context, client *atmossync.Client, job Job) error {
@@ -164,13 +259,213 @@ func (p PDSProcessor) processFrozenInventory(ctx context.Context, client *atmoss
 	if err != nil {
 		return err
 	}
+	var retryPending bool
+	var unavailable bool
+	var unavailableCode string
+	var permanentCode string
+	var outcomeFailure *pdsAttemptFailure
 	for _, frozen := range entries {
-		entry := atmossync.ListReposEntry{DID: atmos.DID(frozen.DID), Rev: frozen.Revision, Active: true}
-		if _, err := p.processActiveEntry(ctx, client, &job, entry); err != nil {
+		did := frozen.DID
+		if completedRevisionAtLeast(job.CompletedRepos[did], frozen.Revision) {
+			continue
+		}
+		entry := atmossync.ListReposEntry{DID: atmos.DID(did), Rev: frozen.Revision, Active: true}
+		retry, err := p.Manager.GetRepositoryRetry(job.ID, did)
+		if err != nil {
 			return err
 		}
+		switch retry.State {
+		case RepositoryRetryInFlight:
+			var retryAt *time.Time
+			if retry.Attempts < maxRepositoryAttempts {
+				deadline := repositoryRetryDeadline(retry.Attempts, time.Time{}, time.Now())
+				retryAt = &deadline
+			}
+			stored, err := p.Manager.RecordRepositoryFailure(job.ID, did, RepositoryRetryFailure{Category: RepositoryFailureInterrupted, Stage: RepositoryFailureGetRepoRequest}, retryAt, nil)
+			if err != nil {
+				return err
+			}
+			if stored.State == RepositoryRetryWait {
+				retryPending = true
+			} else {
+				unavailable = true
+				if unavailableCode == "" {
+					unavailableCode = "repository_unavailable"
+				}
+			}
+			continue
+		case RepositoryRetryUnresolved:
+			if retry.Failure != nil && retry.Failure.Category == RepositoryFailureRejected {
+				code := p.rejectionCode(job, entry)
+				if permanentCode == "" {
+					permanentCode = code
+				}
+			} else {
+				unavailable = true
+				if retry.Failure != nil && retry.Failure.Code != "" && unavailableCode == "" {
+					unavailableCode = retry.Failure.Code
+				}
+			}
+			continue
+		case RepositoryRetryWait:
+			if retry.RetryAt.After(time.Now()) {
+				retryPending = true
+				continue
+			}
+		case RepositoryRetryReady:
+		default:
+			return errors.New("invalid repository retry state")
+		}
+		cooldown, found, err := p.Manager.GetPDSCooldown(job.PDS)
+		if err != nil {
+			return err
+		}
+		if found && cooldown.Until.After(time.Now()) {
+			retryPending = true
+			break
+		}
+		if err := p.validateListedSnapshot(&job, entry); err != nil {
+			var input *InputError
+			if errors.As(err, &input) && !input.Unavailable {
+				if permanentCode == "" {
+					permanentCode = input.Code
+				}
+				continue
+			}
+			return err
+		}
+		attempt, err := p.Manager.BeginRepositoryAttempt(job.ID, did)
+		if errors.Is(err, ErrRepositoryCoolingDown) || errors.Is(err, ErrRepositoryRetryNotDue) {
+			retryPending = true
+			break
+		}
+		if err != nil {
+			return err
+		}
+		err = p.repository(ctx, client, job, entry)
+		if err == nil {
+			continue
+		}
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return ctx.Err()
+		}
+		var input *InputError
+		if !errors.As(err, &input) {
+			return err
+		}
+		var attemptFailure *pdsAttemptFailure
+		isAttemptFailure := errors.As(err, &attemptFailure)
+		if isAttemptFailure {
+			outcomeFailure = attemptFailure
+		}
+		permanent := !input.Unavailable
+		failure := repositoryFailureFor(err, permanent)
+		if permanent {
+			rejectErr := p.rejectSnapshot(&job, did, frozen.Revision, input.Code)
+			var rejectionInput *InputError
+			if !errors.As(rejectErr, &rejectionInput) {
+				return rejectErr
+			}
+		}
+		var retryAt *time.Time
+		var pdsCooldown *time.Time
+		canRetry := input.Unavailable && input.Code != "repository_size_limit" && (!isAttemptFailure && input.Code != "source_changed" || isAttemptFailure && attemptFailure.retryable) && attempt.Attempts < maxRepositoryAttempts
+		if canRetry {
+			serverDeadline := time.Time{}
+			if isAttemptFailure {
+				serverDeadline = attemptFailure.retryAt
+			}
+			deadline := repositoryRetryDeadline(attempt.Attempts, serverDeadline, time.Now())
+			retryAt = &deadline
+			if isAttemptFailure && attemptFailure.httpStatus == http.StatusTooManyRequests {
+				pdsCooldown = &deadline
+			}
+		} else if isAttemptFailure && attemptFailure.httpStatus == http.StatusTooManyRequests {
+			deadline := repositoryRetryDeadline(attempt.Attempts, attemptFailure.retryAt, time.Now())
+			pdsCooldown = &deadline
+		}
+		stored, err := p.Manager.RecordRepositoryFailure(job.ID, did, failure, retryAt, pdsCooldown)
+		if err != nil {
+			return err
+		}
+		if permanent {
+			if permanentCode == "" {
+				permanentCode = input.Code
+			}
+		} else if stored.State == RepositoryRetryWait {
+			retryPending = true
+		} else {
+			unavailable = true
+			if unavailableCode == "" {
+				unavailableCode = input.Code
+			}
+		}
+		if isAttemptFailure && attemptFailure.httpStatus == http.StatusTooManyRequests {
+			// A 429 cools the whole admitted origin; do no more PDS work in
+			// this job invocation, even for other repositories.
+			retryPending = true
+			break
+		}
+	}
+	if retryPending {
+		return errJobYield
+	}
+	if permanentCode != "" {
+		return &InputError{Code: permanentCode}
+	}
+	if unavailable {
+		if unavailableCode == "" {
+			unavailableCode = "repository_unavailable"
+		}
+		outcome := &InputError{Code: unavailableCode, Unavailable: true}
+		if outcomeFailure != nil {
+			return &pdsJobOutcome{input: outcome, failure: outcomeFailure}
+		}
+		return outcome
 	}
 	return nil
+}
+
+func (p PDSProcessor) rejectionCode(job Job, entry atmossync.ListReposEntry) string {
+	if rejection, ok := p.Manager.lookupSnapshotRejection(job.PDS, job.Policy.Revision, string(entry.DID), entry.Rev, directPDSSnapshotRejectionKind); ok {
+		return rejection.Code
+	}
+	return "snapshot_rejected"
+}
+
+func repositoryFailureFor(err error, permanent bool) RepositoryRetryFailure {
+	stage := RepositoryFailureGetRepoRequest
+	code := ""
+	var input *InputError
+	if errors.As(err, &input) {
+		code = input.Code
+	}
+	if code == "repository_size_limit" {
+		return RepositoryRetryFailure{Category: RepositoryFailureUnknown, Stage: RepositoryFailureGetRepoBody, Code: code}
+	}
+	var attemptFailure *pdsAttemptFailure
+	if errors.As(err, &attemptFailure) {
+		if attemptFailure.stage == pdsStageGetRepoBody {
+			stage = RepositoryFailureGetRepoBody
+		}
+		if permanent {
+			return RepositoryRetryFailure{Category: RepositoryFailureRejected, Stage: stage, Code: code}
+		}
+		switch attemptFailure.causeClass {
+		case pdsCauseTimeout:
+			return RepositoryRetryFailure{Category: RepositoryFailureTimeout, Stage: stage, Code: code}
+		case pdsCauseTransport:
+			return RepositoryRetryFailure{Category: RepositoryFailureTransport, Stage: stage, Code: code}
+		case pdsCauseBodyRead:
+			return RepositoryRetryFailure{Category: RepositoryFailureBodyRead, Stage: stage, Code: code}
+		case pdsCauseHTTP:
+			return RepositoryRetryFailure{Category: RepositoryFailureHTTP, HTTPStatus: attemptFailure.httpStatus, Stage: stage, Code: code}
+		}
+	}
+	if permanent {
+		return RepositoryRetryFailure{Category: RepositoryFailureRejected, Stage: stage, Code: code}
+	}
+	return RepositoryRetryFailure{Category: RepositoryFailureUnknown, Stage: stage, Code: code}
 }
 
 func (p PDSProcessor) client(job Job) *atmossync.Client {
@@ -178,8 +473,13 @@ func (p PDSProcessor) client(job Job) *atmossync.Client {
 	// not silently enroll a migration target or change coverage attribution.
 	httpClient := *p.HTTPClient
 	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	// Keep XRPC retries disabled: the processor applies a narrower retry policy
-	// only around direct getRepo fetches, not listRepos or snapshot validation.
+	baseTransport := httpClient.Transport
+	if baseTransport == nil {
+		baseTransport = http.DefaultTransport
+	}
+	// Raw response headers are needed to combine Retry-After with
+	// RateLimit-Reset; xrpc.Error retains only one parsed reset value.
+	httpClient.Transport = pdsResponseCaptureTransport{base: baseTransport}
 	return atmossync.NewClient(atmossync.Options{Client: &xrpc.Client{Host: job.PDS, HTTPClient: gt.Some(&httpClient), Retry: gt.Some(xrpc.RetryPolicy{MaxAttempts: gt.Some(1)})}, Directory: gt.Some(p.Directory)})
 }
 
@@ -311,7 +611,7 @@ func (p PDSProcessor) repository(ctx context.Context, client *atmossync.Client, 
 	if err := p.verifySource(ctx, entry.DID, job.PDS); err != nil {
 		return err
 	}
-	r, commit, err := fetchRepositoryWithRetry(ctx, client, entry.DID)
+	r, commit, err := fetchRepository(ctx, client, entry.DID)
 	if err != nil {
 		return err
 	}
@@ -328,64 +628,7 @@ func (p PDSProcessor) repository(ctx context.Context, client *atmossync.Client, 
 		}
 		return err
 	}
-	return p.Manager.Checkpoint(job.ID, string(entry.DID), commit.Rev, job.Cursor)
-}
-
-func fetchRepositoryWithRetry(ctx context.Context, client *atmossync.Client, did atmos.DID) (*repo.Repo, *repo.Commit, error) {
-	delay := pdsGetRepoRetryInitialDelay
-	for attempt := 1; attempt <= pdsGetRepoMaxAttempts; attempt++ {
-		r, commit, err := fetchRepository(ctx, client, did)
-		if err == nil || attempt == pdsGetRepoMaxAttempts || !retryablePDSGetRepoFailure(err) {
-			return r, commit, err
-		}
-
-		var failure *pdsAttemptFailure
-		if !errors.As(err, &failure) {
-			return nil, nil, err
-		}
-		timer := time.NewTimer(delay)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			if errors.Is(ctx.Err(), context.Canceled) {
-				return nil, nil, err
-			}
-			input := &InputError{Code: "repository_unavailable", Unavailable: true}
-			return nil, nil, newPDSAttemptFailure(input, ctx.Err(), failure.stage, string(did), failure.stage == pdsStageGetRepoBody)
-		case <-timer.C:
-		}
-		delay *= 2
-	}
-	return nil, nil, &InputError{Code: "repository_unavailable", Unavailable: true}
-}
-
-func retryablePDSGetRepoFailure(err error) bool {
-	var failure *pdsAttemptFailure
-	if !errors.As(err, &failure) || (failure.stage != pdsStageGetRepoRequest && failure.stage != pdsStageGetRepoBody) {
-		return false
-	}
-	if errors.Is(failure.cause, context.Canceled) {
-		return false
-	}
-	var responseErr *xrpc.Error
-	if errors.As(failure.cause, &responseErr) {
-		status := responseErr.StatusCode
-		return status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || (status >= 500 && status <= 599)
-	}
-	if errors.Is(failure.cause, context.DeadlineExceeded) {
-		return true
-	}
-	var networkErr net.Error
-	if errors.As(failure.cause, &networkErr) {
-		return true
-	}
-	var urlErr *url.Error
-	if errors.As(failure.cause, &urlErr) {
-		return true
-	}
-	// A non-EOF error from the getRepo response body is a failed transport
-	// read, not evidence that the CAR itself is malformed.
-	return failure.stage == pdsStageGetRepoBody
+	return p.Manager.CheckpointRepository(job.ID, string(entry.DID), entry.Rev, commit.Rev, job.Cursor)
 }
 
 // repositoryReadErrors records a non-EOF getRepo body failure so it cannot
@@ -439,10 +682,15 @@ func verifySourceIdentity(ident *identity.Identity, pds string) error {
 }
 
 func fetchRepository(ctx context.Context, client *atmossync.Client, did atmos.DID) (*repo.Repo, *repo.Commit, error) {
+	capture := &pdsResponseCapture{}
+	ctx = context.WithValue(ctx, pdsResponseCaptureKey{}, capture)
 	body, err := client.GetRepoStream(ctx, did, "")
 	if err != nil {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return nil, nil, ctx.Err()
+		}
 		input := &InputError{Code: "repository_unavailable", Unavailable: true}
-		return nil, nil, newPDSAttemptFailure(input, err, pdsStageGetRepoRequest, string(did), false)
+		return nil, nil, newPDSAttemptFailure(input, err, pdsStageGetRepoRequest, string(did), false, capture)
 	}
 	defer body.Close()
 	// Bound transient full-CAR input. Exceeding the bound is explicit incomplete
@@ -461,11 +709,15 @@ func fetchRepository(ctx context.Context, client *atmossync.Client, did atmos.DI
 		if contextCause := context.Cause(ctx); contextCause != nil {
 			cause = contextCause
 		}
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return nil, nil, ctx.Err()
+		}
 		input := &InputError{Code: "repository_unavailable", Unavailable: true}
-		return nil, nil, newPDSAttemptFailure(input, cause, pdsStageGetRepoBody, string(did), readErrors.err != nil)
+		return nil, nil, newPDSAttemptFailure(input, cause, pdsStageGetRepoBody, string(did), readErrors.err != nil, capture)
 	}
 	if errors.Is(err, io.ErrUnexpectedEOF) {
-		return nil, nil, &InputError{Code: "repository_incomplete", Unavailable: true}
+		input := &InputError{Code: "repository_incomplete", Unavailable: true}
+		return nil, nil, newPDSAttemptFailure(input, err, pdsStageGetRepoBody, string(did), true, capture)
 	}
 	if err != nil {
 		return nil, nil, &InputError{Code: "invalid_repository"}
