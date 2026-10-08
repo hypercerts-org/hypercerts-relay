@@ -1138,13 +1138,27 @@ func TestPDSProcessorRateLimitYieldsToOtherPDSAndPersistsCooldown(t *testing.T) 
 	processor := PDSProcessor{Manager: m, HTTPClient: http.DefaultClient, Directory: directory}
 	startedAt := time.Now()
 	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan error, 1)
-	go func() { done <- m.Run(ctx, processor.Run) }()
+	done := make(chan struct{})
+	var runErr error
+	go func() {
+		runErr = m.Run(ctx, processor.Run)
+		close(done)
+	}()
+	// Assertions below can fail before normal shutdown; join the manager before
+	// the deferred Pebble close on every exit path.
+	defer func() {
+		cancel()
+		<-done
+	}()
 
 	require.Eventually(t, func() bool {
 		currentB, getErr := m.Get(jobB.ID)
-		return getErr == nil && currentB.State == Complete && getRepoAttempts.Load() > 0
-	}, time.Second, 5*time.Millisecond, "PDS B should progress after PDS A yields its 429")
+		if getErr != nil || currentB.State != Complete || getRepoAttempts.Load() == 0 {
+			return false
+		}
+		_, found, cooldownErr := m.GetPDSCooldown(pdsA.URL)
+		return cooldownErr == nil && found
+	}, time.Second, 5*time.Millisecond, "PDS B should progress after PDS A yields its 429 and the cooldown is persisted")
 	require.Equal(t, int64(1), getRepoAttempts.Load(), "one 429 must yield to manager scheduling instead of retrying inside the downloader")
 	cooldown, found, err := m.GetPDSCooldown(pdsA.URL)
 	require.NoError(t, err)
@@ -1161,7 +1175,8 @@ func TestPDSProcessorRateLimitYieldsToOtherPDSAndPersistsCooldown(t *testing.T) 
 
 	require.NoError(t, m.Cancel(jobA.ID), "cancellation must work while the job waits for its persisted deadline")
 	cancel()
-	require.ErrorIs(t, <-done, context.Canceled)
+	<-done
+	require.ErrorIs(t, runErr, context.Canceled)
 	require.Equal(t, Canceled, mustGetJob(t, m, jobA.ID).State)
 	require.NoError(t, db.Close())
 
