@@ -602,6 +602,10 @@ func TestPDSProcessorStalledBodyIsIncompleteWithoutRejectionOrProgress(t *testin
 
 	runPDSProcessorUntilIncomplete(t, m, processor)
 	first := m.List()[0]
+	require.NotNil(t, first.Evidence)
+	require.Zero(t, first.Evidence.Scanned)
+	require.Zero(t, first.Evidence.NoMatch)
+	require.Zero(t, first.Evidence.AttributableRecords)
 	require.Equal(t, int64(3), downloads.Load())
 	require.Empty(t, first.CompletedRepos)
 	require.Empty(t, first.Cursor)
@@ -757,6 +761,11 @@ func TestPDSProcessorRetryExhaustionPreservesEarlierRepositoryProgress(t *testin
 	require.ErrorIs(t, <-done, context.Canceled)
 
 	incomplete := m.List()[0]
+	require.NotNil(t, incomplete.Evidence)
+	require.Equal(t, 1, incomplete.Evidence.Scanned)
+	require.Equal(t, 1, incomplete.Evidence.NoMatch)
+	require.Zero(t, incomplete.Evidence.Matching)
+	require.Zero(t, incomplete.Evidence.AttributableRecords)
 	require.Equal(t, Incomplete, incomplete.State)
 	require.Equal(t, "repository_unavailable", incomplete.ErrorCode)
 	require.True(t, incomplete.TotalReposKnown)

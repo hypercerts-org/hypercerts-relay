@@ -227,6 +227,7 @@ export function createApp(
         req.query.pds ? origin.parse(req.query.pds) : "",
       );
     res.json({
+      ...coverage,
       items: coverage.items.map((item) => ({
         ...item,
         reason: item.reason,

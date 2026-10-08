@@ -244,7 +244,7 @@ All paths below start with `/hypercerts/v1`:
 | `POST /jobs` | `{"pds":"https://pds.example","reason":"backfill","requestId":"optional-idempotency-key"}` or reason `quota_recovery`; the same nonempty request ID returns its prior job, while unkeyed duplicate active work is reused and a later terminal recovery creates fresh work. |
 | `GET /jobs?limit=100&after=<cursor>` | Sorted page, maximum 200 jobs, optional `nextCursor`. Concurrent additions may require a fresh listing. |
 | `GET /snapshot-rejections?limit=100&after=<cursor>` | The most recent 1,000 bounded non-payload direct-PDS snapshot rejections, with optional repeated exact `pds` filters. Older rejections are evicted. Returns origin, policy/listed revisions, DID, kind/code and timestamp; never CAR bytes, records, tokens or storage keys. |
-| `GET /coverage?limit=100&after=<pds>` | Latest current-state job per PDS, sorted and paginated by PDS with optional exact `pds` filter. |
+| `GET /coverage?limit=100&after=<pds>` | Current-policy coverage by enabled PDS; sorted by origin. Supports repeated exact `pds` filters. See [Coverage](#coverage). |
 | `GET /jobs/{id}` | Durable state, progress, attempt count, and coverage. |
 | `POST /jobs/{id}/cancel` | Cancels pending/running work. |
 | `POST /jobs/{id}/retry` | Resumes current-policy work from durable progress; a removed source or obsolete revision returns conflict. |
@@ -263,6 +263,42 @@ Errors use a bounded JSON `error` code: 400 invalid input, 401 authentication,
 Mutation bodies are limited to 64 KiB and reject unknown fields/trailing JSON.
 Local persistence errors do not acknowledge a successful change or expose raw
 storage errors. Job progress and outcomes survive restart.
+
+### Coverage
+
+`GET /hypercerts/v1/coverage` returns schema version `1`, scoped to
+`enabled_sources_current_policy`. `summary=1` returns the same response.
+
+- **Sources:** enabled PDS origins and their current source/policy revisions.
+  No matching job means `unknown`.
+- **Selection:** new work and explicit retries supersede earlier acquisitions.
+  This ordering survives restart; legacy jobs use timestamps and job ID.
+- **Aggregate:** always covers all enabled sources, regardless of filters or
+  pagination. It is `complete` only when every source is complete with no known
+  unresolved repositories. Otherwise it is `incomplete`; missing job evidence or
+  an empty source set takes precedence as `unknown`.
+
+`acquisition.counts` applies to the job's inventory, not individual collections.
+Null means unknown, not zero; older jobs may lack these counts.
+
+| Field | Meaning |
+| --- | --- |
+| `initialInventory` | Active repositories in the completed inventory. |
+| `scanned` | Successfully verified and reconciled repositories. |
+| `matching` | Scanned repositories with selected records. |
+| `noMatch` | Successful scans with no selected records. |
+| `unresolved` | Inventory minus scans, including unavailable or invalid snapshots. |
+| `attributableRecords` | Selected records in completed scans, not archive size or event count. |
+
+`acquisition.state` maps pending/running jobs to `running` and incomplete jobs to
+`stopped_incomplete`. Other states are `failed`, `canceled`, `complete`, and
+`unknown`; `retry_waiting` is reserved. Diagnostics include failure category,
+attempts, last saved progress, and an affected DID when available. Stopped/failed
+jobs offer `explicit_retry`; no retry time is available.
+
+`history.state` and `live.state` remain `unknown`: snapshot completion does not
+prove historical coverage or live freshness. Missing telemetry does not change
+acquisition status. Legacy progress fields remain for compatibility.
 
 ### Backfill command receipts
 

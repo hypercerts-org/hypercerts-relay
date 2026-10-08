@@ -271,11 +271,42 @@ test("archive key service calls keep Jetstream paths and error codes", async (t)
 test("T10 coverage preserves current-state limits, unknown historical provenance and Jetstream reason", async (t) => {
   const { request, services } = await fixture(t);
   services.coverage = async () => ({
+    schemaVersion: 1,
+    scope: "enabled_sources_current_policy",
+    policy: { revision: 2, collections: ["app.bsky.feed.post"] },
+    aggregate: {
+      scope: "enabled_sources_current_policy",
+      policy: { revision: 2, collections: ["app.bsky.feed.post"] },
+      enabledSources: 2,
+      state: "unknown",
+    },
     items: [
       {
         pds: "https://pds.example",
         policy: { revision: 2, collections: ["app.bsky.feed.post"] },
         jobId: "coverage-job",
+        sourceRevision: 3,
+        matchingJob: true,
+        acquisition: {
+          state: "stopped_incomplete",
+          progressScope: "job_inventory",
+          counts: {
+            initialInventory: 10,
+            scanned: 3,
+            matching: 1,
+            noMatch: 2,
+            unresolved: 7,
+            attributableRecords: 4,
+          },
+          diagnostics: {
+            failureCategory: "source_unavailable",
+            lastProgressAt: "2026-09-15T00:00:00.000Z",
+            attempts: 2,
+            retryAction: "explicit_retry",
+          },
+        },
+        history: { state: "unknown" },
+        live: { state: "unknown" },
         reason: "quota_recovery",
         state: "incomplete",
         completedRepos: 3,
@@ -297,6 +328,46 @@ test("T10 coverage preserves current-state limits, unknown historical provenance
   assert.equal(page.items[0].coverage, "current_state");
   assert.equal(page.items[0].historicalPDSAttribution, "unknown");
   assert.equal(page.next, "next-page");
+  const expected = await services.coverage();
+  assert.deepEqual(page.aggregate, expected.aggregate);
+  assert.equal(page.schemaVersion, 1);
+  assert.equal(page.scope, expected.scope);
+  assert.deepEqual(page.policy, expected.policy);
+  assert.deepEqual(page.items[0].acquisition, expected.items[0].acquisition);
+  assert.equal(page.items[0].sourceRevision, 3);
+  assert.equal(page.items[0].matchingJob, true);
+  assert.deepEqual(page.items[0].policy, expected.items[0].policy);
+  assert.equal(page.nextCursor, "next-page");
+  assert.deepEqual(page.items[0].history, { state: "unknown" });
+  assert.deepEqual(page.items[0].live, { state: "unknown" });
+  const missing = {
+    pds: "https://missing.example",
+    sourceRevision: 4,
+    policy: expected.policy,
+    matchingJob: false,
+    acquisition: {
+      state: "unknown" as const,
+      progressScope: "job_inventory" as const,
+      counts: {
+        initialInventory: null,
+        scanned: null,
+        matching: null,
+        noMatch: null,
+        unresolved: null,
+        attributableRecords: null,
+      },
+      diagnostics: { attempts: 0, lastProgressAt: null },
+    },
+    history: { state: "unknown" as const },
+    live: { state: "unknown" as const },
+  };
+  services.coverage = () => Promise.resolve({ ...expected, items: [missing] });
+  const unavailable = await (await request("/api/v1/coverage")).json();
+  assert.deepEqual(unavailable.items[0], {
+    ...missing,
+    historicalPDSAttribution: "unknown",
+  });
+  assert.deepEqual(unavailable.aggregate, expected.aggregate);
 });
 test("authentication, CSRF and immediate administrator removal guard durable mutations", async (t) => {
   const { store, request } = await fixture(t);
