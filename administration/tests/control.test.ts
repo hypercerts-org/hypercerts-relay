@@ -361,7 +361,7 @@ test("T10 coverage preserves current-state limits, unknown historical provenance
     history: { state: "unknown" as const },
     live: { state: "unknown" as const },
   };
-  services.coverage = async () => ({ ...expected, items: [missing] });
+  services.coverage = () => Promise.resolve({ ...expected, items: [missing] });
   const unavailable = await (await request("/api/v1/coverage")).json();
   assert.deepEqual(unavailable.items[0], {
     ...missing,

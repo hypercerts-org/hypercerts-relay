@@ -173,6 +173,20 @@ func newerAcquisition(a, b jobs.Job) bool {
 	return at.After(bt) || (at.Equal(bt) && a.ID > b.ID)
 }
 
+func latestMatchingAcquisition(pds string, sourceRevision, policyRevision uint64, history []jobs.Job) *jobs.Job {
+	var selected *jobs.Job
+	for i := range history {
+		j := &history[i]
+		if j.PDS != pds || j.SourceRevision != sourceRevision || j.Policy.Revision != policyRevision {
+			continue
+		}
+		if selected == nil || newerAcquisition(*j, *selected) {
+			selected = j
+		}
+	}
+	return selected
+}
+
 func New(enabled map[string]bool, revisions map[string]uint64, policy selection.Policy, history []jobs.Job) Snapshot {
 	out := Snapshot{SchemaVersion: 1, Scope: "enabled_sources_current_policy", Policy: policy, Items: []Source{}}
 	for pds, active := range enabled {
@@ -180,16 +194,7 @@ func New(enabled map[string]bool, revisions map[string]uint64, policy selection.
 			continue
 		}
 		row := Source{LegacyProgress: &LegacyProgress{State: jobs.State("unknown"), Coverage: "current_state"}, PDS: pds, SourceRevision: revisions[pds], Policy: policy, Acquisition: Acquisition{State: "unknown", ProgressScope: "job_inventory"}, History: IndependentEvidence{State: "unknown"}, Live: IndependentEvidence{State: "unknown"}}
-		var selected *jobs.Job
-		for i := range history {
-			j := &history[i]
-			if j.PDS != pds || j.SourceRevision != revisions[pds] || j.Policy.Revision != policy.Revision {
-				continue
-			}
-			if selected == nil || newerAcquisition(*j, *selected) {
-				selected = j
-			}
-		}
+		selected := latestMatchingAcquisition(pds, revisions[pds], policy.Revision, history)
 		if selected != nil {
 			row.LegacyProgress = &LegacyProgress{Reason: selected.Reason, State: selected.State, CompletedRepos: integer(len(selected.CompletedRepos)), TotalRepos: integer(selected.TotalRepos), TotalReposKnown: selected.TotalReposKnown, ErrorCode: selected.ErrorCode, CreatedAt: selected.CreatedAt, Coverage: "current_state"}
 			row.MatchingJob = true
