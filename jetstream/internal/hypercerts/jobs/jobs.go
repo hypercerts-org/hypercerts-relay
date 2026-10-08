@@ -117,16 +117,18 @@ type data struct {
 	SnapshotRejections map[string]SnapshotRejection `json:"snapshotRejections"`
 }
 type Manager struct {
-	mu             sync.Mutex
-	db             *store.Store
-	policy         *selection.Manager
-	data           data
-	cancel         context.CancelFunc
-	running        bool
-	runningID      string
-	receiptSender  ReceiptSender
-	policyAdvancer PolicyAdvanceSender
-	wake           chan struct{}
+	mu                        sync.Mutex
+	db                        *store.Store
+	policy                    *selection.Manager
+	data                      data
+	cancel                    context.CancelFunc
+	running                   bool
+	runningID                 string
+	receiptSender             ReceiptSender
+	policyAdvancer            PolicyAdvanceSender
+	repositoryDetailSnapshots map[[16]byte]*repositoryDetailsSnapshot
+	repositoryDetailRows      int
+	wake                      chan struct{}
 }
 
 // ReceiptSender submits a completed job's bounded recovery coordinate to the

@@ -1,7 +1,9 @@
 package jobs
 
 import (
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,7 +23,15 @@ const (
 	maxRepositoryAttempts    = 3
 	repositoryRetryBaseDelay = time.Second
 	repositoryRetryMaxDelay  = 15 * time.Minute
+
+	repositoryDetailsSnapshotTTL = 5 * time.Minute
+	maxRepositoryDetailSnapshots = 8
+	maxRepositoryDetailCacheRows = MaxRepositoryDetailsSnapshotRows
 )
+
+// MaxRepositoryDetailsSnapshotRows caps the aggregate sanitized projection
+// retained by the in-memory repository details snapshot cache.
+const MaxRepositoryDetailsSnapshotRows = 50_000
 
 // RepositoryRetryState is the derived or persisted state of one repository in
 // a frozen job inventory. Ready and complete are derived rather than stored:
@@ -89,10 +99,62 @@ type PDSCooldown struct {
 	Until time.Time `json:"until"`
 }
 
+type JobExecution string
+
+const (
+	JobExecutionQueued   JobExecution = "queued"
+	JobExecutionRunning  JobExecution = "running"
+	JobExecutionWaiting  JobExecution = "waiting"
+	JobExecutionStopped  JobExecution = "stopped"
+	JobExecutionComplete JobExecution = "complete"
+)
+
+type JobDiagnostics struct {
+	Execution             JobExecution `json:"execution"`
+	Reason                string       `json:"reason,omitempty"`
+	RetryAt               *time.Time   `json:"retryAt,omitempty"`
+	PDSCooldownUntil      *time.Time   `json:"pdsCooldownUntil,omitempty"`
+	UnresolvedRepos       *int         `json:"unresolvedRepos,omitempty"`
+	RetryingRepos         *int         `json:"retryingRepos,omitempty"`
+	MaxRepositoryAttempts int          `json:"maxRepositoryAttempts"`
+}
+
+type JobDiagnosticSnapshot struct {
+	Job            Job            `json:"job"`
+	CompletedRepos int            `json:"-"`
+	Diagnostics    JobDiagnostics `json:"diagnostics"`
+}
+
+type RepositoryDetailsSnapshot struct {
+	Snapshot     JobDiagnosticSnapshot
+	Repositories []RepositoryDetail
+	NextCursor   string
+}
+
+type repositoryDetailsSnapshot struct {
+	ID            [16]byte
+	Snapshot      JobDiagnosticSnapshot
+	Repositories  []RepositoryDetail
+	ExpiresAt     time.Time
+	LastAccessAt  time.Time
+	IssuedOffsets map[int]struct{}
+}
+
+type RepositoryDetail struct {
+	DID            string                  `json:"did"`
+	ListedRevision string                  `json:"listedRevision"`
+	State          RepositoryRetryState    `json:"state"`
+	Attempts       int                     `json:"attempts"`
+	Failure        *RepositoryRetryFailure `json:"failure,omitempty"`
+	RetryAt        *time.Time              `json:"retryAt,omitempty"`
+}
+
 var (
-	ErrRepositoryCoolingDown    = errors.New("PDS is in repository retry cooldown")
-	ErrRepositoryRetryNotDue    = errors.New("repository retry deadline has not elapsed")
-	ErrRepositoryRetryExhausted = errors.New("repository retry attempt budget is exhausted")
+	ErrRepositoryCoolingDown             = errors.New("PDS is in repository retry cooldown")
+	ErrRepositoryRetryNotDue             = errors.New("repository retry deadline has not elapsed")
+	ErrRepositoryRetryExhausted          = errors.New("repository retry attempt budget is exhausted")
+	ErrRepositoryDetailsSnapshotExpired  = errors.New("repository snapshot expired; restart pagination")
+	ErrRepositoryDetailsSnapshotTooLarge = errors.New("repository detail snapshot exceeds the in-memory row limit")
 )
 
 func repositoryRetryJobPrefix(jobID string) []byte {
@@ -142,6 +204,216 @@ func (m *Manager) ListRepositoryRetries(jobID string) ([]RepositoryRetry, error)
 		return nil, err
 	}
 	slices.SortFunc(out, func(a, b RepositoryRetry) int { return strings.Compare(a.DID, b.DID) })
+	return out, nil
+}
+
+func (m *Manager) RepositoryDetails(jobID, cursor string, limit int) (RepositoryDetailsSnapshot, error) {
+	if jobID == "" || len(cursor) > 64 || limit < 1 || limit > 200 {
+		return RepositoryDetailsSnapshot{}, ErrInvalidInput
+	}
+	var snapshotID [16]byte
+	offset := 0
+	if cursor != "" {
+		var err error
+		snapshotID, offset, err = decodeRepositoryDetailsCursor(cursor)
+		if err != nil {
+			return RepositoryDetailsSnapshot{}, err
+		}
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := time.Now().UTC()
+	m.expireRepositoryDetailsSnapshotsLocked(now)
+	if cursor != "" {
+		snapshot, ok := m.repositoryDetailSnapshots[snapshotID]
+		if !ok {
+			return RepositoryDetailsSnapshot{}, ErrRepositoryDetailsSnapshotExpired
+		}
+		if snapshot.Snapshot.Job.ID != jobID {
+			return RepositoryDetailsSnapshot{}, ErrInvalidInput
+		}
+		if _, issued := snapshot.IssuedOffsets[offset]; !issued || offset >= len(snapshot.Repositories) {
+			return RepositoryDetailsSnapshot{}, ErrInvalidInput
+		}
+		snapshot.LastAccessAt = now
+		return m.repositoryDetailsPageLocked(snapshot, offset, limit)
+	}
+
+	job, ok := m.data.Jobs[jobID]
+	if !ok {
+		return RepositoryDetailsSnapshot{}, ErrNotFound
+	}
+	if !job.TotalReposKnown {
+		return RepositoryDetailsSnapshot{}, ErrConflict
+	}
+	jobSnapshot, inv, retries, err := m.jobSnapshotLocked(job, now)
+	if err != nil {
+		return RepositoryDetailsSnapshot{}, err
+	}
+	projected := make([]RepositoryDetail, 0, min(len(inv.Entries), maxRepositoryDetailCacheRows+1))
+	for did, listedRevision := range inv.Entries {
+		if completedRevisionAtLeast(job.CompletedRepos[did], listedRevision) {
+			continue
+		}
+		retry, exists := retries[did]
+		if !exists {
+			retry = RepositoryRetry{DID: did, ListedRevision: listedRevision, State: RepositoryRetryReady}
+		}
+		detail := RepositoryDetail{DID: did, ListedRevision: listedRevision, State: retry.State, Attempts: retry.Attempts, Failure: retry.Failure}
+		if !retry.RetryAt.IsZero() {
+			detail.RetryAt = timePointer(retry.RetryAt)
+		}
+		projected = append(projected, detail)
+		if len(projected) > maxRepositoryDetailCacheRows {
+			return RepositoryDetailsSnapshot{}, ErrRepositoryDetailsSnapshotTooLarge
+		}
+	}
+	slices.SortFunc(projected, func(a, b RepositoryDetail) int { return strings.Compare(a.DID, b.DID) })
+	jobSnapshot.Job.CompletedRepos = nil
+	snapshot := &repositoryDetailsSnapshot{Snapshot: jobSnapshot, Repositories: projected}
+	if len(projected) <= limit {
+		return m.repositoryDetailsPageLocked(snapshot, 0, limit)
+	}
+	if err := m.storeRepositoryDetailsSnapshotLocked(snapshot, now); err != nil {
+		return RepositoryDetailsSnapshot{}, err
+	}
+	return m.repositoryDetailsPageLocked(snapshot, 0, limit)
+}
+
+func (m *Manager) repositoryDetailsPageLocked(snapshot *repositoryDetailsSnapshot, offset, limit int) (RepositoryDetailsSnapshot, error) {
+	end := min(offset+limit, len(snapshot.Repositories))
+	page := RepositoryDetailsSnapshot{
+		Snapshot: JobDiagnosticSnapshot{
+			Job:            clone(snapshot.Snapshot.Job),
+			CompletedRepos: snapshot.Snapshot.CompletedRepos,
+			Diagnostics:    clone(snapshot.Snapshot.Diagnostics),
+		},
+		Repositories: clone(snapshot.Repositories[offset:end]),
+	}
+	if end < len(snapshot.Repositories) {
+		token, err := encodeRepositoryDetailsCursor(snapshot.ID, end)
+		if err != nil {
+			return RepositoryDetailsSnapshot{}, err
+		}
+		snapshot.IssuedOffsets[end] = struct{}{}
+		page.NextCursor = token
+	}
+	return page, nil
+}
+
+func (m *Manager) storeRepositoryDetailsSnapshotLocked(snapshot *repositoryDetailsSnapshot, now time.Time) error {
+	if len(snapshot.Repositories) > maxRepositoryDetailCacheRows {
+		return ErrRepositoryDetailsSnapshotTooLarge
+	}
+	m.expireRepositoryDetailsSnapshotsLocked(now)
+	if m.repositoryDetailSnapshots == nil {
+		m.repositoryDetailSnapshots = make(map[[16]byte]*repositoryDetailsSnapshot)
+	}
+	var id [16]byte
+	uniqueID := false
+	for attempts := 0; attempts < 4; attempts++ {
+		if _, err := rand.Read(id[:]); err != nil {
+			return err
+		}
+		if _, exists := m.repositoryDetailSnapshots[id]; !exists {
+			uniqueID = true
+			break
+		}
+	}
+	if !uniqueID {
+		return errors.New("could not allocate a unique repository detail snapshot id")
+	}
+	for len(m.repositoryDetailSnapshots) >= maxRepositoryDetailSnapshots || m.repositoryDetailRows+len(snapshot.Repositories) > maxRepositoryDetailCacheRows {
+		var oldestID [16]byte
+		var oldest *repositoryDetailsSnapshot
+		for id, candidate := range m.repositoryDetailSnapshots {
+			if oldest == nil || candidate.LastAccessAt.Before(oldest.LastAccessAt) {
+				oldestID = id
+				oldest = candidate
+			}
+		}
+		if oldest == nil {
+			return ErrRepositoryDetailsSnapshotTooLarge
+		}
+		m.deleteRepositoryDetailsSnapshotLocked(oldestID)
+	}
+	snapshot.ID = id
+	snapshot.ExpiresAt = now.Add(repositoryDetailsSnapshotTTL)
+	snapshot.LastAccessAt = now
+	snapshot.IssuedOffsets = make(map[int]struct{})
+	m.repositoryDetailSnapshots[id] = snapshot
+	m.repositoryDetailRows += len(snapshot.Repositories)
+	return nil
+}
+
+func (m *Manager) expireRepositoryDetailsSnapshotsLocked(now time.Time) {
+	for id, snapshot := range m.repositoryDetailSnapshots {
+		if !now.Before(snapshot.ExpiresAt) {
+			m.deleteRepositoryDetailsSnapshotLocked(id)
+		}
+	}
+}
+
+func (m *Manager) deleteRepositoryDetailsSnapshotLocked(id [16]byte) {
+	if snapshot, ok := m.repositoryDetailSnapshots[id]; ok {
+		m.repositoryDetailRows -= len(snapshot.Repositories)
+		delete(m.repositoryDetailSnapshots, id)
+	}
+}
+
+func encodeRepositoryDetailsCursor(id [16]byte, offset int) (string, error) {
+	if offset < 1 || offset > maxRepositoryDetailCacheRows {
+		return "", ErrInvalidInput
+	}
+	var payload [20]byte
+	copy(payload[:16], id[:])
+	binary.BigEndian.PutUint32(payload[16:], uint32(offset))
+	return base64.RawURLEncoding.EncodeToString(payload[:]), nil
+}
+
+func decodeRepositoryDetailsCursor(cursor string) ([16]byte, int, error) {
+	var id [16]byte
+	payload, err := base64.RawURLEncoding.DecodeString(cursor)
+	if err != nil || len(payload) != 20 || base64.RawURLEncoding.EncodeToString(payload) != cursor {
+		return id, 0, ErrInvalidInput
+	}
+	copy(id[:], payload[:16])
+	offset := int(binary.BigEndian.Uint32(payload[16:]))
+	if offset < 1 || offset > maxRepositoryDetailCacheRows {
+		return id, 0, ErrInvalidInput
+	}
+	return id, offset, nil
+}
+
+func (m *Manager) repositoryRetriesLocked(job Job, inv inventory) (map[string]RepositoryRetry, error) {
+	prefix := repositoryRetryJobPrefix(job.ID)
+	iter, err := m.db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: store.PrefixUpperBound(prefix)})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = iter.Close() }()
+
+	out := make(map[string]RepositoryRetry)
+	for iter.First(); iter.Valid(); iter.Next() {
+		retry, err := decodePersistedRepositoryRetry(job.ID, prefix, iter.Key(), iter.Value())
+		if err != nil {
+			return nil, err
+		}
+		listedRevision, exists := inv.Entries[retry.DID]
+		if !exists || listedRevision != retry.ListedRevision {
+			// A frozen inventory can be discarded by the existing failed-job
+			// retry path. Never expose its old attempts as work for a new listing.
+			continue
+		}
+		if completedRevisionAtLeast(job.CompletedRepos[retry.DID], listedRevision) {
+			continue
+		}
+		out[retry.DID] = retry
+	}
+	if err := iter.Error(); err != nil {
+		return nil, err
+	}
 	return out, nil
 }
 
@@ -201,6 +473,160 @@ func listFrozenRepositoryRetryRows(iter *pebble.Iterator, jobID string, job Job,
 		return nil, err
 	}
 	return out, nil
+}
+
+// DiagnosticSnapshots derives execution presentation from durable state while
+// holding the manager lock. It does not mutate retry budgets or job state.
+func (m *Manager) DiagnosticSnapshots(jobIDs []string) ([]JobDiagnosticSnapshot, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	snapshots := make([]JobDiagnosticSnapshot, 0, len(jobIDs))
+	now := time.Now().UTC()
+	for _, id := range jobIDs {
+		job, ok := m.data.Jobs[id]
+		if !ok {
+			return nil, ErrNotFound
+		}
+		snapshot, _, _, err := m.jobSnapshotLocked(job, now)
+		if err != nil {
+			return nil, err
+		}
+		snapshots = append(snapshots, snapshot)
+	}
+	return snapshots, nil
+}
+
+func (m *Manager) jobSnapshotLocked(job Job, now time.Time) (JobDiagnosticSnapshot, inventory, map[string]RepositoryRetry, error) {
+	diagnostics := JobDiagnostics{MaxRepositoryAttempts: maxRepositoryAttempts}
+	snapshot := JobDiagnosticSnapshot{
+		Job:            clone(job),
+		CompletedRepos: len(job.CompletedRepos),
+		Diagnostics:    diagnostics,
+	}
+	switch job.State {
+	case Pending:
+		diagnostics.Execution = JobExecutionQueued
+	case Running:
+		diagnostics.Execution = JobExecutionRunning
+	case Complete:
+		diagnostics.Execution = JobExecutionComplete
+	default:
+		diagnostics.Execution = JobExecutionStopped
+	}
+	if !job.TotalReposKnown {
+		if job.State == Pending {
+			cooldown, found, err := m.readPDSCooldownLocked(job.PDS)
+			if err != nil {
+				return JobDiagnosticSnapshot{}, inventory{}, nil, err
+			}
+			if found && cooldown.Until.After(now) {
+				diagnostics.Execution = JobExecutionWaiting
+				diagnostics.Reason = "pds_cooldown"
+				diagnostics.PDSCooldownUntil = timePointer(cooldown.Until)
+			} else {
+				diagnostics.Reason = "inventory"
+			}
+		}
+		snapshot.Diagnostics = diagnostics
+		return snapshot, inventory{Entries: map[string]string{}}, nil, nil
+	}
+
+	inv, err := m.readInventory(job.ID)
+	if err != nil {
+		return JobDiagnosticSnapshot{}, inventory{}, nil, err
+	}
+	if len(inv.Entries) != job.TotalRepos {
+		return JobDiagnosticSnapshot{}, inventory{}, nil, errors.New("invalid persisted job inventory count")
+	}
+	retries, err := m.repositoryRetriesLocked(job, inv)
+	if err != nil {
+		return JobDiagnosticSnapshot{}, inventory{}, nil, err
+	}
+	cooldown, hasCooldown, err := m.readPDSCooldownLocked(job.PDS)
+	if err != nil {
+		return JobDiagnosticSnapshot{}, inventory{}, nil, err
+	}
+	cooldownActive := hasCooldown && cooldown.Until.After(now)
+	completed := 0
+	unresolved := 0
+	retrying := 0
+	var earliestWork time.Time
+	var earliestReason string
+	var earliestRetry time.Time
+	for did, listedRevision := range inv.Entries {
+		if completedRevisionAtLeast(job.CompletedRepos[did], listedRevision) {
+			completed++
+			continue
+		}
+		unresolved++
+		retry, exists := retries[did]
+		if !exists {
+			retry.State = RepositoryRetryReady
+		}
+		if retry.State == RepositoryRetryWait && (job.State == Pending || job.State == Running) {
+			retrying++
+			if retry.RetryAt.After(now) && (earliestRetry.IsZero() || retry.RetryAt.Before(earliestRetry)) {
+				earliestRetry = retry.RetryAt
+			}
+		}
+		if retry.State == RepositoryRetryInFlight && job.State == Running {
+			retrying++
+		}
+		if job.State != Pending {
+			continue
+		}
+
+		due := now
+		reason := ""
+		switch retry.State {
+		case RepositoryRetryReady, RepositoryRetryInFlight:
+		case RepositoryRetryWait:
+			due = retry.RetryAt
+			if !due.After(now) {
+				due = now
+			} else {
+				reason = "repository_retry"
+			}
+		case RepositoryRetryUnresolved:
+			continue
+		default:
+			return JobDiagnosticSnapshot{}, inventory{}, nil, errors.New("invalid repository retry state")
+		}
+		if cooldownActive && cooldown.Until.After(due) {
+			due = cooldown.Until
+			reason = "pds_cooldown"
+		}
+		if earliestWork.IsZero() || due.Before(earliestWork) || due.Equal(earliestWork) && reason == "pds_cooldown" {
+			earliestWork = due
+			earliestReason = reason
+		}
+	}
+
+	diagnostics.UnresolvedRepos = intPointer(unresolved)
+	diagnostics.RetryingRepos = intPointer(retrying)
+	if (job.State == Pending || job.State == Running) && !earliestRetry.IsZero() {
+		diagnostics.RetryAt = timePointer(earliestRetry)
+	}
+	if (job.State == Pending || job.State == Running) && cooldownActive {
+		diagnostics.PDSCooldownUntil = timePointer(cooldown.Until)
+	}
+	if job.State == Pending && !earliestWork.IsZero() && earliestWork.After(now) {
+		diagnostics.Execution = JobExecutionWaiting
+		diagnostics.Reason = earliestReason
+	}
+	snapshot.CompletedRepos = completed
+	snapshot.Diagnostics = diagnostics
+	return snapshot, inv, retries, nil
+}
+
+func timePointer(value time.Time) *time.Time {
+	value = value.UTC()
+	return &value
+}
+
+func intPointer(value int) *int {
+	return &value
 }
 
 // BeginRepositoryAttempt durably consumes one job/repository attempt before

@@ -2,6 +2,8 @@ package control
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -252,6 +254,8 @@ func TestPrivateLifecycleAndCoverage(t *testing.T) {
 	require.NoError(t, json.Unmarshal(filtered.Body.Bytes(), &summaries))
 	require.Len(t, summaries.Items, 2)
 	require.Equal(t, "https://other.example", summaries.Items[0].PDS)
+	require.Equal(t, jobs.JobExecutionQueued, summaries.Items[0].Diagnostics.Execution)
+	require.Nil(t, summaries.Items[0].Diagnostics.UnresolvedRepos)
 	require.Equal(t, "https://pds.example", summaries.Items[1].PDS)
 	require.NotContains(t, filtered.Body.String(), "policy")
 	require.Equal(t, 204, request(h, "DELETE", "/sources", `{"pds":"https://pds.example"}`, testToken).Code)
@@ -261,6 +265,385 @@ func TestPrivateLifecycleAndCoverage(t *testing.T) {
 // promoted to complete: it has no coverage before a job, and an unavailable
 // current-state acquisition stays explicitly incomplete. Historical provenance
 // is intentionally not inferred by this owner.
+func TestJobDiagnosticsUseSchedulerEligibilityAndTerminalState(t *testing.T) {
+	h, manager := setup(t)
+	unknown, err := manager.AddSource("https://unknown.example")
+	require.NoError(t, err)
+	unknownResponse := request(h, "GET", "/jobs/"+unknown.ID, "", testToken)
+	require.Equal(t, http.StatusOK, unknownResponse.Code)
+	var unknownView map[string]any
+	require.NoError(t, json.Unmarshal(unknownResponse.Body.Bytes(), &unknownView))
+	unknownDiagnostics, ok := unknownView["diagnostics"].(map[string]any)
+	require.True(t, ok, "job view must include manager-owned diagnostics")
+	require.Equal(t, "queued", unknownDiagnostics["execution"])
+	require.NotContains(t, unknownDiagnostics, "unresolvedRepos", "an unfinished inventory is unknown, not zero")
+	unknownCoverage := request(h, "GET", "/coverage?pds=https%3A%2F%2Funknown.example", "", testToken)
+	require.Equal(t, http.StatusOK, unknownCoverage.Code)
+	var unknownCoveragePage struct {
+		Items []coverageView `json:"items"`
+	}
+	require.NoError(t, json.Unmarshal(unknownCoverage.Body.Bytes(), &unknownCoveragePage))
+	require.Len(t, unknownCoveragePage.Items, 1)
+	require.Equal(t, jobs.JobExecutionQueued, unknownCoveragePage.Items[0].Diagnostics.Execution)
+	require.Nil(t, unknownCoveragePage.Items[0].Diagnostics.UnresolvedRepos)
+	require.Equal(t, http.StatusConflict, request(h, "GET", "/jobs/"+unknown.ID+"/repositories", "", testToken).Code)
+	require.NoError(t, manager.Cancel(unknown.ID))
+
+	listing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/xrpc/com.atproto.sync.listRepos" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Retry-After", "3600")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	t.Cleanup(listing.Close)
+	listingJob, err := manager.AddSource(listing.URL)
+	require.NoError(t, err)
+	processor := jobs.PDSProcessor{
+		Manager:    manager,
+		HTTPClient: listing.Client(),
+		Directory:  &identity.Directory{Cache: identity.NewLRUCache(1, time.Hour)},
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- manager.Run(ctx, processor.Run) }()
+	require.Eventually(t, func() bool {
+		current, getErr := manager.Get(listingJob.ID)
+		return getErr == nil && current.State == jobs.Incomplete
+	}, time.Second, time.Millisecond)
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+	cooldown, found, err := manager.GetPDSCooldown(listing.URL)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.True(t, cooldown.Until.After(time.Now()))
+
+	cooldownJob, err := manager.Request(listing.URL, "quota_recovery")
+	require.NoError(t, err)
+	cooldownResponse := request(h, "GET", "/jobs/"+cooldownJob.ID, "", testToken)
+	require.Equal(t, http.StatusOK, cooldownResponse.Code)
+	var cooldownView map[string]any
+	require.NoError(t, json.Unmarshal(cooldownResponse.Body.Bytes(), &cooldownView))
+	cooldownDiagnostics, ok := cooldownView["diagnostics"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "waiting", cooldownDiagnostics["execution"])
+	require.Equal(t, "pds_cooldown", cooldownDiagnostics["reason"])
+	require.NotContains(t, cooldownDiagnostics, "unresolvedRepos", "listing 429 did not produce a frozen inventory")
+	require.NotEmpty(t, cooldownDiagnostics["pdsCooldownUntil"])
+
+	mixed, err := manager.AddSource("https://mixed.example")
+	require.NoError(t, err)
+	const (
+		retryingDID   = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
+		readyDID      = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"
+		rejectedDID   = "did:plc:cccccccccccccccccccccccc"
+		exhaustedDID  = "did:plc:dddddddddddddddddddddddd"
+		completedDID  = "did:plc:eeeeeeeeeeeeeeeeeeeeeeee"
+		revision      = "3l3qo2vutsw2b"
+		newerRevision = "3l3qo2vutsw2c"
+	)
+	ctx, cancel = context.WithCancel(t.Context())
+	done = make(chan error, 1)
+	go func() {
+		done <- manager.Run(ctx, func(_ context.Context, job jobs.Job) error {
+			if job.ID != mixed.ID {
+				return &jobs.InputError{Code: "source_unavailable", Unavailable: true}
+			}
+			if err := manager.CheckpointInventory(job.ID, "", map[string]string{
+				retryingDID: revision, readyDID: revision, rejectedDID: revision,
+				exhaustedDID: revision, completedDID: revision,
+			}, true); err != nil {
+				return err
+			}
+			if _, err := manager.BeginRepositoryAttempt(job.ID, retryingDID); err != nil {
+				return err
+			}
+			retryAt := time.Now().UTC().Add(time.Hour)
+			if _, err := manager.RecordRepositoryFailure(job.ID, retryingDID, jobs.RepositoryRetryFailure{
+				Category:   jobs.RepositoryFailureHTTP,
+				HTTPStatus: http.StatusServiceUnavailable,
+				Stage:      jobs.RepositoryFailureGetRepoRequest,
+				Code:       "source_unavailable",
+			}, &retryAt, nil); err != nil {
+				return err
+			}
+			if _, err := manager.BeginRepositoryAttempt(job.ID, completedDID); err != nil {
+				return err
+			}
+			if err := manager.CheckpointRepository(job.ID, completedDID, revision, newerRevision, ""); err != nil {
+				return err
+			}
+			if _, err := manager.BeginRepositoryAttempt(job.ID, rejectedDID); err != nil {
+				return err
+			}
+			if _, err := manager.RecordRepositoryFailure(job.ID, rejectedDID, jobs.RepositoryRetryFailure{
+				Category: jobs.RepositoryFailureRejected,
+				Stage:    jobs.RepositoryFailureGetRepoBody,
+				Code:     "verification_failed",
+			}, nil, nil); err != nil {
+				return err
+			}
+			for attempt := 1; attempt <= 3; attempt++ {
+				if _, err := manager.BeginRepositoryAttempt(job.ID, exhaustedDID); err != nil {
+					return err
+				}
+				var nextRetry *time.Time
+				if attempt < 3 {
+					past := time.Now().UTC().Add(-time.Second)
+					nextRetry = &past
+				}
+				if _, err := manager.RecordRepositoryFailure(job.ID, exhaustedDID, jobs.RepositoryRetryFailure{
+					Category:   jobs.RepositoryFailureHTTP,
+					HTTPStatus: http.StatusServiceUnavailable,
+					Stage:      jobs.RepositoryFailureGetRepoRequest,
+					Code:       "source_unavailable",
+				}, nextRetry, nil); err != nil {
+					return err
+				}
+			}
+			return &jobs.InputError{Code: "source_unavailable", Unavailable: true}
+		})
+	}()
+	require.Eventually(t, func() bool {
+		current, getErr := manager.Get(mixed.ID)
+		return getErr == nil && current.State == jobs.Incomplete
+	}, time.Second, time.Millisecond)
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+	stoppedResponse := request(h, "GET", "/jobs/"+mixed.ID, "", testToken)
+	require.Equal(t, http.StatusOK, stoppedResponse.Code)
+	var stoppedView map[string]any
+	require.NoError(t, json.Unmarshal(stoppedResponse.Body.Bytes(), &stoppedView))
+	stoppedDiagnostics, ok := stoppedView["diagnostics"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "stopped", stoppedDiagnostics["execution"])
+	require.EqualValues(t, 1, stoppedView["completedRepos"], "a newer checkpoint counts as complete for its frozen coordinate")
+	require.EqualValues(t, 5, stoppedView["totalRepos"])
+	require.EqualValues(t, 4, stoppedDiagnostics["unresolvedRepos"], "a newer completed checkpoint satisfies its older listing")
+	require.EqualValues(t, 0, stoppedDiagnostics["retryingRepos"], "terminal jobs do not present persisted wait rows as active retries")
+
+	firstDetails := request(h, "GET", "/jobs/"+mixed.ID+"/repositories?limit=1", "", testToken)
+	require.Equal(t, http.StatusOK, firstDetails.Code)
+	var repositoryPage struct {
+		Job struct {
+			State          jobs.State          `json:"state"`
+			CompletedRepos int                 `json:"completedRepos"`
+			TotalRepos     int                 `json:"totalRepos"`
+			Diagnostics    jobs.JobDiagnostics `json:"diagnostics"`
+		} `json:"job"`
+		Repositories []map[string]any `json:"repositories"`
+		NextCursor   string           `json:"nextCursor"`
+	}
+	require.NoError(t, json.Unmarshal(firstDetails.Body.Bytes(), &repositoryPage))
+	require.Equal(t, jobs.Incomplete, repositoryPage.Job.State)
+	require.Equal(t, 1, repositoryPage.Job.CompletedRepos)
+	require.Equal(t, 5, repositoryPage.Job.TotalRepos)
+	require.NotNil(t, repositoryPage.Job.Diagnostics.UnresolvedRepos)
+	require.Equal(t, 4, *repositoryPage.Job.Diagnostics.UnresolvedRepos)
+	require.Equal(t, repositoryPage.Job.TotalRepos, repositoryPage.Job.CompletedRepos+*repositoryPage.Job.Diagnostics.UnresolvedRepos)
+	require.Len(t, repositoryPage.Repositories, 1)
+	require.Equal(t, retryingDID, repositoryPage.Repositories[0]["did"])
+	require.Equal(t, revision, repositoryPage.Repositories[0]["listedRevision"])
+	require.Equal(t, "retry_wait", repositoryPage.Repositories[0]["state"])
+	require.EqualValues(t, 1, repositoryPage.Repositories[0]["attempts"])
+	failure, ok := repositoryPage.Repositories[0]["failure"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "http", failure["category"])
+	require.EqualValues(t, http.StatusServiceUnavailable, failure["httpStatus"])
+	require.Equal(t, "getRepo/request", failure["stage"])
+	require.Equal(t, "source_unavailable", failure["code"])
+	require.NotContains(t, firstDetails.Body.String(), "responseBody")
+	require.NotEmpty(t, repositoryPage.NextCursor)
+	forgedCursor, err := base64.RawURLEncoding.DecodeString(repositoryPage.NextCursor)
+	require.NoError(t, err)
+	binary.BigEndian.PutUint32(forgedCursor[16:], 2)
+	forgedCursorValue := base64.RawURLEncoding.EncodeToString(forgedCursor)
+	require.Equal(t, http.StatusBadRequest, request(h, "GET", "/jobs/"+mixed.ID+"/repositories?limit=1&after="+url.QueryEscape(forgedCursorValue), "", testToken).Code)
+	require.Equal(t, http.StatusBadRequest, request(h, "GET", "/jobs/"+unknown.ID+"/repositories?limit=1&after="+url.QueryEscape(repositoryPage.NextCursor), "", testToken).Code)
+	secondDetails := request(h, "GET", "/jobs/"+mixed.ID+"/repositories?limit=1&after="+url.QueryEscape(repositoryPage.NextCursor), "", testToken)
+	require.Equal(t, http.StatusOK, secondDetails.Code)
+	var nextRepositoryPage struct {
+		Repositories []map[string]any `json:"repositories"`
+		NextCursor   string           `json:"nextCursor"`
+	}
+	require.NoError(t, json.Unmarshal(secondDetails.Body.Bytes(), &nextRepositoryPage))
+	require.Len(t, nextRepositoryPage.Repositories, 1)
+	require.Equal(t, readyDID, nextRepositoryPage.Repositories[0]["did"])
+	require.Equal(t, "ready", nextRepositoryPage.Repositories[0]["state"])
+	require.EqualValues(t, 0, nextRepositoryPage.Repositories[0]["attempts"])
+	remainingDetails := request(h, "GET", "/jobs/"+mixed.ID+"/repositories?limit=200&after="+url.QueryEscape(nextRepositoryPage.NextCursor), "", testToken)
+	require.Equal(t, http.StatusOK, remainingDetails.Code)
+	var remainingPage struct {
+		Repositories []map[string]any `json:"repositories"`
+	}
+	require.NoError(t, json.Unmarshal(remainingDetails.Body.Bytes(), &remainingPage))
+	require.Len(t, remainingPage.Repositories, 2, "the newer checkpoint is excluded from unresolved details")
+	require.Equal(t, rejectedDID, remainingPage.Repositories[0]["did"])
+	require.Equal(t, "unresolved", remainingPage.Repositories[0]["state"])
+	require.EqualValues(t, 1, remainingPage.Repositories[0]["attempts"])
+	rejectedFailure := remainingPage.Repositories[0]["failure"].(map[string]any)
+	require.Equal(t, "rejected", rejectedFailure["category"])
+	require.Equal(t, "getRepo/body", rejectedFailure["stage"])
+	require.Equal(t, "verification_failed", rejectedFailure["code"])
+	require.Equal(t, exhaustedDID, remainingPage.Repositories[1]["did"])
+	require.EqualValues(t, 3, remainingPage.Repositories[1]["attempts"])
+	require.Equal(t, http.StatusBadRequest, request(h, "GET", "/jobs/"+mixed.ID+"/repositories?limit=201", "", testToken).Code)
+
+	require.NoError(t, manager.Retry(mixed.ID))
+	mixedResponse := request(h, "GET", "/jobs/"+mixed.ID, "", testToken)
+	require.Equal(t, http.StatusOK, mixedResponse.Code)
+	var mixedView map[string]any
+	require.NoError(t, json.Unmarshal(mixedResponse.Body.Bytes(), &mixedView))
+	mixedDiagnostics, ok := mixedView["diagnostics"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "queued", mixedDiagnostics["execution"], "ready repository work is due now despite another future retry")
+	require.EqualValues(t, 4, mixedDiagnostics["unresolvedRepos"])
+	require.EqualValues(t, 1, mixedDiagnostics["retryingRepos"])
+	require.NotEmpty(t, mixedDiagnostics["retryAt"])
+	require.EqualValues(t, 3, mixedDiagnostics["maxRepositoryAttempts"])
+
+	require.NoError(t, manager.Cancel(mixed.ID))
+	lingering, err := manager.ListRepositoryRetries(mixed.ID)
+	require.NoError(t, err)
+	require.Len(t, lingering, 1)
+	terminalResponse := request(h, "GET", "/jobs/"+mixed.ID, "", testToken)
+	require.Equal(t, http.StatusOK, terminalResponse.Code)
+	var terminalView map[string]any
+	require.NoError(t, json.Unmarshal(terminalResponse.Body.Bytes(), &terminalView))
+	terminalDiagnostics, ok := terminalView["diagnostics"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "stopped", terminalDiagnostics["execution"], "a stored retry deadline cannot make a canceled job active")
+	terminalCoverage := request(h, "GET", "/coverage?pds=https%3A%2F%2Fmixed.example", "", testToken)
+	require.Equal(t, http.StatusOK, terminalCoverage.Code)
+	var terminalCoveragePage struct {
+		Items []coverageView `json:"items"`
+	}
+	require.NoError(t, json.Unmarshal(terminalCoverage.Body.Bytes(), &terminalCoveragePage))
+	require.Len(t, terminalCoveragePage.Items, 1)
+	require.Equal(t, jobs.JobExecutionStopped, terminalCoveragePage.Items[0].Diagnostics.Execution)
+	require.Equal(t, 1, terminalCoveragePage.Items[0].CompletedRepos)
+	require.Equal(t, 5, terminalCoveragePage.Items[0].TotalRepos)
+	require.Equal(t, 4, *terminalCoveragePage.Items[0].Diagnostics.UnresolvedRepos)
+	require.Equal(t, terminalCoveragePage.Items[0].TotalRepos, terminalCoveragePage.Items[0].CompletedRepos+*terminalCoveragePage.Items[0].Diagnostics.UnresolvedRepos)
+}
+
+func TestRepositoryDetailsOversizedSnapshotReturnsPayloadTooLarge(t *testing.T) {
+	h, manager := setup(t)
+	job, err := manager.AddSource("https://large-inventory.example")
+	require.NoError(t, err)
+	entries := make(map[string]string, jobs.MaxRepositoryDetailsSnapshotRows+1)
+	for i := 0; i < jobs.MaxRepositoryDetailsSnapshotRows+1; i++ {
+		var suffix [24]byte
+		for j := range suffix {
+			suffix[j] = 'a'
+		}
+		value := i
+		for j := len(suffix) - 1; value > 0; j-- {
+			suffix[j] = 'a' + byte(value%26)
+			value /= 26
+		}
+		entries["did:plc:"+string(suffix[:])] = "3l3qo2vutsw2b"
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- manager.Run(ctx, func(_ context.Context, current jobs.Job) error {
+			if current.ID != job.ID {
+				return &jobs.InputError{Code: "unexpected_job"}
+			}
+			if err := manager.CheckpointInventory(current.ID, "", entries, true); err != nil {
+				return err
+			}
+			return &jobs.InputError{Code: "source_unavailable", Unavailable: true}
+		})
+	}()
+	require.Eventually(t, func() bool {
+		current, getErr := manager.Get(job.ID)
+		return getErr == nil && current.State == jobs.Incomplete && current.TotalReposKnown
+	}, 10*time.Second, time.Millisecond)
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+
+	response := request(h, "GET", "/jobs/"+job.ID+"/repositories?limit=200", "", testToken)
+	require.Equal(t, http.StatusRequestEntityTooLarge, response.Code)
+	var body struct {
+		Error string `json:"error"`
+	}
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &body))
+	require.Equal(t, "repository_snapshot_too_large", body.Error)
+}
+
+func TestRepositoryDetailsCursorExpiresAfterManagerRestart(t *testing.T) {
+	const (
+		didA = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
+		didB = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"
+		rev  = "3l3qo2vutsw2b"
+	)
+	dir := t.TempDir()
+	db, err := store.Open(dir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	policy, err := selection.Open(db, []string{"app.bsky.feed.post"})
+	require.NoError(t, err)
+	manager, err := jobs.Open(db, policy)
+	require.NoError(t, err)
+	h, err := New(testToken, manager, policy)
+	require.NoError(t, err)
+	job, err := manager.AddSource("https://restart.example")
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- manager.Run(ctx, func(ctx context.Context, current jobs.Job) error {
+			if current.ID != job.ID {
+				return &jobs.InputError{Code: "unexpected_job"}
+			}
+			if err := manager.CheckpointInventory(current.ID, "", map[string]string{didA: rev, didB: rev}, true); err != nil {
+				return err
+			}
+			<-ctx.Done()
+			return ctx.Err()
+		})
+	}()
+	require.Eventually(t, func() bool {
+		current, getErr := manager.Get(job.ID)
+		return getErr == nil && current.State == jobs.Running && current.TotalReposKnown
+	}, time.Second, time.Millisecond)
+
+	first := request(h, "GET", "/jobs/"+job.ID+"/repositories?limit=1", "", testToken)
+	require.Equal(t, http.StatusOK, first.Code)
+	var page struct {
+		NextCursor string `json:"nextCursor"`
+	}
+	require.NoError(t, json.Unmarshal(first.Body.Bytes(), &page))
+	require.NotEmpty(t, page.NextCursor)
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+	require.NoError(t, db.Close())
+
+	db, err = store.Open(dir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	policy, err = selection.Open(db, []string{"app.bsky.feed.post"})
+	require.NoError(t, err)
+	manager, err = jobs.Open(db, policy)
+	require.NoError(t, err)
+	h, err = New(testToken, manager, policy)
+	require.NoError(t, err)
+	response := request(h, "GET", "/jobs/"+job.ID+"/repositories?limit=1&after="+url.QueryEscape(page.NextCursor), "", testToken)
+	require.Equal(t, http.StatusGone, response.Code)
+	var expired struct {
+		Error string `json:"error"`
+	}
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &expired))
+	require.Equal(t, "repository_snapshot_expired", expired.Error)
+}
+
 func TestT10CoverageTruthfulness(t *testing.T) {
 	h, m := setup(t)
 	job, err := m.AddSource("https://offline.example")

@@ -122,6 +122,46 @@ export interface Policy {
   revision: number;
   collections: string[];
 }
+export interface JobDiagnostics {
+  execution: "queued" | "running" | "waiting" | "stopped" | "complete";
+  reason?: string;
+  retryAt?: string;
+  pdsCooldownUntil?: string;
+  unresolvedRepos?: number;
+  retryingRepos?: number;
+  maxRepositoryAttempts: number;
+}
+export type RepositoryRetryState =
+  | "ready"
+  | "in_flight"
+  | "retry_wait"
+  | "unresolved";
+export interface RepositoryRetryFailure {
+  category:
+    | "timeout"
+    | "transport"
+    | "body_read"
+    | "http"
+    | "unknown"
+    | "interrupted"
+    | "rejected";
+  httpStatus?: number;
+  stage: "getRepo/request" | "getRepo/body";
+  code?: string;
+}
+export interface RepositoryDetail {
+  did: string;
+  listedRevision: string;
+  state: RepositoryRetryState;
+  attempts: number;
+  failure?: RepositoryRetryFailure;
+  retryAt?: string;
+}
+export interface RepositoryDetailsPage {
+  job: Job;
+  repositories: RepositoryDetail[];
+  nextCursor?: string;
+}
 export interface Job {
   id: string;
   pds: string;
@@ -135,6 +175,7 @@ export interface Job {
   errorCode?: string;
   createdAt: string;
   coverage: string;
+  diagnostics: JobDiagnostics;
 }
 export class ApiError extends Error {
   constructor(

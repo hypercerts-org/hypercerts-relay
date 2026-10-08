@@ -220,6 +220,18 @@ export function createApp(
       .jobs(p.after, req.query.pds ? origin.parse(req.query.pds) : "")
       .then((v) => res.json(v));
   });
+  app.get("/api/v1/jobs/:id/repositories", (req, res) => {
+    const id = z.string().regex(/^[a-f0-9]{32}$/).parse(req.params.id);
+    const p = z
+      .object({
+        after: z.string().max(2048).default(""),
+        limit: z.coerce.number().int().min(1).max(100).default(50),
+      })
+      .parse(req.query);
+    return services
+      .repositoryDetails(id, p.after, p.limit)
+      .then((v) => res.json(v));
+  });
   app.get("/api/v1/coverage", async (req, res) => {
     const p = page.parse(req.query),
       coverage = await services.coverage(

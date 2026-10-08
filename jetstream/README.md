@@ -245,21 +245,68 @@ All paths below start with `/hypercerts/v1`:
 | `GET /jobs?limit=100&after=<cursor>` | Sorted page, maximum 200 jobs, optional `nextCursor`. Concurrent additions may require a fresh listing. |
 | `GET /snapshot-rejections?limit=100&after=<cursor>` | The most recent 1,000 bounded non-payload direct-PDS snapshot rejections, with optional repeated exact `pds` filters. Older rejections are evicted. Returns origin, policy/listed revisions, DID, kind/code and timestamp; never CAR bytes, records, tokens or storage keys. |
 | `GET /coverage?limit=100&after=<pds>` | Latest current-state job per PDS, sorted and paginated by PDS with optional exact `pds` filter. |
-| `GET /jobs/{id}` | Durable state, progress, attempt count, and coverage. |
+| `GET /jobs/{id}` | Durable state, progress, attempt count, coverage, and bounded execution diagnostics. |
+| `GET /jobs/{id}/repositories?limit=100&after=<opaque-cursor>` | Snapshot-consistent frozen repository coordinates and sanitized retry state; maximum 200 rows per page. Unknown inventory returns `409`; expired snapshots return `410`; projections over 50,000 rows return `413`. |
 | `POST /jobs/{id}/cancel` | Cancels pending/running work. |
 | `POST /jobs/{id}/retry` | Resumes current-policy work from durable progress; a removed source or obsolete revision returns conflict. |
 
 Each job reports `id`, `pds`, `policy.revision`, `policy.collections`, `reason`,
 `state`, `attempts`, `completedRepos` (count), `totalRepos` with
 `totalReposKnown`, page `cursor`, bounded `errorCode`,
-creation/start/finish times, and `coverage`. Job states are `pending`, `running`,
-`failed`, `canceled`, `incomplete`, and `complete`. A completed job identifies the
-exact PDS origin and policy revision whose **current state** it covers. An
-unreachable PDS returns `incomplete`, never
+creation/start/finish times, `coverage`, and `diagnostics`. Job states are
+`pending`, `running`, `failed`, `canceled`, `incomplete`, and `complete`. A
+completed job identifies the exact PDS origin and policy revision whose
+**current state** it covers. An unreachable PDS returns `incomplete`, never
 `complete`.
 
+`diagnostics.execution` is `queued`, `running`, `waiting`, `stopped`, or `complete`;
+it is presentation derived from the durable job state, frozen inventory,
+`CompletedRepos`, explicit repository retry rows, and canonical PDS cooldown under
+the jobs manager lock. A pending job is `waiting` only when the scheduler's
+earliest eligible next-work deadline is in the future. A ready repository keeps
+it `queued` even if another repository has a future retry deadline; an active PDS
+cooldown delays all eligible work. A current `running` claim remains `running`
+with an `in_flight` row. Terminal jobs remain `stopped` regardless of lingering
+retry deadlines. `retryAt` and `pdsCooldownUntil` are separate timestamps.
+
+`totalReposKnown` gates the legacy progress fields. When it is true,
+`completedRepos` counts frozen coordinates whose retained checkpoint revision is
+at or newer than the listed revision, and `completedRepos + unresolvedRepos` equals
+`totalRepos`. When it is false, the existing `completedRepos` field remains the
+count of retained checkpoints, not a refreshed inventory denominator; consumers
+must not present it as current progress. `unresolvedRepos` and `retryingRepos` are
+omitted until the frozen inventory is known; no denominator or backlog is inferred
+from a partial `listRepos` scan. `unresolvedRepos` counts frozen coordinates not
+satisfied by `CompletedRepos`, including a completed revision newer than its listed
+revision. `retryingRepos`
+counts repository retry rows only for pending/running jobs; it is not a job claim
+count. `maxRepositoryAttempts` is the current maximum of three attempts per
+job/repository retry cycle. Job-level `attempts` remains the separate claim count.
+Viewing diagnostics never consumes or resets a retry budget.
+
+`GET /jobs/{id}/repositories` returns sorted, cursor-paginated coordinates from
+the frozen inventory that do not have an adequate `CompletedRepos` checkpoint.
+Each item has `did`, `listedRevision`, `state`, per-cycle `attempts`, and optional
+`failure` (`category`, `httpStatus`, `stage`, `code`) and `retryAt`. Missing retry
+rows are shown as `ready` with zero attempts. Failure fields are bounded and do
+not include raw response bodies, credentials, or storage keys. A checkpoint newer
+than the listed revision is treated as complete and omitted. Retry deadlines on a
+terminal job do not mean work is still running; use the parent diagnostic state.
+
+The first page captures an immutable parent job/diagnostics view and sanitized row
+projection under the jobs manager lock. Later pages reuse that exact view and
+projection even if checkpoints, retry rows, or the live job state change; they do
+not rescan the inventory. The in-memory cache is not persisted status authority:
+it retains at most eight snapshots and 50,000 projected rows total for five minutes
+from capture, evicting least-recently-used snapshots under pressure. If a snapshot
+exceeds 50,000 unresolved rows the first-page request returns `413`; restart with
+an empty cursor. Expired, evicted, or pre-restart cursors return `410` with the same
+restart instruction. Start a new listing with an empty `after` value for a fresh
+view.
+
 Errors use a bounded JSON `error` code: 400 invalid input, 401 authentication,
-404 unknown job/source, 409 policy/state conflict, and 500 persistence failure.
+404 unknown job/source, 409 policy/state conflict, 410 expired repository snapshot,
+413 oversized repository projection, and 500 persistence failure.
 Mutation bodies are limited to 64 KiB and reject unknown fields/trailing JSON.
 Local persistence errors do not acknowledge a successful change or expose raw
 storage errors. Job progress and outcomes survive restart.

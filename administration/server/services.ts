@@ -5,7 +5,9 @@ import {
   type CreatedArchiveKey,
   type Command,
   type Job,
+  type JobDiagnostics,
   type Policy,
+  type RepositoryDetailsPage,
 } from "./contracts.ts";
 
 export interface ServiceConfig {
@@ -86,6 +88,14 @@ export class Services {
     return this.call<{ jobs: Job[]; nextCursor?: string }>(
       "jetstream",
       `/jobs?limit=50&after=${encodeURIComponent(after)}&pds=${encodeURIComponent(pds)}`,
+    );
+  }
+  repositoryDetails(id: string, after = "", limit = 100) {
+    const query = new URLSearchParams({ limit: String(limit) });
+    if (after) query.set("after", after);
+    return this.call<RepositoryDetailsPage>(
+      "jetstream",
+      `/jobs/${encodeURIComponent(id)}/repositories?${query}`,
     );
   }
   coverage(after = "", pds = "") {
@@ -242,9 +252,13 @@ async function controlError(
     service === "jetstream" && path.startsWith("/archive-keys")
       ? await remoteArchiveError(response)
       : null;
+  const repositoryDetailsError =
+    service === "jetstream" && /^\/jobs\/[a-f0-9]{32}\/repositories(?:\?|$)/.test(path)
+      ? await remoteRepositoryDetailsError(response)
+      : null;
   return new ApiError(
     response.status >= 500 ? 503 : response.status,
-    archiveError ?? `${service}_rejected_${response.status}`,
+    archiveError ?? repositoryDetailsError ?? `${service}_rejected_${response.status}`,
   );
 }
 
@@ -282,6 +296,7 @@ interface CoverageSummaryPage {
     errorCode?: string;
     createdAt: string;
     coverage: string;
+    diagnostics: JobDiagnostics;
   }[];
 }
 
@@ -298,8 +313,42 @@ interface CoveragePage {
     errorCode?: string;
     createdAt: string;
     coverage: string;
+    diagnostics: JobDiagnostics;
   }[];
   nextCursor?: string;
+}
+
+async function remoteRepositoryDetailsError(
+  response: Response,
+): Promise<string | null> {
+  const expected =
+    response.status === 410
+      ? "repository_snapshot_expired"
+      : response.status === 413
+        ? "repository_snapshot_too_large"
+        : null;
+  if (!expected) return null;
+  const reader = response.body?.getReader();
+  if (!reader) return null;
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.length;
+      if (size > 8192) return null;
+      chunks.push(value);
+    }
+  } finally {
+    await reader.cancel();
+  }
+  try {
+    const body = JSON.parse(Buffer.concat(chunks).toString());
+    return body?.error === expected ? expected : null;
+  } catch {
+    return null;
+  }
 }
 
 async function remoteArchiveError(response: Response): Promise<string | null> {
