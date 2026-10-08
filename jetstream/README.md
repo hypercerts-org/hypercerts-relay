@@ -244,7 +244,7 @@ All paths below start with `/hypercerts/v1`:
 | `POST /jobs` | `{"pds":"https://pds.example","reason":"backfill","requestId":"optional-idempotency-key"}` or reason `quota_recovery`; the same nonempty request ID returns its prior job, while unkeyed duplicate active work is reused and a later terminal recovery creates fresh work. |
 | `GET /jobs?limit=100&after=<cursor>` | Sorted page, maximum 200 jobs, optional `nextCursor`. Concurrent additions may require a fresh listing. |
 | `GET /snapshot-rejections?limit=100&after=<cursor>` | The most recent 1,000 bounded non-payload direct-PDS snapshot rejections, with optional repeated exact `pds` filters. Older rejections are evicted. Returns origin, policy/listed revisions, DID, kind/code and timestamp; never CAR bytes, records, tokens or storage keys. |
-| `GET /coverage?limit=100&after=<pds>` | Latest current-state job per PDS, sorted and paginated by PDS with optional exact `pds` filter. |
+| `GET /coverage?limit=100&after=<pds>` | Version 1 current-policy status snapshot for every enabled PDS, sorted and paginated by exact origin; optional repeated exact `pds` filters. `summary=1` returns the same authoritative snapshot. |
 | `GET /jobs/{id}` | Durable state, progress, attempt count, and coverage. |
 | `POST /jobs/{id}/cancel` | Cancels pending/running work. |
 | `POST /jobs/{id}/retry` | Resumes current-policy work from durable progress; a removed source or obsolete revision returns conflict. |
@@ -294,3 +294,61 @@ transient incomplete/no-rejection outcomes followed by same-job completion, and
 one restart-durable non-payload `verification_failed` rejection with no archive
 row for the invalid record. Artifacts are evidence only when a command run exits
 successfully; generated credentials are removed during cleanup.
+
+### Current-policy status snapshot (schema version 1)
+
+`GET /hypercerts/v1/coverage` projects existing durable job state; it does not
+create another status store. `schemaVersion: 1` and
+`scope: "enabled_sources_current_policy"` identify the contract. `policy` is the
+currently applied revision and exact collection list. Each item identifies its
+`pds`, `sourceRevision`, `policy`, and `matchingJob`; `jobId` appears only when a
+job matches both current revisions. Disabled sources and obsolete jobs cannot
+prove current acquisition. Sources without matching jobs remain `unknown`. At an exact source/policy
+coordinate, the latest durable acquisition generation is authoritative: new work
+and explicit retries advance the generation atomically, including a pending retry
+of an older-created job. Claims, outcomes, restarts, and duplicate command receipts
+do not advance it. Thus newer-created completed jobs cannot hide current retried
+work, and later successful acquisitions supersede historical failures. Older jobs
+without generations use durable creation/attempt/progress times, with job ID as a
+deterministic tie-breaker until a new acquisition is requested.
+
+`acquisition.state` deliberately maps pending/running jobs to `running`,
+incomplete to `stopped_incomplete`, and failed/canceled/complete to their named
+states. `unknown` means missing execution evidence. `retry_waiting` is reserved
+for a future job-layer acquisition retry schedule; existing short in-attempt
+fetch retries remain running, and Relay receipt retries are not acquisition
+retries. Stopped/failed jobs expose `diagnostics.retryAction: "explicit_retry"`;
+no acquisition retry time is invented.
+
+`acquisition.counts` contains nullable durable counts:
+
+- `initialInventory`: active repositories in the completed frozen inventory.
+- `scanned`: repositories successfully verified and reconciled at a checkpoint.
+- `matching`: successful scans with at least one selected record.
+- `noMatch`: successful verified scans with no selected records, including empty
+  selection. These are successful work, not unresolved repositories.
+- `unresolved`: frozen inventory minus successful scans, including unavailable
+  and permanently invalid snapshots; unknown until the inventory is known.
+- `attributableRecords`: selected records in successfully checkpointed snapshots,
+  not an archive size, event count, or count of records currently served.
+
+Null is unknown, never zero. Jobs persisted before attribution evidence existed
+retain null scanned/matching/no-match/record counts. Existing legacy execution
+fields are retained for matching jobs, but do not replace these counts. Without
+a matching job, legacy state is unknown and legacy numeric progress is null.
+`progressScope: "job_inventory"` makes the evidence job-wide: no collection row
+may claim these matching or record counts as collection-specific attribution.
+`diagnostics` exposes bounded failure category, attempts, safe affected DID when
+available, and last durable progress time. It excludes raw errors and payloads.
+
+`history.state` and `live.state` are independently unknown: this seam owns neither
+historical boundaries nor PDS-attributable connection/freshness evidence. Missing
+bootstrap metrics cannot erase durable acquisition evidence. Snapshot completion,
+a cursor, and connection state do not prove each other.
+
+`aggregate` always covers **all** enabled sources and the current policy,
+regardless of item filtering/pagination. It is complete only when every matching
+acquisition is complete with no evidenced unresolved repositories; any matching
+non-complete acquisition makes it incomplete. Missing current execution evidence
+wins unknown over incomplete, and an empty enabled-source set is unknown. The
+aggregate does not assert matching or record attribution for old jobs lacking it.

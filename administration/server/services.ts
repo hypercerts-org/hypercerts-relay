@@ -6,6 +6,7 @@ import {
   type Command,
   type Job,
   type Policy,
+  type CoveragePage,
 } from "./contracts.ts";
 
 export interface ServiceConfig {
@@ -104,7 +105,7 @@ export class Services {
           summary: "1",
         });
         for (const origin of origins) query.append("pds", origin);
-        return this.call<CoverageSummaryPage>(
+        return this.call<CoveragePage>(
           "jetstream",
           `/coverage?${query}`,
           "GET",
@@ -269,37 +270,6 @@ async function readControlBody<T>(response: Response): Promise<T> {
 
 interface RelaySourceView {
   Revision: number;
-}
-
-interface CoverageSummaryPage {
-  items: {
-    pds: string;
-    jobId: string;
-    state: string;
-    completedRepos: number;
-    totalRepos: number;
-    totalReposKnown: boolean;
-    errorCode?: string;
-    createdAt: string;
-    coverage: string;
-  }[];
-}
-
-interface CoveragePage {
-  items: {
-    pds: string;
-    policy: Policy;
-    jobId: string;
-    reason: string;
-    state: string;
-    completedRepos: number;
-    totalRepos: number;
-    totalReposKnown: boolean;
-    errorCode?: string;
-    createdAt: string;
-    coverage: string;
-  }[];
-  nextCursor?: string;
 }
 
 async function remoteArchiveError(response: Response): Promise<string | null> {

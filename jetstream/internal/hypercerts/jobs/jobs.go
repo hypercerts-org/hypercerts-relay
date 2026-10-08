@@ -47,11 +47,26 @@ var ErrPolicyMirrorRequired = errors.New("Relay policy mirror is required for a 
 var ErrReceiptStale = errors.New("recovery receipt rejected as stale")
 var ErrReceiptSourceMissing = errors.New("recovery receipt source no longer exists")
 
+// AcquisitionEvidence is checkpoint-owned evidence for one frozen inventory.
+// A nil pointer on older jobs means attribution is unknown, never zero.
+type AcquisitionEvidence struct {
+	Scanned             int       `json:"scanned"`
+	Matching            int       `json:"matching"`
+	NoMatch             int       `json:"noMatch"`
+	AttributableRecords int       `json:"attributableRecords"`
+	LastProgressAt      time.Time `json:"lastProgressAt"`
+}
+
 type Job struct {
-	ID     string           `json:"id"`
-	PDS    string           `json:"pds"`
-	Policy selection.Policy `json:"policy"`
-	Reason string           `json:"reason"`
+	// AcquisitionGeneration orders acquisition requests at an exact source/policy
+	// coordinate. Explicit retry advances it; claim/restart/outcomes do not.
+	AcquisitionGeneration uint64               `json:"acquisitionGeneration,omitempty"`
+	Evidence              *AcquisitionEvidence `json:"acquisitionEvidence,omitempty"`
+	FailureRepository     string               `json:"failureRepository,omitempty"`
+	ID                    string               `json:"id"`
+	PDS                   string               `json:"pds"`
+	Policy                selection.Policy     `json:"policy"`
+	Reason                string               `json:"reason"`
 	// SourceRevision is the Relay lifecycle revision this job is allowed to
 	// acknowledge after it reaches its durable current-state boundary.
 	SourceRevision uint64            `json:"sourceRevision,omitempty"`
@@ -310,7 +325,7 @@ func (m *Manager) commitInventory(next data, id string, inv inventory) error {
 }
 func newJob(pds string, policy selection.Policy, reason string, sourceRevision uint64) Job {
 	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\n%d\n%s\n%d", pds, policy.Revision, reason, sourceRevision)))
-	return Job{ID: hex.EncodeToString(sum[:16]), PDS: pds, Policy: policy, Reason: reason, SourceRevision: sourceRevision, State: Pending, CompletedRepos: map[string]string{}, CreatedAt: time.Now().UTC(), Coverage: "current_state"}
+	return Job{ID: hex.EncodeToString(sum[:16]), PDS: pds, Policy: policy, Reason: reason, SourceRevision: sourceRevision, State: Pending, Evidence: &AcquisitionEvidence{}, CompletedRepos: map[string]string{}, CreatedAt: time.Now().UTC(), Coverage: "current_state"}
 }
 
 // SeedSources applies CLI configuration once; stale environment cannot revive a removed source.
@@ -329,6 +344,9 @@ func (m *Manager) SeedSources(sources []string) error {
 		}
 		next.Sources[pds] = true
 		j := newJob(pds, m.policy.Current(), "source_added", next.SourceRevisions[pds])
+		if err := beginAcquisition(next, &j); err != nil {
+			return err
+		}
 		next.Jobs[j.ID] = j
 	}
 	next.Initialized = true
@@ -367,6 +385,9 @@ func (m *Manager) AddSourceWithRevision(raw string, sourceRevision uint64) (Job,
 		return clone(existing), nil
 	}
 	next.Sources[pds] = true
+	if err := beginAcquisition(next, &job); err != nil {
+		return Job{}, err
+	}
 	next.Jobs[job.ID] = job
 	if err := m.commit(next); err != nil {
 		return Job{}, err
@@ -447,6 +468,9 @@ func (m *Manager) SetPolicy(ctx context.Context, expected uint64, collections []
 		for pds, enabled := range next.Sources {
 			if enabled {
 				j := newJob(pds, policy, "policy_changed", next.SourceRevisions[pds])
+				if err := beginAcquisition(next, &j); err != nil {
+					return err
+				}
 				next.Jobs[j.ID] = j
 			}
 		}
@@ -498,7 +522,10 @@ func (m *Manager) RequestOnceWithSourceRevision(raw, reason, requestID string, s
 	if advanced {
 		m.cancelStaleSourceJobs(&next, pds, sourceRevision)
 	}
-	job := requestJob(next, pds, reason, m.policy.Current(), next.SourceRevisions[pds])
+	job, err := requestJob(next, pds, reason, m.policy.Current(), next.SourceRevisions[pds])
+	if err != nil {
+		return Job{}, err
+	}
 	remembered, err := m.rememberRequest(next, job, requestID)
 	if err != nil {
 		return Job{}, err
@@ -569,23 +596,42 @@ func (m *Manager) cancelStaleSourceJobs(next *data, pds string, sourceRevision u
 	}
 }
 
-func requestJob(next data, pds, reason string, policy selection.Policy, sourceRevision uint64) Job {
+// beginAcquisition is called only when scheduling new work or accepting an
+// explicit retry, under the manager lock and in the same durable write.
+func beginAcquisition(next data, job *Job) error {
+	var generation uint64
+	for _, existing := range next.Jobs {
+		if existing.PDS == job.PDS && existing.Policy.Revision == job.Policy.Revision && existing.SourceRevision == job.SourceRevision && existing.AcquisitionGeneration > generation {
+			generation = existing.AcquisitionGeneration
+		}
+	}
+	if generation == ^uint64(0) {
+		return ErrConflict
+	}
+	job.AcquisitionGeneration = generation + 1
+	return nil
+}
+
+func requestJob(next data, pds, reason string, policy selection.Policy, sourceRevision uint64) (Job, error) {
 	for _, existing := range next.Jobs {
 		if existing.PDS == pds && existing.Policy.Revision == policy.Revision && existing.Reason == reason && (existing.State == Pending || existing.State == Running) {
-			return existing
+			return existing, nil
 		}
 	}
 	j := newJob(pds, policy, reason, sourceRevision)
 	if existing, ok := next.Jobs[j.ID]; ok {
 		if existing.State == Pending || existing.State == Running {
-			return existing
+			return existing, nil
 		}
 		// A later recovery gap is new work, preserving the previous result.
 		sum := sha256.Sum256([]byte(fmt.Sprintf("%s/%d", j.ID, len(next.Jobs))))
 		j.ID = hex.EncodeToString(sum[:16])
 	}
+	if err := beginAcquisition(next, &j); err != nil {
+		return Job{}, err
+	}
 	next.Jobs[j.ID] = j
-	return j
+	return j, nil
 }
 func (m *Manager) Cancel(id string) error                  { return m.transition(id, Canceled) }
 func (m *Manager) Retry(id string) error                   { return m.transition(id, Pending) }
@@ -627,9 +673,15 @@ func (m *Manager) commitTransition(j Job, state State, requestID string) error {
 	if requestID != "" && (j.State == state || (state == Pending && j.State == Running)) {
 		return m.commit(next)
 	}
+	if state == Pending {
+		if err := beginAcquisition(next, &j); err != nil {
+			return err
+		}
+	}
 	resetInventory := state == Pending && j.State == Failed
 	j.State = state
 	j.ErrorCode = ""
+	j.FailureRepository = ""
 	j.FinishedAt = time.Time{}
 	if resetInventory {
 		// A permanent listing/snapshot verdict may become valid only when the
@@ -640,6 +692,8 @@ func (m *Manager) commitTransition(j Job, state State, requestID string) error {
 		j.TotalRepos = 0
 		j.TotalReposKnown = false
 		j.CompletedRepos = map[string]string{}
+		j.Evidence = &AcquisitionEvidence{}
+		j.FailureRepository = ""
 	}
 	if state == Canceled {
 		j.FinishedAt = time.Now().UTC()
@@ -955,6 +1009,9 @@ func (m *Manager) CheckpointInventory(id, cursor string, entries map[string]stri
 	next := clone(m.data)
 	job := next.Jobs[id]
 	job.Cursor = cursor
+	if job.Evidence != nil {
+		job.Evidence.LastProgressAt = time.Now().UTC()
+	}
 	job.EnumeratedRepos = len(inv.Entries)
 	if complete {
 		job.TotalRepos = len(inv.Entries)
@@ -1004,11 +1061,61 @@ func (m *Manager) Checkpoint(id, did, rev, cursor string) error {
 	next := clone(m.data)
 	j := next.Jobs[id]
 	if did != "" {
+		// Legacy checkpoint callers supply no selected-record attribution.
+		j.Evidence = nil
 		j.CompletedRepos[did] = rev
 	}
 	j.Cursor = cursor
 	next.Jobs[id] = j
 	return m.commit(next)
+}
+
+// CheckpointAcquisition atomically records a successful verified reconciliation
+// and its selected-record evidence. A duplicate DID/revision cannot count twice.
+func (m *Manager) CheckpointAcquisition(id, did, rev, cursor string, records int) error {
+	if records < 0 {
+		return ErrInvalidInput
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.active(id) {
+		return ErrConflict
+	}
+	next := clone(m.data)
+	j := next.Jobs[id]
+	if previous, ok := j.CompletedRepos[did]; ok {
+		if previous == rev {
+			return nil
+		}
+		return ErrConflict
+	}
+	j.CompletedRepos[did] = rev
+	j.Cursor = cursor
+	// Old partial inventories retain unknown attribution through completion.
+	if j.Evidence != nil {
+		j.Evidence.Scanned++
+		if records == 0 {
+			j.Evidence.NoMatch++
+		} else {
+			j.Evidence.Matching++
+		}
+		j.Evidence.AttributableRecords += records
+		j.Evidence.LastProgressAt = time.Now().UTC()
+	}
+	next.Jobs[id] = j
+	return m.commit(next)
+}
+
+// StatusInputs returns one coherent source, policy and job coordinate while
+// holding the same lock used by policy/source updates.
+func (m *Manager) StatusInputs() (map[string]bool, map[string]uint64, selection.Policy, []Job) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	list := make([]Job, 0, len(m.data.Jobs))
+	for _, j := range m.data.Jobs {
+		list = append(list, clone(j))
+	}
+	return clone(m.data.Sources), clone(m.data.SourceRevisions), m.policy.Current(), list
 }
 
 type Processor func(context.Context, Job) error
@@ -1137,6 +1244,12 @@ func (m *Manager) persistJobOutcome(ctx context.Context, id string, processErr e
 	job := next.Jobs[id]
 	job.FinishedAt = time.Now().UTC()
 	job.State = state
+	var boundedFailure *pdsAttemptFailure
+	if errors.As(processErr, &boundedFailure) && boundedFailure.repositoryDID != "" {
+		if _, err := atmos.ParseDID(boundedFailure.repositoryDID); err == nil && len(boundedFailure.repositoryDID) <= 2048 {
+			job.FailureRepository = boundedFailure.repositoryDID
+		}
+	}
 	if state == Complete && job.SourceRevision != 0 {
 		// This flag is written in the same durable job record as Complete, so a
 		// process loss after local success replays the acknowledgement on restart.

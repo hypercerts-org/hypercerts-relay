@@ -149,3 +149,64 @@ function compareCollections(a: string, b: string) {
   if (a === b) return 0;
   return a < b ? -1 : 1;
 }
+
+// Version 1 Go-owned snapshot; null means no durable evidence, never zero.
+export type AcquisitionState =
+  | "unknown"
+  | "running"
+  | "retry_waiting"
+  | "stopped_incomplete"
+  | "failed"
+  | "canceled"
+  | "complete";
+export interface Acquisition {
+  state: AcquisitionState;
+  progressScope: "job_inventory";
+  counts: {
+    initialInventory: number | null;
+    scanned: number | null;
+    matching: number | null;
+    noMatch: number | null;
+    unresolved: number | null;
+    attributableRecords: number | null;
+  };
+  diagnostics: {
+    failureCategory?: string;
+    lastProgressAt: string | null;
+    attempts: number;
+    affectedRepository?: string;
+    retryAction?: string;
+  };
+}
+export interface CoverageSource {
+  pds: string;
+  sourceRevision: number;
+  policy: Policy;
+  matchingJob: boolean;
+  jobId?: string;
+  acquisition: Acquisition;
+  history: { state: "unknown" };
+  live: { state: "unknown" };
+  // Legacy execution fields exist only with matchingJob=true.
+  reason?: string;
+  state?: string;
+  completedRepos?: number | null;
+  totalRepos?: number | null;
+  totalReposKnown?: boolean;
+  errorCode?: string;
+  createdAt?: string;
+  coverage?: string;
+}
+export interface CoveragePage {
+  schemaVersion: 1;
+  scope: "enabled_sources_current_policy";
+  policy: Policy;
+  items: CoverageSource[];
+  aggregate: {
+    scope: "enabled_sources_current_policy";
+    policy: Policy;
+    enabledSources: number;
+    state: "unknown" | "incomplete" | "complete";
+  };
+  nextCursor?: string;
+}

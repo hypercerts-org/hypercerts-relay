@@ -140,19 +140,23 @@ for job submission and retry/cancel so lost responses cannot duplicate work.
 Unavailable services remain incomplete until an explicit retry. Source removal
 stops acquisition without deleting archives. Job progress remains owned by Jetstream.
 
-Coverage is a page of PDS/policy results with the exact selected collections, job
-ID, progress and incomplete reason. Historical PDS attribution is explicitly
-unknown; a completed current snapshot is not a historical event-completeness claim.
-Sources without jobs have unknown coverage. The Sources table presents the
-initial Jetstream inventory totals and processed repositories for the latest job
-beside Relay-observed accounts. Its compact coverage enrichment has a three-second
-private-service bound; on failure, Relay source state remains available and the
-Jetstream cells are marked unavailable. Source detail presents the same Jetstream
-current-state coverage alongside Relay connection state and durable cursors. Its
-admission quota is a limit only:
-Relay-observed accounts are shown separately and are not a census of the PDS or
-a limit on Jetstream backfill. The source-detail collection list is collapsed by
-default.
+Coverage proxies Jetstream's schema version 1 `enabled_sources_current_policy`
+snapshot and global aggregate unchanged. Exact source/policy revisions and
+`matchingJob` scope acquisition; stale jobs and disabled sources cannot establish
+current completion. Source-table enrichment retains its three-second bound.
+The browser adds only `historicalPDSAttribution: "unknown"` and the existing
+`next` pagination alias. It preserves `nextCursor` and all snapshot fields.
+
+`acquisition.counts` distinguishes the frozen `initialInventory`, successful
+verified `scanned`, selected-record `matching`, successful `noMatch`, remaining
+`unresolved`, and checkpointed `attributableRecords`. Null means unknown, never
+zero; old jobs lacking evidence retain null attribution. No-match is successful
+work. Progress is job-wide and cannot establish individual collection attribution.
+`acquisition`, `history`, and `live` remain independent: history and freshness
+are unknown at this private seam. The aggregate covers every enabled source
+regardless of pagination or exact PDS filtering. Missing evidence takes precedence
+as unknown; otherwise non-complete work is incomplete, and only every-source
+completion is complete. No enabled sources yields unknown.
 
 ## Rate policy
 

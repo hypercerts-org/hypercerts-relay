@@ -221,7 +221,7 @@ func (p PDSProcessor) processActiveEntry(ctx context.Context, client *atmossync.
 	if err := p.validateListedSnapshot(job, entry); err != nil {
 		return false, err
 	}
-	if rev, ok := job.CompletedRepos[did]; ok && rev == entry.Rev {
+	if rev, ok := job.CompletedRepos[did]; ok && (job.TotalReposKnown || rev == entry.Rev) {
 		return false, nil
 	}
 	if err := p.repository(ctx, client, *job, entry); err != nil {
@@ -328,7 +328,7 @@ func (p PDSProcessor) repository(ctx context.Context, client *atmossync.Client, 
 		}
 		return err
 	}
-	return p.Manager.Checkpoint(job.ID, string(entry.DID), commit.Rev, job.Cursor)
+	return p.Manager.CheckpointAcquisition(job.ID, string(entry.DID), commit.Rev, job.Cursor, len(snapshot.Records))
 }
 
 func fetchRepositoryWithRetry(ctx context.Context, client *atmossync.Client, did atmos.DID) (*repo.Repo, *repo.Commit, error) {
