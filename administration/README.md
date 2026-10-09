@@ -141,45 +141,21 @@ for job submission and retry/cancel so lost responses cannot duplicate work.
 Unavailable services remain incomplete until an explicit retry. Source removal
 stops acquisition without deleting archives. Job progress remains owned by Jetstream.
 
-Coverage is a page of PDS/policy results with the exact selected collections, job
-ID, progress, bounded execution diagnostics and incomplete reason. Historical PDS
-attribution is explicitly unknown; a completed current snapshot is not a historical
-event-completeness claim. Sources without jobs have unknown coverage. The Sources
-table presents the initial Jetstream inventory total and progress for the latest
-job beside Relay-observed accounts. `totalReposKnown` gates legacy progress fields:
-when false, the API may retain a `completedRepos` checkpoint count, but it is not a
-refreshed inventory denominator and the UI does not present it as current progress.
-Unknown totals and diagnostics remain unknown rather than appearing as zero. Its compact coverage
-enrichment has a three-second private-service bound; on failure, Relay source state
-remains available and the Jetstream cells are marked unavailable. Source detail
-presents the same Jetstream current-state coverage and diagnostics alongside Relay
-connection state and durable cursors. Its admission quota is a limit only:
-Relay-observed accounts are shown separately and are not a census of the PDS or
-a limit on Jetstream backfill. The source-detail collection list is collapsed by
-default.
+Sources show the latest Jetstream job's progress beside Relay-observed accounts.
+Coverage describes current records, not complete event history. Unknown totals stay
+unknown; older jobs keep saved counts but cannot show repository details without a
+saved inventory. If Jetstream is unavailable, Relay source information stays visible.
+Account quotas limit Relay admission, not Jetstream backfill.
 
-Job `state` remains Jetstream's durable outcome; the separate `diagnostics.execution`
-shows whether work is queued, running, waiting, stopped or complete. Pending work
-is shown as waiting only when the scheduler has no eligible coordinate until a
-future retry deadline or PDS-wide cooldown. A ready repository keeps the job
-queued while other safe work can continue. A running job stays running with an
-`in_flight` repository attempt, and terminal jobs stay stopped despite lingering
-retry timestamps. Per-repository retry attempts (maximum three in the current job
-cycle) are distinct from job claim attempts. Inventory-derived unresolved/retrying
-counts are omitted until the frozen inventory is known. For a known frozen
-inventory, `completedRepos` counts coordinates with an at-or-newer retained
-checkpoint, so it and `unresolvedRepos` sum to `totalRepos`. Repository details
-load only when requested and are paginated; they show safe DID/revision coordinates
-and bounded failure category, HTTP status, stage and code, never response bodies.
-The first page and every cursor page share one immutable Jetstream snapshot of job
-status and detail rows, even if the live job changes. Snapshots are process-local,
-expire after five minutes, and are bounded to eight snapshots and 50,000 rows total;
-least-recently-used snapshots may be evicted. Expired, evicted or pre-restart cursors
-show a restart instruction. A projection exceeding 50,000 rows cannot be paginated.
-Diagnostics describe current state, not historical completeness or the cause of an
-earlier coverage gap. Viewing is read-only. Retry remains an explicit audited
-operation: safe completed checkpoints are preserved, incomplete jobs reset eligible
-unresolved repository budgets, and failed jobs refresh the inventory.
+Job `state` records the outcome; `diagnostics.execution` shows whether work is
+queued, running, waiting, stopped or complete. Ready work keeps a job queued;
+retry delays do not make a stopped job active. Repository details load on request,
+keep the same snapshot across pages, and show safe failure information, never raw
+response bodies. Restart the listing if its snapshot expires.
+
+Viewing does not change jobs. Retry is an audited action that preserves completed
+work, resets eligible retries for incomplete jobs, and refreshes the inventory for
+failed jobs.
 
 ## Rate policy
 

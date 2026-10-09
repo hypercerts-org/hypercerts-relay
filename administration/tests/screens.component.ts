@@ -5,6 +5,50 @@ import Collections from "../src/Collections.svelte";
 import Operations from "../src/Operations.svelte";
 import Limits from "../src/Limits.svelte";
 import AccountQuota from "../src/AccountQuota.svelte";
+import type { Job, JobDiagnostics } from "../server/contracts.ts";
+
+type RepositoryJobOverrides = Partial<
+  Omit<Job, "id" | "pds" | "policy" | "diagnostics">
+> & { diagnostics?: Partial<JobDiagnostics> };
+
+function repositoryJob(
+  id: string,
+  pds: string,
+  overrides: RepositoryJobOverrides = {},
+): Job {
+  const { diagnostics, ...jobOverrides } = overrides;
+  return {
+    id,
+    pds,
+    policy: { revision: 2, collections: ["app.bsky.feed.post"] },
+    reason: "backfill",
+    state: "incomplete",
+    completedRepos: 0,
+    totalRepos: 2,
+    totalReposKnown: true,
+    attempts: 1,
+    createdAt: "2026-09-09T00:00:00.000Z",
+    coverage: "current_state",
+    ...jobOverrides,
+    diagnostics: {
+      execution: "stopped",
+      unresolvedRepos: 2,
+      retryingRepos: 0,
+      maxRepositoryAttempts: 3,
+      ...diagnostics,
+    },
+  };
+}
+
+function renderJobs(jobs: Job[]) {
+  return render(Operations, {
+    screen: "jobs",
+    submit: vi.fn(),
+    action: vi.fn(),
+    jobs,
+  });
+}
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   let reject!: (reason?: unknown) => void;
@@ -355,25 +399,11 @@ test("jobs explain recovery types and use operator-facing progress labels", () =
 });
 
 test("job execution diagnostics stay distinct from durable state and lazy details page safe retry data", async () => {
-  const currentJob = {
-    id: "pending-job",
-    pds: "https://waiting.example",
-    policy: { revision: 2, collections: ["app.bsky.feed.post"] },
-    reason: "backfill",
-    state: "incomplete",
+  const currentJob = repositoryJob("pending-job", "https://waiting.example", {
     completedRepos: 1,
     totalRepos: 3,
-    totalReposKnown: true,
     attempts: 4,
-    createdAt: "2026-09-09T00:00:00.000Z",
-    coverage: "current_state",
-    diagnostics: {
-      execution: "stopped",
-      unresolvedRepos: 2,
-      retryingRepos: 0,
-      maxRepositoryAttempts: 3,
-    },
-  };
+  });
   const pages = [
     Response.json({
       job: currentJob,
@@ -406,7 +436,7 @@ test("job execution diagnostics stay distinct from durable state and lazy detail
       ],
     }),
   ];
-  const fetcher = vi.fn().mockImplementation(async () => pages.shift());
+  const fetcher = vi.fn().mockImplementation(() => Promise.resolve(pages.shift()));
   vi.stubGlobal("fetch", fetcher);
   try {
     const submit = vi.fn().mockResolvedValue(undefined);
@@ -562,25 +592,7 @@ test("job execution diagnostics stay distinct from durable state and lazy detail
 });
 
 test("expired repository snapshot resets accumulated rows and offers a first-page restart", async () => {
-  const job = {
-    id: "expired-job",
-    pds: "https://expired.example",
-    policy: { revision: 2, collections: ["app.bsky.feed.post"] },
-    reason: "backfill",
-    state: "incomplete",
-    completedRepos: 0,
-    totalRepos: 2,
-    totalReposKnown: true,
-    attempts: 1,
-    createdAt: "2026-09-09T00:00:00.000Z",
-    coverage: "current_state",
-    diagnostics: {
-      execution: "stopped" as const,
-      unresolvedRepos: 2,
-      retryingRepos: 0,
-      maxRepositoryAttempts: 3,
-    },
-  };
+  const job = repositoryJob("expired-job", "https://expired.example");
   const pages = [
     Response.json({
       job,
@@ -616,15 +628,10 @@ test("expired repository snapshot resets accumulated rows and offers a first-pag
       ],
     }),
   ];
-  const fetcher = vi.fn().mockImplementation(async () => pages.shift());
+  const fetcher = vi.fn().mockImplementation(() => Promise.resolve(pages.shift()));
   vi.stubGlobal("fetch", fetcher);
   try {
-    render(Operations, {
-      screen: "jobs",
-      submit: vi.fn(),
-      action: vi.fn(),
-      jobs: [job],
-    });
+    renderJobs([job]);
     await fireEvent.click(
       screen.getByRole("button", { name: "View unresolved repositories (2)" }),
     );
@@ -659,25 +666,7 @@ test("expired repository snapshot resets accumulated rows and offers a first-pag
 });
 
 test("reopening repository details keeps the newest first-page response and cursor", async () => {
-  const job = {
-    id: "race-job",
-    pds: "https://race.example",
-    policy: { revision: 2, collections: ["app.bsky.feed.post"] },
-    reason: "backfill",
-    state: "incomplete",
-    completedRepos: 0,
-    totalRepos: 2,
-    totalReposKnown: true,
-    attempts: 1,
-    createdAt: "2026-09-09T00:00:00.000Z",
-    coverage: "current_state",
-    diagnostics: {
-      execution: "stopped" as const,
-      unresolvedRepos: 2,
-      retryingRepos: 0,
-      maxRepositoryAttempts: 3,
-    },
-  };
+  const job = repositoryJob("race-job", "https://race.example");
   const obsoleteJob = {
     ...job,
     diagnostics: { ...job.diagnostics, reason: "obsolete_snapshot" },
@@ -775,25 +764,7 @@ test("reopening repository details keeps the newest first-page response and curs
 });
 
 test("obsolete repository failure cannot replace the reopened request loading state", async () => {
-  const job = {
-    id: "error-race-job",
-    pds: "https://error-race.example",
-    policy: { revision: 2, collections: ["app.bsky.feed.post"] },
-    reason: "backfill",
-    state: "incomplete",
-    completedRepos: 0,
-    totalRepos: 2,
-    totalReposKnown: true,
-    attempts: 1,
-    createdAt: "2026-09-09T00:00:00.000Z",
-    coverage: "current_state",
-    diagnostics: {
-      execution: "stopped" as const,
-      unresolvedRepos: 2,
-      retryingRepos: 0,
-      maxRepositoryAttempts: 3,
-    },
-  };
+  const job = repositoryJob("error-race-job", "https://error-race.example");
   const obsoleteRequest = deferred<Response>();
   const reopenedRequest = deferred<Response>();
   const responses = [obsoleteRequest.promise, reopenedRequest.promise];
@@ -847,36 +818,14 @@ test("obsolete repository failure cannot replace the reopened request loading st
 });
 
 test("hiding repository details ignores a late job snapshot", async () => {
-  const job = {
-    id: "hidden-race-job",
-    pds: "https://hidden-race.example",
-    policy: { revision: 2, collections: ["app.bsky.feed.post"] },
-    reason: "backfill",
-    state: "incomplete",
-    completedRepos: 0,
-    totalRepos: 2,
-    totalReposKnown: true,
-    attempts: 1,
-    createdAt: "2026-09-09T00:00:00.000Z",
-    coverage: "current_state",
-    diagnostics: {
-      execution: "stopped" as const,
-      reason: "initial_diagnostics",
-      unresolvedRepos: 2,
-      retryingRepos: 0,
-      maxRepositoryAttempts: 3,
-    },
-  };
+  const job = repositoryJob("hidden-race-job", "https://hidden-race.example", {
+    diagnostics: { reason: "initial_diagnostics" },
+  });
   const request = deferred<Response>();
   const fetcher = vi.fn().mockImplementation(() => request.promise);
   vi.stubGlobal("fetch", fetcher);
   try {
-    render(Operations, {
-      screen: "jobs",
-      submit: vi.fn(),
-      action: vi.fn(),
-      jobs: [job],
-    });
+    renderJobs([job]);
     await fireEvent.click(
       screen.getByRole("button", { name: "View unresolved repositories (2)" }),
     );
@@ -915,26 +864,9 @@ test("hiding repository details ignores a late job snapshot", async () => {
 });
 
 test("switching jobs revokes the previous repository request", async () => {
-  const firstJob = {
-    id: "first-switch-job",
-    pds: "https://first-switch.example",
-    policy: { revision: 2, collections: ["app.bsky.feed.post"] },
-    reason: "backfill",
-    state: "incomplete",
-    completedRepos: 0,
-    totalRepos: 2,
-    totalReposKnown: true,
-    attempts: 1,
-    createdAt: "2026-09-09T00:00:00.000Z",
-    coverage: "current_state",
-    diagnostics: {
-      execution: "stopped" as const,
-      reason: "initial_diagnostics",
-      unresolvedRepos: 2,
-      retryingRepos: 0,
-      maxRepositoryAttempts: 3,
-    },
-  };
+  const firstJob = repositoryJob("first-switch-job", "https://first-switch.example", {
+    diagnostics: { reason: "initial_diagnostics" },
+  });
   const secondJob = {
     ...firstJob,
     id: "second-switch-job",
@@ -946,12 +878,7 @@ test("switching jobs revokes the previous repository request", async () => {
   const fetcher = vi.fn().mockImplementation(() => responses.shift());
   vi.stubGlobal("fetch", fetcher);
   try {
-    render(Operations, {
-      screen: "jobs",
-      submit: vi.fn(),
-      action: vi.fn(),
-      jobs: [firstJob, secondJob],
-    });
+    renderJobs([firstJob, secondJob]);
     const firstRow = screen.getByText(firstJob.id).closest("tr");
     const secondRow = screen.getByText(secondJob.id).closest("tr");
     expect(firstRow).toBeTruthy();
@@ -1155,15 +1082,6 @@ test("latest same-source detail refresh wins over an older response", async () =
     LastDurableCursor: 1,
     Validation: { Status: "passed", Reason: "" },
     AccountQuota: { Count: 4, Limit: 25 },
-  };
-  const deferred = <T>() => {
-    let resolve!: (value: T) => void;
-    let reject!: (reason?: unknown) => void;
-    const promise = new Promise<T>((res, rej) => {
-      resolve = res;
-      reject = rej;
-    });
-    return { promise, resolve, reject };
   };
   const oldCoverage = deferred<Response>();
   const newCoverage = deferred<Response>();

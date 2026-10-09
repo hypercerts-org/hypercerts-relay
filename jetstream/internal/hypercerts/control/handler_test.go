@@ -182,6 +182,100 @@ func TestPrivateSnapshotRejectionQueryBounds(t *testing.T) {
 	require.Equal(t, 400, request(h, "GET", "/snapshot-rejections?after="+overlongAfter, "", testToken).Code)
 }
 
+func TestLegacyKnownTotalJobWithoutInventoryRemainsReadable(t *testing.T) {
+	const (
+		legacyDID = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
+		revision  = "3l3qo2vutsw2b"
+	)
+	dir := t.TempDir()
+	db, err := store.Open(dir, nil)
+	require.NoError(t, err)
+	policy, err := selection.Open(db, []string{"app.bsky.feed.post"})
+	require.NoError(t, err)
+	manager, err := jobs.Open(db, policy)
+	require.NoError(t, err)
+	legacyJob, err := manager.AddSource("https://legacy.example")
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- manager.Run(ctx, func(_ context.Context, running jobs.Job) error {
+			if running.ID != legacyJob.ID {
+				return jobs.ErrConflict
+			}
+			if err := manager.SetTotalRepos(running.ID, 3); err != nil {
+				return err
+			}
+			if err := manager.Checkpoint(running.ID, legacyDID, revision, ""); err != nil {
+				return err
+			}
+			return &jobs.InputError{Code: "source_unavailable", Unavailable: true}
+		})
+	}()
+	require.Eventually(t, func() bool {
+		current, getErr := manager.Get(legacyJob.ID)
+		return getErr == nil && current.State == jobs.Incomplete
+	}, time.Second, time.Millisecond)
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+	require.NoError(t, db.Close())
+
+	db, err = store.Open(dir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	policy, err = selection.Open(db, []string{"app.bsky.feed.post"})
+	require.NoError(t, err)
+	manager, err = jobs.Open(db, policy)
+	require.NoError(t, err)
+	h, err := New(testToken, manager, policy)
+	require.NoError(t, err)
+
+	detail := request(h, "GET", "/jobs/"+legacyJob.ID, "", testToken)
+	require.Equal(t, http.StatusOK, detail.Code)
+	var detailView jobView
+	require.NoError(t, json.Unmarshal(detail.Body.Bytes(), &detailView))
+	require.Equal(t, 1, detailView.CompletedRepos)
+	require.Equal(t, 3, detailView.TotalRepos)
+	require.True(t, detailView.TotalReposKnown)
+	require.Equal(t, jobs.JobExecutionStopped, detailView.Diagnostics.Execution)
+	require.Nil(t, detailView.Diagnostics.UnresolvedRepos)
+	require.Nil(t, detailView.Diagnostics.RetryingRepos)
+
+	listing := request(h, "GET", "/jobs?limit=10", "", testToken)
+	require.Equal(t, http.StatusOK, listing.Code)
+	var listPage struct {
+		Jobs []jobView `json:"jobs"`
+	}
+	require.NoError(t, json.Unmarshal(listing.Body.Bytes(), &listPage))
+	require.Len(t, listPage.Jobs, 1)
+	require.Equal(t, 1, listPage.Jobs[0].CompletedRepos)
+	require.Equal(t, 3, listPage.Jobs[0].TotalRepos)
+	require.True(t, listPage.Jobs[0].TotalReposKnown)
+	require.Nil(t, listPage.Jobs[0].Diagnostics.UnresolvedRepos)
+
+	coverage := request(h, "GET", "/coverage", "", testToken)
+	require.Equal(t, http.StatusOK, coverage.Code)
+	var coveragePage struct {
+		Items []coverageView `json:"items"`
+	}
+	require.NoError(t, json.Unmarshal(coverage.Body.Bytes(), &coveragePage))
+	require.Len(t, coveragePage.Items, 1)
+	require.Equal(t, 1, coveragePage.Items[0].CompletedRepos)
+	require.Equal(t, 3, coveragePage.Items[0].TotalRepos)
+	require.True(t, coveragePage.Items[0].TotalReposKnown)
+	require.Nil(t, coveragePage.Items[0].Diagnostics.UnresolvedRepos)
+
+	repositoryDetails := request(h, "GET", "/jobs/"+legacyJob.ID+"/repositories?limit=10", "", testToken)
+	require.Equal(t, http.StatusConflict, repositoryDetails.Code)
+
+	// An absent legacy inventory is readable, but a present inventory whose
+	// count contradicts the durable total remains a persistence error.
+	require.NoError(t, db.Set([]byte("hypercerts/backfill-job-inventory/"+legacyJob.ID), []byte(`{"entries":{}}`), store.SyncWrites))
+	corrupt := request(h, "GET", "/jobs/"+legacyJob.ID, "", testToken)
+	require.Equal(t, http.StatusInternalServerError, corrupt.Code)
+}
+
 func TestPrivateLifecycleAndCoverage(t *testing.T) {
 	h, m := setup(t)
 	w := request(h, "POST", "/sources", `{"pds":"https://pds.example"}`, testToken)

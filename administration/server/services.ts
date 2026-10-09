@@ -318,16 +318,7 @@ interface CoveragePage {
   nextCursor?: string;
 }
 
-async function remoteRepositoryDetailsError(
-  response: Response,
-): Promise<string | null> {
-  const expected =
-    response.status === 410
-      ? "repository_snapshot_expired"
-      : response.status === 413
-        ? "repository_snapshot_too_large"
-        : null;
-  if (!expected) return null;
+async function readBoundedRemoteErrorBody(response: Response): Promise<unknown | null> {
   const reader = response.body?.getReader();
   if (!reader) return null;
   const chunks: Uint8Array[] = [];
@@ -340,50 +331,47 @@ async function remoteRepositoryDetailsError(
       if (size > 8192) return null;
       chunks.push(value);
     }
-  } finally {
-    await reader.cancel();
-  }
-  try {
-    const body = JSON.parse(Buffer.concat(chunks).toString());
-    return body?.error === expected ? expected : null;
+    return JSON.parse(Buffer.concat(chunks).toString()) as unknown;
   } catch {
     return null;
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {
+      // A failed body read still falls back to the generic upstream error.
+    }
   }
 }
 
-async function remoteArchiveError(response: Response): Promise<string | null> {
-  const reader = response.body?.getReader();
-  if (!reader) return null;
-  const chunks: Uint8Array[] = [];
-  let size = 0;
-  try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      size += value.length;
-      if (size > 8192) return null;
-      chunks.push(value);
-    }
-    const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString());
-    if (
-      typeof parsed === "object" &&
-      parsed !== null &&
-      "error" in parsed &&
-      typeof parsed.error === "string" &&
-      [
-        "invalid_json",
-        "invalid_input",
-        "not_found",
-        "persistence_error",
-      ].includes(parsed.error)
-    )
-      return parsed.error;
-  } catch {
+async function remoteRepositoryDetailsError(
+  response: Response,
+): Promise<string | null> {
+  let expected: string;
+  if (response.status === 410) {
+    expected = "repository_snapshot_expired";
+  } else if (response.status === 413) {
+    expected = "repository_snapshot_too_large";
+  } else {
     return null;
-  } finally {
-    await reader.cancel();
   }
-  return null;
+  const body = await readBoundedRemoteErrorBody(response);
+  return typeof body === "object" && body !== null && "error" in body && body.error === expected
+    ? expected
+    : null;
+}
+
+async function remoteArchiveError(response: Response): Promise<string | null> {
+  const body = await readBoundedRemoteErrorBody(response);
+  if (typeof body !== "object" || body === null || !("error" in body)) return null;
+  const code = body.error;
+  return typeof code === "string" && [
+    "invalid_json",
+    "invalid_input",
+    "not_found",
+    "persistence_error",
+  ].includes(code)
+    ? code
+    : null;
 }
 
 function allowedControlTransport(url: URL, railwayPrivateNetwork: boolean) {

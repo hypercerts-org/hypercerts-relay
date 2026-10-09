@@ -271,7 +271,7 @@ func (h *Handler) listCoverage(w http.ResponseWriter, r *http.Request) {
 		reply(w, 400, map[string]string{"error": "invalid_limit"})
 		return
 	}
-	items, next := pageCoverage(latestCoverageJobs(h.jobs.List(), options.requestedPDS), options.after, options.limit)
+	items, next := pageCoverage(latestCoverageJobs(h.jobs.ListForDiagnostics(), options.requestedPDS), options.after, options.limit)
 	ids := make([]string, 0, len(items))
 	for _, item := range items {
 		ids = append(ids, item.JobID)
@@ -542,7 +542,7 @@ func (h *Handler) listJobs(w http.ResponseWriter, r *http.Request) {
 	after := r.URL.Query().Get("after")
 	selected := make([]jobs.Job, 0, limit)
 	next := ""
-	for _, j := range h.jobs.List() {
+	for _, j := range h.jobs.ListForDiagnostics() {
 		if pds := r.URL.Query().Get("pds"); pds != "" && j.PDS != pds {
 			continue
 		}

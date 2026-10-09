@@ -695,6 +695,20 @@ func (m *Manager) List() []Job {
 	return out
 }
 
+// ListForDiagnostics returns sorted job metadata without per-repository checkpoints.
+func (m *Manager) ListForDiagnostics() []Job {
+	m.mu.Lock()
+	out := make([]Job, 0, len(m.data.Jobs))
+	for _, job := range m.data.Jobs {
+		job.CompletedRepos = nil
+		job.Policy.Collections = slices.Clone(job.Policy.Collections)
+		out = append(out, job)
+	}
+	m.mu.Unlock()
+	slices.SortFunc(out, func(a, b Job) int { return strings.Compare(a.ID, b.ID) })
+	return out
+}
+
 // Get returns one durable job snapshot.
 func (m *Manager) Get(id string) (Job, error) {
 	m.mu.Lock()

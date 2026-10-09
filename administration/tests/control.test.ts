@@ -332,17 +332,22 @@ test("repository detail proxy keeps the private path, cursor and bearer boundary
     },
   ]);
 });
-test("repository detail proxy preserves snapshot expiry and size error codes", async (t) => {
+test("repository detail proxy bounds remote error bodies and preserves snapshot error codes", async (t) => {
   const server = createServer((req, res) => {
     const expired = req.url?.includes("limit=25");
-    res.statusCode = expired ? 410 : 413;
+    const oversized = req.url?.includes("limit=27");
+    res.statusCode = expired || oversized ? 410 : 413;
     res.setHeader("Content-Type", "application/json");
     res.end(
-      JSON.stringify({
-        error: expired
-          ? "repository_snapshot_expired"
-          : "repository_snapshot_too_large",
-      }),
+      JSON.stringify(
+        oversized
+          ? { error: "repository_snapshot_expired", detail: "x".repeat(8192) }
+          : {
+              error: expired
+                ? "repository_snapshot_expired"
+                : "repository_snapshot_too_large",
+            },
+      ),
     );
   }).listen(0, "127.0.0.1");
   await new Promise<void>((resolve) => server.once("listening", resolve));
@@ -373,13 +378,22 @@ test("repository detail proxy preserves snapshot expiry and size error codes", a
       return true;
     },
   );
+  await assert.rejects(
+    services.repositoryDetails("0123456789abcdef0123456789abcdef", "", 27),
+    (error: unknown) => {
+      assert.ok(error instanceof ApiError);
+      assert.equal(error.status, 410);
+      assert.equal(error.code, "jetstream_rejected_410");
+      return true;
+    },
+  );
 });
 test("administration repository detail route validates and proxies a read-only page", async (t) => {
   const { request, services, store } = await fixture(t);
   const seen: unknown[] = [];
-  services.repositoryDetails = async (id, after = "", limit = 100) => {
+  services.repositoryDetails = (id, after = "", limit = 100) => {
     seen.push([id, after, limit]);
-    return {
+    return Promise.resolve({
       job: {
         id,
         pds: "https://pds.example",
@@ -414,7 +428,7 @@ test("administration repository detail route validates and proxies a read-only p
         },
       ],
       nextCursor: "",
-    };
+    });
   };
   const id = "0123456789abcdef0123456789abcdef";
   const after = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
