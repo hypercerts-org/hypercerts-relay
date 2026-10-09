@@ -24,6 +24,9 @@ func startRepositoryWorker(t *testing.T, m *Manager, jobID string, entries map[s
 	started := make(chan Job, 1)
 	done := make(chan error, 1)
 	go func() {
+		// Closing after publishing the result makes deferred shutdown safe after
+		// finishAs has already joined the worker.
+		defer close(done)
 		done <- m.Run(ctx, func(ctx context.Context, job Job) error {
 			if job.ID != jobID {
 				return ErrConflict
@@ -45,13 +48,19 @@ func startRepositoryWorker(t *testing.T, m *Manager, jobID string, entries map[s
 		return repositoryWorker{finish: finish, cancel: cancel, done: done}, job
 	case err := <-done:
 		cancel()
-		require.NoError(t, err)
+		t.Fatalf("job worker exited before publishing its inventory: %v", err)
 		return repositoryWorker{}, Job{}
-	case <-time.After(time.Second):
+	case <-time.After(10 * time.Second):
 		cancel()
-		t.Fatal("job worker did not start")
+		<-done
+		t.Fatal("job worker did not publish its inventory within 10 seconds")
 		return repositoryWorker{}, Job{}
 	}
+}
+
+func (w repositoryWorker) stop() error {
+	w.cancel()
+	return <-w.done
 }
 
 func (w repositoryWorker) finishAs(t *testing.T, m *Manager, jobID string, outcome error, state State) {
@@ -61,8 +70,7 @@ func (w repositoryWorker) finishAs(t *testing.T, m *Manager, jobID string, outco
 		job, err := m.Get(jobID)
 		return err == nil && job.State == state
 	}, time.Second, time.Millisecond)
-	w.cancel()
-	require.ErrorIs(t, <-w.done, context.Canceled)
+	require.ErrorIs(t, w.stop(), context.Canceled)
 }
 
 func (w repositoryWorker) finishIncomplete(t *testing.T, m *Manager, jobID string) {
@@ -620,60 +628,13 @@ func TestRepositoryDetailsAggregateRowLimitEvictsLeastRecentlyUsedSnapshot(t *te
 	createSnapshot := func(pds string, count int) (string, string) {
 		job, err := m.AddSource(pds)
 		require.NoError(t, err)
-		ctx, cancel := context.WithCancel(t.Context())
-		finish := make(chan error, 1)
-		started := make(chan struct{})
-		done := make(chan error, 1)
-		go func() {
-			done <- m.Run(ctx, func(workerCtx context.Context, running Job) error {
-				if running.ID != job.ID {
-					return ErrConflict
-				}
-				if err := m.CheckpointInventory(job.ID, "", inventoryEntries(count), true); err != nil {
-					return err
-				}
-				close(started)
-				select {
-				case err := <-finish:
-					return err
-				case <-workerCtx.Done():
-					return workerCtx.Err()
-				}
-			})
-		}()
-		joined := false
-		stopWorker := func() {
-			if joined {
-				return
-			}
-			cancel()
-			stopErr := <-done
-			joined = true
-			require.ErrorIs(t, stopErr, context.Canceled)
-		}
-		defer stopWorker()
-
-		select {
-		case <-started:
-		case runErr := <-done:
-			joined = true
-			cancel()
-			require.NoError(t, runErr)
-			t.Fatal("job worker exited before publishing its inventory")
-		case <-time.After(time.Second):
-			stopWorker()
-			t.Fatal("job worker did not start")
-		}
+		worker, _ := startRepositoryWorker(t, m, job.ID, inventoryEntries(count))
+		defer worker.stop()
 
 		page, err := m.RepositoryDetails(job.ID, "", 1)
 		require.NoError(t, err)
 		require.NotEmpty(t, page.NextCursor)
-		finish <- &InputError{Code: "source_unavailable", Unavailable: true}
-		require.Eventually(t, func() bool {
-			current, getErr := m.Get(job.ID)
-			return getErr == nil && current.State == Incomplete
-		}, time.Second, time.Millisecond)
-		stopWorker()
+		worker.finishIncomplete(t, m, job.ID)
 		return job.ID, page.NextCursor
 	}
 	cacheCounts := func() (rows, snapshots int) {
