@@ -24,6 +24,9 @@ func startRepositoryWorker(t *testing.T, m *Manager, jobID string, entries map[s
 	started := make(chan Job, 1)
 	done := make(chan error, 1)
 	go func() {
+		// Closing after publishing the result makes deferred shutdown safe after
+		// finishAs has already joined the worker.
+		defer close(done)
 		done <- m.Run(ctx, func(ctx context.Context, job Job) error {
 			if job.ID != jobID {
 				return ErrConflict
@@ -45,13 +48,19 @@ func startRepositoryWorker(t *testing.T, m *Manager, jobID string, entries map[s
 		return repositoryWorker{finish: finish, cancel: cancel, done: done}, job
 	case err := <-done:
 		cancel()
-		require.NoError(t, err)
+		t.Fatalf("job worker exited before publishing its inventory: %v", err)
 		return repositoryWorker{}, Job{}
-	case <-time.After(time.Second):
+	case <-time.After(10 * time.Second):
 		cancel()
-		t.Fatal("job worker did not start")
+		<-done
+		t.Fatal("job worker did not publish its inventory within 10 seconds")
 		return repositoryWorker{}, Job{}
 	}
+}
+
+func (w repositoryWorker) stop() error {
+	w.cancel()
+	return <-w.done
 }
 
 func (w repositoryWorker) finishAs(t *testing.T, m *Manager, jobID string, outcome error, state State) {
@@ -61,8 +70,7 @@ func (w repositoryWorker) finishAs(t *testing.T, m *Manager, jobID string, outco
 		job, err := m.Get(jobID)
 		return err == nil && job.State == state
 	}, time.Second, time.Millisecond)
-	w.cancel()
-	require.ErrorIs(t, <-w.done, context.Canceled)
+	require.ErrorIs(t, w.stop(), context.Canceled)
 }
 
 func (w repositoryWorker) finishIncomplete(t *testing.T, m *Manager, jobID string) {
@@ -589,6 +597,88 @@ func TestRepositoryDetailsSnapshotExpiryAndLRUEviction(t *testing.T) {
 	require.NoError(t, err, "the least-recently-used snapshot must remain available")
 	_, err = m.RepositoryDetails(jobIDs[1], cursors[1], 1)
 	require.ErrorIs(t, err, ErrRepositoryDetailsSnapshotExpired, "the least-recently-used cursor must expire on capacity eviction")
+}
+
+func TestRepositoryDetailsAggregateRowLimitEvictsLeastRecentlyUsedSnapshot(t *testing.T) {
+	const (
+		revision   = "3l3qo2vutsw2b"
+		firstRows  = 20_000
+		secondRows = 20_000
+		thirdRows  = 20_000
+	)
+	m, db := newManager(t, t.TempDir())
+	defer db.Close()
+
+	inventoryEntries := func(count int) map[string]string {
+		entries := make(map[string]string, count)
+		for i := 0; i < count; i++ {
+			var suffix [24]byte
+			for j := range suffix {
+				suffix[j] = 'a'
+			}
+			value := i
+			for j := len(suffix) - 1; value > 0; j-- {
+				suffix[j] = 'a' + byte(value%26)
+				value /= 26
+			}
+			entries["did:plc:"+string(suffix[:])] = revision
+		}
+		return entries
+	}
+	createSnapshot := func(pds string, count int) (string, string) {
+		job, err := m.AddSource(pds)
+		require.NoError(t, err)
+		worker, _ := startRepositoryWorker(t, m, job.ID, inventoryEntries(count))
+		defer worker.stop()
+
+		page, err := m.RepositoryDetails(job.ID, "", 1)
+		require.NoError(t, err)
+		require.NotEmpty(t, page.NextCursor)
+		worker.finishIncomplete(t, m, job.ID)
+		return job.ID, page.NextCursor
+	}
+	cacheCounts := func() (rows, snapshots int) {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		return m.repositoryDetailRows, len(m.repositoryDetailSnapshots)
+	}
+
+	firstJob, firstCursor := createSnapshot("https://first.example", firstRows)
+	secondJob, secondCursor := createSnapshot("https://second.example", secondRows)
+	rows, snapshots := cacheCounts()
+	require.Equal(t, firstRows+secondRows, rows)
+	require.LessOrEqual(t, rows, MaxRepositoryDetailsSnapshotRows,
+		"the two initial snapshots fit within the aggregate row budget")
+	require.Equal(t, 2, snapshots)
+
+	// Touch the first immutable projection after the second, then retain its
+	// newly issued continuation cursor for the post-eviction assertion.
+	time.Sleep(time.Millisecond)
+	firstContinuation, err := m.RepositoryDetails(firstJob, firstCursor, 1)
+	require.NoError(t, err)
+	require.Len(t, firstContinuation.Repositories, 1)
+	firstFreshCursor := firstContinuation.NextCursor
+	require.NotEmpty(t, firstFreshCursor)
+	require.NotEqual(t, firstCursor, firstFreshCursor)
+
+	thirdJob, thirdCursor := createSnapshot("https://third.example", thirdRows)
+	rows, snapshots = cacheCounts()
+	require.Equal(t, firstRows+thirdRows, rows,
+		"eviction accounting must retain the recently accessed and new projections")
+	require.LessOrEqual(t, rows, MaxRepositoryDetailsSnapshotRows)
+	require.Equal(t, 2, snapshots,
+		"three snapshots are below the eight-snapshot cap; aggregate rows caused the eviction")
+	require.Greater(t, firstRows+secondRows+thirdRows, MaxRepositoryDetailsSnapshotRows)
+
+	_, err = m.RepositoryDetails(secondJob, secondCursor, 1)
+	require.ErrorIs(t, err, ErrRepositoryDetailsSnapshotExpired,
+		"the untouched least-recently-used snapshot must be evicted")
+	firstPage, err := m.RepositoryDetails(firstJob, firstFreshCursor, 1)
+	require.NoError(t, err, "the touched snapshot's fresh continuation remains valid")
+	require.Len(t, firstPage.Repositories, 1)
+	thirdPage, err := m.RepositoryDetails(thirdJob, thirdCursor, 1)
+	require.NoError(t, err, "the newly-created snapshot remains valid")
+	require.Len(t, thirdPage.Repositories, 1)
 }
 
 func TestFailedJobRetryStartsFreshBudgetForRefreshedInventory(t *testing.T) {
