@@ -43,6 +43,8 @@ const (
 	pdsCauseHTTP      = "http"
 	pdsCauseTransport = "transport"
 	pdsCauseUnknown   = "unknown"
+
+	maxPDSServerRetryWait = 30 * time.Minute
 )
 
 type pdsResponseCaptureKey struct{}
@@ -133,28 +135,50 @@ func retryablePDSStatus(status int) bool {
 }
 
 func pdsServerRetryDeadline(headers http.Header, now time.Time) time.Time {
-	var latest time.Time
-	if reset := strings.TrimSpace(headers.Get("RateLimit-Reset")); reset != "" {
-		if unix, err := strconv.ParseInt(reset, 10, 64); err == nil {
-			candidate := time.Unix(unix, 0).UTC()
-			if validRetryDeadline(candidate) && candidate.After(now) {
-				latest = candidate
-			}
-		}
-	}
-	if value := strings.TrimSpace(headers.Get("Retry-After")); value != "" {
-		var candidate time.Time
-		maxSeconds := time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC).Unix() - now.Unix()
-		if seconds, err := strconv.ParseInt(value, 10, 64); err == nil && seconds >= 0 && seconds <= maxSeconds {
-			candidate = time.Unix(now.Unix()+seconds, int64(now.Nanosecond())).UTC()
-		} else if parsed, err := http.ParseTime(value); err == nil {
-			candidate = parsed.UTC()
-		}
-		if validRetryDeadline(candidate) && candidate.After(latest) {
-			latest = candidate
-		}
+	ceiling := now.Add(maxPDSServerRetryWait)
+	latest := pdsRateLimitResetDeadline(strings.TrimSpace(headers.Get("RateLimit-Reset")), now, ceiling)
+	if retryAfter := pdsRetryAfterDeadline(strings.TrimSpace(headers.Get("Retry-After")), now, ceiling); retryAfter.After(latest) {
+		latest = retryAfter
 	}
 	return latest
+}
+
+func pdsRateLimitResetDeadline(value string, now, ceiling time.Time) time.Time {
+	unix, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || unix <= now.Unix() {
+		return time.Time{}
+	}
+	if unix > ceiling.Unix() {
+		return ceiling
+	}
+	return time.Unix(unix, 0).UTC()
+}
+
+func pdsRetryAfterDeadline(value string, now, ceiling time.Time) time.Time {
+	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil {
+		if seconds < 0 {
+			return time.Time{}
+		}
+		if seconds > int64(maxPDSServerRetryWait/time.Second) {
+			return ceiling
+		}
+		return boundedPDSRetryDeadline(now.Add(time.Duration(seconds)*time.Second), now, ceiling)
+	}
+	parsed, err := http.ParseTime(value)
+	if err != nil {
+		return time.Time{}
+	}
+	return boundedPDSRetryDeadline(parsed.UTC(), now, ceiling)
+}
+
+func boundedPDSRetryDeadline(candidate, now, ceiling time.Time) time.Time {
+	if !candidate.After(now) {
+		return time.Time{}
+	}
+	if candidate.After(ceiling) {
+		return ceiling
+	}
+	return candidate.UTC()
 }
 
 func repositoryRetryDeadline(attempt int, serverDeadline, now time.Time) time.Time {
@@ -203,36 +227,10 @@ func (p PDSProcessor) enumerateInventory(ctx context.Context, client *atmossync.
 	requestCtx := context.WithValue(ctx, pdsResponseCaptureKey{}, capture)
 	for page, err := range client.ListRepos(requestCtx, 100, job.Cursor) {
 		if err != nil {
-			failure := newListReposAttemptFailure(requestCtx, err, capture)
-			var attemptFailure *pdsAttemptFailure
-			if errors.As(failure, &attemptFailure) && attemptFailure.httpStatus == http.StatusTooManyRequests {
-				deadline := repositoryRetryDeadline(1, attemptFailure.retryAt, time.Now())
-				if err := p.Manager.RecordPDSCooldown(job.ID, deadline); err != nil {
-					return err
-				}
-			}
-			return failure
+			return p.recordInventoryFailure(requestCtx, job, err, capture)
 		}
-		entries := make(map[string]string)
-		for _, entry := range page.Entries {
-			if !entry.Active {
-				continue
-			}
-			if err := p.validateListedSnapshot(job, entry); err != nil {
-				return err
-			}
-			if previous, exists := entries[string(entry.DID)]; exists && previous != entry.Rev {
-				return &InputError{Code: "invalid_listing"}
-			}
-			entries[string(entry.DID)] = entry.Rev
-		}
-		if err := p.Manager.CheckpointInventory(job.ID, page.NextCursor, entries, page.NextCursor == ""); err != nil {
+		if err := p.checkpointInventoryPage(job, page); err != nil {
 			return err
-		}
-		job.Cursor = page.NextCursor
-		job.EnumeratedRepos += len(entries)
-		if page.NextCursor == "" {
-			job.TotalReposKnown = true
 		}
 		capture.status = 0
 		capture.header = nil
@@ -241,6 +239,44 @@ func (p PDSProcessor) enumerateInventory(ctx context.Context, client *atmossync.
 		if err := p.Manager.CheckpointInventory(job.ID, job.Cursor, nil, true); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func (p PDSProcessor) recordInventoryFailure(ctx context.Context, job *Job, cause error, capture *pdsResponseCapture) error {
+	failure := newListReposAttemptFailure(ctx, cause, capture)
+	var attemptFailure *pdsAttemptFailure
+	if !errors.As(failure, &attemptFailure) || attemptFailure.httpStatus != http.StatusTooManyRequests {
+		return failure
+	}
+	deadline := repositoryRetryDeadline(1, attemptFailure.retryAt, time.Now())
+	if err := p.Manager.RecordPDSCooldown(job.ID, deadline); err != nil {
+		return err
+	}
+	return failure
+}
+
+func (p PDSProcessor) checkpointInventoryPage(job *Job, page atmossync.ListReposPage) error {
+	entries := make(map[string]string)
+	for _, entry := range page.Entries {
+		if !entry.Active {
+			continue
+		}
+		if err := p.validateListedSnapshot(job, entry); err != nil {
+			return err
+		}
+		if previous, exists := entries[string(entry.DID)]; exists && previous != entry.Rev {
+			return &InputError{Code: "invalid_listing"}
+		}
+		entries[string(entry.DID)] = entry.Rev
+	}
+	if err := p.Manager.CheckpointInventory(job.ID, page.NextCursor, entries, page.NextCursor == ""); err != nil {
+		return err
+	}
+	job.Cursor = page.NextCursor
+	job.EnumeratedRepos += len(entries)
+	if page.NextCursor == "" {
+		job.TotalReposKnown = true
 	}
 	return nil
 }
@@ -254,176 +290,219 @@ func newListReposAttemptFailure(ctx context.Context, cause error, capture *pdsRe
 	return newPDSAttemptFailure(input, cause, pdsStageListRepos, "", false, capture)
 }
 
+type frozenRepositoryOutcome struct {
+	retryPending    bool
+	stop            bool
+	unavailable     bool
+	unavailableCode string
+	permanentCode   string
+	attemptFailure  *pdsAttemptFailure
+}
+
 func (p PDSProcessor) processFrozenInventory(ctx context.Context, client *atmossync.Client, job Job) error {
 	entries, err := p.Manager.Inventory(job.ID)
 	if err != nil {
 		return err
 	}
-	var retryPending bool
-	var unavailable bool
-	var unavailableCode string
-	var permanentCode string
-	var outcomeFailure *pdsAttemptFailure
+	var outcome frozenRepositoryOutcome
 	for _, frozen := range entries {
-		did := frozen.DID
-		if completedRevisionAtLeast(job.CompletedRepos[did], frozen.Revision) {
+		if completedRevisionAtLeast(job.CompletedRepos[frozen.DID], frozen.Revision) {
 			continue
 		}
-		entry := atmossync.ListReposEntry{DID: atmos.DID(did), Rev: frozen.Revision, Active: true}
-		retry, err := p.Manager.GetRepositoryRetry(job.ID, did)
+		current, err := p.processFrozenRepository(ctx, client, job, frozen)
 		if err != nil {
 			return err
 		}
-		switch retry.State {
-		case RepositoryRetryInFlight:
-			var retryAt *time.Time
-			if retry.Attempts < maxRepositoryAttempts {
-				deadline := repositoryRetryDeadline(retry.Attempts, time.Time{}, time.Now())
-				retryAt = &deadline
-			}
-			stored, err := p.Manager.RecordRepositoryFailure(job.ID, did, RepositoryRetryFailure{Category: RepositoryFailureInterrupted, Stage: RepositoryFailureGetRepoRequest}, retryAt, nil)
-			if err != nil {
-				return err
-			}
-			if stored.State == RepositoryRetryWait {
-				retryPending = true
-			} else {
-				unavailable = true
-				if unavailableCode == "" {
-					unavailableCode = "repository_unavailable"
-				}
-			}
-			continue
-		case RepositoryRetryUnresolved:
-			if retry.Failure != nil && retry.Failure.Category == RepositoryFailureRejected {
-				code := p.rejectionCode(job, entry)
-				if permanentCode == "" {
-					permanentCode = code
-				}
-			} else {
-				unavailable = true
-				if retry.Failure != nil && retry.Failure.Code != "" && unavailableCode == "" {
-					unavailableCode = retry.Failure.Code
-				}
-			}
-			continue
-		case RepositoryRetryWait:
-			if retry.RetryAt.After(time.Now()) {
-				retryPending = true
-				continue
-			}
-		case RepositoryRetryReady:
-		default:
-			return errors.New("invalid repository retry state")
-		}
-		cooldown, found, err := p.Manager.GetPDSCooldown(job.PDS)
-		if err != nil {
-			return err
-		}
-		if found && cooldown.Until.After(time.Now()) {
-			retryPending = true
-			break
-		}
-		if err := p.validateListedSnapshot(&job, entry); err != nil {
-			var input *InputError
-			if errors.As(err, &input) && !input.Unavailable {
-				if permanentCode == "" {
-					permanentCode = input.Code
-				}
-				continue
-			}
-			return err
-		}
-		attempt, err := p.Manager.BeginRepositoryAttempt(job.ID, did)
-		if errors.Is(err, ErrRepositoryCoolingDown) || errors.Is(err, ErrRepositoryRetryNotDue) {
-			retryPending = true
-			break
-		}
-		if err != nil {
-			return err
-		}
-		err = p.repository(ctx, client, job, entry)
-		if err == nil {
-			continue
-		}
-		if errors.Is(ctx.Err(), context.Canceled) {
-			return ctx.Err()
-		}
-		var input *InputError
-		if !errors.As(err, &input) {
-			return err
-		}
-		var attemptFailure *pdsAttemptFailure
-		isAttemptFailure := errors.As(err, &attemptFailure)
-		if isAttemptFailure {
-			outcomeFailure = attemptFailure
-		}
-		permanent := !input.Unavailable
-		failure := repositoryFailureFor(err, permanent)
-		if permanent {
-			rejectErr := p.rejectSnapshot(&job, did, frozen.Revision, input.Code)
-			var rejectionInput *InputError
-			if !errors.As(rejectErr, &rejectionInput) {
-				return rejectErr
-			}
-		}
-		var retryAt *time.Time
-		var pdsCooldown *time.Time
-		canRetry := input.Unavailable && input.Code != "repository_size_limit" && (!isAttemptFailure && input.Code != "source_changed" || isAttemptFailure && attemptFailure.retryable) && attempt.Attempts < maxRepositoryAttempts
-		if canRetry {
-			serverDeadline := time.Time{}
-			if isAttemptFailure {
-				serverDeadline = attemptFailure.retryAt
-			}
-			deadline := repositoryRetryDeadline(attempt.Attempts, serverDeadline, time.Now())
-			retryAt = &deadline
-			if isAttemptFailure && attemptFailure.httpStatus == http.StatusTooManyRequests {
-				pdsCooldown = &deadline
-			}
-		} else if isAttemptFailure && attemptFailure.httpStatus == http.StatusTooManyRequests {
-			deadline := repositoryRetryDeadline(attempt.Attempts, attemptFailure.retryAt, time.Now())
-			pdsCooldown = &deadline
-		}
-		stored, err := p.Manager.RecordRepositoryFailure(job.ID, did, failure, retryAt, pdsCooldown)
-		if err != nil {
-			return err
-		}
-		if permanent {
-			if permanentCode == "" {
-				permanentCode = input.Code
-			}
-		} else if stored.State == RepositoryRetryWait {
-			retryPending = true
-		} else {
-			unavailable = true
-			if unavailableCode == "" {
-				unavailableCode = input.Code
-			}
-		}
-		if isAttemptFailure && attemptFailure.httpStatus == http.StatusTooManyRequests {
-			// A 429 cools the whole admitted origin; do no more PDS work in
-			// this job invocation, even for other repositories.
-			retryPending = true
+		outcome = mergeFrozenRepositoryOutcome(outcome, current)
+		if current.stop {
 			break
 		}
 	}
-	if retryPending {
+	if outcome.retryPending {
 		return errJobYield
 	}
-	if permanentCode != "" {
-		return &InputError{Code: permanentCode}
+	if outcome.permanentCode != "" {
+		return &InputError{Code: outcome.permanentCode}
 	}
-	if unavailable {
-		if unavailableCode == "" {
-			unavailableCode = "repository_unavailable"
-		}
-		outcome := &InputError{Code: unavailableCode, Unavailable: true}
-		if outcomeFailure != nil {
-			return &pdsJobOutcome{input: outcome, failure: outcomeFailure}
-		}
-		return outcome
+	if !outcome.unavailable {
+		return nil
 	}
-	return nil
+	if outcome.unavailableCode == "" {
+		outcome.unavailableCode = "repository_unavailable"
+	}
+	input := &InputError{Code: outcome.unavailableCode, Unavailable: true}
+	if outcome.attemptFailure != nil {
+		return &pdsJobOutcome{input: input, failure: outcome.attemptFailure}
+	}
+	return input
+}
+
+func mergeFrozenRepositoryOutcome(total, current frozenRepositoryOutcome) frozenRepositoryOutcome {
+	total.retryPending = total.retryPending || current.retryPending
+	total.unavailable = total.unavailable || current.unavailable
+	if total.unavailableCode == "" {
+		total.unavailableCode = current.unavailableCode
+	}
+	if total.permanentCode == "" {
+		total.permanentCode = current.permanentCode
+	}
+	if current.attemptFailure != nil {
+		total.attemptFailure = current.attemptFailure
+	}
+	return total
+}
+
+func (p PDSProcessor) processFrozenRepository(ctx context.Context, client *atmossync.Client, job Job, frozen ListedRepository) (frozenRepositoryOutcome, error) {
+	entry := atmossync.ListReposEntry{DID: atmos.DID(frozen.DID), Rev: frozen.Revision, Active: true}
+	retry, err := p.Manager.GetRepositoryRetry(job.ID, frozen.DID)
+	if err != nil {
+		return frozenRepositoryOutcome{}, err
+	}
+	outcome, handled, err := p.persistedRetryOutcome(job, entry, retry)
+	if err != nil || handled {
+		return outcome, err
+	}
+	cooldown, found, err := p.Manager.GetPDSCooldown(job.PDS)
+	if err != nil {
+		return frozenRepositoryOutcome{}, err
+	}
+	if found && cooldown.Until.After(time.Now()) {
+		return frozenRepositoryOutcome{retryPending: true, stop: true}, nil
+	}
+	return p.processReadyRepository(ctx, client, job, entry)
+}
+
+func (p PDSProcessor) persistedRetryOutcome(job Job, entry atmossync.ListReposEntry, retry RepositoryRetry) (frozenRepositoryOutcome, bool, error) {
+	switch retry.State {
+	case RepositoryRetryInFlight:
+		outcome, err := p.recordInterruptedRepository(job, entry, retry)
+		return outcome, true, err
+	case RepositoryRetryUnresolved:
+		return unresolvedRepositoryOutcome(p, job, entry, retry), true, nil
+	case RepositoryRetryWait:
+		if retry.RetryAt.After(time.Now()) {
+			return frozenRepositoryOutcome{retryPending: true}, true, nil
+		}
+	case RepositoryRetryReady:
+	default:
+		return frozenRepositoryOutcome{}, false, errors.New("invalid repository retry state")
+	}
+	return frozenRepositoryOutcome{}, false, nil
+}
+
+func (p PDSProcessor) recordInterruptedRepository(job Job, entry atmossync.ListReposEntry, retry RepositoryRetry) (frozenRepositoryOutcome, error) {
+	var retryAt *time.Time
+	if retry.Attempts < maxRepositoryAttempts {
+		deadline := repositoryRetryDeadline(retry.Attempts, time.Time{}, time.Now())
+		retryAt = &deadline
+	}
+	stored, err := p.Manager.RecordRepositoryFailure(job.ID, string(entry.DID), RepositoryRetryFailure{Category: RepositoryFailureInterrupted, Stage: RepositoryFailureGetRepoRequest}, retryAt, nil)
+	if err != nil {
+		return frozenRepositoryOutcome{}, err
+	}
+	if stored.State == RepositoryRetryWait {
+		return frozenRepositoryOutcome{retryPending: true}, nil
+	}
+	return frozenRepositoryOutcome{unavailable: true, unavailableCode: "repository_unavailable"}, nil
+}
+
+func unresolvedRepositoryOutcome(p PDSProcessor, job Job, entry atmossync.ListReposEntry, retry RepositoryRetry) frozenRepositoryOutcome {
+	if retry.Failure != nil && retry.Failure.Category == RepositoryFailureRejected {
+		return frozenRepositoryOutcome{permanentCode: p.rejectionCode(job, entry)}
+	}
+	outcome := frozenRepositoryOutcome{unavailable: true}
+	if retry.Failure != nil {
+		outcome.unavailableCode = retry.Failure.Code
+	}
+	return outcome
+}
+
+func (p PDSProcessor) processReadyRepository(ctx context.Context, client *atmossync.Client, job Job, entry atmossync.ListReposEntry) (frozenRepositoryOutcome, error) {
+	if err := p.validateListedSnapshot(&job, entry); err != nil {
+		var input *InputError
+		if errors.As(err, &input) && !input.Unavailable {
+			return frozenRepositoryOutcome{permanentCode: input.Code}, nil
+		}
+		return frozenRepositoryOutcome{}, err
+	}
+	attempt, err := p.Manager.BeginRepositoryAttempt(job.ID, string(entry.DID))
+	if errors.Is(err, ErrRepositoryCoolingDown) || errors.Is(err, ErrRepositoryRetryNotDue) {
+		return frozenRepositoryOutcome{retryPending: true, stop: true}, nil
+	}
+	if err != nil {
+		return frozenRepositoryOutcome{}, err
+	}
+	if err := p.repository(ctx, client, job, entry); err == nil {
+		return frozenRepositoryOutcome{}, nil
+	} else if errors.Is(ctx.Err(), context.Canceled) {
+		return frozenRepositoryOutcome{}, ctx.Err()
+	} else {
+		var input *InputError
+		if !errors.As(err, &input) {
+			return frozenRepositoryOutcome{}, err
+		}
+		return p.recordRepositoryAttemptFailure(job, entry, attempt, err, input)
+	}
+}
+
+func (p PDSProcessor) recordRepositoryAttemptFailure(job Job, entry atmossync.ListReposEntry, attempt RepositoryRetry, err error, input *InputError) (frozenRepositoryOutcome, error) {
+	var attemptFailure *pdsAttemptFailure
+	_ = errors.As(err, &attemptFailure)
+	permanent := !input.Unavailable
+	if permanent {
+		rejectErr := p.rejectSnapshot(&job, string(entry.DID), entry.Rev, input.Code)
+		var rejectionInput *InputError
+		if !errors.As(rejectErr, &rejectionInput) {
+			return frozenRepositoryOutcome{}, rejectErr
+		}
+	}
+	failure := repositoryFailureFor(err, permanent)
+	retryAt, pdsCooldown := repositoryRetrySchedule(attempt, input, attemptFailure)
+	stored, err := p.Manager.RecordRepositoryFailure(job.ID, string(entry.DID), failure, retryAt, pdsCooldown)
+	if err != nil {
+		return frozenRepositoryOutcome{}, err
+	}
+	return repositoryAttemptFailureOutcome(input, attemptFailure, permanent, stored), nil
+}
+
+func repositoryRetrySchedule(attempt RepositoryRetry, input *InputError, attemptFailure *pdsAttemptFailure) (*time.Time, *time.Time) {
+	rateLimited := attemptFailure != nil && attemptFailure.httpStatus == http.StatusTooManyRequests
+	canRetry := input.Unavailable && input.Code != "repository_size_limit" && (attemptFailure == nil && input.Code != "source_changed" || attemptFailure != nil && attemptFailure.retryable) && attempt.Attempts < maxRepositoryAttempts
+	if !canRetry && !rateLimited {
+		return nil, nil
+	}
+	serverDeadline := time.Time{}
+	if attemptFailure != nil {
+		serverDeadline = attemptFailure.retryAt
+	}
+	deadline := repositoryRetryDeadline(attempt.Attempts, serverDeadline, time.Now())
+	var retryAt *time.Time
+	if canRetry {
+		retryAt = &deadline
+	}
+	var pdsCooldown *time.Time
+	if rateLimited {
+		pdsCooldown = &deadline
+	}
+	return retryAt, pdsCooldown
+}
+
+func repositoryAttemptFailureOutcome(input *InputError, attemptFailure *pdsAttemptFailure, permanent bool, stored RepositoryRetry) frozenRepositoryOutcome {
+	outcome := frozenRepositoryOutcome{attemptFailure: attemptFailure}
+	if permanent {
+		outcome.permanentCode = input.Code
+	} else if stored.State == RepositoryRetryWait {
+		outcome.retryPending = true
+	} else {
+		outcome.unavailable = true
+		outcome.unavailableCode = input.Code
+	}
+	if attemptFailure != nil && attemptFailure.httpStatus == http.StatusTooManyRequests {
+		// A 429 cools the whole admitted origin; do no more PDS work in this invocation.
+		outcome.retryPending = true
+		outcome.stop = true
+	}
+	return outcome
 }
 
 func (p PDSProcessor) rejectionCode(job Job, entry atmossync.ListReposEntry) string {

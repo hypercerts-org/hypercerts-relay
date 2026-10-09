@@ -1260,61 +1260,107 @@ func TestPDSProcessorListReposRateLimitCoolsDownOriginForOtherJobs(t *testing.T)
 	require.ErrorIs(t, <-done, context.Canceled)
 }
 
-func TestPDSProcessorPersistsLargeNumericRetryAfterWithoutDurationOverflow(t *testing.T) {
+func TestPDSProcessorBoundsServerRetryDeadlinesOverRealHTTP(t *testing.T) {
 	const did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
 	const revision = "3l3qo2vutsw2b"
-	const retryAfterSeconds int64 = 10_000_000_000
-	var getRepoAttempts atomic.Int64
-	pds := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/xrpc/com.atproto.sync.listRepos":
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"repos":[{"did":"` + did + `","rev":"` + revision + `","head":"head","active":true}]}`))
-		case "/xrpc/com.atproto.sync.getRepo":
-			getRepoAttempts.Add(1)
-			w.Header().Set("Retry-After", strconv.FormatInt(retryAfterSeconds, 10))
-			http.Error(w, "temporarily rate limited", http.StatusTooManyRequests)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer pds.Close()
+	tests := []struct {
+		name       string
+		setHeaders func(http.Header, time.Time)
+		wantDelay  time.Duration
+		fallback   bool
+	}{
+		{name: "numeric Retry-After within ceiling is honored", setHeaders: func(h http.Header, _ time.Time) { h.Set("Retry-After", "120") }, wantDelay: 2 * time.Minute},
+		{name: "numeric Retry-After beyond ceiling is clamped", setHeaders: func(h http.Header, _ time.Time) { h.Set("Retry-After", "10000000000") }, wantDelay: 30 * time.Minute},
+		{name: "HTTP-date Retry-After within ceiling is honored", setHeaders: func(h http.Header, now time.Time) {
+			h.Set("Retry-After", now.Add(2*time.Minute).UTC().Truncate(time.Second).Format(http.TimeFormat))
+		}, wantDelay: 2 * time.Minute},
+		{name: "HTTP-date Retry-After beyond ceiling is clamped", setHeaders: func(h http.Header, now time.Time) {
+			h.Set("Retry-After", now.Add(45*time.Minute).UTC().Format(http.TimeFormat))
+		}, wantDelay: 30 * time.Minute},
+		{name: "RateLimit-Reset within ceiling is honored", setHeaders: func(h http.Header, now time.Time) {
+			h.Set("RateLimit-Reset", strconv.FormatInt(now.Add(3*time.Minute).Unix(), 10))
+		}, wantDelay: 3 * time.Minute},
+		{name: "RateLimit-Reset beyond ceiling is clamped", setHeaders: func(h http.Header, _ time.Time) { h.Set("RateLimit-Reset", "10000000000") }, wantDelay: 30 * time.Minute},
+		{name: "later valid header deadline wins", setHeaders: func(h http.Header, now time.Time) {
+			h.Set("Retry-After", now.Add(2*time.Minute).UTC().Format(http.TimeFormat))
+			h.Set("RateLimit-Reset", strconv.FormatInt(now.Add(3*time.Minute).Unix(), 10))
+		}, wantDelay: 3 * time.Minute},
+		{name: "malformed headers use fallback", setHeaders: func(h http.Header, _ time.Time) {
+			h.Set("Retry-After", "not-a-date")
+			h.Set("RateLimit-Reset", "not-unix")
+		}, fallback: true},
+		{name: "expired headers use fallback", setHeaders: func(h http.Header, now time.Time) {
+			h.Set("Retry-After", now.Add(-time.Minute).UTC().Format(http.TimeFormat))
+			h.Set("RateLimit-Reset", strconv.FormatInt(now.Add(-time.Minute).Unix(), 10))
+		}, fallback: true},
+	}
 
-	dir := t.TempDir()
-	m, db := newManager(t, dir)
-	defer func() { _ = db.Close() }()
-	job, err := m.AddSource(pds.URL)
-	require.NoError(t, err)
-	directory := &identity.Directory{Cache: identity.NewLRUCache(1, time.Hour)}
-	directory.Cache.Set(t.Context(), "did:"+did, &identity.Identity{DID: atmos.DID(did), Services: map[string]identity.ServiceEndpoint{"atproto_pds": {URL: pds.URL}}})
-	startedAt := time.Now()
-	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan error, 1)
-	go func() {
-		done <- m.Run(ctx, PDSProcessor{Manager: m, HTTPClient: pds.Client(), Directory: directory}.Run)
-	}()
-	require.Eventually(t, func() bool {
-		current, getErr := m.Get(job.ID)
-		return getErr == nil && current.State == Pending && getRepoAttempts.Load() == 1
-	}, time.Second, time.Millisecond)
-	cooldown, found, err := m.GetPDSCooldown(pds.URL)
-	require.NoError(t, err)
-	require.True(t, found)
-	remainingSeconds := cooldown.Until.Unix() - startedAt.Unix()
-	require.GreaterOrEqual(t, remainingSeconds, retryAfterSeconds)
-	require.LessOrEqual(t, remainingSeconds, retryAfterSeconds+2, "large Retry-After must remain an absolute date, not overflow or wrap")
-	require.Never(t, func() bool { return getRepoAttempts.Load() > 1 }, 100*time.Millisecond, time.Millisecond)
-	require.NoError(t, m.Cancel(job.ID))
-	cancel()
-	require.ErrorIs(t, <-done, context.Canceled)
-	require.NoError(t, db.Close())
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			responseTimes := make(chan time.Time, 1)
+			pds := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/xrpc/com.atproto.sync.listRepos":
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{"repos":[{"did":"` + did + `","rev":"` + revision + `","head":"head","active":true}]}`))
+				case "/xrpc/com.atproto.sync.getRepo":
+					responseAt := time.Now().UTC()
+					test.setHeaders(w.Header(), responseAt)
+					responseTimes <- responseAt
+					http.Error(w, "temporarily rate limited", http.StatusTooManyRequests)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer pds.Close()
 
-	m, db = newManager(t, dir)
-	restored, found, err := m.GetPDSCooldown(pds.URL)
-	require.NoError(t, err)
-	require.True(t, found)
-	require.Equal(t, cooldown.Until, restored.Until)
-	require.Equal(t, Canceled, mustGetJob(t, m, job.ID).State)
+			m, db := newManager(t, t.TempDir())
+			defer db.Close()
+			_, err := m.AddSource(pds.URL)
+			require.NoError(t, err)
+			directory := &identity.Directory{Cache: identity.NewLRUCache(1, time.Hour)}
+			directory.Cache.Set(t.Context(), "did:"+did, &identity.Identity{DID: atmos.DID(did), Services: map[string]identity.ServiceEndpoint{"atproto_pds": {URL: pds.URL}}})
+			ctx, cancel := context.WithCancel(t.Context())
+			done := make(chan struct{})
+			var runErr error
+			go func() {
+				runErr = m.Run(ctx, PDSProcessor{Manager: m, HTTPClient: pds.Client(), Directory: directory}.Run)
+				close(done)
+			}()
+			defer func() {
+				cancel()
+				<-done
+			}()
+
+			var responseAt time.Time
+			select {
+			case responseAt = <-responseTimes:
+			case <-time.After(time.Second):
+				t.Fatal("PDS did not receive the getRepo request")
+			}
+			require.Eventually(t, func() bool {
+				_, found, getErr := m.GetPDSCooldown(pds.URL)
+				return getErr == nil && found
+			}, time.Second, time.Millisecond, "429 cooldown should be durably recorded")
+			cooldown, found, err := m.GetPDSCooldown(pds.URL)
+			require.NoError(t, err)
+			require.True(t, found)
+			cancel()
+			<-done
+			require.ErrorIs(t, runErr, context.Canceled)
+			if test.fallback {
+				assertFallbackRetryDeadline(t, responseAt, cooldown.Until)
+			} else {
+				require.WithinDuration(t, responseAt.Add(test.wantDelay), cooldown.Until, time.Second)
+			}
+		})
+	}
+}
+
+func assertFallbackRetryDeadline(t *testing.T, responseAt, deadline time.Time) {
+	t.Helper()
+	require.True(t, deadline.After(responseAt.Add(700*time.Millisecond)), "invalid or expired server deadlines must use the existing one-second fallback")
+	require.True(t, deadline.Before(responseAt.Add(2*time.Second)), "fallback retains its existing short jittered delay")
 }
 
 func boundaryTruncatedCAR(t *testing.T, full []byte) []byte {

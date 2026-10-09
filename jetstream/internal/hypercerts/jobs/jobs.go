@@ -1054,52 +1054,69 @@ type InputError struct {
 func (e *InputError) Error() string { return e.Code }
 
 func (m *Manager) Run(ctx context.Context, process Processor) error {
+	if err := m.startRunner(); err != nil {
+		return err
+	}
+	defer m.stopRunner()
+	for {
+		if err := m.runPass(ctx, process); err != nil {
+			return err
+		}
+	}
+}
+
+func (m *Manager) startRunner() error {
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.running {
-		m.mu.Unlock()
 		return ErrConflict
 	}
 	m.running = true
-	m.mu.Unlock()
-	defer func() { m.mu.Lock(); m.running = false; m.mu.Unlock() }()
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := m.flushReceipts(ctx); err != nil {
-			return err
-		}
-		worked, err := m.runNext(ctx, process)
-		if err != nil {
-			return err
-		}
-		if !worked {
-			delay, found, err := m.nextWorkDelay()
-			if err != nil {
-				return err
-			}
-			if found && delay <= 0 {
-				continue
-			}
-			var timer *time.Timer
-			var timerC <-chan time.Time
-			if found {
-				timer = time.NewTimer(delay)
-				timerC = timer.C
-			}
-			select {
-			case <-ctx.Done():
-				if timer != nil {
-					timer.Stop()
-				}
-				return ctx.Err()
-			case <-m.wake:
-				if timer != nil {
-					timer.Stop()
-				}
-			case <-timerC:
-			}
-		}
+	return nil
+}
+
+func (m *Manager) stopRunner() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.running = false
+}
+
+func (m *Manager) runPass(ctx context.Context, process Processor) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := m.flushReceipts(ctx); err != nil {
+		return err
+	}
+	worked, err := m.runNext(ctx, process)
+	if err != nil || worked {
+		return err
+	}
+	return m.waitForWork(ctx)
+}
+
+func (m *Manager) waitForWork(ctx context.Context) error {
+	delay, found, err := m.nextWorkDelay()
+	if err != nil {
+		return err
+	}
+	if found && delay <= 0 {
+		return nil
+	}
+	var timer *time.Timer
+	var timerC <-chan time.Time
+	if found {
+		timer = time.NewTimer(delay)
+		timerC = timer.C
+		defer timer.Stop()
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-m.wake:
+		return nil
+	case <-timerC:
+		return nil
 	}
 }
 

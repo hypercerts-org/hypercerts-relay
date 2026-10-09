@@ -137,14 +137,7 @@ func (m *Manager) ListRepositoryRetries(jobID string) ([]RepositoryRetry, error)
 	if err != nil {
 		return nil, err
 	}
-	prefix := repositoryRetryJobPrefix(jobID)
-	iter, err := m.db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: store.PrefixUpperBound(prefix)})
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = iter.Close() }()
-
-	out, err := listFrozenRepositoryRetryRows(iter, jobID, job, inv.Entries)
+	out, err := m.listFrozenRepositoryRetryRowsLocked(jobID, job, inv.Entries)
 	if err != nil {
 		return nil, err
 	}
@@ -175,6 +168,16 @@ func decodePersistedRepositoryRetry(jobID string, prefix, key, value []byte) (Re
 	return retry, nil
 }
 
+func (m *Manager) listFrozenRepositoryRetryRowsLocked(jobID string, job Job, entries map[string]string) ([]RepositoryRetry, error) {
+	prefix := repositoryRetryJobPrefix(jobID)
+	iter, err := m.db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: store.PrefixUpperBound(prefix)})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = iter.Close() }()
+	return listFrozenRepositoryRetryRows(iter, jobID, job, entries)
+}
+
 func listFrozenRepositoryRetryRows(iter *pebble.Iterator, jobID string, job Job, entries map[string]string) ([]RepositoryRetry, error) {
 	prefix := repositoryRetryJobPrefix(jobID)
 	out := make([]RepositoryRetry, 0)
@@ -189,7 +192,7 @@ func listFrozenRepositoryRetryRows(iter *pebble.Iterator, jobID string, job Job,
 			// retry path. Never expose its old attempts as work for a new listing.
 			continue
 		}
-		if _, complete := job.CompletedRepos[retry.DID]; complete {
+		if completedRevisionAtLeast(job.CompletedRepos[retry.DID], listedRevision) {
 			continue
 		}
 		out = append(out, retry)
@@ -411,18 +414,7 @@ func (m *Manager) ResetUnresolvedRepositoryRetries(jobID string) (int, error) {
 	if !m.repositoryResetEligibleLocked(job) || !job.TotalReposKnown {
 		return 0, ErrConflict
 	}
-	inv, err := m.readInventory(jobID)
-	if err != nil {
-		return 0, err
-	}
-	prefix := repositoryRetryJobPrefix(jobID)
-	iter, err := m.db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: store.PrefixUpperBound(prefix)})
-	if err != nil {
-		return 0, err
-	}
-	defer func() { _ = iter.Close() }()
-
-	deletes, err := unresolvedRepositoryRetryDeletes(iter, jobID, job, inv.Entries)
+	deletes, err := m.repositoryRetryDeleteKeysLocked(jobID, true)
 	if err != nil {
 		return 0, err
 	}
@@ -433,29 +425,6 @@ func (m *Manager) ResetUnresolvedRepositoryRetries(jobID string) (int, error) {
 		return 0, err
 	}
 	return len(deletes), nil
-}
-
-func unresolvedRepositoryRetryDeletes(iter *pebble.Iterator, jobID string, job Job, entries map[string]string) ([][]byte, error) {
-	prefix := repositoryRetryJobPrefix(jobID)
-	var deletes [][]byte
-	for iter.First(); iter.Valid(); iter.Next() {
-		retry, err := decodePersistedRepositoryRetry(jobID, prefix, iter.Key(), iter.Value())
-		if err != nil {
-			return nil, err
-		}
-		listedRevision, exists := entries[retry.DID]
-		if !exists || listedRevision != retry.ListedRevision {
-			continue
-		}
-		if _, complete := job.CompletedRepos[retry.DID]; complete || retry.State != RepositoryRetryUnresolved {
-			continue
-		}
-		deletes = append(deletes, append([]byte(nil), iter.Key()...))
-	}
-	if err := iter.Error(); err != nil {
-		return nil, err
-	}
-	return deletes, nil
 }
 
 // RecordPDSCooldown monotonically extends the active job's canonical PDS-origin
@@ -581,53 +550,110 @@ func (m *Manager) repositoryResetEligibleLocked(job Job) bool {
 }
 
 func (m *Manager) pendingJobDueLocked(job Job, now time.Time) (time.Time, bool, error) {
-	cooldown, coolingDown, err := m.readPDSCooldownLocked(job.PDS)
+	cooldown, found, err := m.readPDSCooldownLocked(job.PDS)
 	if err != nil {
 		return time.Time{}, false, err
 	}
+	coolingDown := found && cooldown.Until.After(now)
 	if !job.TotalReposKnown {
-		if coolingDown && cooldown.Until.After(now) {
-			return cooldown.Until, true, nil
-		}
-		return now, true, nil
+		return applyPDSCooldown(now, cooldown, coolingDown), true, nil
 	}
 	inv, err := m.readInventory(job.ID)
 	if err != nil {
 		return time.Time{}, false, err
 	}
-	var earliest time.Time
-	for did, listedRevision := range inv.Entries {
-		if completedRevisionAtLeast(job.CompletedRepos[did], listedRevision) {
-			continue
-		}
-		retry, err := m.repositoryRetryLocked(job, did, listedRevision)
-		if err != nil {
-			return time.Time{}, false, err
-		}
-		var due time.Time
-		switch retry.State {
-		case RepositoryRetryReady, RepositoryRetryInFlight:
-			due = now
-		case RepositoryRetryWait:
-			due = retry.RetryAt
-		case RepositoryRetryUnresolved:
-			continue
-		default:
-			return time.Time{}, false, errors.New("invalid repository retry state")
-		}
-		if coolingDown && cooldown.Until.After(due) {
-			due = cooldown.Until
-		}
-		if earliest.IsZero() || due.Before(earliest) {
-			earliest = due
-		}
+	retries, err := m.pendingRepositoryRetryRowsLocked(job, inv.Entries)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	earliest, dueNow, err := pendingRetryDeadline(retries, now)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	if dueNow || pendingInventoryHasImplicitReady(job, inv.Entries, retries) {
+		return applyPDSCooldown(now, cooldown, coolingDown), true, nil
 	}
 	if earliest.IsZero() {
 		// Give the processor one pass to persist the terminal outcome for an
 		// inventory whose remaining entries are all already resolved.
 		return now, true, nil
 	}
-	return earliest, true, nil
+	return applyPDSCooldown(earliest, cooldown, coolingDown), true, nil
+}
+
+func (m *Manager) pendingRepositoryRetryRowsLocked(job Job, entries map[string]string) ([]RepositoryRetry, error) {
+	prefix := repositoryRetryJobPrefix(job.ID)
+	iter, err := m.db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: store.PrefixUpperBound(prefix)})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = iter.Close() }()
+	var retries []RepositoryRetry
+	for iter.First(); iter.Valid(); iter.Next() {
+		retry, err := decodePersistedRepositoryRetry(job.ID, prefix, iter.Key(), iter.Value())
+		if err != nil {
+			return nil, err
+		}
+		listedRevision, exists := entries[retry.DID]
+		if !exists {
+			continue
+		}
+		if listedRevision != retry.ListedRevision {
+			return nil, ErrConflict
+		}
+		if completedRevisionAtLeast(job.CompletedRepos[retry.DID], listedRevision) {
+			continue
+		}
+		retries = append(retries, retry)
+	}
+	if err := iter.Error(); err != nil {
+		return nil, err
+	}
+	return retries, nil
+}
+
+func pendingRetryDeadline(retries []RepositoryRetry, now time.Time) (time.Time, bool, error) {
+	var earliest time.Time
+	for _, retry := range retries {
+		switch retry.State {
+		case RepositoryRetryInFlight:
+			return now, true, nil
+		case RepositoryRetryWait:
+			if !retry.RetryAt.After(now) {
+				return now, true, nil
+			}
+			if earliest.IsZero() || retry.RetryAt.Before(earliest) {
+				earliest = retry.RetryAt
+			}
+		case RepositoryRetryUnresolved:
+		default:
+			return time.Time{}, false, errors.New("invalid repository retry state")
+		}
+	}
+	return earliest, false, nil
+}
+
+func pendingInventoryHasImplicitReady(job Job, entries map[string]string, retries []RepositoryRetry) bool {
+	retryDIDs := make(map[string]struct{}, len(retries))
+	for _, retry := range retries {
+		retryDIDs[retry.DID] = struct{}{}
+	}
+	for did, listedRevision := range entries {
+		if completedRevisionAtLeast(job.CompletedRepos[did], listedRevision) {
+			continue
+		}
+		if _, found := retryDIDs[did]; !found {
+			return true
+		}
+	}
+	return false
+}
+
+func applyPDSCooldown(deadline time.Time, cooldown PDSCooldown, coolingDown bool) time.Time {
+	if coolingDown && cooldown.Until.After(deadline) {
+		return cooldown.Until
+	}
+	return deadline
 }
 
 func completedRevisionAtLeast(completed, listed string) bool {
@@ -639,32 +665,51 @@ func completedRevisionAtLeast(completed, listed string) bool {
 func (m *Manager) nextWorkDelay() (time.Duration, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	now := time.Now().UTC()
+	deadline, found, err := m.nextWorkDeadlineLocked(time.Now().UTC())
+	if err != nil || !found {
+		return 0, found, err
+	}
+	return max(time.Until(deadline), 0), true, nil
+}
+
+func (m *Manager) nextWorkDeadlineLocked(now time.Time) (time.Time, bool, error) {
 	var earliest time.Time
 	for _, job := range m.data.Jobs {
 		if job.State == Pending {
 			due, found, err := m.pendingJobDueLocked(job, now)
 			if err != nil {
-				return 0, false, err
+				return time.Time{}, false, err
 			}
-			if found && (earliest.IsZero() || due.Before(earliest)) {
-				earliest = due
-			}
-		}
-		if m.receiptSender != nil && job.State == Complete && job.ReceiptPending {
-			due := job.ReceiptRetryAt
-			if due.IsZero() || !due.After(now) {
-				return 0, true, nil
-			}
-			if earliest.IsZero() || due.Before(earliest) {
-				earliest = due
+			if found {
+				earliest = earlierDeadline(earliest, due)
 			}
 		}
+		receiptDeadline, ready := receiptRetryDeadline(job, m.receiptSender != nil, now)
+		if ready {
+			return now, true, nil
+		}
+		if !receiptDeadline.IsZero() {
+			earliest = earlierDeadline(earliest, receiptDeadline)
+		}
 	}
-	if earliest.IsZero() {
-		return 0, false, nil
+	return earliest, !earliest.IsZero(), nil
+}
+
+func receiptRetryDeadline(job Job, senderConfigured bool, now time.Time) (time.Time, bool) {
+	if !senderConfigured || job.State != Complete || !job.ReceiptPending {
+		return time.Time{}, false
 	}
-	return max(time.Until(earliest), 0), true, nil
+	if job.ReceiptRetryAt.IsZero() || !job.ReceiptRetryAt.After(now) {
+		return now, true
+	}
+	return job.ReceiptRetryAt, false
+}
+
+func earlierDeadline(current, candidate time.Time) time.Time {
+	if current.IsZero() || candidate.Before(current) {
+		return candidate
+	}
+	return current
 }
 
 func (m *Manager) signalScheduler() {
