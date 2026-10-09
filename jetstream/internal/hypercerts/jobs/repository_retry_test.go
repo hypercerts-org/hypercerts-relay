@@ -250,6 +250,56 @@ func TestRepositoryFailureAndPDSCooldownCommitAtomically(t *testing.T) {
 	worker.finishIncomplete(t, m, job.ID)
 }
 
+func TestRecordPDSCooldownRequiresActiveJobAndExtendsCanonicalOrigin(t *testing.T) {
+	dir := t.TempDir()
+	m, db := newManager(t, dir)
+	defer func() { _ = db.Close() }()
+	job, err := m.AddSource("https://PDS.example/")
+	require.NoError(t, err)
+	firstDeadline := time.Now().Add(5 * time.Minute).UTC()
+	require.ErrorIs(t, m.RecordPDSCooldown(job.ID, firstDeadline), ErrConflict, "only the active job may record an origin cooldown")
+
+	worker, _ := startRepositoryWorker(t, m, job.ID, map[string]string{})
+	select {
+	case <-m.wake:
+	default:
+	}
+	require.NoError(t, m.RecordPDSCooldown(job.ID, firstDeadline))
+	select {
+	case <-m.wake:
+	case <-time.After(time.Second):
+		t.Fatal("persisting an origin cooldown must wake the scheduler")
+	}
+	cooldown, found, err := m.GetPDSCooldown("https://pds.example")
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, "https://pds.example", cooldown.PDS, "the cooldown uses the canonical origin stored on the active job")
+	require.Equal(t, firstDeadline, cooldown.Until)
+
+	shorterDeadline := firstDeadline.Add(-time.Minute)
+	require.NoError(t, m.RecordPDSCooldown(job.ID, shorterDeadline))
+	cooldown, found, err = m.GetPDSCooldown(job.PDS)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, firstDeadline, cooldown.Until, "cooldowns only extend monotonically")
+
+	laterDeadline := firstDeadline.Add(time.Minute)
+	require.NoError(t, m.RecordPDSCooldown(job.ID, laterDeadline))
+	cooldown, found, err = m.GetPDSCooldown(job.PDS)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, laterDeadline, cooldown.Until)
+	worker.finishIncomplete(t, m, job.ID)
+	require.NoError(t, db.Close())
+
+	m, db = newManager(t, dir)
+	defer db.Close()
+	cooldown, found, err = m.GetPDSCooldown(job.PDS)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, laterDeadline, cooldown.Until, "the cooldown batch is synced across restart")
+}
+
 func TestRepositoryCheckpointAndRetryStateCommitAtomically(t *testing.T) {
 	const did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
 	injected := errors.New("injected checkpoint failure")
@@ -326,6 +376,108 @@ func TestRepositoryRetryResetOnlyDeletesEligibleUnresolvedRows(t *testing.T) {
 	require.Empty(t, listed)
 }
 
+func TestFailedJobRetryPreservesCompletedCoordinateAndResetsSameRevisionBudget(t *testing.T) {
+	const (
+		didComplete = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
+		didRetry    = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"
+		listedRev   = "3l3qo2vutsw2b"
+		newerRev    = "3l3qo2vutsw2c"
+	)
+	injected := errors.New("injected failed-job retry batch failure")
+	fault := &store.KeyPrefixFault{Prefix: []byte(repositoryRetryPrefix), Op: store.WriteOpBatchCommit, Ordinal: 5, Err: injected}
+	m, db := newManagerWithOptions(t, t.TempDir(), store.WithFaultInjector(fault))
+	defer db.Close()
+	job, err := m.AddSource("https://pds.example")
+	require.NoError(t, err)
+	entries := map[string]string{didComplete: listedRev, didRetry: listedRev}
+	worker, _ := startRepositoryWorker(t, m, job.ID, entries)
+	_, err = m.BeginRepositoryAttempt(job.ID, didComplete)
+	require.NoError(t, err)
+	require.NoError(t, m.CheckpointRepository(job.ID, didComplete, listedRev, newerRev, ""))
+	_, err = m.BeginRepositoryAttempt(job.ID, didRetry)
+	require.NoError(t, err)
+	_, err = m.RecordRepositoryFailure(job.ID, didRetry, RepositoryRetryFailure{Category: RepositoryFailureHTTP, HTTPStatus: 503, Stage: RepositoryFailureGetRepoRequest}, nil, nil)
+	require.NoError(t, err)
+	worker.finishAs(t, m, job.ID, &InputError{Code: "invalid_repository"}, Failed)
+
+	require.ErrorIs(t, m.Retry(job.ID), injected)
+	unchanged, err := m.Get(job.ID)
+	require.NoError(t, err)
+	require.Equal(t, Failed, unchanged.State)
+	require.Equal(t, map[string]string{didComplete: newerRev}, unchanged.CompletedRepos)
+	unresolved, err := m.GetRepositoryRetry(job.ID, didRetry)
+	require.NoError(t, err)
+	require.Equal(t, RepositoryRetryUnresolved, unresolved.State)
+	require.Equal(t, 1, unresolved.Attempts)
+
+	require.NoError(t, m.Retry(job.ID))
+	retried, err := m.Get(job.ID)
+	require.NoError(t, err)
+	require.Equal(t, map[string]string{didComplete: newerRev}, retried.CompletedRepos,
+		"a failed retry refreshes inventory without discarding archive-backed checkpoints")
+	require.False(t, retried.TotalReposKnown)
+	require.Empty(t, retried.Cursor)
+
+	worker, _ = startRepositoryWorker(t, m, job.ID, entries)
+	completed, err := m.GetRepositoryRetry(job.ID, didComplete)
+	require.NoError(t, err)
+	require.Equal(t, RepositoryRetryComplete, completed.State)
+	fresh, err := m.GetRepositoryRetry(job.ID, didRetry)
+	require.NoError(t, err)
+	require.Equal(t, RepositoryRetryReady, fresh.State,
+		"a same-DID/same-revision retry row from the discarded inventory must not carry its old budget")
+	require.Zero(t, fresh.Attempts)
+	worker.finishIncomplete(t, m, job.ID)
+}
+
+func TestIncompleteRetryAtomicallyResetsOnlyUnresolvedBudget(t *testing.T) {
+	const (
+		didComplete = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
+		didRetry    = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"
+		listedRev   = "3l3qo2vutsw2b"
+		newerRev    = "3l3qo2vutsw2c"
+	)
+	injected := errors.New("injected incomplete-job retry batch failure")
+	fault := &store.KeyPrefixFault{Prefix: []byte(repositoryRetryPrefix), Op: store.WriteOpBatchCommit, Ordinal: 5, Err: injected}
+	m, db := newManagerWithOptions(t, t.TempDir(), store.WithFaultInjector(fault))
+	defer db.Close()
+	job, err := m.AddSource("https://pds.example")
+	require.NoError(t, err)
+	worker, _ := startRepositoryWorker(t, m, job.ID, map[string]string{didComplete: listedRev, didRetry: listedRev})
+	_, err = m.BeginRepositoryAttempt(job.ID, didComplete)
+	require.NoError(t, err)
+	require.NoError(t, m.CheckpointRepository(job.ID, didComplete, listedRev, newerRev, ""))
+	_, err = m.BeginRepositoryAttempt(job.ID, didRetry)
+	require.NoError(t, err)
+	_, err = m.RecordRepositoryFailure(job.ID, didRetry, RepositoryRetryFailure{Category: RepositoryFailureHTTP, HTTPStatus: 503, Stage: RepositoryFailureGetRepoRequest}, nil, nil)
+	require.NoError(t, err)
+	worker.finishIncomplete(t, m, job.ID)
+
+	require.ErrorIs(t, m.Retry(job.ID), injected)
+	unchanged, err := m.Get(job.ID)
+	require.NoError(t, err)
+	require.Equal(t, Incomplete, unchanged.State)
+	require.Equal(t, map[string]string{didComplete: newerRev}, unchanged.CompletedRepos)
+	stillUnresolved, err := m.GetRepositoryRetry(job.ID, didRetry)
+	require.NoError(t, err)
+	require.Equal(t, RepositoryRetryUnresolved, stillUnresolved.State)
+	require.Equal(t, 1, stillUnresolved.Attempts)
+
+	require.NoError(t, m.Retry(job.ID))
+	retried, err := m.Get(job.ID)
+	require.NoError(t, err)
+	require.Equal(t, Pending, retried.State)
+	require.Equal(t, map[string]string{didComplete: newerRev}, retried.CompletedRepos)
+	require.True(t, retried.TotalReposKnown, "incomplete retry resumes the frozen inventory")
+	completed, err := m.GetRepositoryRetry(job.ID, didComplete)
+	require.NoError(t, err)
+	require.Equal(t, RepositoryRetryComplete, completed.State)
+	fresh, err := m.GetRepositoryRetry(job.ID, didRetry)
+	require.NoError(t, err)
+	require.Equal(t, RepositoryRetryReady, fresh.State)
+	require.Zero(t, fresh.Attempts)
+}
+
 func TestRepositoryRetryDoesNotMaterializeRowsForExistingJobs(t *testing.T) {
 	const did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
 	dir := t.TempDir()
@@ -347,7 +499,7 @@ func TestRepositoryRetryDoesNotMaterializeRowsForExistingJobs(t *testing.T) {
 	require.Empty(t, listed, "reopening an existing job must not eagerly create retry rows")
 }
 
-func TestRepositoryRetryIgnoresStaleAttemptsAfterFailedJobInventoryReset(t *testing.T) {
+func TestFailedJobRetryStartsFreshBudgetForRefreshedInventory(t *testing.T) {
 	const did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
 	m, db := newManager(t, t.TempDir())
 	defer db.Close()
@@ -362,13 +514,16 @@ func TestRepositoryRetryIgnoresStaleAttemptsAfterFailedJobInventoryReset(t *test
 
 	require.NoError(t, m.Retry(job.ID))
 	worker, _ = startRepositoryWorker(t, m, job.ID, map[string]string{did: "3l3qo2vutsw2c"})
-	_, err = m.GetRepositoryRetry(job.ID, did)
-	require.ErrorIs(t, err, ErrConflict, "an old attempt cannot be exposed for the new listed revision")
-	_, err = m.BeginRepositoryAttempt(job.ID, did)
-	require.ErrorIs(t, err, ErrConflict, "stale attempts cannot start work")
+	ready, err := m.GetRepositoryRetry(job.ID, did)
+	require.NoError(t, err)
+	require.Equal(t, RepositoryRetryReady, ready.State, "failed-job retry clears rows from the discarded inventory")
+	require.Zero(t, ready.Attempts)
+	fresh, err := m.BeginRepositoryAttempt(job.ID, did)
+	require.NoError(t, err)
+	require.Equal(t, 1, fresh.Attempts)
 	listed, err := m.ListRepositoryRetries(job.ID)
 	require.NoError(t, err)
-	require.Empty(t, listed, "stale rows are ignored by the explicit retry-row list")
+	require.Len(t, listed, 1)
 	worker.finishIncomplete(t, m, job.ID)
 	reset, err := m.ResetUnresolvedRepositoryRetries(job.ID)
 	require.NoError(t, err)

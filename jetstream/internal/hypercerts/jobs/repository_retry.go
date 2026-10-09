@@ -17,6 +17,10 @@ import (
 const (
 	repositoryRetryPrefix = "hypercerts/backfill-repo-retry/"
 	pdsCooldownPrefix     = "hypercerts/backfill-pds-cooldown/"
+
+	maxRepositoryAttempts    = 3
+	repositoryRetryBaseDelay = time.Second
+	repositoryRetryMaxDelay  = 15 * time.Minute
 )
 
 // RepositoryRetryState is the derived or persisted state of one repository in
@@ -37,11 +41,13 @@ const (
 type RepositoryFailureCategory string
 
 const (
-	RepositoryFailureTimeout   RepositoryFailureCategory = "timeout"
-	RepositoryFailureTransport RepositoryFailureCategory = "transport"
-	RepositoryFailureBodyRead  RepositoryFailureCategory = "body_read"
-	RepositoryFailureHTTP      RepositoryFailureCategory = "http"
-	RepositoryFailureUnknown   RepositoryFailureCategory = "unknown"
+	RepositoryFailureTimeout     RepositoryFailureCategory = "timeout"
+	RepositoryFailureTransport   RepositoryFailureCategory = "transport"
+	RepositoryFailureBodyRead    RepositoryFailureCategory = "body_read"
+	RepositoryFailureHTTP        RepositoryFailureCategory = "http"
+	RepositoryFailureUnknown     RepositoryFailureCategory = "unknown"
+	RepositoryFailureInterrupted RepositoryFailureCategory = "interrupted"
+	RepositoryFailureRejected    RepositoryFailureCategory = "rejected"
 )
 
 // RepositoryFailureStage limits stored failure location to direct getRepo
@@ -59,6 +65,7 @@ type RepositoryRetryFailure struct {
 	Category   RepositoryFailureCategory `json:"category"`
 	HTTPStatus int                       `json:"httpStatus,omitempty"`
 	Stage      RepositoryFailureStage    `json:"stage"`
+	Code       string                    `json:"code,omitempty"`
 }
 
 // RepositoryRetry is the repository-local attempt state for one job's frozen
@@ -83,8 +90,9 @@ type PDSCooldown struct {
 }
 
 var (
-	ErrRepositoryCoolingDown = errors.New("PDS is in repository retry cooldown")
-	ErrRepositoryRetryNotDue = errors.New("repository retry deadline has not elapsed")
+	ErrRepositoryCoolingDown    = errors.New("PDS is in repository retry cooldown")
+	ErrRepositoryRetryNotDue    = errors.New("repository retry deadline has not elapsed")
+	ErrRepositoryRetryExhausted = errors.New("repository retry attempt budget is exhausted")
 )
 
 func repositoryRetryJobPrefix(jobID string) []byte {
@@ -129,14 +137,7 @@ func (m *Manager) ListRepositoryRetries(jobID string) ([]RepositoryRetry, error)
 	if err != nil {
 		return nil, err
 	}
-	prefix := repositoryRetryJobPrefix(jobID)
-	iter, err := m.db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: store.PrefixUpperBound(prefix)})
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = iter.Close() }()
-
-	out, err := listFrozenRepositoryRetryRows(iter, jobID, job, inv.Entries)
+	out, err := m.listFrozenRepositoryRetryRowsLocked(jobID, job, inv.Entries)
 	if err != nil {
 		return nil, err
 	}
@@ -167,6 +168,16 @@ func decodePersistedRepositoryRetry(jobID string, prefix, key, value []byte) (Re
 	return retry, nil
 }
 
+func (m *Manager) listFrozenRepositoryRetryRowsLocked(jobID string, job Job, entries map[string]string) ([]RepositoryRetry, error) {
+	prefix := repositoryRetryJobPrefix(jobID)
+	iter, err := m.db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: store.PrefixUpperBound(prefix)})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = iter.Close() }()
+	return listFrozenRepositoryRetryRows(iter, jobID, job, entries)
+}
+
 func listFrozenRepositoryRetryRows(iter *pebble.Iterator, jobID string, job Job, entries map[string]string) ([]RepositoryRetry, error) {
 	prefix := repositoryRetryJobPrefix(jobID)
 	out := make([]RepositoryRetry, 0)
@@ -181,7 +192,7 @@ func listFrozenRepositoryRetryRows(iter *pebble.Iterator, jobID string, job Job,
 			// retry path. Never expose its old attempts as work for a new listing.
 			continue
 		}
-		if _, complete := job.CompletedRepos[retry.DID]; complete {
+		if completedRevisionAtLeast(job.CompletedRepos[retry.DID], listedRevision) {
 			continue
 		}
 		out = append(out, retry)
@@ -211,6 +222,9 @@ func (m *Manager) BeginRepositoryAttempt(jobID, did string) (RepositoryRetry, er
 	}
 	if current.State == RepositoryRetryComplete || current.State == RepositoryRetryInFlight || current.State == RepositoryRetryUnresolved {
 		return RepositoryRetry{}, ErrConflict
+	}
+	if current.Attempts >= maxRepositoryAttempts {
+		return RepositoryRetry{}, ErrRepositoryRetryExhausted
 	}
 	if current.State == RepositoryRetryWait && current.RetryAt.After(time.Now()) {
 		return RepositoryRetry{}, ErrRepositoryRetryNotDue
@@ -342,6 +356,51 @@ func (m *Manager) CheckpointRepository(jobID, did, listedRevision, completedRevi
 	return m.commitRepositoryRetryBatch(next, true, nil, [][]byte{repositoryRetryKey(jobID, did)}, nil)
 }
 
+func (m *Manager) repositoryRetryDeleteKeysLocked(jobID string, unresolvedOnly bool) ([][]byte, error) {
+	prefix := repositoryRetryJobPrefix(jobID)
+	var inv inventory
+	var err error
+	var job Job
+	if unresolvedOnly {
+		job = m.data.Jobs[jobID]
+		inv, err = m.readInventory(jobID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	iter, err := m.db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: store.PrefixUpperBound(prefix)})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = iter.Close() }()
+	var deletes [][]byte
+	for iter.First(); iter.Valid(); iter.Next() {
+		var retry RepositoryRetry
+		if err := json.Unmarshal(iter.Value(), &retry); err != nil {
+			return nil, errors.New("invalid persisted repository retry state")
+		}
+		key := append([]byte(nil), iter.Key()...)
+		keyDID, err := decodeRepositoryRetryDID(prefix, key)
+		if err != nil || keyDID != retry.DID || retry.JobID != jobID || !validPersistedRepositoryRetry(retry) {
+			return nil, errors.New("invalid persisted repository retry state")
+		}
+		if unresolvedOnly {
+			listedRevision, exists := inv.Entries[retry.DID]
+			if !exists || listedRevision != retry.ListedRevision || retry.State != RepositoryRetryUnresolved {
+				continue
+			}
+			if _, complete := job.CompletedRepos[retry.DID]; complete {
+				continue
+			}
+		}
+		deletes = append(deletes, key)
+	}
+	if err := iter.Error(); err != nil {
+		return nil, err
+	}
+	return deletes, nil
+}
+
 // ResetUnresolvedRepositoryRetries deletes only unresolved rows for an eligible
 // non-running job. Deletion restores the implicit ready state and zeroes this
 // job/repository's attempt count; checkpointed repositories are never touched.
@@ -355,18 +414,7 @@ func (m *Manager) ResetUnresolvedRepositoryRetries(jobID string) (int, error) {
 	if !m.repositoryResetEligibleLocked(job) || !job.TotalReposKnown {
 		return 0, ErrConflict
 	}
-	inv, err := m.readInventory(jobID)
-	if err != nil {
-		return 0, err
-	}
-	prefix := repositoryRetryJobPrefix(jobID)
-	iter, err := m.db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: store.PrefixUpperBound(prefix)})
-	if err != nil {
-		return 0, err
-	}
-	defer func() { _ = iter.Close() }()
-
-	deletes, err := unresolvedRepositoryRetryDeletes(iter, jobID, job, inv.Entries)
+	deletes, err := m.repositoryRetryDeleteKeysLocked(jobID, true)
 	if err != nil {
 		return 0, err
 	}
@@ -379,27 +427,36 @@ func (m *Manager) ResetUnresolvedRepositoryRetries(jobID string) (int, error) {
 	return len(deletes), nil
 }
 
-func unresolvedRepositoryRetryDeletes(iter *pebble.Iterator, jobID string, job Job, entries map[string]string) ([][]byte, error) {
-	prefix := repositoryRetryJobPrefix(jobID)
-	var deletes [][]byte
-	for iter.First(); iter.Valid(); iter.Next() {
-		retry, err := decodePersistedRepositoryRetry(jobID, prefix, iter.Key(), iter.Value())
-		if err != nil {
-			return nil, err
-		}
-		listedRevision, exists := entries[retry.DID]
-		if !exists || listedRevision != retry.ListedRevision {
-			continue
-		}
-		if _, complete := job.CompletedRepos[retry.DID]; complete || retry.State != RepositoryRetryUnresolved {
-			continue
-		}
-		deletes = append(deletes, append([]byte(nil), iter.Key()...))
+// RecordPDSCooldown monotonically extends the active job's canonical PDS-origin
+// deadline without creating a repository retry row. The cooldown is synced
+// through the retry-state batch so all jobs for that origin observe it.
+func (m *Manager) RecordPDSCooldown(jobID string, until time.Time) error {
+	until = until.UTC()
+	if jobID == "" || !validRetryDeadline(until) || !until.After(time.Now().UTC()) {
+		return ErrInvalidInput
 	}
-	if err := iter.Error(); err != nil {
-		return nil, err
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	job, ok := m.data.Jobs[jobID]
+	if !ok {
+		return ErrNotFound
 	}
-	return deletes, nil
+	if !m.active(jobID) {
+		return ErrConflict
+	}
+	canonical, err := normalizeSource(job.PDS)
+	if err != nil || canonical != job.PDS {
+		return errors.New("invalid persisted job source")
+	}
+	existing, found, err := m.readPDSCooldownLocked(canonical)
+	if err != nil {
+		return err
+	}
+	if found && !until.After(existing.Until) {
+		return nil
+	}
+	cooldown := PDSCooldown{PDS: canonical, Until: until}
+	return m.commitRepositoryRetryBatch(m.data, false, nil, nil, &cooldown)
 }
 
 // GetPDSCooldown returns the canonical origin's persisted cooldown, including
@@ -492,6 +549,179 @@ func (m *Manager) repositoryResetEligibleLocked(job Job) bool {
 	return m.data.SourceRevisions[job.PDS] == 0 || job.SourceRevision == m.data.SourceRevisions[job.PDS]
 }
 
+func (m *Manager) pendingJobDueLocked(job Job, now time.Time) (time.Time, bool, error) {
+	cooldown, found, err := m.readPDSCooldownLocked(job.PDS)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	coolingDown := found && cooldown.Until.After(now)
+	if !job.TotalReposKnown {
+		return applyPDSCooldown(now, cooldown, coolingDown), true, nil
+	}
+	inv, err := m.readInventory(job.ID)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	retries, err := m.pendingRepositoryRetryRowsLocked(job, inv.Entries)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	earliest, dueNow, err := pendingRetryDeadline(retries, now)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	if dueNow || pendingInventoryHasImplicitReady(job, inv.Entries, retries) {
+		return applyPDSCooldown(now, cooldown, coolingDown), true, nil
+	}
+	if earliest.IsZero() {
+		// Give the processor one pass to persist the terminal outcome for an
+		// inventory whose remaining entries are all already resolved.
+		return now, true, nil
+	}
+	return applyPDSCooldown(earliest, cooldown, coolingDown), true, nil
+}
+
+func (m *Manager) pendingRepositoryRetryRowsLocked(job Job, entries map[string]string) ([]RepositoryRetry, error) {
+	prefix := repositoryRetryJobPrefix(job.ID)
+	iter, err := m.db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: store.PrefixUpperBound(prefix)})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = iter.Close() }()
+	var retries []RepositoryRetry
+	for iter.First(); iter.Valid(); iter.Next() {
+		retry, err := decodePersistedRepositoryRetry(job.ID, prefix, iter.Key(), iter.Value())
+		if err != nil {
+			return nil, err
+		}
+		listedRevision, exists := entries[retry.DID]
+		if !exists {
+			continue
+		}
+		if listedRevision != retry.ListedRevision {
+			return nil, ErrConflict
+		}
+		if completedRevisionAtLeast(job.CompletedRepos[retry.DID], listedRevision) {
+			continue
+		}
+		retries = append(retries, retry)
+	}
+	if err := iter.Error(); err != nil {
+		return nil, err
+	}
+	return retries, nil
+}
+
+func pendingRetryDeadline(retries []RepositoryRetry, now time.Time) (time.Time, bool, error) {
+	var earliest time.Time
+	for _, retry := range retries {
+		switch retry.State {
+		case RepositoryRetryInFlight:
+			return now, true, nil
+		case RepositoryRetryWait:
+			if !retry.RetryAt.After(now) {
+				return now, true, nil
+			}
+			if earliest.IsZero() || retry.RetryAt.Before(earliest) {
+				earliest = retry.RetryAt
+			}
+		case RepositoryRetryUnresolved:
+		default:
+			return time.Time{}, false, errors.New("invalid repository retry state")
+		}
+	}
+	return earliest, false, nil
+}
+
+func pendingInventoryHasImplicitReady(job Job, entries map[string]string, retries []RepositoryRetry) bool {
+	retryDIDs := make(map[string]struct{}, len(retries))
+	for _, retry := range retries {
+		retryDIDs[retry.DID] = struct{}{}
+	}
+	for did, listedRevision := range entries {
+		if completedRevisionAtLeast(job.CompletedRepos[did], listedRevision) {
+			continue
+		}
+		if _, found := retryDIDs[did]; !found {
+			return true
+		}
+	}
+	return false
+}
+
+func applyPDSCooldown(deadline time.Time, cooldown PDSCooldown, coolingDown bool) time.Time {
+	if coolingDown && cooldown.Until.After(deadline) {
+		return cooldown.Until
+	}
+	return deadline
+}
+
+func completedRevisionAtLeast(completed, listed string) bool {
+	completedTID, completedErr := atmos.ParseTID(completed)
+	listedTID, listedErr := atmos.ParseTID(listed)
+	return completedErr == nil && listedErr == nil && completedTID.Integer() >= listedTID.Integer()
+}
+
+func (m *Manager) nextWorkDelay() (time.Duration, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	deadline, found, err := m.nextWorkDeadlineLocked(time.Now().UTC())
+	if err != nil || !found {
+		return 0, found, err
+	}
+	return max(time.Until(deadline), 0), true, nil
+}
+
+func (m *Manager) nextWorkDeadlineLocked(now time.Time) (time.Time, bool, error) {
+	var earliest time.Time
+	for _, job := range m.data.Jobs {
+		if job.State == Pending {
+			due, found, err := m.pendingJobDueLocked(job, now)
+			if err != nil {
+				return time.Time{}, false, err
+			}
+			if found {
+				earliest = earlierDeadline(earliest, due)
+			}
+		}
+		receiptDeadline, ready := receiptRetryDeadline(job, m.receiptSender != nil, now)
+		if ready {
+			return now, true, nil
+		}
+		if !receiptDeadline.IsZero() {
+			earliest = earlierDeadline(earliest, receiptDeadline)
+		}
+	}
+	return earliest, !earliest.IsZero(), nil
+}
+
+func receiptRetryDeadline(job Job, senderConfigured bool, now time.Time) (time.Time, bool) {
+	if !senderConfigured || job.State != Complete || !job.ReceiptPending {
+		return time.Time{}, false
+	}
+	if job.ReceiptRetryAt.IsZero() || !job.ReceiptRetryAt.After(now) {
+		return now, true
+	}
+	return job.ReceiptRetryAt, false
+}
+
+func earlierDeadline(current, candidate time.Time) time.Time {
+	if current.IsZero() || candidate.Before(current) {
+		return candidate
+	}
+	return current
+}
+
+func (m *Manager) signalScheduler() {
+	if m.wake == nil {
+		return
+	}
+	select {
+	case m.wake <- struct{}{}:
+	default:
+	}
+}
+
 func (m *Manager) commitRepositoryRetryBatch(next data, persistJob bool, retry *RepositoryRetry, deleteRetries [][]byte, cooldown *PDSCooldown) error {
 	batch := m.db.NewBatch()
 	defer func() { _ = batch.Close() }()
@@ -533,6 +763,7 @@ func (m *Manager) commitRepositoryRetryBatch(next data, persistJob bool, retry *
 	if persistJob {
 		m.data = next
 	}
+	m.signalScheduler()
 	return nil
 }
 
@@ -549,9 +780,10 @@ func decodeRepositoryRetryDID(prefix, key []byte) (string, error) {
 }
 
 func validRepositoryFailure(failure RepositoryRetryFailure) bool {
-	categoryValid := failure.Category == RepositoryFailureTimeout || failure.Category == RepositoryFailureTransport || failure.Category == RepositoryFailureBodyRead || failure.Category == RepositoryFailureHTTP || failure.Category == RepositoryFailureUnknown
+	categoryValid := failure.Category == RepositoryFailureTimeout || failure.Category == RepositoryFailureTransport || failure.Category == RepositoryFailureBodyRead || failure.Category == RepositoryFailureHTTP || failure.Category == RepositoryFailureUnknown || failure.Category == RepositoryFailureInterrupted || failure.Category == RepositoryFailureRejected
 	stageValid := failure.Stage == RepositoryFailureGetRepoRequest || failure.Stage == RepositoryFailureGetRepoBody
-	if !categoryValid || !stageValid {
+	codeValid := len(failure.Code) <= 64 && strings.Trim(failure.Code, "abcdefghijklmnopqrstuvwxyz0123456789_") == ""
+	if !categoryValid || !stageValid || !codeValid {
 		return false
 	}
 	if failure.Category == RepositoryFailureHTTP {
