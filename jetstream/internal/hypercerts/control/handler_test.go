@@ -1,6 +1,7 @@
 package control
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/binary"
@@ -11,14 +12,19 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/hypercerts/jobs"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
+	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/jcalabro/atmos"
+	atmoscrypto "github.com/jcalabro/atmos/crypto"
 	"github.com/jcalabro/atmos/identity"
+	"github.com/jcalabro/atmos/mst"
+	"github.com/jcalabro/atmos/repo"
 	"github.com/stretchr/testify/require"
 )
 
@@ -881,6 +887,215 @@ func TestPrivatePolicyAndJobsRemainAtomicOnWriteFailure(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, policy.Current(), restored.Current())
 	require.Equal(t, 200, request(h, "PUT", "/policy", `{"expectedRevision":1,"collections":[]}`, testToken).Code)
+}
+
+func TestAuthorizedRetryAfterRestartPreservesCompletedAcquisition(t *testing.T) {
+	const (
+		didA = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
+		didB = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"
+	)
+	keyA, err := atmoscrypto.GenerateP256()
+	require.NoError(t, err)
+	carA, revisionA := controlPDSCAR(t, atmos.DID(didA), keyA)
+	keyB, err := atmoscrypto.GenerateP256()
+	require.NoError(t, err)
+	carB, revisionB := controlPDSCAR(t, atmos.DID(didB), keyB)
+
+	var listReposRequests atomic.Int64
+	var getRepoARequests atomic.Int64
+	var getRepoBRequests atomic.Int64
+	var allowBSuccess atomic.Bool
+	var reconciled atomic.Int64
+	pds := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/xrpc/com.atproto.sync.listRepos":
+			listReposRequests.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"repos":[{"did":"` + didA + `","rev":"` + revisionA + `","head":"a","active":true},{"did":"` + didB + `","rev":"` + revisionB + `","head":"b","active":true}]}`))
+		case "/xrpc/com.atproto.sync.getRepo":
+			switch r.URL.Query().Get("did") {
+			case didA:
+				getRepoARequests.Add(1)
+				w.Header().Set("Content-Type", "application/vnd.ipld.car")
+				_, _ = w.Write(carA)
+			case didB:
+				getRepoBRequests.Add(1)
+				if !allowBSuccess.Load() {
+					http.Error(w, "temporary PDS failure", http.StatusServiceUnavailable)
+					return
+				}
+				w.Header().Set("Content-Type", "application/vnd.ipld.car")
+				_, _ = w.Write(carB)
+			default:
+				http.NotFound(w, r)
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer pds.Close()
+
+	directory := &identity.Directory{
+		Resolver: controlSnapshotResolver{documents: map[string]*identity.DIDDocument{
+			didA: controlPDSDocument(atmos.DID(didA), keyA, pds.URL),
+			didB: controlPDSDocument(atmos.DID(didB), keyB, pds.URL),
+		}},
+		Cache: identity.NewLRUCache(2, time.Hour),
+	}
+	for did := range map[string]struct{}{didA: {}, didB: {}} {
+		directory.Cache.Set(t.Context(), "did:"+did, &identity.Identity{
+			DID:      atmos.DID(did),
+			Services: map[string]identity.ServiceEndpoint{"atproto_pds": {URL: pds.URL}},
+		})
+	}
+
+	dbDir := t.TempDir()
+	var db *store.Store
+	t.Cleanup(func() {
+		if db != nil {
+			require.NoError(t, db.Close())
+		}
+	})
+	openManager := func() (*jobs.Manager, *Handler) {
+		var openErr error
+		db, openErr = store.Open(dbDir, nil)
+		require.NoError(t, openErr)
+		policy, openErr := selection.Open(db, []string{"app.bsky.feed.post"})
+		require.NoError(t, openErr)
+		manager, openErr := jobs.Open(db, policy)
+		require.NoError(t, openErr)
+		handler, openErr := New(testToken, manager, policy)
+		require.NoError(t, openErr)
+		return manager, handler
+	}
+	processorFor := func(manager *jobs.Manager) jobs.PDSProcessor {
+		return jobs.PDSProcessor{
+			Manager: manager, HTTPClient: pds.Client(), Directory: directory,
+			Reconcile: func(context.Context, ingest.Snapshot) error {
+				reconciled.Add(1)
+				return nil
+			},
+		}
+	}
+
+	manager, _ := openManager()
+	job, err := manager.AddSource(pds.URL)
+	require.NoError(t, err)
+	runControlManagerUntilState(t, manager, processorFor(manager), job.ID, jobs.Incomplete)
+	beforeRestart, err := manager.Get(job.ID)
+	require.NoError(t, err)
+	require.Equal(t, map[string]string{didA: revisionA}, beforeRestart.CompletedRepos)
+	require.Equal(t, int64(1), getRepoARequests.Load())
+	require.Equal(t, int64(3), getRepoBRequests.Load())
+	require.Equal(t, int64(1), reconciled.Load())
+	require.NoError(t, db.Close())
+	db = nil
+
+	manager, handler := openManager()
+	restored, err := manager.Get(job.ID)
+	require.NoError(t, err)
+	require.Equal(t, jobs.Incomplete, restored.State)
+	require.Equal(t, map[string]string{didA: revisionA}, restored.CompletedRepos,
+		"Pebble reopen must retain the successful repository checkpoint")
+	require.Equal(t, http.StatusUnauthorized, request(handler, "POST", "/jobs/"+job.ID+"/retry", "", "invalid-token").Code)
+	require.Equal(t, jobs.Incomplete, mustGetControlJob(t, manager, job.ID).State,
+		"an unauthorized retry must not create another acquisition cycle")
+
+	allowBSuccess.Store(true)
+	retryResponse := request(handler, "POST", "/jobs/"+job.ID+"/retry", "", testToken)
+	require.Equal(t, http.StatusOK, retryResponse.Code)
+	var retryView jobView
+	require.NoError(t, json.Unmarshal(retryResponse.Body.Bytes(), &retryView))
+	require.Equal(t, jobs.Pending, retryView.State)
+	require.True(t, retryView.TotalReposKnown, "incomplete retry resumes the frozen inventory")
+	require.Equal(t, 1, retryView.CompletedRepos)
+	reset, err := manager.GetRepositoryRetry(job.ID, didB)
+	require.NoError(t, err)
+	require.Equal(t, jobs.RepositoryRetryReady, reset.State)
+	require.Zero(t, reset.Attempts)
+
+	runControlManagerUntilState(t, manager, processorFor(manager), job.ID, jobs.Complete)
+	completed, err := manager.Get(job.ID)
+	require.NoError(t, err)
+	require.Equal(t, map[string]string{didA: revisionA, didB: revisionB}, completed.CompletedRepos)
+	require.Equal(t, int64(1), listReposRequests.Load(), "the authorized retry uses the durable frozen inventory")
+	require.Equal(t, int64(1), getRepoARequests.Load(), "a checkpointed repository must not be downloaded a second time")
+	require.Equal(t, int64(4), getRepoBRequests.Load(), "the unresolved coordinate receives a fresh retry cycle")
+	require.Equal(t, int64(2), reconciled.Load())
+}
+
+type controlSnapshotResolver struct {
+	documents map[string]*identity.DIDDocument
+}
+
+func (r controlSnapshotResolver) ResolveDID(_ context.Context, did atmos.DID) (*identity.DIDDocument, error) {
+	document := r.documents[string(did)]
+	if document == nil {
+		return nil, errors.New("fixture DID document not found")
+	}
+	return document, nil
+}
+
+func (controlSnapshotResolver) ResolveHandle(context.Context, atmos.Handle) (atmos.DID, error) {
+	return "", errors.New("fixture resolver does not resolve handles")
+}
+
+func controlPDSDocument(did atmos.DID, key atmoscrypto.PrivateKey, pds string) *identity.DIDDocument {
+	return &identity.DIDDocument{
+		ID: string(did),
+		VerificationMethod: []identity.VerificationMethod{{
+			ID:                 string(did) + "#atproto",
+			Type:               "Multikey",
+			Controller:         string(did),
+			PublicKeyMultibase: key.PublicKey().Multibase(),
+		}},
+		Service: []identity.Service{{
+			ID:              "#atproto_pds",
+			Type:            "AtprotoPersonalDataServer",
+			ServiceEndpoint: pds,
+		}},
+	}
+}
+
+func controlPDSCAR(t *testing.T, did atmos.DID, key atmoscrypto.PrivateKey) ([]byte, string) {
+	t.Helper()
+	blockStore := mst.NewMemBlockStore()
+	snapshot := &repo.Repo{DID: did, Clock: atmos.NewTIDClock(0), Store: blockStore, Tree: mst.NewTree(blockStore)}
+	require.NoError(t, snapshot.Create("app.bsky.feed.post", "3l3qo2vutsw2b", map[string]any{"text": string(did)}))
+	var car bytes.Buffer
+	require.NoError(t, snapshot.ExportCAR(&car, key))
+	_, commit, err := repo.LoadCompleteFromCAR(bytes.NewReader(car.Bytes()))
+	require.NoError(t, err)
+	return car.Bytes(), commit.Rev
+}
+
+func runControlManagerUntilState(t *testing.T, manager *jobs.Manager, processor jobs.PDSProcessor, jobID string, want jobs.State) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- manager.Run(ctx, processor.Run) }()
+	joined := false
+	defer func() {
+		if !joined {
+			cancel()
+			<-done
+		}
+	}()
+	require.Eventually(t, func() bool {
+		current, err := manager.Get(jobID)
+		return err == nil && current.State == want
+	}, 10*time.Second, 5*time.Millisecond)
+	cancel()
+	err := <-done
+	joined = true
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+func mustGetControlJob(t *testing.T, manager *jobs.Manager, id string) jobs.Job {
+	t.Helper()
+	job, err := manager.Get(id)
+	require.NoError(t, err)
+	return job
 }
 
 // Exposes the real persistent management contract to the Node acceptance harness.
