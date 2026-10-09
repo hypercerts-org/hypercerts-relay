@@ -113,7 +113,7 @@ test("administrator operates sources, collections, jobs, rates and revokes the s
   await expect(
     page
       .getByRole("region", { name: "Source detail" })
-      .getByText("0 repositories scanned; initial inventory is still being counted"),
+      .getByText("Initial repository inventory is unknown; progress total unavailable"),
   ).toBeVisible({ timeout: 12000 });
   await page.getByRole("link", { name: "Rate limits", exact: true }).click();
   await page.getByLabel("Events per second").fill("12");

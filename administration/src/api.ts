@@ -1,5 +1,13 @@
 import type { Command, Policy } from "../server/contracts";
-export type { Command, Operation, Policy, Job } from "../server/contracts";
+export type {
+  Command,
+  Job,
+  JobDiagnostics,
+  Operation,
+  Policy,
+  RepositoryDetail,
+  RepositoryDetailsPage,
+} from "../server/contracts";
 export interface Administrator {
   did: string;
   handle?: string | null;
@@ -36,6 +44,7 @@ export interface JetstreamSummary {
   totalReposKnown: boolean;
   createdAt: string;
   coverage: string;
+  diagnostics: import("../server/contracts").JobDiagnostics;
 }
 export interface Coverage {
   pds: string;
@@ -49,6 +58,7 @@ export interface Coverage {
   reason: string | null;
   historicalPDSAttribution: string;
   coverage: string;
+  diagnostics: import("../server/contracts").JobDiagnostics;
 }
 export interface Audit {
   seq: number;

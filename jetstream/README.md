@@ -245,21 +245,23 @@ All paths below start with `/hypercerts/v1`:
 | `GET /jobs?limit=100&after=<cursor>` | Sorted page, maximum 200 jobs, optional `nextCursor`. Concurrent additions may require a fresh listing. |
 | `GET /snapshot-rejections?limit=100&after=<cursor>` | The most recent 1,000 bounded non-payload direct-PDS snapshot rejections, with optional repeated exact `pds` filters. Older rejections are evicted. Returns origin, policy/listed revisions, DID, kind/code and timestamp; never CAR bytes, records, tokens or storage keys. |
 | `GET /coverage?limit=100&after=<pds>` | Latest current-state job per PDS, sorted and paginated by PDS with optional exact `pds` filter. |
-| `GET /jobs/{id}` | Durable state, progress, attempt count, and coverage. |
+| `GET /jobs/{id}` | Durable state, progress, attempt count, coverage, and bounded execution diagnostics. |
+| `GET /jobs/{id}/repositories?limit=100&after=<opaque-cursor>` | Snapshot-consistent frozen repository coordinates and sanitized retry state; maximum 200 rows per page. Unknown inventory returns `409`; expired snapshots return `410`; projections over 50,000 rows return `413`. |
 | `POST /jobs/{id}/cancel` | Cancels pending/running work. |
 | `POST /jobs/{id}/retry` | Resumes current-policy work from durable progress; a removed source or obsolete revision returns conflict. |
 
 Each job reports `id`, `pds`, `policy.revision`, `policy.collections`, `reason`,
 `state`, `attempts`, `completedRepos` (count), `totalRepos` with
 `totalReposKnown`, page `cursor`, bounded `errorCode`,
-creation/start/finish times, and `coverage`. Job states are `pending`, `running`,
-`failed`, `canceled`, `incomplete`, and `complete`. A completed job identifies the
-exact PDS origin and policy revision whose **current state** it covers. An
-unreachable PDS returns `incomplete`, never
+creation/start/finish times, `coverage`, and `diagnostics`. Job states are
+`pending`, `running`, `failed`, `canceled`, `incomplete`, and `complete`. A
+completed job identifies the exact PDS origin and policy revision whose
+**current state** it covers. An unreachable PDS returns `incomplete`, never
 `complete`.
 
 Errors use a bounded JSON `error` code: 400 invalid input, 401 authentication,
-404 unknown job/source, 409 policy/state conflict, and 500 persistence failure.
+404 unknown job/source, 409 policy/state conflict, 410 expired repository snapshot,
+413 oversized repository projection, and 500 persistence failure.
 Mutation bodies are limited to 64 KiB and reject unknown fields/trailing JSON.
 Local persistence errors do not acknowledge a successful change or expose raw
 storage errors. Job progress and outcomes survive restart.

@@ -117,16 +117,18 @@ type data struct {
 	SnapshotRejections map[string]SnapshotRejection `json:"snapshotRejections"`
 }
 type Manager struct {
-	mu             sync.Mutex
-	db             *store.Store
-	policy         *selection.Manager
-	data           data
-	cancel         context.CancelFunc
-	running        bool
-	runningID      string
-	receiptSender  ReceiptSender
-	policyAdvancer PolicyAdvanceSender
-	wake           chan struct{}
+	mu                        sync.Mutex
+	db                        *store.Store
+	policy                    *selection.Manager
+	data                      data
+	cancel                    context.CancelFunc
+	running                   bool
+	runningID                 string
+	receiptSender             ReceiptSender
+	policyAdvancer            PolicyAdvanceSender
+	repositoryDetailSnapshots map[[16]byte]*repositoryDetailsSnapshot
+	repositoryDetailRows      int
+	wake                      chan struct{}
 }
 
 // ReceiptSender submits a completed job's bounded recovery coordinate to the
@@ -689,6 +691,20 @@ func (m *Manager) List() []Job {
 	for _, j := range m.data.Jobs {
 		out = append(out, clone(j))
 	}
+	slices.SortFunc(out, func(a, b Job) int { return strings.Compare(a.ID, b.ID) })
+	return out
+}
+
+// ListForDiagnostics returns sorted job metadata without per-repository checkpoints.
+func (m *Manager) ListForDiagnostics() []Job {
+	m.mu.Lock()
+	out := make([]Job, 0, len(m.data.Jobs))
+	for _, job := range m.data.Jobs {
+		job.CompletedRepos = nil
+		job.Policy.Collections = slices.Clone(job.Policy.Collections)
+		out = append(out, job)
+	}
+	m.mu.Unlock()
 	slices.SortFunc(out, func(a, b Job) int { return strings.Compare(a.ID, b.ID) })
 	return out
 }

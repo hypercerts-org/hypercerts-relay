@@ -3,6 +3,7 @@ package jobs
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -497,6 +498,97 @@ func TestRepositoryRetryDoesNotMaterializeRowsForExistingJobs(t *testing.T) {
 	listed, err := m.ListRepositoryRetries(job.ID)
 	require.NoError(t, err)
 	require.Empty(t, listed, "reopening an existing job must not eagerly create retry rows")
+}
+
+func TestRepositoryDetailsContinuationUsesImmutableSnapshotAfterCheckpointAndStoreClose(t *testing.T) {
+	const (
+		didA = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
+		didB = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"
+		rev  = "3l3qo2vutsw2b"
+	)
+	m, db := newManager(t, t.TempDir())
+	defer db.Close()
+	job, err := m.AddSource("https://pds.example")
+	require.NoError(t, err)
+	worker, _ := startRepositoryWorker(t, m, job.ID, map[string]string{didA: rev, didB: rev})
+
+	first, err := m.RepositoryDetails(job.ID, "", 1)
+	require.NoError(t, err)
+	require.NotEmpty(t, first.NextCursor)
+	require.Equal(t, Running, first.Snapshot.Job.State)
+	require.Equal(t, 2, *first.Snapshot.Diagnostics.UnresolvedRepos)
+	require.Equal(t, didA, first.Repositories[0].DID)
+
+	_, err = m.BeginRepositoryAttempt(job.ID, didB)
+	require.NoError(t, err)
+	require.NoError(t, m.CheckpointRepository(job.ID, didB, rev, rev, ""))
+	worker.cancel()
+	require.ErrorIs(t, <-worker.done, context.Canceled)
+	require.NoError(t, db.Close())
+
+	second, err := m.RepositoryDetails(job.ID, first.NextCursor, 1)
+	require.NoError(t, err, "continuation must use the captured projection without reading Pebble")
+	require.Equal(t, Running, second.Snapshot.Job.State, "parent status must match the first page snapshot")
+	require.Equal(t, 2, *second.Snapshot.Diagnostics.UnresolvedRepos)
+	require.Equal(t, didB, second.Repositories[0].DID)
+	require.Equal(t, RepositoryRetryReady, second.Repositories[0].State)
+	require.Zero(t, second.Repositories[0].Attempts)
+}
+
+func TestRepositoryDetailsSnapshotExpiryAndLRUEviction(t *testing.T) {
+	const (
+		didA = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
+		didB = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"
+		rev  = "3l3qo2vutsw2b"
+	)
+	m, db := newManager(t, t.TempDir())
+	defer db.Close()
+	firstJob, err := m.AddSource("https://first.example")
+	require.NoError(t, err)
+	firstWorker, _ := startRepositoryWorker(t, m, firstJob.ID, map[string]string{didA: rev, didB: rev})
+	firstPage, err := m.RepositoryDetails(firstJob.ID, "", 1)
+	require.NoError(t, err)
+	id, _, err := decodeRepositoryDetailsCursor(firstPage.NextCursor)
+	require.NoError(t, err)
+
+	m.mu.Lock()
+	m.repositoryDetailSnapshots[id].ExpiresAt = time.Now().UTC().Add(-time.Second)
+	m.mu.Unlock()
+	_, err = m.RepositoryDetails(firstJob.ID, firstPage.NextCursor, 1)
+	require.ErrorIs(t, err, ErrRepositoryDetailsSnapshotExpired)
+	freshPage, err := m.RepositoryDetails(firstJob.ID, "", 1)
+	require.NoError(t, err, "expired cursors require a fresh first-page capture")
+	require.NotEmpty(t, freshPage.NextCursor)
+	firstWorker.finishIncomplete(t, m, firstJob.ID)
+
+	cursors := []string{freshPage.NextCursor}
+	jobIDs := []string{firstJob.ID}
+	for i := 1; i < maxRepositoryDetailSnapshots; i++ {
+		job, addErr := m.AddSource(fmt.Sprintf("https://pds-%d.example", i))
+		require.NoError(t, addErr)
+		worker, _ := startRepositoryWorker(t, m, job.ID, map[string]string{didA: rev, didB: rev})
+		page, pageErr := m.RepositoryDetails(job.ID, "", 1)
+		require.NoError(t, pageErr)
+		require.NotEmpty(t, page.NextCursor)
+		cursors = append(cursors, page.NextCursor)
+		jobIDs = append(jobIDs, job.ID)
+		worker.finishIncomplete(t, m, job.ID)
+	}
+
+	_, err = m.RepositoryDetails(jobIDs[0], cursors[0], 1)
+	require.NoError(t, err, "access updates the snapshot's LRU position")
+	lastJob, err := m.AddSource("https://last.example")
+	require.NoError(t, err)
+	lastWorker, _ := startRepositoryWorker(t, m, lastJob.ID, map[string]string{didA: rev, didB: rev})
+	lastPage, err := m.RepositoryDetails(lastJob.ID, "", 1)
+	require.NoError(t, err)
+	require.NotEmpty(t, lastPage.NextCursor)
+	lastWorker.finishIncomplete(t, m, lastJob.ID)
+
+	_, err = m.RepositoryDetails(jobIDs[0], cursors[0], 1)
+	require.NoError(t, err, "the least-recently-used snapshot must remain available")
+	_, err = m.RepositoryDetails(jobIDs[1], cursors[1], 1)
+	require.ErrorIs(t, err, ErrRepositoryDetailsSnapshotExpired, "the least-recently-used cursor must expire on capacity eviction")
 }
 
 func TestFailedJobRetryStartsFreshBudgetForRefreshedInventory(t *testing.T) {

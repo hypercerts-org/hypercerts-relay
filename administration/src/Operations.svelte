@@ -1,12 +1,15 @@
 <script lang="ts">
   import State from "./State.svelte";
   import {
+    api,
     target,
     type Job,
     type Operation,
     type Coverage,
     type Audit,
     type Command,
+    type RepositoryDetail,
+    type RepositoryDetailsPage,
   } from "./api";
   export let screen: string;
   export let jobs: Job[] = [];
@@ -42,14 +45,12 @@
       : "Selected-collection backfill";
   }
   function jobProgress(job: Job) {
-    if (["running", "in_progress"].includes(job.state)) {
-      return job.totalReposKnown
-        ? `${job.completedRepos} of ${job.totalRepos} repositories from the initial inventory processed`
-        : "Counting the initial repository inventory before backfill starts";
+    if (!job.totalReposKnown) {
+      return job.state === "running"
+        ? "Counting the initial repository inventory; total not known yet"
+        : "Initial repository inventory is unknown; progress total unavailable";
     }
-    return job.totalReposKnown
-      ? `${job.completedRepos} of ${job.totalRepos} repositories from the initial inventory processed`
-      : `${job.completedRepos} repositories processed`;
+    return `${job.completedRepos} of ${job.totalRepos} repositories from the initial inventory processed`;
   }
   function currentStateScope(item: { coverage: string }) {
     const scope = item.coverage.replaceAll("_", " ");
@@ -59,6 +60,31 @@
     return actor.actorHandle ? `@${actor.actorHandle}` : actor.actor;
   }
   let copyStatus = "";
+  type RepositoryDetailsAccumulator = Pick<
+    RepositoryDetailsPage,
+    "repositories" | "nextCursor"
+  >;
+  let openRepositoryJob = "";
+  let repositoryPages: Record<string, RepositoryDetailsAccumulator> = {};
+  let repositoryJobs: Record<string, Job> = {};
+  let repositoryErrors: Record<string, string> = {};
+  let repositoryLoading: Record<string, boolean> = {};
+  let repositorySnapshotGeneration = 0;
+  let repositoryRequestTokens = new Map<string, symbol>();
+  function invalidateRepositorySnapshots() {
+    repositorySnapshotGeneration++;
+    repositoryRequestTokens.clear();
+    repositoryPages = {};
+    repositoryJobs = {};
+    repositoryErrors = {};
+    repositoryLoading = {};
+    openRepositoryJob = "";
+  }
+  $: if (jobs) invalidateRepositorySnapshots();
+  function jobAction(id: string, action: "retry" | "cancel") {
+    invalidateRepositorySnapshots();
+    void submit({ kind: "job_action", id, action });
+  }
   async function copy(actor: { actor: string; actorHandle?: string | null }) {
     try {
       if (!navigator.clipboard) throw new Error("clipboard unavailable");
@@ -67,6 +93,94 @@
     } catch {
       copyStatus = `Could not copy the DID for ${actorLabel(actor)}.`;
     }
+  }
+  function revokeRepositoryRequest(jobId: string) {
+    repositoryRequestTokens.delete(jobId);
+    repositoryLoading = { ...repositoryLoading, [jobId]: false };
+  }
+  async function toggleRepositories(job: Job) {
+    const previouslyOpenJob = openRepositoryJob;
+    if (previouslyOpenJob === job.id) {
+      revokeRepositoryRequest(job.id);
+      openRepositoryJob = "";
+      return;
+    }
+    if (previouslyOpenJob) revokeRepositoryRequest(previouslyOpenJob);
+    openRepositoryJob = job.id;
+    await loadRepositories(job.id);
+  }
+  async function loadRepositories(jobId: string, append = false) {
+    const generation = repositorySnapshotGeneration;
+    const requestToken = Symbol(jobId);
+    repositoryRequestTokens.set(jobId, requestToken);
+    const ownsRequest = () =>
+      generation === repositorySnapshotGeneration &&
+      repositoryRequestTokens.get(jobId) === requestToken;
+    repositoryLoading = { ...repositoryLoading, [jobId]: true };
+    repositoryErrors = { ...repositoryErrors, [jobId]: "" };
+    const after = append ? repositoryPages[jobId]?.nextCursor ?? "" : "";
+    try {
+      const page = await api<RepositoryDetailsPage>(
+        `/jobs/${encodeURIComponent(jobId)}/repositories?limit=50${after ? `&after=${encodeURIComponent(after)}` : ""}`,
+      );
+      if (!ownsRequest()) return;
+      const previous = repositoryPages[jobId];
+      repositoryJobs = { ...repositoryJobs, [jobId]: page.job };
+      repositoryPages = {
+        ...repositoryPages,
+        [jobId]: {
+          repositories: append
+            ? [...(previous?.repositories ?? []), ...page.repositories]
+            : page.repositories,
+          nextCursor: page.nextCursor,
+        },
+      };
+    } catch (error) {
+      if (ownsRequest()) {
+        const message = (error as Error).message;
+        if (message === "repository snapshot expired") {
+          const pages = { ...repositoryPages };
+          const snapshots = { ...repositoryJobs };
+          delete pages[jobId];
+          delete snapshots[jobId];
+          repositoryPages = pages;
+          repositoryJobs = snapshots;
+          repositoryErrors = {
+            ...repositoryErrors,
+            [jobId]: "Repository snapshot expired. Restart from the first page.",
+          };
+        } else if (message === "repository snapshot too large") {
+          repositoryErrors = {
+            ...repositoryErrors,
+            [jobId]: "This inventory exceeds the 50,000-row repository detail limit; no rows were loaded.",
+          };
+        } else {
+          repositoryErrors = { ...repositoryErrors, [jobId]: message };
+        }
+      }
+    } finally {
+      if (ownsRequest()) {
+        repositoryLoading = { ...repositoryLoading, [jobId]: false };
+      }
+    }
+  }
+  function repositoryFailure(detail: RepositoryDetail) {
+    const failure = detail.failure;
+    if (!failure) return "No failure recorded";
+    return [
+      failure.category.replaceAll("_", " "),
+      failure.httpStatus ? `HTTP ${failure.httpStatus}` : "",
+      failure.stage,
+      failure.code?.replaceAll("_", " ") ?? "",
+    ]
+      .filter(Boolean)
+      .join(" · ");
+  }
+  function diagnosticReason(job: Job) {
+    return job.diagnostics.reason?.replaceAll("_", " ") ?? "";
+  }
+  function timeLabel(value?: string) {
+    return value ? new Date(value).toLocaleString() : "";
   }
 </script>
 
@@ -81,6 +195,13 @@
       inventories active repositories directly from that PDS; Relay-observed
       account counts do not limit it. Job status comes from Jetstream.
     </p>
+  </div>
+  <div class="notice">
+    Diagnostics describe current execution, not historical completeness or the
+    cause of an earlier coverage gap. Viewing never retries work. Retry is an
+    explicit audited action: completed archive checkpoints are preserved;
+    incomplete jobs reset eligible unresolved repository budgets, while failed
+    jobs refresh their inventory.
   </div>
   <form
     class="inline-form"
@@ -123,37 +244,58 @@
           ><th>Actions</th></tr
         ></thead
       ><tbody
-        >{#each jobs as job}<tr
-            ><td>{job.pds}<small>{job.id}</small></td><td
-              >{job.policy.collections.join(", ") || "No collections"}</td
-            ><td>{jobPurpose(job)}</td><td
-              >{jobProgress(job)}<small>{currentStateScope(job)}</small><small>{job.attempts} attempts</small></td
+        >{#each jobs as job}{@const currentJob = repositoryJobs[job.id] ?? job}<tr
+            ><td>{currentJob.pds}<small>{currentJob.id}</small></td><td
+              >{currentJob.policy.collections.join(", ") || "No collections"}</td
+            ><td>{jobPurpose(currentJob)}</td><td
+              >{jobProgress(currentJob)}<small>{currentStateScope(currentJob)}</small><small>Job claim attempts: {currentJob.attempts}</small><small>Repository cycle: up to {currentJob.diagnostics.maxRepositoryAttempts} attempts per coordinate</small>{#if currentJob.diagnostics.unresolvedRepos !== undefined}<small>{currentJob.diagnostics.unresolvedRepos} repositories unresolved</small>{/if}</td
             ><td
-              ><State value={job.state} /><small
-                >{job.errorCode?.replaceAll("_", " ") ?? ""}</small
-              ></td
+              ><State value={currentJob.state} /><small>Execution: {currentJob.diagnostics.execution.replaceAll("_", " ")}</small>{#if diagnosticReason(currentJob)}<small>Reason: {diagnosticReason(currentJob)}</small>{/if}{#if currentJob.diagnostics.retryAt}<small>Next repository retry: {timeLabel(currentJob.diagnostics.retryAt)}</small>{/if}{#if currentJob.diagnostics.pdsCooldownUntil}<small>PDS cooldown until: {timeLabel(currentJob.diagnostics.pdsCooldownUntil)}</small>{/if}{#if currentJob.diagnostics.retryingRepos}<small>Repositories with retry state: {currentJob.diagnostics.retryingRepos}</small>{/if}<small>{currentJob.errorCode?.replaceAll("_", " ") ?? ""}</small></td
             ><td
               ><div class="actions">
-                {#if ["pending", "running"].includes(job.state)}<button
+                <button
+                  disabled={!currentJob.totalReposKnown || currentJob.diagnostics.unresolvedRepos === 0}
+                  aria-expanded={openRepositoryJob === currentJob.id}
+                  onclick={() => void toggleRepositories(currentJob)}
+                  >{openRepositoryJob === currentJob.id
+                    ? "Hide repository details"
+                    : currentJob.totalReposKnown
+                      ? `View unresolved repositories (${currentJob.diagnostics.unresolvedRepos ?? "unknown"})`
+                      : "Inventory not known"}</button
+                >
+                {#if ["pending", "running"].includes(currentJob.state)}<button
                     disabled={busy}
-                    onclick={() =>
-                      submit({
-                        kind: "job_action",
-                        id: job.id,
-                        action: "cancel",
-                      })}>Cancel job</button
+                    onclick={() => jobAction(currentJob.id, "cancel")}>Cancel job</button
                   >{:else}<button
                     disabled={busy}
-                    onclick={() =>
-                      submit({
-                        kind: "job_action",
-                        id: job.id,
-                        action: "retry",
-                      })}>Retry job</button
+                    onclick={() => jobAction(currentJob.id, "retry")}>Retry job</button
                   >{/if}
               </div></td
             ></tr
-          >{:else}<tr
+            >{#if openRepositoryJob === currentJob.id}<tr
+              ><td colspan="6">
+                <section id={`repository-details-${currentJob.id}`} aria-label={`Unresolved repositories for ${currentJob.pds}`}>
+                  <h3>Unresolved repositories</h3>
+                  {#if repositoryLoading[currentJob.id]}<p role="status">Loading repository details…</p>
+                  {:else if repositoryErrors[currentJob.id]}<p role="alert">{repositoryErrors[currentJob.id]}</p>{#if repositoryErrors[currentJob.id].startsWith("Repository snapshot expired")}<button onclick={() => void loadRepositories(currentJob.id)}>Restart repository details</button>{:else if !repositoryErrors[currentJob.id].startsWith("This inventory exceeds")}<button onclick={() => void loadRepositories(currentJob.id)}>Retry loading details</button>{/if}
+                  {:else if repositoryPages[currentJob.id]?.repositories.length}
+                    <div class="table-wrap" role="region" aria-label={`Repository details for ${currentJob.pds}`} tabindex="0">
+                      <table>
+                        <caption>Not-checkpointed repositories for {currentJob.pds}</caption>
+                        <thead><tr><th>DID</th><th>Listed revision</th><th>Repository state</th><th>Retry attempts</th><th>Failure / next retry</th></tr></thead>
+                        <tbody>{#each repositoryPages[currentJob.id].repositories as detail (detail.did)}<tr>
+                          <td>{detail.did}</td><td>{detail.listedRevision}</td><td>{detail.state.replaceAll("_", " ")}</td>
+                          <td>{detail.attempts} of {currentJob.diagnostics.maxRepositoryAttempts} in this job/repository cycle</td>
+                          <td>{repositoryFailure(detail)}{#if detail.retryAt}<small>Retry deadline: {timeLabel(detail.retryAt)}</small>{/if}</td>
+                        </tr>{/each}</tbody>
+                      </table>
+                    </div>
+                    {#if repositoryPages[currentJob.id].nextCursor}<button disabled={repositoryLoading[currentJob.id]} onclick={() => void loadRepositories(currentJob.id, true)}>Load more repositories</button>{/if}
+                  {:else}<p>No unresolved repositories in the frozen inventory.</p>{/if}
+                  {#if ["incomplete", "failed", "canceled"].includes(currentJob.state)}<p>Work is stopped. Use the explicit Retry action only when you want Jetstream to resume eligible work.</p>{/if}
+                </section>
+              </td></tr>{/if}
+          {:else}<tr
             ><td colspan="6" class="empty"
               >No jobs on this page. Submit a backfill for an enabled source.</td
             ></tr
@@ -199,11 +341,14 @@
                   ><td>{collection}</td><td
                     ><State value={group.item.state} /><small
                       >Historical PDS attribution: {group.item.historicalPDSAttribution}</small
-                    ></td
+                    ><small>Execution: {group.item.diagnostics.execution.replaceAll("_", " ")}{#if group.item.diagnostics.reason}; {group.item.diagnostics.reason.replaceAll("_", " ")}{/if}</small
+                    >{#if group.item.diagnostics.unresolvedRepos !== undefined}<small>{group.item.diagnostics.unresolvedRepos} repositories unresolved</small>{/if}{#if group.item.diagnostics.retryAt}<small>Next repository retry: {timeLabel(group.item.diagnostics.retryAt)}</small>{/if}{#if group.item.diagnostics.pdsCooldownUntil}<small>PDS cooldown until: {timeLabel(group.item.diagnostics.pdsCooldownUntil)}</small>{/if}</td
                   ><td
                     >{group.item.totalReposKnown
                       ? `${group.item.completedRepos} of ${group.item.totalRepos} repositories from the initial inventory processed`
-                      : `${group.item.completedRepos} repositories processed; initial inventory is still being counted`}<small
+                      : group.item.diagnostics.execution === "running"
+                        ? "Counting the initial inventory; total not known yet"
+                        : "Initial repository inventory is unknown; progress total unavailable"}<small
                       >Policy revision {group.item.policy.revision}; {currentStateScope(group.item)}</small
                     ><small
                       >{group.item.reason?.replaceAll("_", " ") ||

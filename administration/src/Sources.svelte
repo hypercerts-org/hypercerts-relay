@@ -134,9 +134,11 @@
     }
   }
   function coverageProgress(item: Coverage | JetstreamSummary) {
-    return item.totalReposKnown
-      ? `${item.completedRepos} of ${item.totalRepos} repositories from the initial inventory scanned`
-      : `${item.completedRepos} repositories scanned; initial inventory is still being counted`;
+    if (item.totalReposKnown)
+      return `${item.completedRepos} of ${item.totalRepos} repositories from the initial inventory scanned`;
+    return item.diagnostics.execution === "running"
+      ? "Counting the initial inventory; total not known yet"
+      : "Initial repository inventory is unknown; progress total unavailable";
   }
   function totalAccounts(
     item: Coverage | JetstreamSummary | null,
@@ -144,14 +146,14 @@
   ) {
     if (unavailable) return "Unavailable";
     if (!item) return "Unknown";
-    return item.totalReposKnown ? String(item.totalRepos) : "Counting";
+    return item.totalReposKnown ? String(item.totalRepos) : "Unknown";
   }
   function jetstreamAccounts(
     item: Coverage | JetstreamSummary | null,
     unavailable = false,
   ) {
     if (unavailable) return "Unavailable";
-    return item ? String(item.completedRepos) : "Unknown";
+    return item?.totalReposKnown ? String(item.completedRepos) : "Unknown";
   }
 </script>
 
@@ -275,6 +277,22 @@
           <div>
             <dt>Backfill progress</dt>
             <dd>{coverageProgress(jetstreamStats)}</dd>
+          </div>
+          <div>
+            <dt>Execution</dt>
+            <dd>{jetstreamStats.diagnostics.execution.replaceAll("_", " ")}<small>{jetstreamStats.diagnostics.reason?.replaceAll("_", " ") ?? "No current wait reason reported."}</small></dd>
+          </div>
+          <div>
+            <dt>Unresolved repositories</dt>
+            <dd>{jetstreamStats.diagnostics.unresolvedRepos ?? "Unknown"}<small>Unknown until the frozen PDS inventory is complete.</small></dd>
+          </div>
+          <div>
+            <dt>Repositories with retry state</dt>
+            <dd>{jetstreamStats.diagnostics.retryingRepos ?? "Unknown"}<small>Up to {jetstreamStats.diagnostics.maxRepositoryAttempts} attempts per repository and job retry cycle; separate from job claim count.</small></dd>
+          </div>
+          <div>
+            <dt>Retry timing</dt>
+            <dd>{#if jetstreamStats.diagnostics.retryAt}Repository retry: {new Date(jetstreamStats.diagnostics.retryAt).toLocaleString()}{/if}{#if jetstreamStats.diagnostics.pdsCooldownUntil}<small>PDS-wide cooldown until {new Date(jetstreamStats.diagnostics.pdsCooldownUntil).toLocaleString()}</small>{:else if !jetstreamStats.diagnostics.retryAt}<small>No active retry or cooldown deadline reported.</small>{/if}</dd>
           </div>
           <div>
             <dt>Current-state coverage</dt>

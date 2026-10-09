@@ -5,7 +5,9 @@ import {
   type CreatedArchiveKey,
   type Command,
   type Job,
+  type JobDiagnostics,
   type Policy,
+  type RepositoryDetailsPage,
 } from "./contracts.ts";
 
 export interface ServiceConfig {
@@ -86,6 +88,14 @@ export class Services {
     return this.call<{ jobs: Job[]; nextCursor?: string }>(
       "jetstream",
       `/jobs?limit=50&after=${encodeURIComponent(after)}&pds=${encodeURIComponent(pds)}`,
+    );
+  }
+  repositoryDetails(id: string, after = "", limit = 100) {
+    const query = new URLSearchParams({ limit: String(limit) });
+    if (after) query.set("after", after);
+    return this.call<RepositoryDetailsPage>(
+      "jetstream",
+      `/jobs/${encodeURIComponent(id)}/repositories?${query}`,
     );
   }
   coverage(after = "", pds = "") {
@@ -242,9 +252,13 @@ async function controlError(
     service === "jetstream" && path.startsWith("/archive-keys")
       ? await remoteArchiveError(response)
       : null;
+  const repositoryDetailsError =
+    service === "jetstream" && /^\/jobs\/[a-f0-9]{32}\/repositories(?:\?|$)/.test(path)
+      ? await remoteRepositoryDetailsError(response)
+      : null;
   return new ApiError(
     response.status >= 500 ? 503 : response.status,
-    archiveError ?? `${service}_rejected_${response.status}`,
+    archiveError ?? repositoryDetailsError ?? `${service}_rejected_${response.status}`,
   );
 }
 
@@ -282,6 +296,7 @@ interface CoverageSummaryPage {
     errorCode?: string;
     createdAt: string;
     coverage: string;
+    diagnostics: JobDiagnostics;
   }[];
 }
 
@@ -298,11 +313,12 @@ interface CoveragePage {
     errorCode?: string;
     createdAt: string;
     coverage: string;
+    diagnostics: JobDiagnostics;
   }[];
   nextCursor?: string;
 }
 
-async function remoteArchiveError(response: Response): Promise<string | null> {
+async function readBoundedRemoteErrorBody(response: Response): Promise<unknown | null> {
   const reader = response.body?.getReader();
   if (!reader) return null;
   const chunks: Uint8Array[] = [];
@@ -315,26 +331,47 @@ async function remoteArchiveError(response: Response): Promise<string | null> {
       if (size > 8192) return null;
       chunks.push(value);
     }
-    const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString());
-    if (
-      typeof parsed === "object" &&
-      parsed !== null &&
-      "error" in parsed &&
-      typeof parsed.error === "string" &&
-      [
-        "invalid_json",
-        "invalid_input",
-        "not_found",
-        "persistence_error",
-      ].includes(parsed.error)
-    )
-      return parsed.error;
+    return JSON.parse(Buffer.concat(chunks).toString()) as unknown;
   } catch {
     return null;
   } finally {
-    await reader.cancel();
+    try {
+      await reader.cancel();
+    } catch {
+      // A failed body read still falls back to the generic upstream error.
+    }
   }
-  return null;
+}
+
+async function remoteRepositoryDetailsError(
+  response: Response,
+): Promise<string | null> {
+  let expected: string;
+  if (response.status === 410) {
+    expected = "repository_snapshot_expired";
+  } else if (response.status === 413) {
+    expected = "repository_snapshot_too_large";
+  } else {
+    return null;
+  }
+  const body = await readBoundedRemoteErrorBody(response);
+  return typeof body === "object" && body !== null && "error" in body && body.error === expected
+    ? expected
+    : null;
+}
+
+async function remoteArchiveError(response: Response): Promise<string | null> {
+  const body = await readBoundedRemoteErrorBody(response);
+  if (typeof body !== "object" || body === null || !("error" in body)) return null;
+  const code = body.error;
+  return typeof code === "string" && [
+    "invalid_json",
+    "invalid_input",
+    "not_found",
+    "persistence_error",
+  ].includes(code)
+    ? code
+    : null;
 }
 
 function allowedControlTransport(url: URL, railwayPrivateNetwork: boolean) {
