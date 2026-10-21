@@ -151,8 +151,9 @@ page and repository progress. A crash before progress acknowledgment may replay
 work safely.
 
 Coverage is explicitly `current_state`: a PDS snapshot cannot prove historical
-event completeness. Job responses expose optional `lastProgressAt`, written
-atomically with a successful inventory or repository checkpoint. Failed
+event completeness. Job and coverage responses expose optional
+`lastProgressAt`, written atomically with a successful inventory or repository
+checkpoint. Failed
 attempts, claims, reads, failed writes, and repeated no-op inventory checkpoints
 do not advance it; older jobs without a recorded date remain unknown. Durable
 repository retry JSON exposes optional `failedAt`; a missing legacy date remains
