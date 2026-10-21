@@ -511,11 +511,12 @@ type jobView struct {
 	CreatedAt       time.Time        `json:"createdAt"`
 	StartedAt       time.Time        `json:"startedAt"`
 	FinishedAt      time.Time        `json:"finishedAt"`
+	LastProgressAt  *time.Time       `json:"lastProgressAt,omitempty"`
 	Coverage        string           `json:"coverage"`
 }
 
 func view(j jobs.Job) jobView {
-	return jobView{ID: j.ID, PDS: j.PDS, Policy: j.Policy, Reason: j.Reason, State: j.State, Attempts: j.Attempts, CompletedRepos: len(j.CompletedRepos), TotalRepos: j.TotalRepos, TotalReposKnown: j.TotalReposKnown, Cursor: j.Cursor, ErrorCode: j.ErrorCode, CreatedAt: j.CreatedAt, StartedAt: j.StartedAt, FinishedAt: j.FinishedAt, Coverage: j.Coverage}
+	return jobView{ID: j.ID, PDS: j.PDS, Policy: j.Policy, Reason: j.Reason, State: j.State, Attempts: j.Attempts, CompletedRepos: len(j.CompletedRepos), TotalRepos: j.TotalRepos, TotalReposKnown: j.TotalReposKnown, Cursor: j.Cursor, ErrorCode: j.ErrorCode, CreatedAt: j.CreatedAt, StartedAt: j.StartedAt, FinishedAt: j.FinishedAt, LastProgressAt: j.LastProgressAt, Coverage: j.Coverage}
 }
 
 type coverageView struct {
@@ -529,11 +530,12 @@ type coverageView struct {
 	TotalReposKnown bool             `json:"totalReposKnown"`
 	ErrorCode       string           `json:"errorCode,omitempty"`
 	CreatedAt       time.Time        `json:"createdAt"`
+	LastProgressAt  *time.Time       `json:"lastProgressAt,omitempty"`
 	Coverage        string           `json:"coverage"`
 }
 
 func coverage(j jobs.Job) coverageView {
-	return coverageView{PDS: j.PDS, Policy: j.Policy, JobID: j.ID, Reason: j.Reason, State: j.State, CompletedRepos: len(j.CompletedRepos), TotalRepos: j.TotalRepos, TotalReposKnown: j.TotalReposKnown, ErrorCode: j.ErrorCode, CreatedAt: j.CreatedAt, Coverage: j.Coverage}
+	return coverageView{PDS: j.PDS, Policy: j.Policy, JobID: j.ID, Reason: j.Reason, State: j.State, CompletedRepos: len(j.CompletedRepos), TotalRepos: j.TotalRepos, TotalReposKnown: j.TotalReposKnown, ErrorCode: j.ErrorCode, CreatedAt: j.CreatedAt, LastProgressAt: j.LastProgressAt, Coverage: j.Coverage}
 }
 
 // coverageSummaryView is a compact table-enrichment view. The full policy is
@@ -547,11 +549,12 @@ type coverageSummaryView struct {
 	TotalReposKnown bool       `json:"totalReposKnown"`
 	ErrorCode       string     `json:"errorCode,omitempty"`
 	CreatedAt       time.Time  `json:"createdAt"`
+	LastProgressAt  *time.Time `json:"lastProgressAt,omitempty"`
 	Coverage        string     `json:"coverage"`
 }
 
 func coverageSummary(view coverageView) coverageSummaryView {
-	return coverageSummaryView{PDS: view.PDS, JobID: view.JobID, State: view.State, CompletedRepos: view.CompletedRepos, TotalRepos: view.TotalRepos, TotalReposKnown: view.TotalReposKnown, ErrorCode: view.ErrorCode, CreatedAt: view.CreatedAt, Coverage: view.Coverage}
+	return coverageSummaryView{PDS: view.PDS, JobID: view.JobID, State: view.State, CompletedRepos: view.CompletedRepos, TotalRepos: view.TotalRepos, TotalReposKnown: view.TotalReposKnown, ErrorCode: view.ErrorCode, CreatedAt: view.CreatedAt, LastProgressAt: view.LastProgressAt, Coverage: view.Coverage}
 }
 
 func (h *Handler) listArchiveKeys(w http.ResponseWriter, r *http.Request) {

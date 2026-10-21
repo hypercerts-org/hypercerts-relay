@@ -60,19 +60,20 @@ type Job struct {
 	CompletedRepos map[string]string `json:"completedRepos"`
 	// EnumeratedRepos is the durable, non-public subtotal used to resume a
 	// single PDS inventory scan without re-counting earlier pages.
-	EnumeratedRepos int       `json:"enumeratedRepos"`
-	TotalRepos      int       `json:"totalRepos"`
-	TotalReposKnown bool      `json:"totalReposKnown"`
-	Cursor          string    `json:"cursor"`
-	ErrorCode       string    `json:"errorCode,omitempty"`
-	CreatedAt       time.Time `json:"createdAt"`
-	StartedAt       time.Time `json:"startedAt,omitempty"`
-	FinishedAt      time.Time `json:"finishedAt,omitempty"`
-	Coverage        string    `json:"coverage"`
-	ReceiptPending  bool      `json:"receiptPending,omitempty"`
-	ReceiptAttempts int       `json:"receiptAttempts,omitempty"`
-	ReceiptRetryAt  time.Time `json:"receiptRetryAt,omitempty"`
-	ReceiptError    string    `json:"receiptError,omitempty"`
+	EnumeratedRepos int        `json:"enumeratedRepos"`
+	TotalRepos      int        `json:"totalRepos"`
+	TotalReposKnown bool       `json:"totalReposKnown"`
+	Cursor          string     `json:"cursor"`
+	LastProgressAt  *time.Time `json:"lastProgressAt,omitempty"`
+	ErrorCode       string     `json:"errorCode,omitempty"`
+	CreatedAt       time.Time  `json:"createdAt"`
+	StartedAt       time.Time  `json:"startedAt,omitempty"`
+	FinishedAt      time.Time  `json:"finishedAt,omitempty"`
+	Coverage        string     `json:"coverage"`
+	ReceiptPending  bool       `json:"receiptPending,omitempty"`
+	ReceiptAttempts int        `json:"receiptAttempts,omitempty"`
+	ReceiptRetryAt  time.Time  `json:"receiptRetryAt,omitempty"`
+	ReceiptError    string     `json:"receiptError,omitempty"`
 }
 
 // inventory is kept under a per-job key instead of inside the job-state
@@ -922,12 +923,22 @@ func (m *Manager) CheckpointEnumeration(id, cursor string, active int, complete 
 	}
 	next := clone(m.data)
 	job := next.Jobs[id]
-	job.Cursor = cursor
-	job.EnumeratedRepos += active
+	enumeratedRepos := job.EnumeratedRepos + active
+	totalRepos := job.TotalRepos
+	totalReposKnown := job.TotalReposKnown
 	if complete {
-		job.TotalRepos = job.EnumeratedRepos
-		job.TotalReposKnown = true
+		totalRepos = enumeratedRepos
+		totalReposKnown = true
 	}
+	if cursor == job.Cursor && enumeratedRepos == job.EnumeratedRepos && totalRepos == job.TotalRepos && totalReposKnown == job.TotalReposKnown {
+		return nil
+	}
+	job.Cursor = cursor
+	job.EnumeratedRepos = enumeratedRepos
+	job.TotalRepos = totalRepos
+	job.TotalReposKnown = totalReposKnown
+	now := time.Now().UTC()
+	job.LastProgressAt = &now
 	next.Jobs[id] = job
 	return m.commit(next)
 }
@@ -946,20 +957,35 @@ func (m *Manager) CheckpointInventory(id, cursor string, entries map[string]stri
 	if err != nil {
 		return err
 	}
+	newEntries := false
 	for did, rev := range entries {
-		if existing, ok := inv.Entries[did]; ok && existing != rev {
-			return &InputError{Code: "invalid_listing"}
+		if existing, ok := inv.Entries[did]; ok {
+			if existing != rev {
+				return &InputError{Code: "invalid_listing"}
+			}
+			continue
 		}
 		inv.Entries[did] = rev
+		newEntries = true
 	}
 	next := clone(m.data)
 	job := next.Jobs[id]
-	job.Cursor = cursor
-	job.EnumeratedRepos = len(inv.Entries)
+	enumeratedRepos := len(inv.Entries)
+	totalRepos := job.TotalRepos
+	totalReposKnown := job.TotalReposKnown
 	if complete {
-		job.TotalRepos = len(inv.Entries)
-		job.TotalReposKnown = true
+		totalRepos = enumeratedRepos
+		totalReposKnown = true
 	}
+	if cursor == job.Cursor && !newEntries && enumeratedRepos == job.EnumeratedRepos && totalRepos == job.TotalRepos && totalReposKnown == job.TotalReposKnown {
+		return nil
+	}
+	job.Cursor = cursor
+	job.EnumeratedRepos = enumeratedRepos
+	job.TotalRepos = totalRepos
+	job.TotalReposKnown = totalReposKnown
+	now := time.Now().UTC()
+	job.LastProgressAt = &now
 	next.Jobs[id] = job
 	return m.commitInventory(next, id, inv)
 }
@@ -1007,6 +1033,8 @@ func (m *Manager) Checkpoint(id, did, rev, cursor string) error {
 		j.CompletedRepos[did] = rev
 	}
 	j.Cursor = cursor
+	now := time.Now().UTC()
+	j.LastProgressAt = &now
 	next.Jobs[id] = j
 	return m.commit(next)
 }

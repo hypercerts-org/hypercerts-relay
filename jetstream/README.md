@@ -154,7 +154,12 @@ Coverage is explicitly `current_state`: a PDS snapshot cannot prove historical
 event completeness. Direct `getRepo` requests retry transient errors (excluding invalid snapshots) up to three times, with 50 ms then 100 ms delays. After retries are exhausted a status of`incomplete` will be reported unless there is a  malformed or unverifiable
 input which returns `failed`. An explicit job retry is required for these statuses. Local persistence failures stop the runtime
 without acknowledging completion. Each repository's fetch and reconciliation
-share a two-minute deadline.
+share a two-minute deadline. Job and coverage responses expose optional
+`lastProgressAt`, written atomically with a successful inventory or repository checkpoint. Failed
+attempts, claims, reads, failed writes, and repeated no-op inventory checkpoints
+do not advance it; older jobs without a recorded date remain unknown. Durable
+repository retry JSON exposes optional `failedAt`; a missing legacy date remains
+unknown rather than being synthesized.
 
 Jetstream will emit a warning message containing details on the failure, optionally the repo did if is is known.
 
@@ -251,7 +256,7 @@ All paths below start with `/hypercerts/v1`:
 
 Each job reports `id`, `pds`, `policy.revision`, `policy.collections`, `reason`,
 `state`, `attempts`, `completedRepos` (count), `totalRepos` with
-`totalReposKnown`, page `cursor`, bounded `errorCode`,
+`totalReposKnown`, page `cursor`, optional `lastProgressAt`, bounded `errorCode`,
 creation/start/finish times, and `coverage`. Job states are `pending`, `running`,
 `failed`, `canceled`, `incomplete`, and `complete`. A completed job identifies the
 exact PDS origin and policy revision whose **current state** it covers. An

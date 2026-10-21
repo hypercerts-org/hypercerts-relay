@@ -72,7 +72,7 @@ type RepositoryRetry struct {
 	Attempts       int                     `json:"attempts"`
 	RetryAt        time.Time               `json:"retryAt,omitempty"`
 	Failure        *RepositoryRetryFailure `json:"failure,omitempty"`
-	FailedAt       time.Time               `json:"failedAt,omitempty"`
+	FailedAt       *time.Time              `json:"failedAt,omitempty"`
 }
 
 // PDSCooldown is a PDS-origin-wide deadline, independent of any job's
@@ -160,6 +160,7 @@ func decodePersistedRepositoryRetry(jobID string, prefix, key, value []byte) (Re
 	if err := json.Unmarshal(value, &retry); err != nil {
 		return RepositoryRetry{}, errors.New("invalid persisted repository retry state")
 	}
+	normalizeRepositoryRetry(&retry)
 	keyDID, err := decodeRepositoryRetryDID(prefix, key)
 	if err != nil || keyDID != retry.DID || retry.JobID != jobID || !validPersistedRepositoryRetry(retry) {
 		return RepositoryRetry{}, errors.New("invalid persisted repository retry state")
@@ -230,7 +231,7 @@ func (m *Manager) BeginRepositoryAttempt(jobID, did string) (RepositoryRetry, er
 	current.Attempts++
 	current.RetryAt = time.Time{}
 	current.Failure = nil
-	current.FailedAt = time.Time{}
+	current.FailedAt = nil
 	if err := m.commitRepositoryRetryBatch(m.data, false, &current, nil, nil); err != nil {
 		return RepositoryRetry{}, err
 	}
@@ -261,7 +262,8 @@ func (m *Manager) RecordRepositoryFailure(jobID, did string, failure RepositoryR
 		return RepositoryRetry{}, ErrConflict
 	}
 	current.Failure = &failure
-	current.FailedAt = time.Now().UTC()
+	failedAt := time.Now().UTC()
+	current.FailedAt = &failedAt
 	if retryAt == nil {
 		current.State = RepositoryRetryUnresolved
 		current.RetryAt = time.Time{}
@@ -338,6 +340,8 @@ func (m *Manager) CheckpointRepository(jobID, did, listedRevision, completedRevi
 	job = next.Jobs[jobID]
 	job.CompletedRepos[did] = completedRevision
 	job.Cursor = cursor
+	now := time.Now().UTC()
+	job.LastProgressAt = &now
 	next.Jobs[jobID] = job
 	return m.commitRepositoryRetryBatch(next, true, nil, [][]byte{repositoryRetryKey(jobID, did)}, nil)
 }
@@ -457,7 +461,11 @@ func (m *Manager) repositoryRetryLocked(job Job, did, listedRevision string) (Re
 	}
 	defer closer.Close()
 	var retry RepositoryRetry
-	if err := json.Unmarshal(value, &retry); err != nil || !validPersistedRepositoryRetry(retry) || retry.JobID != job.ID || retry.DID != did {
+	if err := json.Unmarshal(value, &retry); err != nil {
+		return RepositoryRetry{}, errors.New("invalid persisted repository retry state")
+	}
+	normalizeRepositoryRetry(&retry)
+	if !validPersistedRepositoryRetry(retry) || retry.JobID != job.ID || retry.DID != did {
 		return RepositoryRetry{}, errors.New("invalid persisted repository retry state")
 	}
 	if retry.ListedRevision != listedRevision {
@@ -560,6 +568,12 @@ func validRepositoryFailure(failure RepositoryRetryFailure) bool {
 	return failure.HTTPStatus == 0
 }
 
+func normalizeRepositoryRetry(retry *RepositoryRetry) {
+	if retry.FailedAt != nil && retry.FailedAt.IsZero() {
+		retry.FailedAt = nil
+	}
+}
+
 func validPersistedRepositoryRetry(retry RepositoryRetry) bool {
 	if retry.JobID == "" || retry.Attempts <= 0 || retry.DID == "" {
 		return false
@@ -572,11 +586,11 @@ func validPersistedRepositoryRetry(retry RepositoryRetry) bool {
 	}
 	switch retry.State {
 	case RepositoryRetryInFlight:
-		return retry.RetryAt.IsZero() && retry.Failure == nil && retry.FailedAt.IsZero()
+		return retry.RetryAt.IsZero() && retry.Failure == nil && retry.FailedAt == nil
 	case RepositoryRetryWait:
-		return validRetryDeadline(retry.RetryAt) && retry.Failure != nil && validRepositoryFailure(*retry.Failure) && validRetryDeadline(retry.FailedAt)
+		return validRetryDeadline(retry.RetryAt) && retry.Failure != nil && validRepositoryFailure(*retry.Failure) && (retry.FailedAt == nil || validRetryDeadline(*retry.FailedAt))
 	case RepositoryRetryUnresolved:
-		return retry.RetryAt.IsZero() && retry.Failure != nil && validRepositoryFailure(*retry.Failure) && validRetryDeadline(retry.FailedAt)
+		return retry.RetryAt.IsZero() && retry.Failure != nil && validRepositoryFailure(*retry.Failure) && (retry.FailedAt == nil || validRetryDeadline(*retry.FailedAt))
 	default:
 		return false
 	}

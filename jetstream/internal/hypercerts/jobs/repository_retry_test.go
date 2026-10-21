@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -81,6 +82,10 @@ func TestRepositoryRetryAttemptPersistsAcrossRestart(t *testing.T) {
 	job, err := m.AddSource("https://pds.example")
 	require.NoError(t, err)
 	worker, _ := startRepositoryWorker(t, m, job.ID, map[string]string{didA: revA, didB: revB})
+	checkpointed, err := m.Get(job.ID)
+	require.NoError(t, err)
+	require.NotNil(t, checkpointed.LastProgressAt)
+	lastProgressAt := *checkpointed.LastProgressAt
 
 	ready, err := m.GetRepositoryRetry(job.ID, didA)
 	require.NoError(t, err)
@@ -110,6 +115,39 @@ func TestRepositoryRetryAttemptPersistsAcrossRestart(t *testing.T) {
 	listed, err := m.ListRepositoryRetries(job.ID)
 	require.NoError(t, err)
 	require.Len(t, listed, 2)
+	checkpointed, err = m.Get(job.ID)
+	require.NoError(t, err)
+	require.Equal(t, lastProgressAt, *checkpointed.LastProgressAt, "claims, reads, and reopen do not change inventory progress")
+}
+
+func TestNoOpInventoryCheckpointsDoNotAdvanceProgress(t *testing.T) {
+	const did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
+	m, db := newManager(t, t.TempDir())
+	defer db.Close()
+	job, err := m.AddSource("https://pds.example")
+	require.NoError(t, err)
+	worker, _ := startRepositoryWorker(t, m, job.ID, map[string]string{did: "3l3qo2vutsw2b"})
+	checkpointed, err := m.Get(job.ID)
+	require.NoError(t, err)
+	require.NotNil(t, checkpointed.LastProgressAt)
+	lastProgressAt := time.Date(2020, time.January, 2, 3, 4, 5, 0, time.UTC)
+	m.mu.Lock()
+	storedJob := m.data.Jobs[job.ID]
+	storedJob.LastProgressAt = &lastProgressAt
+	m.data.Jobs[job.ID] = storedJob
+	err = m.commit(m.data)
+	m.mu.Unlock()
+	require.NoError(t, err)
+
+	require.NoError(t, m.CheckpointInventory(job.ID, "", map[string]string{did: "3l3qo2vutsw2b"}, true))
+	current, err := m.Get(job.ID)
+	require.NoError(t, err)
+	require.Equal(t, lastProgressAt, *current.LastProgressAt, "replaying an identical inventory page is not progress")
+	require.NoError(t, m.CheckpointEnumeration(job.ID, "", 0, true))
+	current, err = m.Get(job.ID)
+	require.NoError(t, err)
+	require.Equal(t, lastProgressAt, *current.LastProgressAt, "an already-complete empty checkpoint is not progress")
+	worker.finishIncomplete(t, m, job.ID)
 }
 
 func TestRepositoryRetryKeysAreIsolatedByJobAndDID(t *testing.T) {
@@ -150,6 +188,10 @@ func TestRepositoryRetryFailureAndPDSCooldownPersist(t *testing.T) {
 	job, err := m.AddSource("https://pds.example")
 	require.NoError(t, err)
 	worker, _ := startRepositoryWorker(t, m, job.ID, map[string]string{did: "3l3qo2vutsw2b"})
+	checkpointed, err := m.Get(job.ID)
+	require.NoError(t, err)
+	require.NotNil(t, checkpointed.LastProgressAt)
+	lastProgressAt := *checkpointed.LastProgressAt
 	_, err = m.BeginRepositoryAttempt(job.ID, did)
 	require.NoError(t, err)
 
@@ -161,11 +203,25 @@ func TestRepositoryRetryFailureAndPDSCooldownPersist(t *testing.T) {
 	require.Equal(t, RepositoryRetryWait, stored.State)
 	require.Equal(t, retryAt, stored.RetryAt)
 	require.Equal(t, failure, *stored.Failure)
-	require.False(t, stored.FailedAt.IsZero())
+	require.NotNil(t, stored.FailedAt)
+	failedAtJSON, err := json.Marshal(stored)
+	require.NoError(t, err)
+	var storedJSON map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(failedAtJSON, &storedJSON))
+	var exposedFailedAt time.Time
+	require.NoError(t, json.Unmarshal(storedJSON["failedAt"], &exposedFailedAt))
+	require.Equal(t, *stored.FailedAt, exposedFailedAt)
 	require.ErrorIs(t, func() error {
 		_, beginErr := m.BeginRepositoryAttempt(job.ID, did)
 		return beginErr
 	}(), ErrRepositoryCoolingDown)
+	checkpointed, err = m.Get(job.ID)
+	require.NoError(t, err)
+	require.Equal(t, lastProgressAt, *checkpointed.LastProgressAt, "failure and failed claim do not advance progress")
+	_, err = m.GetRepositoryRetry(job.ID, did)
+	require.NoError(t, err)
+	_, err = m.ListRepositoryRetries(job.ID)
+	require.NoError(t, err)
 	cooldown, found, err := m.GetPDSCooldown("https://PDS.example/")
 	require.NoError(t, err)
 	require.True(t, found)
@@ -182,7 +238,11 @@ func TestRepositoryRetryFailureAndPDSCooldownPersist(t *testing.T) {
 	require.Equal(t, 1, restored.Attempts)
 	require.Equal(t, failure, *restored.Failure)
 	require.Equal(t, retryAt, restored.RetryAt)
-	require.False(t, restored.FailedAt.IsZero())
+	require.NotNil(t, restored.FailedAt)
+	require.Equal(t, *stored.FailedAt, *restored.FailedAt)
+	checkpointed, err = m.Get(job.ID)
+	require.NoError(t, err)
+	require.Equal(t, lastProgressAt, *checkpointed.LastProgressAt, "failure and reads leave progress unchanged after reopen")
 	cooldown, found, err = m.GetPDSCooldown("https://pds.example")
 	require.NoError(t, err)
 	require.True(t, found)
@@ -259,6 +319,10 @@ func TestRepositoryCheckpointAndRetryStateCommitAtomically(t *testing.T) {
 	job, err := m.AddSource("https://pds.example")
 	require.NoError(t, err)
 	worker, _ := startRepositoryWorker(t, m, job.ID, map[string]string{did: "3l3qo2vutsw2b"})
+	currentJob, err := m.Get(job.ID)
+	require.NoError(t, err)
+	require.NotNil(t, currentJob.LastProgressAt)
+	beforeProgress := *currentJob.LastProgressAt
 	_, err = m.BeginRepositoryAttempt(job.ID, did)
 	require.NoError(t, err)
 
@@ -266,9 +330,10 @@ func TestRepositoryCheckpointAndRetryStateCommitAtomically(t *testing.T) {
 	inFlight, err := m.GetRepositoryRetry(job.ID, did)
 	require.NoError(t, err)
 	require.Equal(t, RepositoryRetryInFlight, inFlight.State)
-	currentJob, err := m.Get(job.ID)
+	currentJob, err = m.Get(job.ID)
 	require.NoError(t, err)
 	require.NotContains(t, currentJob.CompletedRepos, did)
+	require.Equal(t, beforeProgress, *currentJob.LastProgressAt, "failed checkpoint batch must not publish its timestamp")
 
 	require.NoError(t, m.CheckpointRepository(job.ID, did, "3l3qo2vutsw2b", "3l3qo2vutsw2c", "cursor"))
 	complete, err := m.GetRepositoryRetry(job.ID, did)
@@ -278,6 +343,9 @@ func TestRepositoryCheckpointAndRetryStateCommitAtomically(t *testing.T) {
 	currentJob, err = m.Get(job.ID)
 	require.NoError(t, err)
 	require.Equal(t, "3l3qo2vutsw2c", currentJob.CompletedRepos[did])
+	require.NotNil(t, currentJob.LastProgressAt)
+	require.True(t, currentJob.LastProgressAt.After(beforeProgress), "successful repository checkpoint advances progress")
+	successfulProgress := *currentJob.LastProgressAt
 	listed, err := m.ListRepositoryRetries(job.ID)
 	require.NoError(t, err)
 	require.Empty(t, listed)
@@ -289,6 +357,9 @@ func TestRepositoryCheckpointAndRetryStateCommitAtomically(t *testing.T) {
 	complete, err = m.GetRepositoryRetry(job.ID, did)
 	require.NoError(t, err)
 	require.Equal(t, RepositoryRetryComplete, complete.State)
+	currentJob, err = m.Get(job.ID)
+	require.NoError(t, err)
+	require.Equal(t, successfulProgress, *currentJob.LastProgressAt, "repository checkpoint time survives reopen")
 }
 
 func TestRepositoryRetryResetOnlyDeletesEligibleUnresolvedRows(t *testing.T) {
@@ -345,6 +416,40 @@ func TestRepositoryRetryDoesNotMaterializeRowsForExistingJobs(t *testing.T) {
 	listed, err := m.ListRepositoryRetries(job.ID)
 	require.NoError(t, err)
 	require.Empty(t, listed, "reopening an existing job must not eagerly create retry rows")
+}
+
+func TestRepositoryRetryMissingFailedAtStaysUnknownAcrossReopen(t *testing.T) {
+	const did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
+	dir := t.TempDir()
+	m, db := newManager(t, dir)
+	job, err := m.AddSource("https://pds.example")
+	require.NoError(t, err)
+	worker, _ := startRepositoryWorker(t, m, job.ID, map[string]string{did: "3l3qo2vutsw2b"})
+	_, err = m.BeginRepositoryAttempt(job.ID, did)
+	require.NoError(t, err)
+	_, err = m.RecordRepositoryFailure(job.ID, did, RepositoryRetryFailure{Category: RepositoryFailureUnknown, Stage: RepositoryFailureGetRepoRequest}, nil, nil)
+	require.NoError(t, err)
+	worker.finishIncomplete(t, m, job.ID)
+
+	value, closer, err := db.Get(repositoryRetryKey(job.ID, did))
+	require.NoError(t, err)
+	persisted := map[string]json.RawMessage{}
+	require.NoError(t, json.Unmarshal(value, &persisted))
+	require.NoError(t, closer.Close())
+	delete(persisted, "failedAt")
+	legacyValue, err := json.Marshal(persisted)
+	require.NoError(t, err)
+	require.NoError(t, db.Set(repositoryRetryKey(job.ID, did), legacyValue, store.SyncWrites))
+	require.NoError(t, db.Close())
+
+	m, db = newManager(t, dir)
+	defer db.Close()
+	restored, err := m.GetRepositoryRetry(job.ID, did)
+	require.NoError(t, err)
+	require.Nil(t, restored.FailedAt, "a missing legacy timestamp is unknown, not synthesized")
+	encoded, err := json.Marshal(restored)
+	require.NoError(t, err)
+	require.NotContains(t, string(encoded), `"failedAt"`)
 }
 
 func TestRepositoryRetryIgnoresStaleAttemptsAfterFailedJobInventoryReset(t *testing.T) {

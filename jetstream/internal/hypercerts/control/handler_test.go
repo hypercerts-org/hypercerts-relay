@@ -187,12 +187,16 @@ func TestPrivateLifecycleAndCoverage(t *testing.T) {
 	var pending jobView
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &pending))
 	require.Equal(t, jobs.Pending, pending.State)
+	require.Nil(t, pending.LastProgressAt, "jobs without a successful checkpoint have no progress timestamp")
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	started := make(chan struct{})
 	release := make(chan struct{})
 	go func() {
 		done <- m.Run(ctx, func(ctx context.Context, j jobs.Job) error {
+			if err := m.CheckpointEnumeration(j.ID, "next", 0, false); err != nil {
+				return err
+			}
 			close(started)
 			select {
 			case <-ctx.Done():
@@ -207,6 +211,25 @@ func TestPrivateLifecycleAndCoverage(t *testing.T) {
 	require.NoError(t, json.Unmarshal(request(h, "GET", "/jobs/"+pending.ID, "", testToken).Body.Bytes(), &running))
 	require.Equal(t, jobs.Running, running.State)
 	require.Equal(t, 1, running.Attempts)
+	require.NotNil(t, running.LastProgressAt, "job response exposes the persisted checkpoint timestamp")
+
+	coverageResponse := request(h, "GET", "/coverage", "", testToken)
+	require.Equal(t, http.StatusOK, coverageResponse.Code)
+	var currentCoverage struct {
+		Items []coverageView `json:"items"`
+	}
+	require.NoError(t, json.Unmarshal(coverageResponse.Body.Bytes(), &currentCoverage))
+	require.Len(t, currentCoverage.Items, 1)
+	require.Equal(t, running.LastProgressAt, currentCoverage.Items[0].LastProgressAt)
+
+	coverageSummaryResponse := request(h, "GET", "/coverage?summary=1", "", testToken)
+	require.Equal(t, http.StatusOK, coverageSummaryResponse.Code)
+	var currentCoverageSummary struct {
+		Items []coverageSummaryView `json:"items"`
+	}
+	require.NoError(t, json.Unmarshal(coverageSummaryResponse.Body.Bytes(), &currentCoverageSummary))
+	require.Len(t, currentCoverageSummary.Items, 1)
+	require.Equal(t, running.LastProgressAt, currentCoverageSummary.Items[0].LastProgressAt)
 	close(release)
 	require.Eventually(t, func() bool { return m.List()[0].State == jobs.Incomplete }, time.Second, time.Millisecond)
 	cancel()
