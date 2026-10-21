@@ -5,7 +5,10 @@ import {
   type CreatedArchiveKey,
   type Command,
   type Job,
+  type JobDiagnostics,
+  type JobLastFailure,
   type Policy,
+  type RepositoryDetailsPage,
 } from "./contracts.ts";
 
 export interface ServiceConfig {
@@ -82,17 +85,38 @@ export class Services {
       "DELETE",
     );
   }
-  jobs(after = "", pds = "") {
-    return this.call<{ jobs: Job[]; nextCursor?: string }>(
+  async jobs(after = "", pds = "") {
+    const page = await this.call<{ jobs: Job[]; nextCursor?: string }>(
       "jetstream",
       `/jobs?limit=50&after=${encodeURIComponent(after)}&pds=${encodeURIComponent(pds)}`,
     );
+    return { ...page, jobs: page.jobs.map(normalizeJobDiagnostics) };
   }
-  coverage(after = "", pds = "") {
-    return this.call<CoveragePage>(
+  async repositoryDetails(id: string, after = "", limit = 100) {
+    const query = new URLSearchParams({ limit: String(limit) });
+    if (after) query.set("after", after);
+    const page = await this.call<RepositoryDetailsPage>(
+      "jetstream",
+      `/jobs/${encodeURIComponent(id)}/repositories?${query}`,
+    );
+    return {
+      ...page,
+      job: normalizeJobDiagnostics(page.job),
+      repositories: page.repositories.map((repository) => ({
+        ...repository,
+        failedAt: recordedTimestamp(repository.failedAt),
+      })),
+    };
+  }
+  async coverage(after = "", pds = "") {
+    const page = await this.call<CoveragePage>(
       "jetstream",
       `/coverage?limit=50&after=${encodeURIComponent(after)}&pds=${encodeURIComponent(pds)}`,
     );
+    return {
+      ...page,
+      items: page.items.map(normalizeJobDiagnostics),
+    };
   }
   async coverageFor(pds: string[]) {
     const chunks = [] as string[][];
@@ -114,7 +138,11 @@ export class Services {
         );
       }),
     );
-    return { items: pages.flatMap((page) => page.items) };
+    return {
+      items: pages
+        .flatMap((page) => page.items)
+        .map(normalizeJobDiagnostics),
+    };
   }
   sources(after = "") {
     return this.call<Record<string, unknown>>(
@@ -242,9 +270,13 @@ async function controlError(
     service === "jetstream" && path.startsWith("/archive-keys")
       ? await remoteArchiveError(response)
       : null;
+  const repositoryDetailsError =
+    service === "jetstream" && /^\/jobs\/[a-f0-9]{32}\/repositories(?:\?|$)/.test(path)
+      ? await remoteRepositoryDetailsError(response)
+      : null;
   return new ApiError(
     response.status >= 500 ? 503 : response.status,
-    archiveError ?? `${service}_rejected_${response.status}`,
+    archiveError ?? repositoryDetailsError ?? `${service}_rejected_${response.status}`,
   );
 }
 
@@ -281,7 +313,10 @@ interface CoverageSummaryPage {
     totalReposKnown: boolean;
     errorCode?: string;
     createdAt: string;
+    lastProgressAt?: string;
+    lastFailure?: JobLastFailure;
     coverage: string;
+    diagnostics: JobDiagnostics;
   }[];
 }
 
@@ -297,12 +332,70 @@ interface CoveragePage {
     totalReposKnown: boolean;
     errorCode?: string;
     createdAt: string;
+    lastProgressAt?: string;
+    lastFailure?: JobLastFailure;
     coverage: string;
+    diagnostics: JobDiagnostics;
   }[];
   nextCursor?: string;
 }
 
-async function remoteArchiveError(response: Response): Promise<string | null> {
+const jobFailureCategories: readonly JobLastFailure["category"][] = [
+  "timeout",
+  "cancel",
+  "body_read",
+  "http",
+  "transport",
+  "unknown",
+];
+const zeroTimestamp = Date.parse("0001-01-01T00:00:00.000Z");
+
+function recordedTimestamp(value: unknown): string | undefined {
+  if (typeof value !== "string" || !value.endsWith("Z")) return undefined;
+  const milliseconds = Date.parse(value);
+  if (!Number.isFinite(milliseconds) || milliseconds === zeroTimestamp)
+    return undefined;
+  return value;
+}
+
+function parseJobLastFailure(value: unknown): JobLastFailure | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    return undefined;
+  const failure = value as Record<string, unknown>;
+  const failedAt = recordedTimestamp(failure.failedAt);
+  if (
+    typeof failure.category !== "string" ||
+    !jobFailureCategories.includes(failure.category as JobLastFailure["category"]) ||
+    failure.stage !== "listRepos" ||
+    !failedAt
+  )
+    return undefined;
+  const httpStatus = failure.httpStatus;
+  return {
+    category: failure.category as JobLastFailure["category"],
+    stage: "listRepos",
+    failedAt,
+    ...(typeof httpStatus === "number" &&
+    Number.isInteger(httpStatus) &&
+    httpStatus >= 100 &&
+    httpStatus <= 599
+      ? { httpStatus }
+      : {}),
+  };
+}
+
+function normalizeJobDiagnostics<T extends {
+  lastProgressAt?: string;
+  lastFailure?: JobLastFailure;
+}>(value: T): T {
+  return {
+    ...value,
+    lastProgressAt: recordedTimestamp(value.lastProgressAt),
+    lastFailure: parseJobLastFailure(value.lastFailure),
+  } as T;
+}
+
+async function readBoundedRemoteErrorBody(response: Response): Promise<unknown | null> {
   const reader = response.body?.getReader();
   if (!reader) return null;
   const chunks: Uint8Array[] = [];
@@ -315,26 +408,47 @@ async function remoteArchiveError(response: Response): Promise<string | null> {
       if (size > 8192) return null;
       chunks.push(value);
     }
-    const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString());
-    if (
-      typeof parsed === "object" &&
-      parsed !== null &&
-      "error" in parsed &&
-      typeof parsed.error === "string" &&
-      [
-        "invalid_json",
-        "invalid_input",
-        "not_found",
-        "persistence_error",
-      ].includes(parsed.error)
-    )
-      return parsed.error;
+    return JSON.parse(Buffer.concat(chunks).toString()) as unknown;
   } catch {
     return null;
   } finally {
-    await reader.cancel();
+    try {
+      await reader.cancel();
+    } catch {
+      // A failed body read still falls back to the generic upstream error.
+    }
   }
-  return null;
+}
+
+async function remoteRepositoryDetailsError(
+  response: Response,
+): Promise<string | null> {
+  let expected: string;
+  if (response.status === 410) {
+    expected = "repository_snapshot_expired";
+  } else if (response.status === 413) {
+    expected = "repository_snapshot_too_large";
+  } else {
+    return null;
+  }
+  const body = await readBoundedRemoteErrorBody(response);
+  return typeof body === "object" && body !== null && "error" in body && body.error === expected
+    ? expected
+    : null;
+}
+
+async function remoteArchiveError(response: Response): Promise<string | null> {
+  const body = await readBoundedRemoteErrorBody(response);
+  if (typeof body !== "object" || body === null || !("error" in body)) return null;
+  const code = body.error;
+  return typeof code === "string" && [
+    "invalid_json",
+    "invalid_input",
+    "not_found",
+    "persistence_error",
+  ].includes(code)
+    ? code
+    : null;
 }
 
 function allowedControlTransport(url: URL, railwayPrivateNetwork: boolean) {

@@ -9,3 +9,5 @@ Retry. No configuration changes are needed.
 
 The cap only affects new responses. Previously saved longer waits remain
 unchanged.
+
+Older jobs without a saved inventory remain readable.
