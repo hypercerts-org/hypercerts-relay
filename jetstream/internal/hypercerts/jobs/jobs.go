@@ -40,6 +40,8 @@ const (
 	receiptRetryMax  = time.Minute
 )
 
+var errJobYield = errors.New("job yielded to durable retry scheduler")
+
 var ErrConflict = errors.New("job or source state conflict")
 var ErrNotFound = errors.New("job not found")
 var ErrInvalidInput = errors.New("invalid job input")
@@ -60,20 +62,30 @@ type Job struct {
 	CompletedRepos map[string]string `json:"completedRepos"`
 	// EnumeratedRepos is the durable, non-public subtotal used to resume a
 	// single PDS inventory scan without re-counting earlier pages.
-	EnumeratedRepos int        `json:"enumeratedRepos"`
-	TotalRepos      int        `json:"totalRepos"`
-	TotalReposKnown bool       `json:"totalReposKnown"`
-	Cursor          string     `json:"cursor"`
-	LastProgressAt  *time.Time `json:"lastProgressAt,omitempty"`
-	ErrorCode       string     `json:"errorCode,omitempty"`
-	CreatedAt       time.Time  `json:"createdAt"`
-	StartedAt       time.Time  `json:"startedAt,omitempty"`
-	FinishedAt      time.Time  `json:"finishedAt,omitempty"`
-	Coverage        string     `json:"coverage"`
-	ReceiptPending  bool       `json:"receiptPending,omitempty"`
-	ReceiptAttempts int        `json:"receiptAttempts,omitempty"`
-	ReceiptRetryAt  time.Time  `json:"receiptRetryAt,omitempty"`
-	ReceiptError    string     `json:"receiptError,omitempty"`
+	EnumeratedRepos int         `json:"enumeratedRepos"`
+	TotalRepos      int         `json:"totalRepos"`
+	TotalReposKnown bool        `json:"totalReposKnown"`
+	Cursor          string      `json:"cursor"`
+	LastProgressAt  *time.Time  `json:"lastProgressAt,omitempty"`
+	ErrorCode       string      `json:"errorCode,omitempty"`
+	LastFailure     *JobFailure `json:"lastFailure,omitempty"`
+	CreatedAt       time.Time   `json:"createdAt"`
+	StartedAt       time.Time   `json:"startedAt,omitempty"`
+	FinishedAt      time.Time   `json:"finishedAt,omitempty"`
+	Coverage        string      `json:"coverage"`
+	ReceiptPending  bool        `json:"receiptPending,omitempty"`
+	ReceiptAttempts int         `json:"receiptAttempts,omitempty"`
+	ReceiptRetryAt  time.Time   `json:"receiptRetryAt,omitempty"`
+	ReceiptError    string      `json:"receiptError,omitempty"`
+}
+
+// JobFailure is sanitized metadata for the most recent listRepos failure.
+// Its values come from the bounded PDS attempt classifier, never raw responses.
+type JobFailure struct {
+	Stage      string    `json:"stage"`
+	Category   string    `json:"category"`
+	HTTPStatus int       `json:"httpStatus,omitempty"`
+	FailedAt   time.Time `json:"failedAt"`
 }
 
 // inventory is kept under a per-job key instead of inside the job-state
@@ -125,6 +137,7 @@ type Manager struct {
 	runningID      string
 	receiptSender  ReceiptSender
 	policyAdvancer PolicyAdvanceSender
+	wake           chan struct{}
 }
 
 // ReceiptSender submits a completed job's bounded recovery coordinate to the
@@ -139,7 +152,7 @@ func Open(db *store.Store, policy *selection.Manager) (*Manager, error) {
 	if policy == nil {
 		return nil, errors.New("jobs require collection policy")
 	}
-	m := &Manager{db: db, policy: policy}
+	m := &Manager{db: db, policy: policy, wake: make(chan struct{}, 1)}
 	persisted, found, err := readPersistedData(db)
 	if err != nil {
 		return nil, err
@@ -217,6 +230,9 @@ func resumePersistedJobs(jobs map[string]Job) error {
 		if job.ID != id || job.CompletedRepos == nil || job.Policy.Revision == 0 {
 			return errors.New("invalid persisted job")
 		}
+		if job.LastFailure != nil && !validJobFailure(*job.LastFailure) {
+			return errors.New("invalid persisted job failure")
+		}
 		if job.State == Running {
 			job.State = Pending
 			jobs[id] = job
@@ -265,6 +281,7 @@ func (m *Manager) commit(next data) error {
 		return err
 	}
 	m.data = next
+	m.signalScheduler()
 	return nil
 }
 
@@ -287,6 +304,10 @@ func (m *Manager) readInventory(id string) (inventory, error) {
 }
 
 func (m *Manager) commitInventory(next data, id string, inv inventory) error {
+	return m.commitJobInventoryRetryBatch(next, id, inv, nil)
+}
+
+func (m *Manager) commitJobInventoryRetryBatch(next data, id string, inv inventory, deleteRetries [][]byte) error {
 	encodedState, err := json.Marshal(next)
 	if err != nil {
 		return err
@@ -303,10 +324,16 @@ func (m *Manager) commitInventory(next data, id string, inv inventory) error {
 	if err := batch.Set(jobInventoryKey(id), encodedInventory, nil); err != nil {
 		return err
 	}
+	for _, key := range deleteRetries {
+		if err := batch.Delete(key, nil); err != nil {
+			return err
+		}
+	}
 	if err := m.db.Commit(batch, store.SyncWrites); err != nil {
 		return err
 	}
 	m.data = next
+	m.signalScheduler()
 	return nil
 }
 func newJob(pds string, policy selection.Policy, reason string, sourceRevision uint64) Job {
@@ -461,6 +488,7 @@ func (m *Manager) SetPolicy(ctx context.Context, expected uint64, collections []
 		return selection.Policy{}, err
 	}
 	m.data = next
+	m.signalScheduler()
 	if m.cancel != nil && m.data.Jobs[m.runningID].Policy.Revision != policy.Revision {
 		m.cancel()
 	}
@@ -629,6 +657,7 @@ func (m *Manager) commitTransition(j Job, state State, requestID string) error {
 		return m.commit(next)
 	}
 	resetInventory := state == Pending && j.State == Failed
+	resetUnresolved := state == Pending && j.State == Incomplete
 	j.State = state
 	j.ErrorCode = ""
 	j.FinishedAt = time.Time{}
@@ -640,14 +669,24 @@ func (m *Manager) commitTransition(j Job, state State, requestID string) error {
 		j.EnumeratedRepos = 0
 		j.TotalRepos = 0
 		j.TotalReposKnown = false
-		j.CompletedRepos = map[string]string{}
 	}
 	if state == Canceled {
 		j.FinishedAt = time.Now().UTC()
 	}
 	next.Jobs[j.ID] = j
 	if resetInventory {
-		return m.commitInventory(next, j.ID, inventory{Entries: map[string]string{}})
+		deletes, err := m.repositoryRetryDeleteKeysLocked(j.ID, false)
+		if err != nil {
+			return err
+		}
+		return m.commitJobInventoryRetryBatch(next, j.ID, inventory{Entries: map[string]string{}}, deletes)
+	}
+	if resetUnresolved {
+		deletes, err := m.repositoryRetryDeleteKeysLocked(j.ID, true)
+		if err != nil {
+			return err
+		}
+		return m.commitRepositoryRetryBatch(next, true, nil, deletes, nil)
 	}
 	if err := m.commit(next); err != nil {
 		return err
@@ -677,6 +716,37 @@ func (m *Manager) Get(id string) (Job, error) {
 		return Job{}, ErrNotFound
 	}
 	return clone(job), nil
+}
+
+func validJobFailure(failure JobFailure) bool {
+	if failure.Stage != pdsStageListRepos || failure.FailedAt.IsZero() {
+		return false
+	}
+	switch failure.Category {
+	case pdsCauseTimeout, pdsCauseCanceled, pdsCauseBodyRead, pdsCauseHTTP, pdsCauseTransport, pdsCauseUnknown:
+	default:
+		return false
+	}
+	if failure.Category == pdsCauseHTTP {
+		return failure.HTTPStatus >= 100 && failure.HTTPStatus <= 599
+	}
+	return failure.HTTPStatus == 0
+}
+
+func (m *Manager) recordJobFailure(id string, failure JobFailure) error {
+	if !validJobFailure(failure) {
+		return ErrInvalidInput
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.data.Jobs[id]; !ok {
+		return ErrNotFound
+	}
+	next := clone(m.data)
+	job := next.Jobs[id]
+	job.LastFailure = &failure
+	next.Jobs[id] = job
+	return m.commit(next)
 }
 func (m *Manager) Sources() map[string]bool {
 	m.mu.Lock()
@@ -976,6 +1046,12 @@ func (m *Manager) CheckpointInventory(id, cursor string, entries map[string]stri
 	if complete {
 		totalRepos = enumeratedRepos
 		totalReposKnown = true
+		for did, completedRevision := range job.CompletedRepos {
+			listedRevision, exists := inv.Entries[did]
+			if !exists || !completedRevisionAtLeast(completedRevision, listedRevision) {
+				delete(job.CompletedRepos, did)
+			}
+		}
 	}
 	if cursor == job.Cursor && !newEntries && enumeratedRepos == job.EnumeratedRepos && totalRepos == job.TotalRepos && totalReposKnown == job.TotalReposKnown {
 		return nil
@@ -1050,34 +1126,69 @@ type InputError struct {
 func (e *InputError) Error() string { return e.Code }
 
 func (m *Manager) Run(ctx context.Context, process Processor) error {
+	if err := m.startRunner(); err != nil {
+		return err
+	}
+	defer m.stopRunner()
+	for {
+		if err := m.runPass(ctx, process); err != nil {
+			return err
+		}
+	}
+}
+
+func (m *Manager) startRunner() error {
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.running {
-		m.mu.Unlock()
 		return ErrConflict
 	}
 	m.running = true
-	m.mu.Unlock()
-	defer func() { m.mu.Lock(); m.running = false; m.mu.Unlock() }()
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := m.flushReceipts(ctx); err != nil {
-			return err
-		}
-		worked, err := m.runNext(ctx, process)
-		if err != nil {
-			return err
-		}
-		if !worked {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-ticker.C:
-			}
-		}
+	return nil
+}
+
+func (m *Manager) stopRunner() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.running = false
+}
+
+func (m *Manager) runPass(ctx context.Context, process Processor) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := m.flushReceipts(ctx); err != nil {
+		return err
+	}
+	worked, err := m.runNext(ctx, process)
+	if err != nil || worked {
+		return err
+	}
+	return m.waitForWork(ctx)
+}
+
+func (m *Manager) waitForWork(ctx context.Context) error {
+	delay, found, err := m.nextWorkDelay()
+	if err != nil {
+		return err
+	}
+	if found && delay <= 0 {
+		return nil
+	}
+	var timer *time.Timer
+	var timerC <-chan time.Time
+	if found {
+		timer = time.NewTimer(delay)
+		timerC = timer.C
+		defer timer.Stop()
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-m.wake:
+		return nil
+	case <-timerC:
+		return nil
 	}
 }
 
@@ -1100,8 +1211,16 @@ func (m *Manager) runNext(ctx context.Context, process Processor) (bool, error) 
 }
 
 func (m *Manager) claimNextLocked() (Job, error) {
+	now := time.Now().UTC()
 	for _, job := range m.data.Jobs {
 		if job.State != Pending {
+			continue
+		}
+		dueAt, found, err := m.pendingJobDueLocked(job, now)
+		if err != nil {
+			return Job{}, err
+		}
+		if !found || dueAt.After(now) {
 			continue
 		}
 		if current := m.data.SourceRevisions[job.PDS]; current > 0 && job.SourceRevision != current {
@@ -1156,6 +1275,15 @@ func (m *Manager) persistJobOutcome(ctx context.Context, id string, processErr e
 	} // Persisted Running resumes on Open.
 	if !m.active(id) {
 		return nil, "", nil
+	}
+	if errors.Is(processErr, errJobYield) {
+		next := clone(m.data)
+		job := next.Jobs[id]
+		job.State = Pending
+		job.ErrorCode = ""
+		job.FinishedAt = time.Time{}
+		next.Jobs[id] = job
+		return nil, "", m.commit(next)
 	}
 	state, code, err := jobOutcome(processErr)
 	if err != nil {

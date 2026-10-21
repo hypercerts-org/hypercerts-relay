@@ -508,6 +508,7 @@ type jobView struct {
 	TotalReposKnown bool             `json:"totalReposKnown"`
 	Cursor          string           `json:"cursor"`
 	ErrorCode       string           `json:"errorCode,omitempty"`
+	LastFailure     *jobs.JobFailure `json:"lastFailure,omitempty"`
 	CreatedAt       time.Time        `json:"createdAt"`
 	StartedAt       time.Time        `json:"startedAt"`
 	FinishedAt      time.Time        `json:"finishedAt"`
@@ -516,7 +517,7 @@ type jobView struct {
 }
 
 func view(j jobs.Job) jobView {
-	return jobView{ID: j.ID, PDS: j.PDS, Policy: j.Policy, Reason: j.Reason, State: j.State, Attempts: j.Attempts, CompletedRepos: len(j.CompletedRepos), TotalRepos: j.TotalRepos, TotalReposKnown: j.TotalReposKnown, Cursor: j.Cursor, ErrorCode: j.ErrorCode, CreatedAt: j.CreatedAt, StartedAt: j.StartedAt, FinishedAt: j.FinishedAt, LastProgressAt: j.LastProgressAt, Coverage: j.Coverage}
+	return jobView{ID: j.ID, PDS: j.PDS, Policy: j.Policy, Reason: j.Reason, State: j.State, Attempts: j.Attempts, CompletedRepos: len(j.CompletedRepos), TotalRepos: j.TotalRepos, TotalReposKnown: j.TotalReposKnown, Cursor: j.Cursor, ErrorCode: j.ErrorCode, LastFailure: j.LastFailure, CreatedAt: j.CreatedAt, StartedAt: j.StartedAt, FinishedAt: j.FinishedAt, LastProgressAt: j.LastProgressAt, Coverage: j.Coverage}
 }
 
 type coverageView struct {
@@ -529,32 +530,34 @@ type coverageView struct {
 	TotalRepos      int              `json:"totalRepos"`
 	TotalReposKnown bool             `json:"totalReposKnown"`
 	ErrorCode       string           `json:"errorCode,omitempty"`
-	CreatedAt       time.Time        `json:"createdAt"`
 	LastProgressAt  *time.Time       `json:"lastProgressAt,omitempty"`
+	LastFailure     *jobs.JobFailure `json:"lastFailure,omitempty"`
+	CreatedAt       time.Time        `json:"createdAt"`
 	Coverage        string           `json:"coverage"`
 }
 
 func coverage(j jobs.Job) coverageView {
-	return coverageView{PDS: j.PDS, Policy: j.Policy, JobID: j.ID, Reason: j.Reason, State: j.State, CompletedRepos: len(j.CompletedRepos), TotalRepos: j.TotalRepos, TotalReposKnown: j.TotalReposKnown, ErrorCode: j.ErrorCode, CreatedAt: j.CreatedAt, LastProgressAt: j.LastProgressAt, Coverage: j.Coverage}
+	return coverageView{PDS: j.PDS, Policy: j.Policy, JobID: j.ID, Reason: j.Reason, State: j.State, CompletedRepos: len(j.CompletedRepos), TotalRepos: j.TotalRepos, TotalReposKnown: j.TotalReposKnown, ErrorCode: j.ErrorCode, LastProgressAt: j.LastProgressAt, LastFailure: j.LastFailure, CreatedAt: j.CreatedAt, Coverage: j.Coverage}
 }
 
 // coverageSummaryView is a compact table-enrichment view. The full policy is
 // intentionally omitted because it is fetched only for the selected source.
 type coverageSummaryView struct {
-	PDS             string     `json:"pds"`
-	JobID           string     `json:"jobId"`
-	State           jobs.State `json:"state"`
-	CompletedRepos  int        `json:"completedRepos"`
-	TotalRepos      int        `json:"totalRepos"`
-	TotalReposKnown bool       `json:"totalReposKnown"`
-	ErrorCode       string     `json:"errorCode,omitempty"`
-	CreatedAt       time.Time  `json:"createdAt"`
-	LastProgressAt  *time.Time `json:"lastProgressAt,omitempty"`
-	Coverage        string     `json:"coverage"`
+	PDS             string           `json:"pds"`
+	JobID           string           `json:"jobId"`
+	State           jobs.State       `json:"state"`
+	CompletedRepos  int              `json:"completedRepos"`
+	TotalRepos      int              `json:"totalRepos"`
+	TotalReposKnown bool             `json:"totalReposKnown"`
+	ErrorCode       string           `json:"errorCode,omitempty"`
+	LastProgressAt  *time.Time       `json:"lastProgressAt,omitempty"`
+	LastFailure     *jobs.JobFailure `json:"lastFailure,omitempty"`
+	CreatedAt       time.Time        `json:"createdAt"`
+	Coverage        string           `json:"coverage"`
 }
 
 func coverageSummary(view coverageView) coverageSummaryView {
-	return coverageSummaryView{PDS: view.PDS, JobID: view.JobID, State: view.State, CompletedRepos: view.CompletedRepos, TotalRepos: view.TotalRepos, TotalReposKnown: view.TotalReposKnown, ErrorCode: view.ErrorCode, CreatedAt: view.CreatedAt, LastProgressAt: view.LastProgressAt, Coverage: view.Coverage}
+	return coverageSummaryView{PDS: view.PDS, JobID: view.JobID, State: view.State, CompletedRepos: view.CompletedRepos, TotalRepos: view.TotalRepos, TotalReposKnown: view.TotalReposKnown, ErrorCode: view.ErrorCode, LastProgressAt: view.LastProgressAt, LastFailure: view.LastFailure, CreatedAt: view.CreatedAt, Coverage: view.Coverage}
 }
 
 func (h *Handler) listArchiveKeys(w http.ResponseWriter, r *http.Request) {

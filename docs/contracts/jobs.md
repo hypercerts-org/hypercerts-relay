@@ -43,14 +43,13 @@ action returns conflict. Without a receipt, repeated job requests coalesce only
 applicable pending or running work; a later unkeyed request after terminal work
 may create a new job.
 
-Job list/detail and coverage responses, including coverage summaries, include
-optional camelCase `lastProgressAt` after a successful durable inventory or
-repository checkpoint. It is omitted when no date is known, including for legacy
-jobs without the field. Claims, reads, failed repository attempts, failed
-checkpoint writes, and no-op inventory checkpoints do not advance it. Durable
-`RepositoryRetry` JSON similarly uses optional camelCase `failedAt`; a legacy row
-without that date remains unknown. Repository retry rows are not part of the
-current job-summary HTTP routes.
+Job list/detail responses include optional camelCase `lastProgressAt` after a
+successful durable inventory or repository checkpoint. It is omitted when no
+date is known, including for legacy jobs without the field. Claims, reads, failed
+repository attempts, failed checkpoint writes, and no-op inventory checkpoints
+do not advance it. Durable `RepositoryRetry` JSON similarly uses optional
+camelCase `failedAt`; a legacy row without that date remains unknown. Repository
+retry rows are not part of the current job-summary HTTP routes.
 
 ## Completion semantics
 

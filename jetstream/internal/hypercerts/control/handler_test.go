@@ -116,6 +116,228 @@ func seedSnapshotRejections(t *testing.T, manager *jobs.Manager, dids []string, 
 	return pds.URL
 }
 
+func TestPrivateJobStatusExposesBoundedInventoryFailure(t *testing.T) {
+	h, manager := setup(t)
+	const bodyMarker = "control-fixture-inventory-body-secret"
+	const headerMarker = "control-fixture-inventory-header-secret"
+	pds := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-Fixture-Sensitive", headerMarker)
+		http.Error(w, bodyMarker, http.StatusServiceUnavailable)
+	}))
+	defer pds.Close()
+
+	job, err := manager.AddSource(pds.URL)
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- manager.Run(ctx, jobs.PDSProcessor{
+			Manager:    manager,
+			HTTPClient: pds.Client(),
+			Directory:  &identity.Directory{},
+		}.Run)
+	}()
+	require.Eventually(t, func() bool {
+		current, getErr := manager.Get(job.ID)
+		return getErr == nil && current.State == jobs.Incomplete
+	}, time.Second, time.Millisecond)
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+
+	type failureView struct {
+		Stage      string    `json:"stage"`
+		Category   string    `json:"category"`
+		HTTPStatus int       `json:"httpStatus"`
+		FailedAt   time.Time `json:"failedAt"`
+	}
+	type statusView struct {
+		State       jobs.State   `json:"state"`
+		ErrorCode   string       `json:"errorCode"`
+		LastFailure *failureView `json:"lastFailure"`
+	}
+	assertStatus := func(encoded []byte) {
+		t.Helper()
+		var got statusView
+		require.NoError(t, json.Unmarshal(encoded, &got))
+		require.Equal(t, jobs.Incomplete, got.State)
+		require.Equal(t, "source_unavailable", got.ErrorCode)
+		require.NotNil(t, got.LastFailure)
+		require.Equal(t, "listRepos", got.LastFailure.Stage)
+		require.Equal(t, "http", got.LastFailure.Category)
+		require.Equal(t, http.StatusServiceUnavailable, got.LastFailure.HTTPStatus)
+		require.False(t, got.LastFailure.FailedAt.IsZero())
+		require.Equal(t, time.UTC, got.LastFailure.FailedAt.Location())
+		require.NotContains(t, string(encoded), bodyMarker)
+		require.NotContains(t, string(encoded), headerMarker)
+	}
+
+	unauthorized := request(h, "GET", "/jobs/"+job.ID, "", "")
+	require.Equal(t, http.StatusUnauthorized, unauthorized.Code)
+	detail := request(h, "GET", "/jobs/"+job.ID, "", testToken)
+	require.Equal(t, http.StatusOK, detail.Code)
+	assertStatus(detail.Body.Bytes())
+	listed := request(h, "GET", "/jobs?limit=10", "", testToken)
+	require.Equal(t, http.StatusOK, listed.Code)
+	var page struct {
+		Jobs []json.RawMessage `json:"jobs"`
+	}
+	require.NoError(t, json.Unmarshal(listed.Body.Bytes(), &page))
+	require.Len(t, page.Jobs, 1)
+	assertStatus(page.Jobs[0])
+}
+
+func TestPrivateCoverageExposesBoundedListingFailure(t *testing.T) {
+	h, manager := setup(t)
+	const bodyMarker = "coverage-fixture-inventory-body-secret"
+	const headerMarker = "coverage-fixture-inventory-header-secret"
+	pds := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/xrpc/com.atproto.sync.listRepos" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Query().Get("cursor") {
+		case "":
+			_, _ = w.Write([]byte(`{"repos":[],"cursor":"page-two"}`))
+		case "page-two":
+			w.Header().Set("X-Fixture-Sensitive", headerMarker)
+			http.Error(w, bodyMarker, http.StatusServiceUnavailable)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer pds.Close()
+
+	job, err := manager.AddSource(pds.URL)
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- manager.Run(ctx, jobs.PDSProcessor{
+			Manager:    manager,
+			HTTPClient: pds.Client(),
+			Directory:  &identity.Directory{},
+		}.Run)
+	}()
+	require.Eventually(t, func() bool {
+		current, getErr := manager.Get(job.ID)
+		return getErr == nil && current.State == jobs.Incomplete
+	}, time.Second, time.Millisecond)
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+
+	type failureView struct {
+		Stage      string    `json:"stage"`
+		Category   string    `json:"category"`
+		HTTPStatus int       `json:"httpStatus"`
+		FailedAt   time.Time `json:"failedAt"`
+	}
+	type coverageItem struct {
+		PDS         string       `json:"pds"`
+		ErrorCode   string       `json:"errorCode"`
+		LastFailure *failureView `json:"lastFailure"`
+	}
+	for _, path := range []string{
+		"/coverage?pds=" + url.QueryEscape(pds.URL),
+		"/coverage?summary=1&pds=" + url.QueryEscape(pds.URL),
+	} {
+		response := request(h, "GET", path, "", testToken)
+		require.Equal(t, http.StatusOK, response.Code)
+		var page struct {
+			Items []coverageItem `json:"items"`
+		}
+		require.NoError(t, json.Unmarshal(response.Body.Bytes(), &page))
+		require.Len(t, page.Items, 1)
+		require.Equal(t, pds.URL, page.Items[0].PDS)
+		require.Equal(t, "source_unavailable", page.Items[0].ErrorCode)
+		require.NotNil(t, page.Items[0].LastFailure)
+		require.Equal(t, "listRepos", page.Items[0].LastFailure.Stage)
+		require.Equal(t, "http", page.Items[0].LastFailure.Category)
+		require.Equal(t, http.StatusServiceUnavailable, page.Items[0].LastFailure.HTTPStatus)
+		require.False(t, page.Items[0].LastFailure.FailedAt.IsZero())
+		require.Equal(t, time.UTC, page.Items[0].LastFailure.FailedAt.Location())
+		require.NotContains(t, response.Body.String(), bodyMarker)
+		require.NotContains(t, response.Body.String(), headerMarker)
+	}
+
+	_, err = manager.AddSource("https://legacy.example")
+	require.NoError(t, err)
+	for _, path := range []string{
+		"/coverage?pds=https%3A%2F%2Flegacy.example",
+		"/coverage?summary=1&pds=https%3A%2F%2Flegacy.example",
+	} {
+		response := request(h, "GET", path, "", testToken)
+		require.Equal(t, http.StatusOK, response.Code)
+		var page struct {
+			Items []json.RawMessage `json:"items"`
+		}
+		require.NoError(t, json.Unmarshal(response.Body.Bytes(), &page))
+		require.Len(t, page.Items, 1)
+		var fields map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(page.Items[0], &fields))
+		require.NotContains(t, fields, "lastFailure", "legacy jobs omit failure diagnostics")
+	}
+}
+
+func TestPrivateCoverageExposesProgressTimestamp(t *testing.T) {
+	h, manager := setup(t)
+	job, err := manager.AddSource("https://progress.example")
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- manager.Run(ctx, func(_ context.Context, current jobs.Job) error {
+			if err := manager.CheckpointEnumeration(current.ID, "page-two", 0, false); err != nil {
+				return err
+			}
+			return &jobs.InputError{Code: "source_unavailable", Unavailable: true}
+		})
+	}()
+	require.Eventually(t, func() bool {
+		current, getErr := manager.Get(job.ID)
+		return getErr == nil && current.State == jobs.Incomplete
+	}, time.Second, time.Millisecond)
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+
+	type coverageItem struct {
+		LastProgressAt *time.Time `json:"lastProgressAt"`
+	}
+	for _, path := range []string{
+		"/coverage?pds=https%3A%2F%2Fprogress.example",
+		"/coverage?summary=1&pds=https%3A%2F%2Fprogress.example",
+	} {
+		response := request(h, "GET", path, "", testToken)
+		require.Equal(t, http.StatusOK, response.Code)
+		var page struct {
+			Items []coverageItem `json:"items"`
+		}
+		require.NoError(t, json.Unmarshal(response.Body.Bytes(), &page))
+		require.Len(t, page.Items, 1)
+		require.NotNil(t, page.Items[0].LastProgressAt)
+		require.False(t, page.Items[0].LastProgressAt.IsZero())
+		require.Equal(t, time.UTC, page.Items[0].LastProgressAt.Location())
+	}
+
+	_, err = manager.AddSource("https://legacy.example")
+	require.NoError(t, err)
+	for _, path := range []string{
+		"/coverage?pds=https%3A%2F%2Flegacy.example",
+		"/coverage?summary=1&pds=https%3A%2F%2Flegacy.example",
+	} {
+		response := request(h, "GET", path, "", testToken)
+		require.Equal(t, http.StatusOK, response.Code)
+		var page struct {
+			Items []json.RawMessage `json:"items"`
+		}
+		require.NoError(t, json.Unmarshal(response.Body.Bytes(), &page))
+		require.Len(t, page.Items, 1)
+		var fields map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(page.Items[0], &fields))
+		require.NotContains(t, fields, "lastProgressAt", "legacy jobs omit progress timestamps")
+	}
+}
+
 func TestPrivateSnapshotRejectionsView(t *testing.T) {
 	h, manager := setup(t)
 	pdsA := seedSnapshotRejections(t, manager, []string{"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"}, true)
@@ -212,24 +434,6 @@ func TestPrivateLifecycleAndCoverage(t *testing.T) {
 	require.Equal(t, jobs.Running, running.State)
 	require.Equal(t, 1, running.Attempts)
 	require.NotNil(t, running.LastProgressAt, "job response exposes the persisted checkpoint timestamp")
-
-	coverageResponse := request(h, "GET", "/coverage", "", testToken)
-	require.Equal(t, http.StatusOK, coverageResponse.Code)
-	var currentCoverage struct {
-		Items []coverageView `json:"items"`
-	}
-	require.NoError(t, json.Unmarshal(coverageResponse.Body.Bytes(), &currentCoverage))
-	require.Len(t, currentCoverage.Items, 1)
-	require.Equal(t, running.LastProgressAt, currentCoverage.Items[0].LastProgressAt)
-
-	coverageSummaryResponse := request(h, "GET", "/coverage?summary=1", "", testToken)
-	require.Equal(t, http.StatusOK, coverageSummaryResponse.Code)
-	var currentCoverageSummary struct {
-		Items []coverageSummaryView `json:"items"`
-	}
-	require.NoError(t, json.Unmarshal(coverageSummaryResponse.Body.Bytes(), &currentCoverageSummary))
-	require.Len(t, currentCoverageSummary.Items, 1)
-	require.Equal(t, running.LastProgressAt, currentCoverageSummary.Items[0].LastProgressAt)
 	close(release)
 	require.Eventually(t, func() bool { return m.List()[0].State == jobs.Incomplete }, time.Second, time.Millisecond)
 	cancel()
