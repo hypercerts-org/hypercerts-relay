@@ -72,7 +72,7 @@ request before selecting the names in the ruleset. GitHub requires a successful
 check within the past seven days; see
 [troubleshooting required status checks](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks).
 
-Install Go 1.26.1 or the toolchain selected by `go.mod`. Relay links SQLite through CGO, so a working C compiler is also required.
+Install Go 1.26.10 or the toolchain selected by `go.mod`. Relay links SQLite through CGO, so a working C compiler is also required.
 
 ```bash
 git clone git@github.com:hypercerts-org/hypercerts-relay.git
