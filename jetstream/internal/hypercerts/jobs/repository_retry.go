@@ -503,7 +503,7 @@ func captureDiagnosticJob(job Job) diagnosticJobInput {
 		}
 	}
 	job.CompletedRepos = nil
-	job.Policy.Collections = slices.Clone(job.Policy.Collections)
+	job = clone(job)
 	return diagnosticJobInput{job: job, completedRepos: completedRepos, completedRepoCount: completedRepoCount}
 }
 
@@ -909,6 +909,17 @@ func (m *Manager) repositoryFailureCooldownLocked(pds string, pdsCooldownUntil *
 // checkpoint and retry-row deletion commit in one synced batch, with
 // CompletedRepos remaining the only completion authority.
 func (m *Manager) CheckpointRepository(jobID, did, listedRevision, completedRevision, cursor string) error {
+	return m.checkpointRepository(jobID, did, listedRevision, completedRevision, cursor, nil)
+}
+
+func (m *Manager) CheckpointRepositoryAcquisition(jobID, did, listedRevision, completedRevision, cursor string, records int) error {
+	if records < 0 {
+		return ErrInvalidInput
+	}
+	return m.checkpointRepository(jobID, did, listedRevision, completedRevision, cursor, &records)
+}
+
+func (m *Manager) checkpointRepository(jobID, did, listedRevision, completedRevision, cursor string, records *int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	job, frozenRevision, err := m.repositoryCoordinateLocked(jobID, did)
@@ -945,6 +956,18 @@ func (m *Manager) CheckpointRepository(jobID, did, listedRevision, completedRevi
 	job.Cursor = cursor
 	now := time.Now().UTC()
 	job.LastProgressAt = &now
+	if records == nil {
+		job.Evidence = nil
+	} else if job.Evidence != nil {
+		job.Evidence.Scanned++
+		if *records == 0 {
+			job.Evidence.NoMatch++
+		} else {
+			job.Evidence.Matching++
+		}
+		job.Evidence.AttributableRecords += *records
+		job.Evidence.LastProgressAt = now
+	}
 	next.Jobs[jobID] = job
 	return m.commitRepositoryRetryBatch(next, true, nil, [][]byte{repositoryRetryKey(jobID, did)}, nil)
 }

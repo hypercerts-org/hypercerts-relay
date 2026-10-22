@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	statusmodel "github.com/bluesky-social/jetstream/internal/hypercerts/coverage"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/jobs"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 	"github.com/bluesky-social/jetstream/internal/ingest"
@@ -489,8 +490,8 @@ func TestLegacyKnownTotalJobWithoutInventoryRemainsReadable(t *testing.T) {
 	}
 	require.NoError(t, json.Unmarshal(coverage.Body.Bytes(), &coveragePage))
 	require.Len(t, coveragePage.Items, 1)
-	require.Equal(t, 1, coveragePage.Items[0].CompletedRepos)
-	require.Equal(t, 3, coveragePage.Items[0].TotalRepos)
+	require.Equal(t, 1, *coveragePage.Items[0].CompletedRepos)
+	require.Equal(t, 3, *coveragePage.Items[0].TotalRepos)
 	require.True(t, coveragePage.Items[0].TotalReposKnown)
 	require.Nil(t, coveragePage.Items[0].Diagnostics.UnresolvedRepos)
 
@@ -850,10 +851,10 @@ func TestJobDiagnosticsUseSchedulerEligibilityAndTerminalState(t *testing.T) {
 	require.NoError(t, json.Unmarshal(terminalCoverage.Body.Bytes(), &terminalCoveragePage))
 	require.Len(t, terminalCoveragePage.Items, 1)
 	require.Equal(t, jobs.JobExecutionStopped, terminalCoveragePage.Items[0].Diagnostics.Execution)
-	require.Equal(t, 1, terminalCoveragePage.Items[0].CompletedRepos)
-	require.Equal(t, 5, terminalCoveragePage.Items[0].TotalRepos)
+	require.Equal(t, 1, *terminalCoveragePage.Items[0].CompletedRepos)
+	require.Equal(t, 5, *terminalCoveragePage.Items[0].TotalRepos)
 	require.Equal(t, 4, *terminalCoveragePage.Items[0].Diagnostics.UnresolvedRepos)
-	require.Equal(t, terminalCoveragePage.Items[0].TotalRepos, terminalCoveragePage.Items[0].CompletedRepos+*terminalCoveragePage.Items[0].Diagnostics.UnresolvedRepos)
+	require.Equal(t, *terminalCoveragePage.Items[0].TotalRepos, *terminalCoveragePage.Items[0].CompletedRepos+*terminalCoveragePage.Items[0].Diagnostics.UnresolvedRepos)
 }
 
 func TestRepositoryDetailsOversizedSnapshotReturnsPayloadTooLarge(t *testing.T) {
@@ -1390,4 +1391,57 @@ func TestCoverageOldPolicyCannotCompleteAndDisabledSourcesDisappear(t *testing.T
 	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &page))
 	require.Empty(t, page.Items)
 	require.Equal(t, "unknown", page.Aggregate.State)
+}
+
+func TestCoverageProjectionPreservesAuthoritativeEvidence(t *testing.T) {
+	for _, mode := range []string{"matching", "source_mismatch", "policy_mismatch", "no_job", "legacy"} {
+		t.Run(mode, func(t *testing.T) {
+			h, manager := setup(t)
+			job, err := manager.AddSourceWithRevision("https://projection.example", 7)
+			require.NoError(t, err)
+			enabled, revisions, policy, history := manager.StatusInputs()
+			switch mode {
+			case "source_mismatch":
+				revisions[job.PDS]++
+			case "policy_mismatch":
+				policy.Revision++
+			case "no_job":
+				history = nil
+			case "legacy":
+				history[0].Evidence = nil
+			}
+			authoritative := statusmodel.New(enabled, revisions, policy, history)
+			items, err := h.coverageViews(authoritative.Items)
+			require.NoError(t, err)
+			require.Len(t, items, 1)
+			for _, projection := range []coverageView{items[0], coverageSummary(items[0])} {
+				encoded, err := json.Marshal(projection)
+				require.NoError(t, err)
+				var got statusmodel.Source
+				require.NoError(t, json.Unmarshal(encoded, &got))
+				require.Equal(t, authoritative.Items[0], got)
+				if !got.MatchingJob {
+					require.Nil(t, projection.Diagnostics)
+					require.Nil(t, projection.LastFailure)
+					require.Nil(t, got.CompletedRepos)
+					require.Nil(t, got.TotalRepos)
+					require.Nil(t, got.Acquisition.Counts.Scanned)
+				}
+			}
+			if mode == "legacy" {
+				require.Nil(t, items[0].Acquisition.Counts.Scanned)
+			}
+			if mode == "matching" {
+				for _, path := range []string{"/coverage", "/coverage?summary=1"} {
+					response := request(h, "GET", path, "", testToken)
+					require.Equal(t, 200, response.Code)
+					var page struct {
+						Items []statusmodel.Source `json:"items"`
+					}
+					require.NoError(t, json.Unmarshal(response.Body.Bytes(), &page))
+					require.Equal(t, authoritative.Items, page.Items)
+				}
+			}
+		})
+	}
 }

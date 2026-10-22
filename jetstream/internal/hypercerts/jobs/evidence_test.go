@@ -48,9 +48,9 @@ func TestAcquisitionEvidenceRestartAndIdempotency(t *testing.T) {
 	require.Equal(t, Failed, failed.State)
 	require.NoError(t, m.Retry(j.ID))
 	retry, _ := m.Get(j.ID)
-	require.Equal(t, &AcquisitionEvidence{}, retry.Evidence)
+	require.Nil(t, retry.Evidence)
 	require.False(t, retry.TotalReposKnown)
-	require.Empty(t, retry.CompletedRepos)
+	require.Equal(t, saved.CompletedRepos, retry.CompletedRepos)
 }
 func (m *Manager) persistEvidenceFailure(id string) error {
 	_, _, err := m.persistJobOutcome(context.Background(), id, &InputError{Code: "invalid_repository"})

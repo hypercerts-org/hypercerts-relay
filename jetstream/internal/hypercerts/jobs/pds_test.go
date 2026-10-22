@@ -1097,8 +1097,8 @@ func TestPDSProcessorRetryExhaustionPreservesEarlierRepositoryProgress(t *testin
 
 	incomplete := m.List()[0]
 	require.NotNil(t, incomplete.Evidence)
-	require.Equal(t, 1, incomplete.Evidence.Scanned)
-	require.Equal(t, 1, incomplete.Evidence.NoMatch)
+	require.Equal(t, 2, incomplete.Evidence.Scanned)
+	require.Equal(t, 2, incomplete.Evidence.NoMatch)
 	require.Zero(t, incomplete.Evidence.Matching)
 	require.Zero(t, incomplete.Evidence.AttributableRecords)
 	require.Equal(t, Incomplete, incomplete.State)

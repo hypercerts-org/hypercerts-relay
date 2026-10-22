@@ -8,7 +8,6 @@ import {
   type JobDiagnostics,
   type JobLastFailure,
   type Policy,
-  type CoveragePage as ContractCoveragePage,
   type CoverageSource,
   type RepositoryDetailsPage,
 } from "./contracts.ts";
@@ -121,7 +120,7 @@ export class Services {
       }),
     );
     if (pages.length === 0) return { items: [] };
-    return { ...pages[0], items: pages.flatMap((page) => page.items) };
+    return { ...pages[0], items: pages.flatMap((page) => page.items.map(normalizeJobDiagnostics)) };
   }
   sources(after = "") {
     return this.call<Record<string, unknown>>(

@@ -235,11 +235,7 @@ func (h *Handler) listRepositoryDetails(w http.ResponseWriter, r *http.Request) 
 		failure(w, err)
 		return
 	}
-	detailJob, viewErr := h.jobView(snapshot.Snapshot.Job)
-	if viewErr != nil {
-		failure(w, viewErr)
-		return
-	}
+	detailJob := view(snapshot.Snapshot.Job, snapshot.Snapshot.CompletedRepos, snapshot.Snapshot.Diagnostics)
 	reply(w, http.StatusOK, struct {
 		Job          jobView                 `json:"job"`
 		Repositories []jobs.RepositoryDetail `json:"repositories"`
@@ -279,56 +275,11 @@ func (h *Handler) listCoverage(w http.ResponseWriter, r *http.Request) {
 	}
 	enabled, revisions, policy, history := h.jobs.StatusInputs()
 	snapshot := statusmodel.New(enabled, revisions, policy, history)
-	// Diagnostics augment authoritative current-policy rows; aggregate and acquisition semantics remain owned by coverage package.
-	byID := map[string]jobs.Job{}
-	ids := make([]string, 0)
-	for _, j := range history {
-		if j.PDS == "" {
-			continue
-		}
-		byID[j.ID] = j
-	}
-	selected := make([]statusmodel.Source, 0, len(snapshot.Items))
-	for _, row := range snapshot.Items {
-		if row.PDS <= options.after {
-			continue
-		}
-		if len(options.requestedPDS) > 0 {
-			if _, ok := options.requestedPDS[row.PDS]; !ok {
-				continue
-			}
-		}
-		selected = append(selected, row)
-	}
-	page := make([]statusmodel.Source, 0, options.limit)
-	next := ""
-	for _, row := range selected {
-		if len(page) == options.limit {
-			next = page[len(page)-1].PDS
-			break
-		}
-		page = append(page, row)
-		if row.JobID != "" {
-			ids = append(ids, row.JobID)
-		}
-	}
-	snaps, err := h.jobs.DiagnosticSnapshots(ids)
+	page, next := pageCoverageSources(snapshot.Items, options)
+	items, err := h.coverageViews(page)
 	if err != nil {
 		failure(w, err)
 		return
-	}
-	diagnostics := map[string]jobs.JobDiagnosticSnapshot{}
-	for _, snap := range snaps {
-		diagnostics[snap.Job.ID] = snap
-	}
-	items := make([]coverageView, 0, len(page))
-	for _, row := range page {
-		j, ok := byID[row.JobID]
-		if !ok {
-			j = jobs.Job{PDS: row.PDS, Policy: policy, Coverage: "current_state"}
-		}
-		snap := diagnostics[j.ID]
-		items = append(items, coverageView{PDS: row.PDS, Policy: row.Policy, JobID: row.JobID, Reason: j.Reason, State: j.State, CompletedRepos: snap.CompletedRepos, TotalRepos: j.TotalRepos, TotalReposKnown: j.TotalReposKnown, ErrorCode: j.ErrorCode, LastProgressAt: j.LastProgressAt, LastFailure: j.LastFailure, CreatedAt: j.CreatedAt, Coverage: j.Coverage, Diagnostics: snap.Diagnostics})
 	}
 	snapshot.Items = nil
 	snapshot.NextCursor = next
@@ -614,45 +565,65 @@ func view(j jobs.Job, completedRepos int, diagnostics jobs.JobDiagnostics) jobVi
 }
 
 type coverageView struct {
-	PDS             string              `json:"pds"`
-	Policy          selection.Policy    `json:"policy"`
-	JobID           string              `json:"jobId"`
-	Reason          string              `json:"reason"`
-	State           jobs.State          `json:"state"`
-	CompletedRepos  int                 `json:"completedRepos"`
-	TotalRepos      int                 `json:"totalRepos"`
-	TotalReposKnown bool                `json:"totalReposKnown"`
-	ErrorCode       string              `json:"errorCode,omitempty"`
-	LastProgressAt  *time.Time          `json:"lastProgressAt,omitempty"`
-	LastFailure     *jobs.JobFailure    `json:"lastFailure,omitempty"`
-	CreatedAt       time.Time           `json:"createdAt"`
-	Coverage        string              `json:"coverage"`
-	Diagnostics     jobs.JobDiagnostics `json:"diagnostics"`
+	statusmodel.Source
+	LastProgressAt *time.Time           `json:"lastProgressAt,omitempty"`
+	LastFailure    *jobs.JobFailure     `json:"lastFailure,omitempty"`
+	Diagnostics    *jobs.JobDiagnostics `json:"diagnostics,omitempty"`
 }
 
-func coverage(j jobs.Job, completedRepos int, diagnostics jobs.JobDiagnostics) coverageView {
-	return coverageView{PDS: j.PDS, Policy: j.Policy, JobID: j.ID, Reason: j.Reason, State: j.State, CompletedRepos: completedRepos, TotalRepos: j.TotalRepos, TotalReposKnown: j.TotalReposKnown, ErrorCode: j.ErrorCode, LastProgressAt: j.LastProgressAt, LastFailure: j.LastFailure, CreatedAt: j.CreatedAt, Coverage: j.Coverage, Diagnostics: diagnostics}
+type coverageSummaryView = coverageView
+
+func coverageSummary(view coverageView) coverageSummaryView { return view }
+
+func pageCoverageSources(rows []statusmodel.Source, options coverageOptions) ([]statusmodel.Source, string) {
+	page := make([]statusmodel.Source, 0, options.limit)
+	for _, row := range rows {
+		if row.PDS <= options.after {
+			continue
+		}
+		if len(options.requestedPDS) > 0 {
+			if _, found := options.requestedPDS[row.PDS]; !found {
+				continue
+			}
+		}
+		if len(page) == options.limit {
+			return page, page[len(page)-1].PDS
+		}
+		page = append(page, row)
+	}
+	return page, ""
 }
 
-// coverageSummaryView is a compact table-enrichment view. The full policy is
-// intentionally omitted because it is fetched only for the selected source.
-type coverageSummaryView struct {
-	PDS             string              `json:"pds"`
-	JobID           string              `json:"jobId"`
-	State           jobs.State          `json:"state"`
-	CompletedRepos  int                 `json:"completedRepos"`
-	TotalRepos      int                 `json:"totalRepos"`
-	TotalReposKnown bool                `json:"totalReposKnown"`
-	ErrorCode       string              `json:"errorCode,omitempty"`
-	LastProgressAt  *time.Time          `json:"lastProgressAt,omitempty"`
-	LastFailure     *jobs.JobFailure    `json:"lastFailure,omitempty"`
-	CreatedAt       time.Time           `json:"createdAt"`
-	Coverage        string              `json:"coverage"`
-	Diagnostics     jobs.JobDiagnostics `json:"diagnostics"`
+func (h *Handler) coverageViews(rows []statusmodel.Source) ([]coverageView, error) {
+	ids := make([]string, 0, len(rows))
+	for _, row := range rows {
+		if row.MatchingJob && row.JobID != "" {
+			ids = append(ids, row.JobID)
+		}
+	}
+	snapshots, err := h.jobs.DiagnosticSnapshots(ids)
+	if err != nil {
+		return nil, err
+	}
+	byID := make(map[string]jobs.JobDiagnosticSnapshot, len(snapshots))
+	for _, snapshot := range snapshots {
+		byID[snapshot.Job.ID] = snapshot
+	}
+	items := make([]coverageView, 0, len(rows))
+	for _, row := range rows {
+		item := coverageView{Source: row}
+		if snapshot, found := byID[row.JobID]; found && matchingCoverageSnapshot(row, snapshot.Job) {
+			item.LastProgressAt = snapshot.Job.LastProgressAt
+			item.LastFailure = snapshot.Job.LastFailure
+			item.Diagnostics = &snapshot.Diagnostics
+		}
+		items = append(items, item)
+	}
+	return items, nil
 }
 
-func coverageSummary(view coverageView) coverageSummaryView {
-	return coverageSummaryView{PDS: view.PDS, JobID: view.JobID, State: view.State, CompletedRepos: view.CompletedRepos, TotalRepos: view.TotalRepos, TotalReposKnown: view.TotalReposKnown, ErrorCode: view.ErrorCode, LastProgressAt: view.LastProgressAt, LastFailure: view.LastFailure, CreatedAt: view.CreatedAt, Coverage: view.Coverage, Diagnostics: view.Diagnostics}
+func matchingCoverageSnapshot(row statusmodel.Source, job jobs.Job) bool {
+	return row.MatchingJob && row.JobID == job.ID && row.PDS == job.PDS && row.SourceRevision == job.SourceRevision && row.Policy.Revision == job.Policy.Revision
 }
 
 func (h *Handler) listArchiveKeys(w http.ResponseWriter, r *http.Request) {

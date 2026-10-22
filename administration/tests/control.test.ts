@@ -426,7 +426,7 @@ test("job and coverage projections preserve bounded diagnostics and leave legacy
         lastFailure: currentJob.lastFailure,
         coverage: "current_state",
         diagnostics: currentJob.diagnostics,
-      }] }));
+      }, { ...legacyJob, jobId: legacyJob.id }, { ...currentJob, lastFailure: { ...currentJob.lastFailure, stage: "raw remote stage" } }] }));
       return;
     }
     res.end(JSON.stringify({ items: [{
@@ -475,6 +475,9 @@ test("job and coverage projections preserve bounded diagnostics and leave legacy
   const coverage = await services.coverage();
   assert.equal(coverage.items[0].lastProgressAt, undefined);
   const summaries = await services.coverageFor(["https://pds.example"]);
+  assert.equal(summaries.items[1].lastProgressAt, undefined);
+  assert.equal(summaries.items[1].lastFailure, undefined);
+  assert.equal(summaries.items[2].lastFailure, undefined);
   assert.equal(summaries.items[0].lastProgressAt, presentAt);
   assert.deepEqual(summaries.items[0].lastFailure, {
     category: "http",

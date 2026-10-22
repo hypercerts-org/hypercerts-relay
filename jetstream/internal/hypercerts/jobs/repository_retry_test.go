@@ -820,3 +820,41 @@ func TestFailedJobRetryStartsFreshBudgetForRefreshedInventory(t *testing.T) {
 	require.NoError(t, err)
 	require.Zero(t, reset, "reset must not mutate rows tied to a discarded inventory")
 }
+
+func TestRepositoryAcquisitionEvidenceCommitsWithRetryCheckpoint(t *testing.T) {
+	const did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
+	const rev = "3l3qo2vutsw2b"
+	injected := errors.New("checkpoint unavailable")
+	fault := &store.KeyPrefixFault{Prefix: []byte(repositoryRetryPrefix), Op: store.WriteOpBatchCommit, Ordinal: 2, Err: injected}
+	dir := t.TempDir()
+	m, db := newManagerWithOptions(t, dir, store.WithFaultInjector(fault))
+	job, err := m.AddSource("https://evidence.example")
+	require.NoError(t, err)
+	worker, _ := startRepositoryWorker(t, m, job.ID, map[string]string{did: rev})
+	_, err = m.BeginRepositoryAttempt(job.ID, did)
+	require.NoError(t, err)
+	require.ErrorIs(t, m.CheckpointRepositoryAcquisition(job.ID, did, rev, rev, "", 4), injected)
+	before, err := m.Get(job.ID)
+	require.NoError(t, err)
+	require.Zero(t, before.Evidence.Scanned)
+	require.Empty(t, before.CompletedRepos)
+	require.NoError(t, m.CheckpointRepositoryAcquisition(job.ID, did, rev, rev, "", 4))
+	require.ErrorIs(t, m.CheckpointRepositoryAcquisition(job.ID, did, rev, rev, "", 4), ErrConflict)
+	after, err := m.Get(job.ID)
+	require.NoError(t, err)
+	require.Equal(t, 1, after.Evidence.Scanned)
+	require.Equal(t, 1, after.Evidence.Matching)
+	require.Equal(t, 4, after.Evidence.AttributableRecords)
+	worker.finishIncomplete(t, m, job.ID)
+	require.NoError(t, m.Retry(job.ID))
+	retried, err := m.Get(job.ID)
+	require.NoError(t, err)
+	require.Equal(t, after.Evidence, retried.Evidence)
+	require.Greater(t, retried.AcquisitionGeneration, after.AcquisitionGeneration)
+	require.NoError(t, db.Close())
+	m, db = newManager(t, dir)
+	defer db.Close()
+	restored, err := m.Get(job.ID)
+	require.NoError(t, err)
+	require.Equal(t, after.Evidence, restored.Evidence)
+}
