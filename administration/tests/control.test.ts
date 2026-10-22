@@ -1035,7 +1035,7 @@ test("coverage proxy preserves canonical retry states and normalizes nested date
     history: { state: "unknown" }, live: { state: "unknown" },
   };
   const page = { schemaVersion: 1, scope: "enabled_sources_current_policy", policy: source.policy, items: [source], aggregate: { scope: "enabled_sources_current_policy", policy: source.policy, enabledSources: 2, state: "incomplete" } };
-  services.call = async <T>() => page as T;
+  services.call = <T>() => Promise.resolve(page as T);
   for (const result of [await services.coverage(), await services.coverageFor([source.pds])]) {
     const item = result.items[0];
     assert.equal(item.acquisition.state, "retry_waiting");

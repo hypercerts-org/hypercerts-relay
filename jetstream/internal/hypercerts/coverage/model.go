@@ -102,17 +102,7 @@ type Snapshot struct {
 
 func integer(n int) *int { return &n }
 func JobAcquisition(j jobs.Job, snapshots ...jobs.JobDiagnosticSnapshot) Acquisition {
-	a := Acquisition{State: "unknown", ProgressScope: "job_inventory", Diagnostics: Diagnostics{Attempts: j.Attempts, FailureCategory: boundedCategory(j.ErrorCode), AffectedRepository: safeRepository(j.FailureRepository)}}
-	if j.LastFailure != nil {
-		switch j.LastFailure.Category {
-		case "timeout", "cancel", "body_read", "http", "transport", "unknown":
-			a.Diagnostics.FailureCategory = j.LastFailure.Category
-		}
-	}
-	if j.LastProgressAt != nil && !j.LastProgressAt.IsZero() {
-		t := *j.LastProgressAt
-		a.Diagnostics.LastProgressAt = &t
-	}
+	a := Acquisition{State: "unknown", ProgressScope: "job_inventory", Diagnostics: jobDiagnostics(j)}
 	switch j.State {
 	case jobs.Pending, jobs.Running:
 		a.State = "running"
@@ -127,6 +117,33 @@ func JobAcquisition(j jobs.Job, snapshots ...jobs.JobDiagnosticSnapshot) Acquisi
 	case jobs.Complete:
 		a.State = "complete"
 	}
+	a.projectEvidence(j)
+	for _, snapshot := range snapshots {
+		if !MatchingSnapshot(j, snapshot) {
+			continue
+		}
+		a.projectWait(j, snapshot)
+		break
+	}
+	return a
+}
+
+func jobDiagnostics(j jobs.Job) Diagnostics {
+	d := Diagnostics{Attempts: j.Attempts, FailureCategory: boundedCategory(j.ErrorCode), AffectedRepository: safeRepository(j.FailureRepository)}
+	if j.LastFailure != nil {
+		switch j.LastFailure.Category {
+		case "timeout", "cancel", "body_read", "http", "transport", "unknown":
+			d.FailureCategory = j.LastFailure.Category
+		}
+	}
+	if j.LastProgressAt != nil && !j.LastProgressAt.IsZero() {
+		t := *j.LastProgressAt
+		d.LastProgressAt = &t
+	}
+	return d
+}
+
+func (a *Acquisition) projectEvidence(j jobs.Job) {
 	if j.TotalReposKnown {
 		a.Counts.InitialInventory = integer(j.TotalRepos)
 	}
@@ -143,33 +160,29 @@ func JobAcquisition(j jobs.Job, snapshots ...jobs.JobDiagnosticSnapshot) Acquisi
 			a.Diagnostics.LastProgressAt = &t
 		}
 	}
-	for _, snapshot := range snapshots {
-		if !MatchingSnapshot(j, snapshot) {
-			continue
-		}
-		if j.State == jobs.Pending && snapshot.Diagnostics.Execution == jobs.JobExecutionWaiting {
-			a.State = RetryWaiting
-			a.Diagnostics.RetryAction = "automatic_retry"
-			for _, deadline := range []struct {
-				source *time.Time
-				target **time.Time
-			}{
-				{snapshot.Diagnostics.RetryAt, &a.Diagnostics.RetryAt},
-				{snapshot.Diagnostics.PDSCooldownUntil, &a.Diagnostics.PDSCooldownUntil},
-			} {
-				if deadline.source != nil && !deadline.source.IsZero() {
-					t := *deadline.source
-					*deadline.target = &t
-				}
-			}
-			switch snapshot.Diagnostics.Reason {
-			case "repository_retry", "pds_cooldown":
-				a.Diagnostics.WaitReason = snapshot.Diagnostics.Reason
+}
+
+func (a *Acquisition) projectWait(j jobs.Job, snapshot jobs.JobDiagnosticSnapshot) {
+	if j.State == jobs.Pending && snapshot.Diagnostics.Execution == jobs.JobExecutionWaiting {
+		a.State = RetryWaiting
+		a.Diagnostics.RetryAction = "automatic_retry"
+		for _, deadline := range []struct {
+			source *time.Time
+			target **time.Time
+		}{
+			{snapshot.Diagnostics.RetryAt, &a.Diagnostics.RetryAt},
+			{snapshot.Diagnostics.PDSCooldownUntil, &a.Diagnostics.PDSCooldownUntil},
+		} {
+			if deadline.source != nil && !deadline.source.IsZero() {
+				t := *deadline.source
+				*deadline.target = &t
 			}
 		}
-		break
+		switch snapshot.Diagnostics.Reason {
+		case "repository_retry", "pds_cooldown":
+			a.Diagnostics.WaitReason = snapshot.Diagnostics.Reason
+		}
 	}
-	return a
 }
 
 func MatchingSnapshot(j jobs.Job, snapshot jobs.JobDiagnosticSnapshot) bool {

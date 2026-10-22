@@ -1434,34 +1434,44 @@ func TestCoverageProjectionPreservesAuthoritativeEvidence(t *testing.T) {
 			require.NoError(t, err)
 			require.Len(t, items, 1)
 			for _, projection := range []coverageView{items[0], coverageSummary(items[0])} {
-				encoded, err := json.Marshal(projection)
-				require.NoError(t, err)
-				var got statusmodel.Source
-				require.NoError(t, json.Unmarshal(encoded, &got))
-				require.Equal(t, authoritative.Items[0], got)
-				if !got.MatchingJob {
-					require.Nil(t, projection.Diagnostics)
-					require.Nil(t, projection.LastFailure)
-					require.Nil(t, got.CompletedRepos)
-					require.Nil(t, got.TotalRepos)
-					require.Nil(t, got.Acquisition.Counts.Scanned)
-				}
+				requireCoverageProjection(t, authoritative.Items[0], projection)
 			}
 			if mode == "legacy" {
 				require.Nil(t, items[0].Acquisition.Counts.Scanned)
 			}
 			if mode == "matching" {
-				for _, path := range []string{"/coverage", "/coverage?summary=1"} {
-					response := request(h, "GET", path, "", testToken)
-					require.Equal(t, 200, response.Code)
-					var page struct {
-						Items []statusmodel.Source `json:"items"`
-					}
-					require.NoError(t, json.Unmarshal(response.Body.Bytes(), &page))
-					require.Equal(t, authoritative.Items, page.Items)
-				}
+				requireCoverageEndpoints(t, h, authoritative.Items)
 			}
 		})
+	}
+}
+
+func requireCoverageProjection(t *testing.T, expected statusmodel.Source, projection coverageView) {
+	t.Helper()
+	encoded, err := json.Marshal(projection)
+	require.NoError(t, err)
+	var got statusmodel.Source
+	require.NoError(t, json.Unmarshal(encoded, &got))
+	require.Equal(t, expected, got)
+	if !got.MatchingJob {
+		require.Nil(t, projection.Diagnostics)
+		require.Nil(t, projection.LastFailure)
+		require.Nil(t, got.CompletedRepos)
+		require.Nil(t, got.TotalRepos)
+		require.Nil(t, got.Acquisition.Counts.Scanned)
+	}
+}
+
+func requireCoverageEndpoints(t *testing.T, h *Handler, expected []statusmodel.Source) {
+	t.Helper()
+	for _, path := range []string{"/coverage", "/coverage?summary=1"} {
+		response := request(h, "GET", path, "", testToken)
+		require.Equal(t, 200, response.Code)
+		var page struct {
+			Items []statusmodel.Source `json:"items"`
+		}
+		require.NoError(t, json.Unmarshal(response.Body.Bytes(), &page))
+		require.Equal(t, expected, page.Items)
 	}
 }
 
