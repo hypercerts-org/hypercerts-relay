@@ -1,5 +1,14 @@
-import type { Command, Policy } from "../server/contracts";
-export type { Command, Operation, Policy, Job } from "../server/contracts";
+import type { Command, JobLastFailure, Policy } from "../server/contracts";
+export type {
+  Command,
+  Job,
+  JobDiagnostics,
+  JobLastFailure,
+  Operation,
+  Policy,
+  RepositoryDetail,
+  RepositoryDetailsPage,
+} from "../server/contracts";
 export interface Administrator {
   did: string;
   handle?: string | null;
@@ -35,7 +44,10 @@ export interface JetstreamSummary {
   totalRepos: number;
   totalReposKnown: boolean;
   createdAt: string;
+  lastProgressAt?: string;
+  lastFailure?: JobLastFailure;
   coverage: string;
+  diagnostics: import("../server/contracts").JobDiagnostics;
 }
 export interface Coverage {
   pds: string;
@@ -48,7 +60,10 @@ export interface Coverage {
   createdAt: string;
   reason: string | null;
   historicalPDSAttribution: string;
+  lastProgressAt?: string;
+  lastFailure?: JobLastFailure;
   coverage: string;
+  diagnostics: import("../server/contracts").JobDiagnostics;
 }
 export interface Audit {
   seq: number;
