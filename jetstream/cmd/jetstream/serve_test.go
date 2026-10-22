@@ -870,7 +870,7 @@ func TestServe_StatusEndpoint(t *testing.T) {
 	bodyStr := string(body)
 	require.Contains(t, bodyStr, "jetstream")
 	require.Contains(t, bodyStr, "Phase")
-	require.Contains(t, bodyStr, "Backfill")
+	require.Contains(t, bodyStr, "Legacy bootstrap observation")
 
 	cancel()
 
