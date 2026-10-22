@@ -97,7 +97,7 @@ export class Services {
   }
   async coverage(after = "", pds = "") {
     const page = await this.call<CoveragePage>("jetstream", `/coverage?limit=50&after=${encodeURIComponent(after)}&pds=${encodeURIComponent(pds)}`);
-    return { ...page, items: page.items.map(normalizeJobDiagnostics) };
+    return { ...page, items: page.items.map(normalizeCoverageDiagnostics) };
   }
   async coverageFor(pds: string[]) {
     const chunks = [] as string[][];
@@ -120,7 +120,7 @@ export class Services {
       }),
     );
     if (pages.length === 0) return { items: [] };
-    return { ...pages[0], items: pages.flatMap((page) => page.items.map(normalizeJobDiagnostics)) };
+    return { ...pages[0], items: pages.flatMap((page) => page.items.map(normalizeCoverageDiagnostics)) };
   }
   sources(after = "") {
     return this.call<Record<string, unknown>>(
@@ -344,6 +344,27 @@ function normalizeJobDiagnostics<T extends {
     lastProgressAt: recordedTimestamp(value.lastProgressAt),
     ...(failure ? { lastFailure: failure } : { lastFailure: undefined }),
   } as T;
+}
+
+function normalizeCoverageDiagnostics<T extends CoverageSource & {
+  lastProgressAt?: string;
+  lastFailure?: unknown;
+}>(value: T): T {
+  const normalized = normalizeJobDiagnostics(value);
+  if (!value.acquisition) return normalized;
+  const diagnostics = value.acquisition.diagnostics;
+  return {
+    ...normalized,
+    acquisition: {
+      ...value.acquisition,
+      diagnostics: {
+        ...diagnostics,
+        lastProgressAt: recordedTimestamp(diagnostics.lastProgressAt) ?? null,
+        retryAt: recordedTimestamp(diagnostics.retryAt),
+        pdsCooldownUntil: recordedTimestamp(diagnostics.pdsCooldownUntil),
+      },
+    },
+  };
 }
 
 async function readBoundedRemoteErrorBody(response: Response): Promise<unknown | null> {

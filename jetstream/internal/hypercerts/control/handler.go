@@ -273,10 +273,14 @@ func (h *Handler) listCoverage(w http.ResponseWriter, r *http.Request) {
 		reply(w, 400, map[string]string{"error": "invalid_limit"})
 		return
 	}
-	enabled, revisions, policy, history := h.jobs.StatusInputs()
-	snapshot := statusmodel.New(enabled, revisions, policy, history)
+	enabled, revisions, policy, history, diagnostics, err := h.jobs.StatusDiagnosticInputs()
+	if err != nil {
+		failure(w, err)
+		return
+	}
+	snapshot := statusmodel.New(enabled, revisions, policy, history, diagnostics...)
 	page, next := pageCoverageSources(snapshot.Items, options)
-	items, err := h.coverageViews(page)
+	items, err := h.coverageViews(page, diagnostics...)
 	if err != nil {
 		failure(w, err)
 		return
@@ -594,17 +598,7 @@ func pageCoverageSources(rows []statusmodel.Source, options coverageOptions) ([]
 	return page, ""
 }
 
-func (h *Handler) coverageViews(rows []statusmodel.Source) ([]coverageView, error) {
-	ids := make([]string, 0, len(rows))
-	for _, row := range rows {
-		if row.MatchingJob && row.JobID != "" {
-			ids = append(ids, row.JobID)
-		}
-	}
-	snapshots, err := h.jobs.DiagnosticSnapshots(ids)
-	if err != nil {
-		return nil, err
-	}
+func (h *Handler) coverageViews(rows []statusmodel.Source, snapshots ...jobs.JobDiagnosticSnapshot) ([]coverageView, error) {
 	byID := make(map[string]jobs.JobDiagnosticSnapshot, len(snapshots))
 	for _, snapshot := range snapshots {
 		byID[snapshot.Job.ID] = snapshot

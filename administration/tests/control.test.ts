@@ -1020,3 +1020,44 @@ test("admins manage other administrators with CSRF, immediate revocation and act
     ],
   );
 });
+
+test("coverage proxy preserves canonical retry states and normalizes nested dates", async (t) => {
+  const { request, services } = await fixture(t);
+  const retryAt = "2026-10-22T12:00:00Z", cooldown = "2026-10-22T12:01:00Z";
+  const source = {
+    pds: "https://pds.example", sourceRevision: 7,
+    policy: { revision: 3, collections: [] }, matchingJob: true, jobId: "a".repeat(32),
+    acquisition: {
+      state: "retry_waiting", progressScope: "job_inventory",
+      counts: { initialInventory: 2, scanned: null, matching: null, noMatch: null, unresolved: null, attributableRecords: null },
+      diagnostics: { attempts: 1, lastProgressAt: "0001-01-01T00:00:00Z", retryAction: "automatic_retry", retryAt, pdsCooldownUntil: cooldown, waitReason: "pds_cooldown", failureCategory: "http" },
+    },
+    history: { state: "unknown" }, live: { state: "unknown" },
+  };
+  const page = { schemaVersion: 1, scope: "enabled_sources_current_policy", policy: source.policy, items: [source], aggregate: { scope: "enabled_sources_current_policy", policy: source.policy, enabledSources: 2, state: "incomplete" } };
+  services.call = async <T>() => page as T;
+  for (const result of [await services.coverage(), await services.coverageFor([source.pds])]) {
+    const item = result.items[0];
+    assert.equal(item.acquisition.state, "retry_waiting");
+    assert.equal(item.acquisition.diagnostics.retryAt, retryAt);
+    assert.equal(item.acquisition.diagnostics.pdsCooldownUntil, cooldown);
+    assert.equal(item.acquisition.diagnostics.lastProgressAt, null);
+    assert.equal(item.acquisition.diagnostics.waitReason, "pds_cooldown");
+    assert.equal(item.acquisition.diagnostics.retryAction, "automatic_retry");
+    assert.equal(item.acquisition.counts.scanned, null);
+  }
+  const response = await request("/api/v1/coverage");
+  assert.equal(response.status, 200);
+  const proxied = await response.json();
+  assert.equal(proxied.items[0].acquisition.state, "retry_waiting");
+  assert.equal(proxied.items[0].acquisition.diagnostics.retryAt, retryAt);
+  assert.equal(proxied.aggregate.enabledSources, 2);
+  assert.equal(proxied.aggregate.state, "incomplete");
+  source.acquisition.state = "complete";
+  source.acquisition.diagnostics.retryAt = "malformed";
+  source.acquisition.diagnostics.pdsCooldownUntil = "0001-01-01T00:00:00Z";
+  const terminal = (await services.coverage()).items[0];
+  assert.equal(terminal.acquisition.state, "complete");
+  assert.equal(terminal.acquisition.diagnostics.retryAt, undefined);
+  assert.equal(terminal.acquisition.diagnostics.pdsCooldownUntil, undefined);
+});

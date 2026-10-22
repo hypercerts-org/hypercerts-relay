@@ -242,9 +242,10 @@ func TestPrivateCoverageExposesBoundedListingFailure(t *testing.T) {
 		FailedAt   time.Time `json:"failedAt"`
 	}
 	type coverageItem struct {
-		PDS         string       `json:"pds"`
-		ErrorCode   string       `json:"errorCode"`
-		LastFailure *failureView `json:"lastFailure"`
+		Acquisition statusmodel.Acquisition `json:"acquisition"`
+		PDS         string                  `json:"pds"`
+		ErrorCode   string                  `json:"errorCode"`
+		LastFailure *failureView            `json:"lastFailure"`
 	}
 	for _, path := range []string{
 		"/coverage?pds=" + url.QueryEscape(pds.URL),
@@ -262,6 +263,8 @@ func TestPrivateCoverageExposesBoundedListingFailure(t *testing.T) {
 		require.NotNil(t, page.Items[0].LastFailure)
 		require.Equal(t, "listRepos", page.Items[0].LastFailure.Stage)
 		require.Equal(t, "http", page.Items[0].LastFailure.Category)
+		require.Equal(t, "http", page.Items[0].Acquisition.Diagnostics.FailureCategory)
+		require.Equal(t, statusmodel.StoppedIncomplete, page.Items[0].Acquisition.State)
 		require.Equal(t, http.StatusServiceUnavailable, page.Items[0].LastFailure.HTTPStatus)
 		require.False(t, page.Items[0].LastFailure.FailedAt.IsZero())
 		require.Equal(t, time.UTC, page.Items[0].LastFailure.FailedAt.Location())
@@ -659,6 +662,22 @@ func TestJobDiagnosticsUseSchedulerEligibilityAndTerminalState(t *testing.T) {
 	require.Equal(t, "pds_cooldown", cooldownDiagnostics["reason"])
 	require.NotContains(t, cooldownDiagnostics, "unresolvedRepos", "listing 429 did not produce a frozen inventory")
 	require.NotEmpty(t, cooldownDiagnostics["pdsCooldownUntil"])
+	for _, path := range []string{"/coverage?pds=" + url.QueryEscape(listing.URL), "/coverage?summary=1&pds=" + url.QueryEscape(listing.URL)} {
+		response := request(h, "GET", path, "", testToken)
+		require.Equal(t, 200, response.Code)
+		var page struct {
+			Items []coverageView `json:"items"`
+		}
+		require.NoError(t, json.Unmarshal(response.Body.Bytes(), &page))
+		require.Len(t, page.Items, 1)
+		a := page.Items[0].Acquisition
+		require.Equal(t, statusmodel.RetryWaiting, a.State)
+		require.Equal(t, "automatic_retry", a.Diagnostics.RetryAction)
+		require.Equal(t, "pds_cooldown", a.Diagnostics.WaitReason)
+		require.Equal(t, cooldown.Until, *a.Diagnostics.PDSCooldownUntil)
+		require.Nil(t, a.Diagnostics.RetryAt)
+		require.Equal(t, 0, *a.Counts.Scanned)
+	}
 
 	mixed, err := manager.AddSource("https://mixed.example")
 	require.NoError(t, err)
@@ -1443,5 +1462,66 @@ func TestCoverageProjectionPreservesAuthoritativeEvidence(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestCoverageRepositoryWaitFromManager(t *testing.T) {
+	h, manager := setup(t)
+	job, err := manager.AddSourceWithRevision("https://retry.example", 7)
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	deadline := time.Now().UTC().Add(time.Hour)
+	go func() {
+		done <- manager.Run(ctx, func(_ context.Context, j jobs.Job) error {
+			if err := manager.CheckpointInventory(j.ID, "", map[string]string{"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa": "3l3qo2vutsw2b"}, true); err != nil {
+				return err
+			}
+			if _, err := manager.BeginRepositoryAttempt(j.ID, "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"); err != nil {
+				return err
+			}
+			if _, err := manager.RecordRepositoryFailure(j.ID, "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", jobs.RepositoryRetryFailure{Category: jobs.RepositoryFailureHTTP, HTTPStatus: 503, Stage: jobs.RepositoryFailureGetRepoRequest}, &deadline, nil); err != nil {
+				return err
+			}
+			return &jobs.InputError{Code: "source_unavailable", Unavailable: true}
+		})
+	}()
+	require.Eventually(t, func() bool { return mustGetControlJob(t, manager, job.ID).State == jobs.Incomplete }, time.Second, time.Millisecond)
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+	require.NoError(t, manager.Retry(job.ID))
+	for _, path := range []string{"/coverage", "/coverage?summary=1"} {
+		response := request(h, "GET", path, "", testToken)
+		require.Equal(t, 200, response.Code)
+		var page struct {
+			Items     []coverageView        `json:"items"`
+			Aggregate statusmodel.Aggregate `json:"aggregate"`
+		}
+		require.NoError(t, json.Unmarshal(response.Body.Bytes(), &page))
+		require.Len(t, page.Items, 1)
+		require.Equal(t, uint64(7), page.Items[0].SourceRevision)
+		require.Equal(t, statusmodel.RetryWaiting, page.Items[0].Acquisition.State)
+		require.Equal(t, "repository_retry", page.Items[0].Acquisition.Diagnostics.WaitReason)
+		require.Equal(t, deadline, *page.Items[0].Acquisition.Diagnostics.RetryAt)
+		require.Equal(t, "automatic_retry", page.Items[0].Acquisition.Diagnostics.RetryAction)
+		require.Equal(t, "incomplete", page.Aggregate.State)
+	}
+	for _, path := range []string{"/jobs", "/jobs/" + job.ID} {
+		response := request(h, "GET", path, "", testToken)
+		require.Equal(t, 200, response.Code)
+		var got jobView
+		if path == "/jobs" {
+			var page struct {
+				Jobs []jobView `json:"jobs"`
+			}
+			require.NoError(t, json.Unmarshal(response.Body.Bytes(), &page))
+			require.Len(t, page.Jobs, 1)
+			got = page.Jobs[0]
+		} else {
+			require.NoError(t, json.Unmarshal(response.Body.Bytes(), &got))
+		}
+		require.Equal(t, jobs.Pending, got.State)
+		require.Equal(t, jobs.JobExecutionWaiting, got.Diagnostics.Execution)
+		require.Equal(t, deadline, *got.Diagnostics.RetryAt)
 	}
 }

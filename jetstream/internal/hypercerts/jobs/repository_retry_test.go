@@ -858,3 +858,35 @@ func TestRepositoryAcquisitionEvidenceCommitsWithRetryCheckpoint(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, after.Evidence, restored.Evidence)
 }
+
+func TestStatusDiagnosticInputsOwnCoherentEvidence(t *testing.T) {
+	m, db := newManager(t, t.TempDir())
+	defer db.Close()
+	job, err := m.AddSourceWithRevision("https://pds.example", 7)
+	require.NoError(t, err)
+	worker, _ := startRepositoryWorker(t, m, job.ID, map[string]string{"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa": "3l3qo2vutsw2b"})
+	defer worker.stop()
+	deadline := time.Now().UTC().Add(time.Hour)
+	require.NoError(t, m.RecordPDSCooldown(job.ID, deadline))
+	enabled, revisions, policy, history, snapshots, err := m.StatusDiagnosticInputs()
+	require.NoError(t, err)
+	require.True(t, enabled[job.PDS])
+	require.Equal(t, uint64(7), revisions[job.PDS])
+	require.Equal(t, uint64(1), policy.Revision)
+	require.Len(t, history, 1)
+	require.Len(t, snapshots, 1)
+	require.Equal(t, Running, history[0].State)
+	require.Equal(t, Running, snapshots[0].Job.State)
+	require.Equal(t, history[0].AcquisitionGeneration, snapshots[0].Job.AcquisitionGeneration)
+	require.Equal(t, deadline, *snapshots[0].Diagnostics.PDSCooldownUntil)
+	require.NoError(t, m.Cancel(job.ID))
+	require.Equal(t, Running, history[0].State)
+	require.Equal(t, Running, snapshots[0].Job.State)
+	history[0].Evidence.Scanned = 99
+	enabled[job.PDS] = false
+	require.Zero(t, snapshots[0].Job.Evidence.Scanned)
+	current, err := m.Get(job.ID)
+	require.NoError(t, err)
+	require.Zero(t, current.Evidence.Scanned)
+	require.True(t, m.Sources()[job.PDS])
+}

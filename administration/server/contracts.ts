@@ -226,6 +226,9 @@ export interface Acquisition {
     attempts: number;
     affectedRepository?: string;
     retryAction?: string;
+    retryAt?: string;
+    pdsCooldownUntil?: string;
+    waitReason?: "repository_retry" | "pds_cooldown";
   };
 }
 export interface CoverageSource {

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/cockroachdb/pebble"
 	"github.com/jcalabro/atmos"
@@ -519,6 +520,10 @@ func (m *Manager) DiagnosticSnapshots(jobIDs []string) ([]JobDiagnosticSnapshot,
 	}
 	defer databaseSnapshot.Close()
 
+	return deriveDiagnosticSnapshots(inputs, databaseSnapshot, now)
+}
+
+func deriveDiagnosticSnapshots(inputs []diagnosticJobInput, databaseSnapshot *pebble.Snapshot, now time.Time) ([]JobDiagnosticSnapshot, error) {
 	snapshots := make([]JobDiagnosticSnapshot, 0, len(inputs))
 	for _, input := range inputs {
 		snapshot, _, _, _, err := jobSnapshot(input, databaseSnapshot, now, false)
@@ -528,6 +533,22 @@ func (m *Manager) DiagnosticSnapshots(jobIDs []string) ([]JobDiagnosticSnapshot,
 		snapshots = append(snapshots, snapshot)
 	}
 	return snapshots, nil
+}
+
+func (m *Manager) StatusDiagnosticInputs() (map[string]bool, map[string]uint64, selection.Policy, []Job, []JobDiagnosticSnapshot, error) {
+	m.mu.Lock()
+	enabled, revisions, policy := clone(m.data.Sources), clone(m.data.SourceRevisions), m.policy.Current()
+	history := make([]Job, 0, len(m.data.Jobs))
+	inputs := make([]diagnosticJobInput, 0, len(m.data.Jobs))
+	for _, job := range m.data.Jobs {
+		history = append(history, clone(job))
+		inputs = append(inputs, captureDiagnosticJob(job))
+	}
+	databaseSnapshot, now := m.db.NewSnapshot(), time.Now().UTC()
+	m.mu.Unlock()
+	defer databaseSnapshot.Close()
+	snapshots, err := deriveDiagnosticSnapshots(inputs, databaseSnapshot, now)
+	return enabled, revisions, policy, history, snapshots, err
 }
 
 func (m *Manager) captureDiagnosticInputs(jobIDs []string) ([]diagnosticJobInput, *pebble.Snapshot, time.Time, error) {
