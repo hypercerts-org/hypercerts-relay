@@ -3,20 +3,20 @@ ARG VERSION=0.9.0
 ARG COMMIT=unknown
 ARG DATE=unknown
 
-FROM golang:1.26.6-bookworm AS bootstrap
+FROM golang:1.26.10-bookworm AS bootstrap
 WORKDIR /src
 COPY jetstream/cmd/container-entrypoint/main.go ./main.go
 RUN CGO_ENABLED=0 go build -trimpath -o /container-entrypoint main.go
 
 # Build from the repository root.
-FROM node:24.18.0-bookworm-slim AS build
+FROM node:24.22.1-bookworm-slim AS build
 WORKDIR /app
 COPY administration/package.json administration/package-lock.json ./
 RUN npm ci --ignore-scripts
 COPY administration/ ./
 RUN npm run build && npm prune --omit=dev --ignore-scripts
 
-FROM node:24.18.0-bookworm-slim
+FROM node:24.22.1-bookworm-slim
 ARG VERSION
 ARG COMMIT
 ARG DATE
