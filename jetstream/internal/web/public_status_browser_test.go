@@ -21,12 +21,12 @@ import (
 type immutableBrowserSnapshot struct{ snap status.Snapshot }
 
 func (s immutableBrowserSnapshot) SnapshotForRequest(_ context.Context, req status.Request) (*status.Snapshot, error) {
-	copy := s.snap
-	copy.Request = req
-	if copy.Request.Tab == "" {
-		copy.Request.Tab = "summary"
+	snapshotCopy := s.snap
+	snapshotCopy.Request = req
+	if snapshotCopy.Request.Tab == "" {
+		snapshotCopy.Request.Tab = "summary"
 	}
-	return &copy, nil
+	return &snapshotCopy, nil
 }
 
 func browserCoverage(state string, scanned, matching, noMatch, unresolved, records *int) *status.CoverageInfo {
@@ -45,8 +45,7 @@ func browserCoverage(state string, scanned, matching, noMatch, unresolved, recor
 func intPtr(v int) *int       { return &v }
 func int64Ptr(v int64) *int64 { return &v }
 
-func TestPublicStatusBrowserFixture(t *testing.T) {
-	now := time.Date(2026, 10, 22, 12, 0, 0, 0, time.UTC)
+func publicStatusScenarios(now time.Time) map[string]status.Snapshot {
 	stale := now.Add(-24 * time.Hour)
 	future := now.Add(time.Hour)
 	scenarios := map[string]status.Snapshot{}
@@ -77,55 +76,78 @@ func TestPublicStatusBrowserFixture(t *testing.T) {
 	scenarios["future"] = futureSnapshot
 	// absent reporter is represented separately from an empty current-policy projection.
 	scenarios["unavailable"] = status.Snapshot{GeneratedAt: now, Request: status.Request{Tab: "summary"}}
+	return scenarios
+}
+
+func newPublicStatusFixture(t *testing.T, now time.Time) *httptest.Server {
+	t.Helper()
 	mux := http.NewServeMux()
-	for name, snap := range scenarios {
+	for name, snap := range publicStatusScenarios(now) {
 		h, err := web.New(web.Options{Snapshotter: immutableBrowserSnapshot{snap: snap}, Now: func() time.Time { return now }})
 		require.NoError(t, err)
 		mux.Handle("/"+name+"/", http.StripPrefix("/"+name, h))
 	}
-	server := httptest.NewServer(mux)
+	return httptest.NewServer(mux)
+}
+
+func assertPublicStatusPrivacy(t *testing.T, body string) {
+	t.Helper()
+	for _, sentinel := range []string{"private-job-sentinel", "private-error-sentinel", "did:plc:private-sentinel", "receiptRetryAt", "jobId"} {
+		require.NotContains(t, body, sentinel)
+	}
+}
+
+func TestPublicStatusBrowserFixture(t *testing.T) {
+	now := time.Date(2026, 10, 22, 12, 0, 0, 0, time.UTC)
+	server := newPublicStatusFixture(t, now)
 	t.Cleanup(server.Close)
-	for name := range scenarios {
-		resp, err := http.Get(server.URL + "/" + name + "/status")
-		require.NoError(t, err)
-		body, readErr := io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
-		require.NoError(t, readErr)
-		require.Equal(t, http.StatusOK, resp.StatusCode)
-		require.Contains(t, string(body), "Current-policy acquisition")
-		if name == "unavailable" {
-			require.Contains(t, string(body), "Current-policy acquisition evidence unavailable.")
-		}
-		if name == "unknown" {
-			require.Contains(t, string(body), "unknown")
-		}
-		if name == "empty-unknown" {
-			require.Contains(t, string(body), "Current-policy acquisition is unknown: no enabled sources.")
-		}
-		if name == "empty-unknown" {
-			require.Contains(t, string(body), "Current-policy acquisition is unknown: no enabled sources.")
-		}
-		if name == "throttled" {
-			require.Contains(t, string(body), "source_unavailable")
-			require.NotContains(t, string(body), "429")
-			require.Contains(t, string(body), "no retry timing is known")
-		}
-		if name == "failed" {
-			require.Contains(t, string(body), "5980")
-			require.Contains(t, string(body), "14541")
-			require.Contains(t, string(body), "job_inventory")
-		}
-		if name == "sparse" {
-			require.Contains(t, string(body), "14539")
-			require.Contains(t, string(body), "unknown")
-		}
-		for _, sentinel := range []string{"private-job-sentinel", "private-error-sentinel", "did:plc:private-sentinel", "receiptRetryAt", "jobId"} {
-			require.NotContains(t, string(body), sentinel)
-		}
+	for name := range publicStatusScenarios(now) {
+		assertPublicStatusHTTP(t, server.URL, name)
 	}
-	if os.Getenv("PUBLIC_STATUS_BROWSER") != "1" {
-		return
+	if os.Getenv("PUBLIC_STATUS_BROWSER") == "1" {
+		runPublicStatusBrowser(t, server.URL)
 	}
+}
+
+func assertPublicStatusHTTP(t *testing.T, baseURL, name string) {
+	t.Helper()
+	resp, err := http.Get(baseURL + "/" + name + "/status")
+	require.NoError(t, err)
+	bodyBytes, readErr := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	require.NoError(t, readErr)
+	body := string(bodyBytes)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Contains(t, body, "Current-policy acquisition")
+	assertPublicStatusScenario(t, name, body)
+	assertPublicStatusPrivacy(t, body)
+}
+
+func assertPublicStatusScenario(t *testing.T, name, body string) {
+	t.Helper()
+	switch name {
+	case "unavailable":
+		require.Contains(t, body, "Current-policy acquisition evidence unavailable.")
+	case "unknown":
+		require.Contains(t, body, "unknown")
+	case "empty-unknown":
+		require.Contains(t, body, "Current-policy acquisition is unknown: no enabled sources.")
+	case "throttled":
+		require.Contains(t, body, "source_unavailable")
+		require.NotContains(t, body, "429")
+		require.Contains(t, body, "no retry timing is known")
+	case "failed":
+		require.Contains(t, body, "5980")
+		require.Contains(t, body, "14541")
+		require.Contains(t, body, "job_inventory")
+	case "sparse":
+		require.Contains(t, body, "14539")
+		require.Contains(t, body, "unknown")
+	}
+}
+
+func runPublicStatusBrowser(t *testing.T, serverURL string) {
+	t.Helper()
 	root, err := filepath.Abs("../../..")
 	require.NoError(t, err)
 	script := filepath.Join(root, "administration/tests/browser/public-status.spec.ts")
@@ -134,7 +156,7 @@ func TestPublicStatusBrowserFixture(t *testing.T) {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "node", script)
 	cmd.Dir = filepath.Join(root, "administration")
-	cmd.Env = append(os.Environ(), "PUBLIC_STATUS_FIXTURE_URL="+server.URL+"/")
+	cmd.Env = append(os.Environ(), "PUBLIC_STATUS_FIXTURE_URL="+serverURL+"/")
 	output, err := cmd.CombinedOutput()
 	require.NoError(t, err, fmt.Sprintf("Node browser fixture: %s", strings.TrimSpace(string(output))))
 	t.Log(string(output))
