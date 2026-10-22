@@ -137,6 +137,12 @@ test("failed partial shows explicit retry and bounded diagnostics without health
 });
 test("jobs show authoritative acquisition independently from execution controls", () => {
   const job = {
+    diagnostics: {
+      execution: "stopped" as const,
+      unresolvedRepos: 8561,
+      retryingRepos: 1,
+      maxRepositoryAttempts: 3,
+    },
     id: "job-evidence",
     pds: "https://failed.example",
     policy: { revision: 9, collections: ["app.bsky.feed.post"] },
@@ -177,11 +183,11 @@ test("jobs show authoritative acquisition independently from execution controls"
   });
   expect(screen.getByText("5980")).toBeTruthy();
   expect(screen.getByText(/Failure category: source unavailable/)).toBeTruthy();
-  expect(screen.getByText(/Last progress:/)).toBeTruthy();
+  expect(screen.getAllByText(/Last progress:/)[0]).toBeTruthy();
   expect(screen.getByText("Attempts: 3")).toBeTruthy();
   expect(screen.getByText(/did:plc:example/)).toBeTruthy();
   expect(screen.getByText("Explicit retry required")).toBeTruthy();
-  expect(screen.getByText(/Execution: failed/)).toBeTruthy();
+  expect(screen.getByText(/Execution: stopped/)).toBeTruthy();
   expect(
     screen.getByText(/History: Unknown; live freshness: Unknown/),
   ).toBeTruthy();
@@ -205,4 +211,33 @@ test("retry waiting conveys no timing", () => {
   });
   expect(screen.getByText("Waiting; timing unknown.")).toBeTruthy();
   expect(document.body.textContent).not.toMatch(/ETA|next retry|countdown/i);
+});
+
+test("retry waiting renders recorded deadlines and classified failure without inventing timing", () => {
+  render(AcquisitionEvidence, {
+    acquisition: {
+      ...complete,
+      state: "retry_waiting",
+      diagnostics: {
+        ...complete.diagnostics,
+        failureCategory: "http",
+        retryAt: "2026-10-22T12:01:00Z",
+        pdsCooldownUntil: "2026-10-22T12:02:00Z",
+        waitReason: "pds_cooldown",
+      },
+    },
+  });
+  expect(
+    screen.getByText(
+      `Next repository retry: ${new Date("2026-10-22T12:01:00Z").toLocaleString()}`,
+    ),
+  ).toBeTruthy();
+  expect(
+    screen.getByText(
+      `PDS cooldown until: ${new Date("2026-10-22T12:02:00Z").toLocaleString()}`,
+    ),
+  ).toBeTruthy();
+  expect(screen.getByText("Wait reason: pds cooldown")).toBeTruthy();
+  expect(screen.getByText("Failure category: http")).toBeTruthy();
+  expect(screen.queryByText("Waiting; timing unknown.")).toBeNull();
 });

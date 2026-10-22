@@ -119,6 +119,11 @@ test("administrator operates sources, collections, jobs, rates and revokes the s
       .getByRole("region", { name: "Source detail" })
       .getByText("Failure category: source unavailable"),
   ).toBeVisible({ timeout: 12000 });
+  await expect(
+    page
+      .getByRole("region", { name: "Source detail" })
+      .getByText("Execution", { exact: true }),
+  ).toBeVisible();
   await page.getByRole("link", { name: "Rate limits", exact: true }).click();
   await page.getByLabel("Events per second").fill("12");
   await page.getByRole("button", { name: "Request limit change" }).click();
@@ -283,6 +288,11 @@ test("coverage read pages preserve global aggregate, diagnostics, and exact PDS 
       json: {
         jobs: [
           {
+            diagnostics: {
+              execution: "stopped",
+              reason: "rate_limited",
+              maxRepositoryAttempts: 3,
+            },
             id: "job-429",
             pds: "https://failed.example",
             policy,
@@ -327,17 +337,19 @@ test("coverage read pages preserve global aggregate, diagnostics, and exact PDS 
     .getByRole("navigation", { name: "Result pages" })
     .getByRole("button", { name: "Next page" })
     .click();
-  await expect(page.getByRole("button", { name: "Next page" }).last()).toBeDisabled();
-  await expect(page.getByText("https://second.example", { exact: true })).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Next page" }).last(),
+  ).toBeDisabled();
+  await expect(
+    page.getByText("https://second.example", { exact: true }),
+  ).toBeVisible();
   await expect(page.getByText("https://first.example")).toHaveCount(0);
   await expect(page.getByText(/3 enabled sources/)).toBeVisible();
   await page.goto("/coverage?pds=https%3A%2F%2Ffailed.example");
   await expect(
     page.getByRole("heading", { name: "Collection coverage" }),
   ).toBeVisible();
-  await page
-    .getByText("https://failed.example", { exact: true })
-    .click();
+  await page.getByText("https://failed.example", { exact: true }).click();
   await expect(page.getByText(/Failure category: throttled/)).toBeVisible();
   await page.goto("/jobs?pds=https%3A%2F%2Ffailed.example");
   await expect(page.getByText(/Failure category: throttled/)).toBeVisible();
@@ -530,6 +542,10 @@ test("branded sign-in and sidebar identity work with and without profile metadat
   });
   const shortBox = await shortAccount.boundingBox();
   expect(shortBox!.y + shortBox!.height).toBeLessThanOrEqual(768);
+  await page.getByRole("link", { name: "Administrators", exact: true }).click();
+  await expect(
+    page.getByRole("heading", { name: "Manage administrators", exact: true }),
+  ).toBeVisible();
   await page.getByRole("link", { name: "Administrators", exact: true }).focus();
   await expect(
     page.getByRole("link", { name: "Administrators", exact: true }),

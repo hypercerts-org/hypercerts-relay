@@ -27,6 +27,9 @@ type Diagnostics struct {
 	Attempts           int        `json:"attempts"`
 	AffectedRepository string     `json:"affectedRepository,omitempty"`
 	RetryAction        string     `json:"retryAction,omitempty"`
+	RetryAt            *time.Time `json:"retryAt,omitempty"`
+	PDSCooldownUntil   *time.Time `json:"pdsCooldownUntil,omitempty"`
+	WaitReason         string     `json:"waitReason,omitempty"`
 }
 
 // IndependentEvidence deliberately makes no history or PDS-live claim from
@@ -35,8 +38,7 @@ type IndependentEvidence struct {
 	State string `json:"state"`
 }
 
-// AcquisitionState is independent of durable execution State. RetryWaiting is
-// reserved until the job layer supplies a durable acquisition retry schedule.
+// AcquisitionState is independent of durable execution State.
 type AcquisitionState string
 
 const (
@@ -99,8 +101,18 @@ type Snapshot struct {
 }
 
 func integer(n int) *int { return &n }
-func JobAcquisition(j jobs.Job) Acquisition {
+func JobAcquisition(j jobs.Job, snapshots ...jobs.JobDiagnosticSnapshot) Acquisition {
 	a := Acquisition{State: "unknown", ProgressScope: "job_inventory", Diagnostics: Diagnostics{Attempts: j.Attempts, FailureCategory: boundedCategory(j.ErrorCode), AffectedRepository: safeRepository(j.FailureRepository)}}
+	if j.LastFailure != nil {
+		switch j.LastFailure.Category {
+		case "timeout", "cancel", "body_read", "http", "transport", "unknown":
+			a.Diagnostics.FailureCategory = j.LastFailure.Category
+		}
+	}
+	if j.LastProgressAt != nil && !j.LastProgressAt.IsZero() {
+		t := *j.LastProgressAt
+		a.Diagnostics.LastProgressAt = &t
+	}
 	switch j.State {
 	case jobs.Pending, jobs.Running:
 		a.State = "running"
@@ -126,12 +138,43 @@ func JobAcquisition(j jobs.Job) Acquisition {
 		if j.TotalReposKnown {
 			a.Counts.Unresolved = integer(max(0, j.TotalRepos-e.Scanned))
 		}
-		if !e.LastProgressAt.IsZero() {
+		if !e.LastProgressAt.IsZero() && (a.Diagnostics.LastProgressAt == nil || e.LastProgressAt.After(*a.Diagnostics.LastProgressAt)) {
 			t := e.LastProgressAt
 			a.Diagnostics.LastProgressAt = &t
 		}
 	}
+	for _, snapshot := range snapshots {
+		if !MatchingSnapshot(j, snapshot) {
+			continue
+		}
+		if j.State == jobs.Pending && snapshot.Diagnostics.Execution == jobs.JobExecutionWaiting {
+			a.State = RetryWaiting
+			a.Diagnostics.RetryAction = "automatic_retry"
+			for _, deadline := range []struct {
+				source *time.Time
+				target **time.Time
+			}{
+				{snapshot.Diagnostics.RetryAt, &a.Diagnostics.RetryAt},
+				{snapshot.Diagnostics.PDSCooldownUntil, &a.Diagnostics.PDSCooldownUntil},
+			} {
+				if deadline.source != nil && !deadline.source.IsZero() {
+					t := *deadline.source
+					*deadline.target = &t
+				}
+			}
+			switch snapshot.Diagnostics.Reason {
+			case "repository_retry", "pds_cooldown":
+				a.Diagnostics.WaitReason = snapshot.Diagnostics.Reason
+			}
+		}
+		break
+	}
 	return a
+}
+
+func MatchingSnapshot(j jobs.Job, snapshot jobs.JobDiagnosticSnapshot) bool {
+	other := snapshot.Job
+	return j.ID == other.ID && j.PDS == other.PDS && j.SourceRevision == other.SourceRevision && j.Policy.Revision == other.Policy.Revision && j.AcquisitionGeneration == other.AcquisitionGeneration
 }
 func boundedCategory(code string) string {
 	if code == "" {
@@ -187,7 +230,7 @@ func latestMatchingAcquisition(pds string, sourceRevision, policyRevision uint64
 	return selected
 }
 
-func New(enabled map[string]bool, revisions map[string]uint64, policy selection.Policy, history []jobs.Job) Snapshot {
+func New(enabled map[string]bool, revisions map[string]uint64, policy selection.Policy, history []jobs.Job, snapshots ...jobs.JobDiagnosticSnapshot) Snapshot {
 	out := Snapshot{SchemaVersion: 1, Scope: "enabled_sources_current_policy", Policy: policy, Items: []Source{}}
 	for pds, active := range enabled {
 		if !active {
@@ -199,7 +242,7 @@ func New(enabled map[string]bool, revisions map[string]uint64, policy selection.
 			row.LegacyProgress = &LegacyProgress{Reason: selected.Reason, State: selected.State, CompletedRepos: integer(len(selected.CompletedRepos)), TotalRepos: integer(selected.TotalRepos), TotalReposKnown: selected.TotalReposKnown, ErrorCode: selected.ErrorCode, CreatedAt: selected.CreatedAt, Coverage: "current_state"}
 			row.MatchingJob = true
 			row.JobID = selected.ID
-			row.Acquisition = JobAcquisition(*selected)
+			row.Acquisition = JobAcquisition(*selected, snapshots...)
 		}
 		out.Items = append(out.Items, row)
 	}

@@ -138,6 +138,9 @@
       if (request === lookupRequest) error = (e as Error).message;
     }
   }
+  function recordedTime(value?: string) {
+    return value ? new Date(value).toLocaleString() : "Not recorded";
+  }
   function totalAccounts(
     item: Coverage | JetstreamSummary | null,
     unavailable = false,
@@ -332,6 +335,52 @@
             </dd>
           </div>
           <div>
+            <dt>Execution</dt>
+            <dd>
+              <small
+                >Last progress: {recordedTime(
+                  jetstreamStats.lastProgressAt,
+                )}</small
+              >{jetstreamStats.diagnostics?.execution.replaceAll("_", " ") ??
+                "Unknown"}<small
+                >{jetstreamStats.diagnostics?.reason?.replaceAll("_", " ") ??
+                  "No current wait reason reported."}</small
+              >
+            </dd>
+          </div>
+          <div>
+            <dt>Unresolved repositories</dt>
+            <dd>
+              {jetstreamStats.diagnostics?.unresolvedRepos ?? "Unknown"}<small
+                >Unknown until the PDS repository listing is complete.</small
+              >
+            </dd>
+          </div>
+          <div>
+            <dt>Repositories with retry state</dt>
+            <dd>
+              {jetstreamStats.diagnostics?.retryingRepos ?? "Unknown"}<small
+                >Up to {jetstreamStats.diagnostics?.maxRepositoryAttempts ??
+                  "Unknown"} attempts per repository; separate from job runs.</small
+              >
+            </dd>
+          </div>
+          <div>
+            <dt>Retry timing</dt>
+            <dd>
+              {#if jetstreamStats.diagnostics?.retryAt}Repository retry: {new Date(
+                  jetstreamStats.diagnostics?.retryAt,
+                ).toLocaleString()}{/if}{#if jetstreamStats.diagnostics?.pdsCooldownUntil}<small
+                  >PDS-wide cooldown until {new Date(
+                    jetstreamStats.diagnostics?.pdsCooldownUntil,
+                  ).toLocaleString()}</small
+                >{:else if !jetstreamStats.diagnostics?.retryAt}<small
+                  >No legacy execution retry deadline reported; see acquisition
+                  diagnostics for recorded timing.</small
+                >{/if}
+            </dd>
+          </div>
+          <div>
             <dt>Current-state coverage</dt>
             <dd>
               <State
@@ -485,17 +534,17 @@
         >
       {:else}<tr
           ><td colspan="9" class="empty"
-            >No sources on this page. Add a PDS origin to begin acquisition.</td
+            >No sources on this page. Add a PDS URL to start syncing.</td
           ></tr
         >{/each}
     </tbody>
   </table>
 </div>
 <p class="note">
-  Disabling or removing a source stops acquisition. Archived records remain
+  Disabling or removing a source stops syncing. Archived records remain
   available.
 </p>
 <p class="note">
   Per-PDS historical collection counts are unavailable because archived events
-  do not retain historical PDS attribution.
+  do not record which PDS supplied the records.
 </p>

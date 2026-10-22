@@ -1,4 +1,4 @@
-import type { Command, Policy } from "../server/contracts";
+import type { Command } from "../server/contracts";
 export type {
   Command,
   Operation,
@@ -7,6 +7,10 @@ export type {
   Acquisition,
   CoverageSource,
   CoveragePage,
+  JobDiagnostics,
+  JobLastFailure,
+  RepositoryDetail,
+  RepositoryDetailsPage,
 } from "../server/contracts";
 export interface Administrator {
   did: string;

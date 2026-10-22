@@ -122,6 +122,51 @@ export interface Policy {
   revision: number;
   collections: string[];
 }
+export interface JobDiagnostics {
+  execution: "queued" | "running" | "waiting" | "stopped" | "complete";
+  reason?: string;
+  retryAt?: string;
+  pdsCooldownUntil?: string;
+  unresolvedRepos?: number;
+  retryingRepos?: number;
+  maxRepositoryAttempts: number;
+}
+export type RepositoryRetryState =
+  "ready" | "in_flight" | "retry_wait" | "unresolved";
+export interface RepositoryRetryFailure {
+  category:
+    | "timeout"
+    | "transport"
+    | "body_read"
+    | "http"
+    | "unknown"
+    | "interrupted"
+    | "rejected";
+  httpStatus?: number;
+  stage: "getRepo/request" | "getRepo/body";
+  code?: string;
+}
+export interface JobLastFailure {
+  category:
+    "timeout" | "cancel" | "body_read" | "http" | "transport" | "unknown";
+  httpStatus?: number;
+  stage: "listRepos";
+  failedAt: string;
+}
+export interface RepositoryDetail {
+  did: string;
+  listedRevision: string;
+  state: RepositoryRetryState;
+  attempts: number;
+  failure?: RepositoryRetryFailure;
+  failedAt?: string;
+  retryAt?: string;
+}
+export interface RepositoryDetailsPage {
+  job: Job;
+  repositories: RepositoryDetail[];
+  nextCursor?: string;
+}
 export interface Job {
   id: string;
   pds: string;
@@ -134,8 +179,11 @@ export interface Job {
   attempts: number;
   errorCode?: string;
   createdAt: string;
+  lastProgressAt?: string;
+  lastFailure?: JobLastFailure;
   coverage: string;
-  acquisition: Acquisition;
+  acquisition?: Acquisition;
+  diagnostics: JobDiagnostics;
 }
 export class ApiError extends Error {
   constructor(
@@ -177,6 +225,9 @@ export interface Acquisition {
     attempts: number;
     affectedRepository?: string;
     retryAction?: string;
+    retryAt?: string;
+    pdsCooldownUntil?: string;
+    waitReason?: "repository_retry" | "pds_cooldown";
   };
 }
 export interface CoverageSource {
@@ -189,6 +240,9 @@ export interface CoverageSource {
   history: { state: "unknown" };
   live: { state: "unknown" };
   // Legacy execution fields exist only with matchingJob=true.
+  diagnostics?: JobDiagnostics;
+  lastProgressAt?: string;
+  lastFailure?: JobLastFailure;
   reason?: string;
   state?: string;
   completedRepos?: number | null;

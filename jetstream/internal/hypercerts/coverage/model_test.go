@@ -107,3 +107,92 @@ func TestRetriedOlderJobSupersedesNewerCreatedCompletion(t *testing.T) {
 		require.Equal(t, first, second)
 	}
 }
+
+func TestAcquisitionDiagnosticSnapshots(t *testing.T) {
+	deadline := time.Date(2026, 10, 22, 12, 0, 0, 0, time.UTC)
+	job := jobs.Job{ID: "job", PDS: "https://pds.example", SourceRevision: 3, Policy: selection.Policy{Revision: 4}, AcquisitionGeneration: 5, State: jobs.Pending}
+	waiting := jobs.JobDiagnosticSnapshot{Job: job, Diagnostics: jobs.JobDiagnostics{Execution: jobs.JobExecutionWaiting, Reason: "repository_retry", RetryAt: &deadline}}
+	for _, tc := range []struct {
+		name      string
+		state     jobs.State
+		execution jobs.JobExecution
+		expected  AcquisitionState
+	}{
+		{"waiting", jobs.Pending, jobs.JobExecutionWaiting, RetryWaiting},
+		{"ready", jobs.Pending, jobs.JobExecutionQueued, Running},
+		{"running", jobs.Running, jobs.JobExecutionWaiting, Running},
+		{"incomplete", jobs.Incomplete, jobs.JobExecutionWaiting, StoppedIncomplete},
+		{"failed", jobs.Failed, jobs.JobExecutionWaiting, Failed},
+		{"canceled", jobs.Canceled, jobs.JobExecutionWaiting, Canceled},
+		{"complete", jobs.Complete, jobs.JobExecutionWaiting, Complete},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			j := job
+			j.State = tc.state
+			snap := waiting
+			snap.Job = j
+			snap.Diagnostics.Execution = tc.execution
+			a := JobAcquisition(j, snap)
+			require.Equal(t, tc.expected, a.State)
+			if tc.expected == RetryWaiting {
+				require.Equal(t, "automatic_retry", a.Diagnostics.RetryAction)
+				require.Equal(t, &deadline, a.Diagnostics.RetryAt)
+				require.Equal(t, "repository_retry", a.Diagnostics.WaitReason)
+			} else {
+				require.Nil(t, a.Diagnostics.RetryAt)
+				require.Empty(t, a.Diagnostics.WaitReason)
+			}
+		})
+	}
+	require.Equal(t, Running, JobAcquisition(job).State)
+	for _, change := range []func(*jobs.Job){func(j *jobs.Job) { j.ID = "other" }, func(j *jobs.Job) { j.PDS = "https://other.example" }, func(j *jobs.Job) { j.SourceRevision++ }, func(j *jobs.Job) { j.Policy.Revision++ }, func(j *jobs.Job) { j.AcquisitionGeneration++ }} {
+		snap := waiting
+		change(&snap.Job)
+		require.Equal(t, Running, JobAcquisition(job, snap).State)
+	}
+	for _, both := range []bool{false, true} {
+		snap := waiting
+		snap.Diagnostics.Reason = "pds_cooldown"
+		snap.Diagnostics.PDSCooldownUntil = &deadline
+		if !both {
+			snap.Diagnostics.RetryAt = nil
+		}
+		a := JobAcquisition(job, snap)
+		require.Equal(t, RetryWaiting, a.State)
+		require.Equal(t, &deadline, a.Diagnostics.PDSCooldownUntil)
+		require.Equal(t, "pds_cooldown", a.Diagnostics.WaitReason)
+		if !both {
+			require.Nil(t, a.Diagnostics.RetryAt)
+		}
+	}
+	waiting.Diagnostics.Reason = "raw response body"
+	waiting.Diagnostics.RetryAt = nil
+	a := JobAcquisition(job, waiting)
+	require.Empty(t, a.Diagnostics.WaitReason)
+	require.Nil(t, a.Diagnostics.RetryAt)
+	snapshot := New(map[string]bool{job.PDS: true}, map[string]uint64{job.PDS: 3}, job.Policy, []jobs.Job{job}, waiting)
+	require.Equal(t, RetryWaiting, snapshot.Items[0].Acquisition.State)
+	require.Equal(t, "incomplete", snapshot.Aggregate.State)
+}
+
+func TestClassifiedFailuresAndLatestDurableProgress(t *testing.T) {
+	early := time.Date(2026, 10, 22, 1, 0, 0, 0, time.UTC)
+	late := early.Add(time.Hour)
+	job := jobs.Job{State: jobs.Incomplete, ErrorCode: "source_unavailable", CreatedAt: late.Add(time.Hour), LastProgressAt: &early, LastFailure: &jobs.JobFailure{Category: "http", FailedAt: late.Add(2 * time.Hour)}}
+	a := JobAcquisition(job)
+	require.Equal(t, "http", a.Diagnostics.FailureCategory)
+	require.Equal(t, &early, a.Diagnostics.LastProgressAt)
+	require.Nil(t, a.Counts.Scanned)
+	job.Evidence = &jobs.AcquisitionEvidence{LastProgressAt: late}
+	require.Equal(t, &late, JobAcquisition(job).Diagnostics.LastProgressAt)
+	job.LastProgressAt = &late
+	job.Evidence.LastProgressAt = early
+	require.Equal(t, &late, JobAcquisition(job).Diagnostics.LastProgressAt)
+	job.LastFailure.Category = "raw credential data"
+	require.Equal(t, "source_unavailable", JobAcquisition(job).Diagnostics.FailureCategory)
+	job.LastFailure.Category = "invented_category"
+	require.Equal(t, "source_unavailable", JobAcquisition(job).Diagnostics.FailureCategory)
+	job.LastProgressAt = &time.Time{}
+	job.Evidence = nil
+	require.Nil(t, JobAcquisition(job).Diagnostics.LastProgressAt)
+}

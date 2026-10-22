@@ -61,7 +61,19 @@
     {:else if acquisition.diagnostics?.retryAction}<p>
         Retry action: {label(acquisition.diagnostics.retryAction)}
       </p>{/if}
-    {#if acquisition.state === "retry_waiting"}<p>
+    {#if acquisition.diagnostics?.retryAt}<p>
+        Next repository retry: {timestamp(acquisition.diagnostics.retryAt)}
+      </p>{/if}
+    {#if acquisition.diagnostics?.pdsCooldownUntil}<p>
+        PDS cooldown until: {timestamp(
+          acquisition.diagnostics.pdsCooldownUntil,
+        )}
+      </p>{/if}
+    {#if acquisition.diagnostics?.waitReason}<p>
+        Wait reason: {label(acquisition.diagnostics.waitReason)}
+      </p>{/if}
+    {#if acquisition.state === "retry_waiting" && !acquisition.diagnostics?.retryAt && !acquisition.diagnostics?.pdsCooldownUntil}<p
+      >
         Waiting; timing unknown.
       </p>{/if}
   {:else}
