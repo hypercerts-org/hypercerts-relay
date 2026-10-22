@@ -135,6 +135,7 @@ export interface Job {
   errorCode?: string;
   createdAt: string;
   coverage: string;
+  acquisition: Acquisition;
 }
 export class ApiError extends Error {
   constructor(

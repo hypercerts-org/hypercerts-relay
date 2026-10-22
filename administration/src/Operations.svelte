@@ -1,5 +1,7 @@
 <script lang="ts">
   import State from "./State.svelte";
+  import AcquisitionEvidence from "./AcquisitionEvidence.svelte";
+  import type { CoveragePage } from "./api";
   import {
     target,
     type Job,
@@ -11,7 +13,9 @@
   export let screen: string;
   export let jobs: Job[] = [];
   export let changes: Operation[] = [];
-  export let coverage: Coverage[] = [];
+  export let coverage: (CoveragePage & { next: string | null }) | null = null;
+  export let nextPage: (cursor: string) => void = () => {};
+  export let previousPage: () => void = () => {};
   export let audit: Audit[] = [];
   export let submit: (command: Command) => Promise<void>;
   export let action: (id: string, action: "retry" | "cancel") => Promise<void>;
@@ -22,18 +26,14 @@
   export let busy = false;
   let pds = "",
     reason: "backfill" | "quota_recovery" = "backfill";
-  function coverageGroups(items: Coverage[]) {
-    const latest = new Map<string, Coverage>();
-    for (const item of items) {
-      const previous = latest.get(item.pds);
-      if (!previous || item.createdAt > previous.createdAt) latest.set(item.pds, item);
-    }
-    return [...latest.values()].map((item) => ({
+  function jobExecution(job: Job) {
+    return `Execution: ${job.state}`;
+  }
+  function coverageGroups(page: typeof coverage) {
+    return (page?.items ?? []).map((item) => ({
       pds: item.pds,
       item,
-      collections: item.policy.collections.length
-        ? item.policy.collections
-        : ["No collections selected"],
+      collections: item.policy.collections,
     }));
   }
   function jobPurpose(job: Job) {
@@ -41,20 +41,7 @@
       ? "Quota recovery"
       : "Selected-collection backfill";
   }
-  function jobProgress(job: Job) {
-    if (["running", "in_progress"].includes(job.state)) {
-      return job.totalReposKnown
-        ? `${job.completedRepos} of ${job.totalRepos} repositories from the initial inventory processed`
-        : "Counting the initial repository inventory before backfill starts";
-    }
-    return job.totalReposKnown
-      ? `${job.completedRepos} of ${job.totalRepos} repositories from the initial inventory processed`
-      : `${job.completedRepos} repositories processed`;
-  }
-  function currentStateScope(item: { coverage: string }) {
-    const scope = item.coverage.replaceAll("_", " ");
-    return `${scope}; historical coverage is unknown`;
-  }
+
   function actorLabel(actor: { actor: string; actorHandle?: string | null }) {
     return actor.actorHandle ? `@${actor.actorHandle}` : actor.actor;
   }
@@ -76,10 +63,11 @@
     <h1>Backfill jobs</h1>
     <p>
       Acquire selected current records directly from a PDS. Selected-collection
-      backfill fills the enabled collections for a source; quota recovery catches
-      up accounts that become admitted after a quota increase. Each PDS backfill
-      inventories active repositories directly from that PDS; Relay-observed
-      account counts do not limit it. Job status comes from Jetstream.
+      backfill fills the enabled collections for a source; quota recovery
+      catches up accounts that become admitted after a quota increase. Each PDS
+      backfill inventories active repositories directly from that PDS;
+      Relay-observed account counts do not limit it. Job status comes from
+      Jetstream.
     </p>
   </div>
   <form
@@ -119,19 +107,20 @@
     <table>
       <caption>Jetstream jobs</caption><thead
         ><tr
-          ><th>PDS / Job id</th><th>Collections</th><th>Purpose</th><th>Progress</th><th>Status</th
-          ><th>Actions</th></tr
+          ><th>PDS / Job id</th><th>Collections</th><th>Purpose</th><th
+            >Acquisition evidence</th
+          ><th>Status</th><th>Actions</th></tr
         ></thead
       ><tbody
         >{#each jobs as job}<tr
             ><td>{job.pds}<small>{job.id}</small></td><td
               >{job.policy.collections.join(", ") || "No collections"}</td
             ><td>{jobPurpose(job)}</td><td
-              >{jobProgress(job)}<small>{currentStateScope(job)}</small><small>{job.attempts} attempts</small></td
+              ><AcquisitionEvidence acquisition={job.acquisition} />
+              <p>History: Unknown; live freshness: Unknown</p></td
             ><td
-              ><State value={job.state} /><small
-                >{job.errorCode?.replaceAll("_", " ") ?? ""}</small
-              ></td
+              ><State value={job.state} /><small>{jobExecution(job)}</small
+              ><small>{job.errorCode?.replaceAll("_", " ") ?? ""}</small></td
             ><td
               ><div class="actions">
                 {#if ["pending", "running"].includes(job.state)}<button
@@ -166,8 +155,8 @@
     <p class="eyebrow">Retention evidence</p>
     <h1>Collection coverage</h1>
     <p>
-      Coverage is grouped by PDS. Expand a PDS to see each selected collection and
-      the latest current-state backfill result known for it.
+      Coverage is grouped by PDS. Expand a PDS to see each selected collection
+      and the latest current-state backfill result known for it.
     </p>
   </div>
   <div class="notice">
@@ -176,10 +165,38 @@
     the current PDS coverage shown below; it means the UI must not claim complete
     historical provenance.
   </div>
+  {#if coverage}
+    <section class="notice" aria-label="All enabled sources current policy">
+      <h2>All enabled sources / current policy</h2>
+      <State value={coverage.aggregate?.state ?? "unknown"} />
+      <p>
+        {coverage.aggregate?.enabledSources ?? "Unknown"} enabled sources; policy
+        revision {coverage.aggregate?.policy?.revision ?? "Unknown"}.
+      </p>
+      <p>
+        Snapshot scope: {coverage.scope?.replaceAll("_", " ") ?? "Unknown"};
+        snapshot policy revision {coverage.policy?.revision ?? "Unknown"}.
+      </p>
+    </section>
+  {:else}<p class="empty">Current-policy aggregate unavailable.</p>{/if}
   <section class="coverage-groups" aria-label="Coverage by PDS">
     {#each coverageGroups(coverage) as group}
       <details class="coverage-group">
         <summary>{group.pds}</summary>
+        <p>
+          Source revision {group.item.sourceRevision}; policy revision {group
+            .item.policy.revision}; matching job: {group.item.matchingJob
+            ? "Yes"
+            : "No"}{#if group.item.jobId}; job {group.item.jobId}{/if}
+        </p>
+        {#if group.item.policy.collections.length}{:else}<p>
+            No collections selected by this empty policy.
+          </p>{/if}
+        <AcquisitionEvidence acquisition={group.item.acquisition} />
+        <p>
+          History: {group.item.history?.state ?? "Unknown"}; live freshness: {group
+            .item.live?.state ?? "Unknown"}
+        </p>
         <!-- svelte-ignore a11y_no_noninteractive_tabindex (Scrollable tables need keyboard access; verified with axe and Chromium.) -->
         <div
           class="table-wrap"
@@ -191,24 +208,22 @@
             <caption>Collections retained for {group.pds}</caption><thead
               ><tr
                 ><th>Collection</th><th>Current-state coverage</th><th
-                  >Progress / limitations</th></tr
+                  >Progress / limitations</th
+                ></tr
               ></thead
             ><tbody
               >{#each group.collections as collection}
                 <tr
                   ><td>{collection}</td><td
-                    ><State value={group.item.state} /><small
-                      >Historical PDS attribution: {group.item.historicalPDSAttribution}</small
+                    ><State
+                      value={group.item.acquisition?.state ?? "unknown"}
+                    /><small
+                      >History: {group.item.history?.state ?? "Unknown"}; live
+                      freshness: {group.item.live?.state ?? "Unknown"}</small
                     ></td
                   ><td
-                    >{group.item.totalReposKnown
-                      ? `${group.item.completedRepos} of ${group.item.totalRepos} repositories from the initial inventory processed`
-                      : `${group.item.completedRepos} repositories processed; initial inventory is still being counted`}<small
-                      >Policy revision {group.item.policy.revision}; {currentStateScope(group.item)}</small
-                    ><small
-                      >{group.item.reason?.replaceAll("_", " ") ||
-                        "No incomplete-input reason reported."}</small
-                    ><small>Job {group.item.jobId}</small></td
+                    >Acquisition progress is job-wide; not measured per
+                    collection.</td
                   ></tr
                 >
               {/each}</tbody
@@ -223,6 +238,11 @@
       </p>
     {/each}
   </section>
+  {#if coverage?.next}<button
+      disabled={busy}
+      onclick={() => nextPage(coverage!.next!)}>Next page</button
+    >{/if}
+  <button disabled={busy} onclick={previousPage}>Previous page</button>
   <a href="/sources">Manage PDS instances</a>
 {:else if screen === "audit"}
   <div class="intro">
@@ -251,10 +271,14 @@
       ><tbody
         >{#each changes as change}<tr
             ><td>{target(change.command)}<small>{change.id}</small></td><td
-              ><span title={change.actor} tabindex="0">{actorLabel(change)}</span>
-              <button class="text-button" aria-label={`Copy DID for ${actorLabel(change)}`} onclick={() => copy(change)}>Copy DID</button><small
-                >{new Date(change.createdAt).toLocaleString()}</small
-              ></td
+              ><span title={change.actor} tabindex="0"
+                >{actorLabel(change)}</span
+              >
+              <button
+                class="text-button"
+                aria-label={`Copy DID for ${actorLabel(change)}`}
+                onclick={() => copy(change)}>Copy DID</button
+              ><small>{new Date(change.createdAt).toLocaleString()}</small></td
             ><td
               ><State value={change.state} /><small
                 >{change.error?.replaceAll("_", " ") ?? ""}</small
@@ -278,14 +302,11 @@
       >
     </table>
   </div>
-  {#if hasMoreChanges}<button disabled={busy} onclick={moreChanges}>Load more requested changes</button>{/if}
+  {#if hasMoreChanges}<button disabled={busy} onclick={moreChanges}
+      >Load more requested changes</button
+    >{/if}
   <!-- svelte-ignore a11y_no_noninteractive_tabindex (Scrollable tables need keyboard access; verified with axe and Chromium.) -->
-  <div
-    class="table-wrap"
-    role="region"
-    aria-label="Audit history"
-    tabindex="0"
-  >
+  <div class="table-wrap" role="region" aria-label="Audit history" tabindex="0">
     <table>
       <caption>Audit history</caption><thead
         ><tr
@@ -296,7 +317,11 @@
         >{#each audit as event}<tr
             ><td>{new Date(event.time).toLocaleString()}</td><td
               ><span title={event.actor} tabindex="0">{actorLabel(event)}</span>
-              <button class="text-button" aria-label={`Copy DID for ${actorLabel(event)}`} onclick={() => copy(event)}>Copy DID</button></td
+              <button
+                class="text-button"
+                aria-label={`Copy DID for ${actorLabel(event)}`}
+                onclick={() => copy(event)}>Copy DID</button
+              ></td
             ><td><State value={event.action} /></td><td
               >{event.operation ?? "Access change"}<small
                 >{String(event.detail.error ?? event.detail.did ?? "")}</small
@@ -309,7 +334,9 @@
       >
     </table>
   </div>
-  {#if hasMoreAudit}<button disabled={busy} onclick={moreAudit}>Load more audit history</button>{/if}
+  {#if hasMoreAudit}<button disabled={busy} onclick={moreAudit}
+      >Load more audit history</button
+    >{/if}
 {/if}
 
 <style>

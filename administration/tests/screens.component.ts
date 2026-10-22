@@ -322,6 +322,19 @@ test("jobs explain recovery types and use operator-facing progress labels", () =
         attempts: 1,
         createdAt: "2026-09-09T00:00:00.000Z",
         coverage: "partial",
+        acquisition: {
+          state: "running",
+          progressScope: "job_inventory",
+          counts: {
+            initialInventory: 10,
+            scanned: 3,
+            matching: 1,
+            noMatch: 2,
+            unresolved: 7,
+            attributableRecords: 1,
+          },
+          diagnostics: { lastProgressAt: null, attempts: 1 },
+        },
       },
     ],
   });
@@ -330,12 +343,10 @@ test("jobs explain recovery types and use operator-facing progress labels", () =
   expect(screen.getByText("Collections")).toBeTruthy();
   expect(screen.getAllByText("Purpose")).toHaveLength(2);
   expect(screen.getAllByText("Quota recovery")).toHaveLength(2);
+  expect(screen.getByText("Acquisition evidence")).toBeTruthy();
   expect(screen.getByText("Status")).toBeTruthy();
-  expect(
-    screen.getByText(
-      "3 of 10 repositories from the initial inventory processed",
-    ),
-  ).toBeTruthy();
+  expect(screen.getByText("3", { selector: "dd" })).toBeTruthy();
+  expect(screen.getByText("Progress scope: job inventory")).toBeTruthy();
   expect(screen.queryByText(/Revision/)).toBeNull();
 });
 
@@ -344,42 +355,97 @@ test("coverage groups collections by collapsed PDS and explains unknown history"
     screen: "coverage",
     submit: vi.fn(),
     action: vi.fn(),
-    coverage: [
-      {
-        pds: "https://pds.example",
-        policy: { revision: 1, collections: ["app.bsky.feed.post"] },
-        jobId: "older",
-        state: "incomplete",
-        completedRepos: 1,
-        totalRepos: 3,
-        totalReposKnown: true,
-        createdAt: "2026-09-08T00:00:00.000Z",
-        reason: "source_unavailable",
-        historicalPDSAttribution: "unknown",
-        coverage: "current_state",
-      },
-      {
-        pds: "https://pds.example",
+    coverage: {
+      schemaVersion: 1,
+      scope: "enabled_sources_current_policy",
+      policy: { revision: 2, collections: ["app.bsky.feed.post"] },
+      aggregate: {
+        scope: "enabled_sources_current_policy",
         policy: { revision: 2, collections: ["app.bsky.feed.post"] },
-        jobId: "abc",
-        state: "complete",
-        completedRepos: 3,
-        totalRepos: 3,
-        totalReposKnown: true,
-        createdAt: "2026-09-09T00:00:00.000Z",
-        reason: null,
-        historicalPDSAttribution: "unknown",
-        coverage: "current_state",
+        enabledSources: 3,
+        state: "incomplete",
       },
-    ],
+      next: null,
+      items: [
+        {
+          pds: "https://pds.example",
+          sourceRevision: 1,
+          matchingJob: true,
+          acquisition: {
+            state: "failed",
+            progressScope: "job_inventory",
+            counts: {
+              initialInventory: 3,
+              scanned: 1,
+              matching: 1,
+              noMatch: 0,
+              unresolved: 2,
+              attributableRecords: 1,
+            },
+            diagnostics: {
+              failureCategory: "source_unavailable",
+              lastProgressAt: null,
+              attempts: 1,
+              retryAction: "explicit_retry",
+            },
+          },
+          history: { state: "unknown" },
+          live: { state: "unknown" },
+          policy: { revision: 1, collections: ["app.bsky.feed.post"] },
+          jobId: "older",
+          state: "incomplete",
+          completedRepos: 1,
+          totalRepos: 3,
+          totalReposKnown: true,
+          createdAt: "2026-09-08T00:00:00.000Z",
+          reason: "source_unavailable",
+          coverage: "current_state",
+        },
+        {
+          pds: "https://pds.example",
+          sourceRevision: 2,
+          matchingJob: true,
+          acquisition: {
+            state: "complete",
+            progressScope: "job_inventory",
+            counts: {
+              initialInventory: 3,
+              scanned: 3,
+              matching: 1,
+              noMatch: 2,
+              unresolved: 0,
+              attributableRecords: 2,
+            },
+            diagnostics: { lastProgressAt: null, attempts: 1 },
+          },
+          history: { state: "unknown" },
+          live: { state: "unknown" },
+          policy: { revision: 2, collections: ["app.bsky.feed.post"] },
+          jobId: "abc",
+          state: "complete",
+          completedRepos: 3,
+          totalRepos: 3,
+          totalReposKnown: true,
+          createdAt: "2026-09-09T00:00:00.000Z",
+          coverage: "current_state",
+        },
+      ],
+    },
   });
-  const group = screen.getByText("https://pds.example").closest("details");
-  expect(group?.hasAttribute("open")).toBe(false);
+  const groups = screen.getAllByText("https://pds.example");
+  expect(
+    groups.every(
+      (group) => group.closest("details")?.hasAttribute("open") === false,
+    ),
+  ).toBe(true);
   expect(document.body.textContent).toContain(
     "do not preserve which PDS supplied older records",
   );
-  expect(screen.getAllByText("app.bsky.feed.post")).toHaveLength(1);
-  expect(screen.getByText(/Policy revision 2; current state/)).toBeTruthy();
+  expect(screen.getAllByText("app.bsky.feed.post")).toHaveLength(2);
+  expect(
+    screen.getByText(/All enabled sources \/ current policy/),
+  ).toBeTruthy();
+  expect(screen.getByText(/3 enabled sources/)).toBeTruthy();
   expect(
     screen.getByRole("link", { name: "Manage PDS instances" }),
   ).toBeTruthy();
@@ -404,9 +470,35 @@ test("selected source detail is loaded on demand without background polling", as
           ok: true,
           status: 200,
           json: async () => ({
+            schemaVersion: 1,
+            scope: "enabled_sources_current_policy",
+            policy: { revision: 2, collections: ["app.bsky.feed.post"] },
+            aggregate: {
+              scope: "enabled_sources_current_policy",
+              policy: { revision: 2, collections: ["app.bsky.feed.post"] },
+              enabledSources: 1,
+              state: "complete",
+            },
             items: [
               {
                 pds: "https://outside.example",
+                sourceRevision: 1,
+                matchingJob: true,
+                acquisition: {
+                  state: "complete",
+                  progressScope: "job_inventory",
+                  counts: {
+                    initialInventory: 13895,
+                    scanned: 13895,
+                    matching: 2,
+                    noMatch: 13893,
+                    unresolved: 0,
+                    attributableRecords: 43,
+                  },
+                  diagnostics: { lastProgressAt: null, attempts: 1 },
+                },
+                history: { state: "unknown" },
+                live: { state: "unknown" },
                 policy: { revision: 2, collections: ["app.bsky.feed.post"] },
                 jobId: "job-1",
                 state: "complete",
@@ -415,7 +507,6 @@ test("selected source detail is loaded on demand without background polling", as
                 totalReposKnown: true,
                 createdAt: "2026-09-09T00:00:00.000Z",
                 reason: null,
-                historicalPDSAttribution: "unknown",
                 coverage: "current_state",
               },
             ],
@@ -431,15 +522,13 @@ test("selected source detail is loaded on demand without background polling", as
     });
     await fireEvent.click(screen.getByRole("button", { name: "Filter" }));
     expect(await screen.findByText("connected")).toBeTruthy();
-    expect(
-      await screen.findByText(
-        "43 of 13895 repositories from the initial inventory scanned",
-      ),
-    ).toBeTruthy();
-    expect(screen.getByText("13895")).toBeTruthy();
-    expect(screen.getByText("43")).toBeTruthy();
+    expect((await screen.findAllByText("13895")).length).toBeGreaterThan(0);
+    expect(screen.getAllByText("43").length).toBeGreaterThan(0);
     expect(document.body.textContent).toContain(
-      "Current snapshot only; historical coverage is unknown.",
+      "Current acquisition snapshot only; history and live freshness",
+    );
+    expect(document.body.textContent).toContain(
+      "History: unknown; live freshness: unknown",
     );
     const collections = screen
       .getByText("1 selected collections")
@@ -491,9 +580,35 @@ test("latest same-source detail refresh wins over an older response", async () =
     expect(fetcher).toHaveBeenCalledTimes(2);
     newCoverage.resolve(
       Response.json({
+        schemaVersion: 1,
+        scope: "enabled_sources_current_policy",
+        policy: { revision: 1, collections: ["app.bsky.feed.post"] },
+        aggregate: {
+          scope: "enabled_sources_current_policy",
+          policy: { revision: 1, collections: ["app.bsky.feed.post"] },
+          enabledSources: 1,
+          state: "complete",
+        },
         items: [
           {
             pds: "https://race.example",
+            sourceRevision: 1,
+            matchingJob: true,
+            acquisition: {
+              state: "complete",
+              progressScope: "job_inventory",
+              counts: {
+                initialInventory: 20,
+                scanned: 20,
+                matching: 2,
+                noMatch: 18,
+                unresolved: 0,
+                attributableRecords: 3,
+              },
+              diagnostics: { lastProgressAt: null, attempts: 1 },
+            },
+            history: { state: "unknown" },
+            live: { state: "unknown" },
             policy: { revision: 1, collections: ["app.bsky.feed.post"] },
             jobId: "new",
             state: "complete",
@@ -501,25 +616,15 @@ test("latest same-source detail refresh wins over an older response", async () =
             totalRepos: 20,
             totalReposKnown: true,
             createdAt: "2026-09-09T00:00:00.000Z",
-            reason: null,
-            historicalPDSAttribution: "unknown",
             coverage: "current_state",
           },
         ],
       }),
     );
-    expect(
-      await screen.findByText(
-        "20 of 20 repositories from the initial inventory scanned",
-      ),
-    ).toBeTruthy();
+    expect((await screen.findAllByText("20")).length).toBeGreaterThan(0);
     oldCoverage.reject(new Error("stale coverage failure"));
     await Promise.resolve();
-    expect(
-      screen.getByText(
-        "20 of 20 repositories from the initial inventory scanned",
-      ),
-    ).toBeTruthy();
+    expect(screen.getAllByText("20").length).toBeGreaterThan(0);
     expect(
       screen.queryByText("Jetstream did not return coverage for this source."),
     ).toBeNull();
