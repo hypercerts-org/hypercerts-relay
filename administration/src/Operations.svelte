@@ -17,8 +17,6 @@
   export let jobs: Job[] = [];
   export let changes: Operation[] = [];
   export let coverage: (CoveragePage & { next: string | null }) | null = null;
-  export let nextPage: (cursor: string) => void = () => {};
-  export let previousPage: () => void = () => {};
   export let audit: Audit[] = [];
   export let submit: (command: Command) => Promise<void>;
   export let action: (id: string, action: "retry" | "cancel") => Promise<void>;
@@ -115,7 +113,10 @@
       repositoryRequestTokens.get(jobId) === requestToken;
     repositoryLoading = { ...repositoryLoading, [jobId]: true };
     repositoryErrors = { ...repositoryErrors, [jobId]: "" };
-    const after = append ? (repositoryPages[jobId]?.nextCursor ?? "") : "";
+    let after = "";
+    if (append) {
+      after = repositoryPages[jobId]?.nextCursor ?? "";
+    }
     try {
       const page = await api<RepositoryDetailsPage>(
         `/jobs/${encodeURIComponent(jobId)}/repositories?limit=50${after ? `&after=${encodeURIComponent(after)}` : ""}`,
@@ -213,7 +214,7 @@
       catches up accounts that become admitted after a quota increase. Each PDS
       backfill inventories active repositories directly from that PDS;
       Relay-observed account counts do not limit it. Job status comes from
-      Jetstream.
+      Jetstream. Acquisition progress is job-wide, not measured per collection.
     </p>
   </div>
   <div class="notice">
@@ -438,8 +439,10 @@
     <p class="eyebrow">Retention evidence</p>
     <h1>Collection coverage</h1>
     <p>
-      Coverage is grouped by PDS. Expand a PDS to see each selected collection
-      and the latest current-state backfill result known for it.
+      Coverage is grouped by PDS and selected collections. Acquisition evidence
+      and progress come from the matching backfill job and are job-wide, not
+      measured separately for each collection. Expand a PDS to see the
+      selected collections and the current-state coverage known for that source.
     </p>
   </div>
   <div class="notice">
@@ -521,11 +524,6 @@
       </p>
     {/each}
   </section>
-  {#if coverage?.next}<button
-      disabled={busy}
-      onclick={() => nextPage(coverage!.next!)}>Next page</button
-    >{/if}
-  <button disabled={busy} onclick={previousPage}>Previous page</button>
   <a href="/sources">Manage PDS instances</a>
 {:else if screen === "audit"}
   <div class="intro">

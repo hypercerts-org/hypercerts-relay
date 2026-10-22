@@ -417,18 +417,6 @@
           {changes}
           {coverage}
           {audit}
-          nextPage={(after) => {
-            previous = [...previous, cursor];
-            cursor = after;
-            void load();
-          }}
-          previousPage={() => {
-            if (previous.length) {
-              cursor = previous[previous.length - 1];
-              previous = previous.slice(0, -1);
-              void load();
-            }
-          }}
           {submit}
           {action}
           moreChanges={() => loadMoreAudit("operations")}

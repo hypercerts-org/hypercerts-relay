@@ -243,6 +243,14 @@ test("coverage read pages preserve global aggregate, diagnostics, and exact PDS 
     live: { state: "unknown" },
   });
   const readPaths: string[] = [];
+  let releaseSecondPage!: () => void;
+  let secondPageRequested!: () => void;
+  const secondPageGate = new Promise<void>((resolve) => {
+    releaseSecondPage = resolve;
+  });
+  const secondPageRequest = new Promise<void>((resolve) => {
+    secondPageRequested = resolve;
+  });
   const pages = [
     {
       ...common,
@@ -273,11 +281,19 @@ test("coverage read pages preserve global aggregate, diagnostics, and exact PDS 
       return;
     }
     const cursor = url.searchParams.get("after") ?? "";
+    if (cursor === "next-page") {
+      secondPageRequested();
+      await secondPageGate;
+    }
+    let pageIndex = 0;
+    if (cursor === "next-page") {
+      pageIndex = 1;
+    } else if (cursor === "filtered-page") {
+      pageIndex = 2;
+    }
     await route.fulfill({
       contentType: "application/json",
-      json: pages[
-        cursor === "next-page" ? 1 : cursor === "filtered-page" ? 2 : 0
-      ],
+      json: pages[pageIndex],
     });
   });
   await page.route("**/api/v1/jobs?*", async (route) => {
@@ -333,17 +349,31 @@ test("coverage read pages preserve global aggregate, diagnostics, and exact PDS 
     page.getByRole("heading", { name: "All enabled sources / current policy" }),
   ).toBeVisible();
   await expect(page.getByText(/3 enabled sources/)).toBeVisible();
-  await page
-    .getByRole("navigation", { name: "Result pages" })
-    .getByRole("button", { name: "Next page" })
-    .click();
-  await expect(
-    page.getByRole("button", { name: "Next page" }).last(),
-  ).toBeDisabled();
+  const resultPages = page.getByRole("navigation", { name: "Result pages" });
+  const nextPageButton = resultPages.getByRole("button", {
+    name: "Next page",
+    exact: true,
+  });
+  const previousPageButton = resultPages.getByRole("button", {
+    name: "Previous page",
+    exact: true,
+  });
+  await expect(page.getByRole("button", { name: "Next page", exact: true })).toHaveCount(1);
+  await expect(page.getByRole("button", { name: "Previous page", exact: true })).toHaveCount(1);
+  await expect(resultPages.getByRole("button")).toHaveCount(2);
+  await expect(previousPageButton).toBeDisabled();
+  await expect(nextPageButton).toBeEnabled();
+  await nextPageButton.click();
+  await secondPageRequest;
+  await expect(nextPageButton).toBeDisabled();
+  releaseSecondPage();
   await expect(
     page.getByText("https://second.example", { exact: true }),
   ).toBeVisible();
   await expect(page.getByText("https://first.example")).toHaveCount(0);
+  await expect(resultPages.getByRole("button")).toHaveCount(2);
+  await expect(previousPageButton).toBeEnabled();
+  await expect(nextPageButton).toBeEnabled();
   await expect(page.getByText(/3 enabled sources/)).toBeVisible();
   await page.goto("/coverage?pds=https%3A%2F%2Ffailed.example");
   await expect(
@@ -364,6 +394,7 @@ test("coverage read pages preserve global aggregate, diagnostics, and exact PDS 
   expect(readPaths).toContain(
     "/api/v1/jobs?after=&pds=https%3A%2F%2Ffailed.example",
   );
+  releaseSecondPage();
   await page.goto("/coverage");
   await page
     .getByRole("navigation", { name: "Result pages" })
@@ -377,6 +408,12 @@ test("coverage read pages preserve global aggregate, diagnostics, and exact PDS 
   await expect(
     page.getByText("No coverage results on this page."),
   ).toBeVisible();
+  await expect(
+    page.getByRole("navigation", { name: "Result pages" }).getByRole("button", {
+      name: "Next page",
+      exact: true,
+    }),
+  ).toBeDisabled();
   await page
     .getByRole("navigation", { name: "Result pages" })
     .getByRole("button", { name: "Previous page" })

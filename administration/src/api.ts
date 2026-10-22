@@ -1,4 +1,4 @@
-import type { Command } from "../server/contracts";
+import type { Command, CoverageSource } from "../server/contracts";
 export type {
   Command,
   Operation,
@@ -39,7 +39,6 @@ export interface Limit {
   unit: string;
   recovery: string;
 }
-import type { CoverageSource } from "../server/contracts";
 export type JetstreamSummary = CoverageSource;
 export type Coverage = CoverageSource;
 export interface Audit {
