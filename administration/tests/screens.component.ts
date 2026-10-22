@@ -59,6 +59,21 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 afterEach(cleanup);
+test.each([
+  ["pending", ["Cancel job"]],
+  ["running", ["Cancel job"]],
+  ["incomplete", ["Retry job"]],
+  ["failed", ["Retry job"]],
+  ["canceled", ["Retry job"]],
+  ["complete", []],
+])("%s jobs offer only the applicable job action", (state, expected) => {
+  renderJobs([repositoryJob("job", "https://pds.example", { state })]);
+  const actions = screen
+    .getAllByRole("button")
+    .map((button) => button.textContent?.trim())
+    .filter((name) => name === "Cancel job" || name === "Retry job");
+  expect(actions).toEqual(expected);
+});
 test("legacy jobs without saved inventory cannot open repository details", () => {
   renderJobs([repositoryJob("legacy-job", "https://legacy.example", {
     diagnostics: { unresolvedRepos: undefined },
@@ -406,7 +421,7 @@ test("jobs explain recovery types and use operator-facing progress labels", () =
   expect(screen.getByText("Status")).toBeTruthy();
   expect(
     screen.getByText(
-      "3 of 10 repositories from the initial PDS listing processed",
+      "3 of 10 repositories processed",
     ),
   ).toBeTruthy();
   expect(screen.queryByText(/Revision/)).toBeNull();
@@ -561,6 +576,25 @@ test("job execution diagnostics stay distinct from durable state and lazy detail
             maxRepositoryAttempts: 3,
           },
         },
+        {
+          id: "complete-job",
+          pds: "https://complete.example",
+          lastProgressAt: "2026-09-09T00:00:30.000Z",
+          policy: { revision: 2, collections: [] },
+          reason: "backfill",
+          state: "complete",
+          completedRepos: 3,
+          totalRepos: 3,
+          totalReposKnown: true,
+          attempts: 1,
+          createdAt: "2026-09-09T00:00:00.000Z",
+          coverage: "current_state",
+          diagnostics: {
+            execution: "complete",
+            unresolvedRepos: 0,
+            maxRepositoryAttempts: 3,
+          },
+        },
       ],
     });
     const pendingRow = screen.getByText("pending-job").closest("tr");
@@ -572,9 +606,25 @@ test("job execution diagnostics stay distinct from durable state and lazy detail
     expect(within(pendingRow!).getByText(/Execution: waiting/)).toBeTruthy();
     expect(within(runningRow!).getByText(/Execution: running/)).toBeTruthy();
     expect(within(stoppedRow!).getByText(/Execution: stopped/)).toBeTruthy();
-    expect(within(stoppedRow!).getByText("Last progress: Not recorded")).toBeTruthy();
-    expect(within(stoppedRow!).getByText("Repository listing failure: Not recorded")).toBeTruthy();
-    expect(within(stoppedRow!).getByText("Repository listing failed at: Not recorded")).toBeTruthy();
+    // Absent diagnostics are omitted rather than rendered as "Not recorded".
+    expect(within(stoppedRow!).queryByText(/Last progress:/)).toBeNull();
+    expect(within(stoppedRow!).queryByText(/Repository listing fail/)).toBeNull();
+    const completeRow = screen.getByText("complete-job").closest("tr");
+    expect(within(completeRow!).queryByRole("button", { name: "Retry job" })).toBeNull();
+    expect(
+      within(completeRow!).getByText(
+        `Last progress: ${new Date("2026-09-09T00:00:30.000Z").toLocaleString()}`,
+      ),
+    ).toBeTruthy();
+    expect(within(completeRow!).queryByText(/Repository listing fail/)).toBeNull();
+    // A finished, single-run job shows only its count and last progress.
+    for (const noise of [/historical coverage/, /Job runs/, /attempts per repository/, /unresolved$/]) {
+      expect(within(completeRow!).queryByText(noise)).toBeNull();
+    }
+    expect(within(completeRow!).getByText("3 of 3 repositories processed")).toBeTruthy();
+    expect(within(stoppedRow!).getByText("1 repositories unresolved")).toBeTruthy();
+    expect(within(stoppedRow!).getByText("Up to 3 attempts per repository")).toBeTruthy();
+    expect(within(stoppedRow!).getByRole("button", { name: "Retry job" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Repository list unavailable" })).toBeTruthy();
     expect(screen.queryByText("12 repositories processed")).toBeNull();
     expect(screen.getByText("Job runs: 4")).toBeTruthy();

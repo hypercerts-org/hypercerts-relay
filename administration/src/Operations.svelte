@@ -50,7 +50,7 @@
         ? "Listing repositories on the PDS; total not known yet"
         : "Repository list unavailable; total unknown";
     }
-    return `${job.completedRepos} of ${job.totalRepos} repositories from the initial PDS listing processed`;
+    return `${job.completedRepos} of ${job.totalRepos} repositories processed`;
   }
   function currentStateScope(item: { coverage: string }) {
     const scope = item.coverage.replaceAll("_", " ");
@@ -268,9 +268,9 @@
             ><td>{currentJob.pds}<small>{currentJob.id}</small></td><td
               >{currentJob.policy.collections.join(", ") || "No collections"}</td
             ><td>{jobPurpose(currentJob)}</td><td
-              >{jobProgress(currentJob)}<small>{currentStateScope(currentJob)}</small><small>Last progress: {recordedTime(currentJob.lastProgressAt)}</small><small title="Counts scheduler runs, not repository download attempts.">Job runs: {currentJob.attempts}</small><small>Up to {currentJob.diagnostics.maxRepositoryAttempts} attempts per repository</small>{#if currentJob.diagnostics.unresolvedRepos !== undefined}<small>{currentJob.diagnostics.unresolvedRepos} repositories unresolved</small>{/if}</td
+              >{jobProgress(currentJob)}{#if currentJob.lastProgressAt}<small>Last progress: {recordedTime(currentJob.lastProgressAt)}</small>{/if}{#if currentJob.attempts > 1}<small title="Counts scheduler runs, not repository download attempts.">Job runs: {currentJob.attempts}</small>{/if}{#if (currentJob.diagnostics.unresolvedRepos ?? 0) > 0}<small>{currentJob.diagnostics.unresolvedRepos} repositories unresolved</small><small>Up to {currentJob.diagnostics.maxRepositoryAttempts} attempts per repository</small>{/if}</td
             ><td
-              ><State value={currentJob.state} /><small>Execution: {currentJob.diagnostics.execution.replaceAll("_", " ")}</small><small>{currentJob.lastFailure ? inventoryFailure(currentJob) : "Repository listing failure: Not recorded"}</small><small>Repository listing failed at: {recordedTime(currentJob.lastFailure?.failedAt)}</small>{#if diagnosticReason(currentJob)}<small>Reason: {diagnosticReason(currentJob)}</small>{/if}{#if currentJob.diagnostics.retryAt}<small>Next repository retry: {timeLabel(currentJob.diagnostics.retryAt)}</small>{/if}{#if currentJob.diagnostics.pdsCooldownUntil}<small>PDS cooldown until: {timeLabel(currentJob.diagnostics.pdsCooldownUntil)}</small>{/if}{#if currentJob.diagnostics.retryingRepos}<small>Repositories with retry state: {currentJob.diagnostics.retryingRepos}</small>{/if}<small>{currentJob.errorCode?.replaceAll("_", " ") ?? ""}</small></td
+              ><State value={currentJob.state} /><small>Execution: {currentJob.diagnostics.execution.replaceAll("_", " ")}</small>{#if currentJob.lastFailure}<small>{inventoryFailure(currentJob)}</small><small>Repository listing failed at: {recordedTime(currentJob.lastFailure.failedAt)}</small>{/if}{#if diagnosticReason(currentJob)}<small>Reason: {diagnosticReason(currentJob)}</small>{/if}{#if currentJob.diagnostics.retryAt}<small>Next repository retry: {timeLabel(currentJob.diagnostics.retryAt)}</small>{/if}{#if currentJob.diagnostics.pdsCooldownUntil}<small>PDS cooldown until: {timeLabel(currentJob.diagnostics.pdsCooldownUntil)}</small>{/if}{#if currentJob.diagnostics.retryingRepos}<small>Repositories with retry state: {currentJob.diagnostics.retryingRepos}</small>{/if}<small>{currentJob.errorCode?.replaceAll("_", " ") ?? ""}</small></td
             ><td
               ><div class="actions">
                 <button
@@ -286,7 +286,7 @@
                 {#if ["pending", "running"].includes(currentJob.state)}<button
                     disabled={busy}
                     onclick={() => jobAction(currentJob.id, "cancel")}>Cancel job</button
-                  >{:else}<button
+                  >{:else if ["incomplete", "failed", "canceled"].includes(currentJob.state)}<button
                     disabled={busy}
                     onclick={() => jobAction(currentJob.id, "retry")}>Retry job</button
                   >{/if}
