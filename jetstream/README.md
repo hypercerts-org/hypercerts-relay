@@ -144,19 +144,53 @@ records produce per-record deletes; another collection is not replaced by a
 DID-wide tombstone. Managed steady-state whole-repository live/retry syncs use scoped record
 replacements and deletes instead of a DID-wide sync tombstone. This preserves newer collection snapshots across delayed sync delivery.
 Inactive account events block stale snapshot publication. Archive writes and
-per-collection revision boundaries are
-synced before repository progress is acknowledged. Delayed older live/retry rows
-cannot overwrite a completed snapshot; newer live rows win. Restart retries a
-running job from its persisted page/repository progress. A crash before progress
-acknowledgment may replay work safely.
+per-collection revision boundaries are synced before repository progress is
+acknowledged. Delayed older live/retry rows cannot overwrite a completed
+snapshot; newer live rows win. Restart resumes a running job from its persisted
+page and repository progress. A crash before progress acknowledgment may replay
+work safely.
 
 Coverage is explicitly `current_state`: a PDS snapshot cannot prove historical
-event completeness. Direct `getRepo` requests retry transient errors (excluding invalid snapshots) up to three times, with 50 ms then 100 ms delays. After retries are exhausted a status of`incomplete` will be reported unless there is a  malformed or unverifiable
-input which returns `failed`. An explicit job retry is required for these statuses. Local persistence failures stop the runtime
-without acknowledging completion. Each repository's fetch and reconciliation
-share a two-minute deadline.
+event completeness. Job and coverage responses expose optional
+`lastProgressAt`, written atomically with a successful inventory or repository
+checkpoint. Failed
+attempts, claims, reads, failed writes, and repeated no-op inventory checkpoints
+do not advance it; older jobs without a recorded date remain unknown. Durable
+repository retry JSON exposes optional `failedAt`; a missing legacy date remains
+unknown rather than being synthesized.
 
-Jetstream will emit a warning message containing details on the failure, optionally the repo did if is is known.
+Each `listRepos` page is requested once. A listing timeout, transport error, or
+non-success HTTP response leaves the job `incomplete` with the compatibility
+`errorCode` `source_unavailable`; the latest classified listing failure is
+persisted as `lastFailure`, and the last durable cursor remains available. Listing
+failures do not trigger an automatic job retry. After checking PDS availability
+and rate limits, retry the same job with
+`POST /hypercerts/v1/jobs/{id}/retry`; processing resumes at the saved cursor. A
+429 also persists a PDS-origin cooldown derived from `Retry-After` and/or
+`RateLimit-Reset`, bounded to 30 minutes. A queued retry waits for that cooldown
+to expire.
+
+Direct `getRepo` work automatically retries transient failures for up to three
+attempts total. Retryable outcomes include timeouts, transport errors, response
+body-read failures, and HTTP 408, 429, and 5xx responses. The delay starts at one
+second, doubles between attempts with ±20% jitter, and is capped at 15 minutes;
+a valid `Retry-After` or `RateLimit-Reset` deadline can extend the wait, bounded
+to 30 minutes. Unavailable work that is not automatically retried, or remains
+unavailable after the attempt budget, leaves the job `incomplete`; permanently
+invalid or unverifiable input leaves it `failed`. Operators can retry either
+status with the same job retry action. Local persistence failures stop the
+runtime without acknowledging completion. Each repository fetch and
+reconciliation share a two-minute deadline.
+
+`lastFailure` contains only `stage`, `category`, optional `httpStatus`, and UTC
+`failedAt`. For inventory listing failures, `stage` is `listRepos`; `category`
+comes from the existing PDS attempt classifier. It never contains raw error
+text, response bodies, headers, or secrets. Authenticated `GET /jobs` and
+`GET /jobs/{id}` expose this metadata while retaining `errorCode` as
+`source_unavailable`.
+
+Failures emit a warning with the job ID, stage, and bounded cause category; HTTP
+status and repository DID are included only when known.
 
 Reconciliation currently scans the archive
 under its rewrite lock, so large archives can pause live appends during an
@@ -245,21 +279,24 @@ All paths below start with `/hypercerts/v1`:
 | `GET /jobs?limit=100&after=<cursor>` | Sorted page, maximum 200 jobs, optional `nextCursor`. Concurrent additions may require a fresh listing. |
 | `GET /snapshot-rejections?limit=100&after=<cursor>` | The most recent 1,000 bounded non-payload direct-PDS snapshot rejections, with optional repeated exact `pds` filters. Older rejections are evicted. Returns origin, policy/listed revisions, DID, kind/code and timestamp; never CAR bytes, records, tokens or storage keys. |
 | `GET /coverage?limit=100&after=<pds>` | Latest current-state job per PDS, sorted and paginated by PDS with optional exact `pds` filter. |
-| `GET /jobs/{id}` | Durable state, progress, attempt count, and coverage. |
+| `GET /jobs/{id}` | Durable state, progress, attempt count, coverage, and bounded execution diagnostics. |
+| `GET /jobs/{id}/repositories?limit=100&after=<opaque-cursor>` | Snapshot-consistent frozen repository coordinates and sanitized retry state, including optional `failedAt` for recorded failures; maximum 200 rows per page. Unknown inventory returns `409`; expired snapshots return `410`; projections over 50,000 rows return `413`. |
 | `POST /jobs/{id}/cancel` | Cancels pending/running work. |
 | `POST /jobs/{id}/retry` | Resumes current-policy work from durable progress; a removed source or obsolete revision returns conflict. |
 
 Each job reports `id`, `pds`, `policy.revision`, `policy.collections`, `reason`,
 `state`, `attempts`, `completedRepos` (count), `totalRepos` with
-`totalReposKnown`, page `cursor`, bounded `errorCode`,
-creation/start/finish times, and `coverage`. Job states are `pending`, `running`,
-`failed`, `canceled`, `incomplete`, and `complete`. A completed job identifies the
-exact PDS origin and policy revision whose **current state** it covers. An
-unreachable PDS returns `incomplete`, never
+`totalReposKnown`, page `cursor`, optional `lastProgressAt`, bounded `errorCode`,
+optional `lastFailure`, creation/start/finish times, `coverage`, and
+`diagnostics`. Job states are
+`pending`, `running`, `failed`, `canceled`, `incomplete`, and `complete`. A
+completed job identifies the exact PDS origin and policy revision whose
+**current state** it covers. An unreachable PDS returns `incomplete`, never
 `complete`.
 
 Errors use a bounded JSON `error` code: 400 invalid input, 401 authentication,
-404 unknown job/source, 409 policy/state conflict, and 500 persistence failure.
+404 unknown job/source, 409 policy/state conflict, 410 expired repository snapshot,
+413 oversized repository projection, and 500 persistence failure.
 Mutation bodies are limited to 64 KiB and reject unknown fields/trailing JSON.
 Local persistence errors do not acknowledge a successful change or expose raw
 storage errors. Job progress and outcomes survive restart.

@@ -134,9 +134,14 @@
     }
   }
   function coverageProgress(item: Coverage | JetstreamSummary) {
-    return item.totalReposKnown
-      ? `${item.completedRepos} of ${item.totalRepos} repositories from the initial inventory scanned`
-      : `${item.completedRepos} repositories scanned; initial inventory is still being counted`;
+    if (item.totalReposKnown)
+      return `${item.completedRepos} of ${item.totalRepos} repositories from the initial PDS listing scanned`;
+    return item.diagnostics.execution === "running"
+      ? "Listing repositories on the PDS; total not known yet"
+      : "Repository list unavailable; total unknown";
+  }
+  function recordedTime(value?: string) {
+    return value ? new Date(value).toLocaleString() : "Not recorded";
   }
   function totalAccounts(
     item: Coverage | JetstreamSummary | null,
@@ -144,14 +149,14 @@
   ) {
     if (unavailable) return "Unavailable";
     if (!item) return "Unknown";
-    return item.totalReposKnown ? String(item.totalRepos) : "Counting";
+    return item.totalReposKnown ? String(item.totalRepos) : "Unknown";
   }
   function jetstreamAccounts(
     item: Coverage | JetstreamSummary | null,
     unavailable = false,
   ) {
     if (unavailable) return "Unavailable";
-    return item ? String(item.completedRepos) : "Unknown";
+    return item?.totalReposKnown ? String(item.completedRepos) : "Unknown";
   }
 </script>
 
@@ -177,7 +182,7 @@
       required
     /><small
       >HTTPS is assumed when no scheme is provided. Adding a source also schedules
-      selected-collection acquisition.</small
+      backfill of selected collections.</small
     >
   </div>
   <button class="primary" disabled={busy}>Add source</button>
@@ -265,7 +270,7 @@
         </div>
         <div>
           <dt>Total accounts</dt>
-          <dd>{totalAccounts(jetstreamStats, coverageUnavailable && !jetstreamStats)}<small>Initial active-repository inventory captured for the latest Jetstream job; it is not a live PDS census.</small></dd>
+          <dd>{totalAccounts(jetstreamStats, coverageUnavailable && !jetstreamStats)}<small>Active repositories listed at the start of the latest Jetstream job; this is not a live PDS account count.</small></dd>
         </div>
         <div>
           <dt>Jetstream accounts</dt>
@@ -274,7 +279,23 @@
         {#if jetstreamStats}
           <div>
             <dt>Backfill progress</dt>
-            <dd>{coverageProgress(jetstreamStats)}</dd>
+            <dd>{coverageProgress(jetstreamStats)}<small>Last progress: {recordedTime(jetstreamStats.lastProgressAt)}</small></dd>
+          </div>
+          <div>
+            <dt>Execution</dt>
+            <dd>{jetstreamStats.diagnostics.execution.replaceAll("_", " ")}<small>{jetstreamStats.diagnostics.reason?.replaceAll("_", " ") ?? "No current wait reason reported."}</small></dd>
+          </div>
+          <div>
+            <dt>Unresolved repositories</dt>
+            <dd>{jetstreamStats.diagnostics.unresolvedRepos ?? "Unknown"}<small>Unknown until the PDS repository listing is complete.</small></dd>
+          </div>
+          <div>
+            <dt>Repositories with retry state</dt>
+            <dd>{jetstreamStats.diagnostics.retryingRepos ?? "Unknown"}<small>Up to {jetstreamStats.diagnostics.maxRepositoryAttempts} attempts per repository; separate from job runs.</small></dd>
+          </div>
+          <div>
+            <dt>Retry timing</dt>
+            <dd>{#if jetstreamStats.diagnostics.retryAt}Repository retry: {new Date(jetstreamStats.diagnostics.retryAt).toLocaleString()}{/if}{#if jetstreamStats.diagnostics.pdsCooldownUntil}<small>PDS-wide cooldown until {new Date(jetstreamStats.diagnostics.pdsCooldownUntil).toLocaleString()}</small>{:else if !jetstreamStats.diagnostics.retryAt}<small>No active retry or cooldown deadline reported.</small>{/if}</dd>
           </div>
           <div>
             <dt>Current-state coverage</dt>
@@ -340,7 +361,7 @@
     <caption>Configured sources</caption><thead
       ><tr
         ><th>Source</th><th>State / runtime connection</th><th>Admission check</th
-        ><th>Admission quota</th><th aria-label="Total accounts (Jetstream initial inventory)">Total accounts<small>Jetstream initial inventory</small></th><th aria-label="Relay accounts (observed)">Relay accounts<small>Observed</small></th><th aria-label="Jetstream accounts (processed)">Jetstream accounts<small>Processed</small></th><th>Cursor</th><th>Actions</th></tr
+        ><th>Admission quota</th><th aria-label="Total accounts (Jetstream initial repository list)">Total accounts<small>Jetstream initial repository list</small></th><th aria-label="Relay accounts (observed)">Relay accounts<small>Observed</small></th><th aria-label="Jetstream accounts (processed)">Jetstream accounts<small>Processed</small></th><th>Cursor</th><th>Actions</th></tr
       ></thead
     ><tbody>
       {#each displayedRows as source (source.HostID)}<tr
@@ -396,17 +417,17 @@
         >
       {:else}<tr
           ><td colspan="9" class="empty"
-            >No sources on this page. Add a PDS origin to begin acquisition.</td
+            >No sources on this page. Add a PDS URL to start syncing.</td
           ></tr
         >{/each}
     </tbody>
   </table>
 </div>
 <p class="note">
-  Disabling or removing a source stops acquisition. Archived records remain
+  Disabling or removing a source stops syncing. Archived records remain
   available.
 </p>
 <p class="note">
   Per-PDS historical collection counts are unavailable because archived events
-  do not retain historical PDS attribution.
+  do not record which PDS supplied the records.
 </p>
