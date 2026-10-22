@@ -684,39 +684,13 @@ func (m *Manager) commitTransition(j Job, state State, requestID string) error {
 	j.FailureRepository = ""
 	j.FinishedAt = time.Time{}
 	if resetInventory {
-		// A permanent listing/snapshot verdict may become valid only when the
-		// PDS exposes a changed revision. An explicit retry therefore starts a
-		// new frozen inventory rather than treating an old denominator as live.
-		j.Cursor = ""
-		j.EnumeratedRepos = 0
-		j.TotalRepos = 0
-		j.TotalReposKnown = false
-		if len(j.CompletedRepos) == 0 {
-			j.Evidence = &AcquisitionEvidence{}
-		} else {
-			j.Evidence = nil
-		}
-		j.FailureRepository = ""
+		resetRetryInventory(&j)
 	}
 	if state == Canceled {
 		j.FinishedAt = time.Now().UTC()
 	}
 	next.Jobs[j.ID] = j
-	if resetInventory {
-		deletes, err := m.repositoryRetryDeleteKeysLocked(j.ID, false)
-		if err != nil {
-			return err
-		}
-		return m.commitJobInventoryRetryBatch(next, j.ID, inventory{Entries: map[string]string{}}, deletes)
-	}
-	if resetUnresolved {
-		deletes, err := m.repositoryRetryDeleteKeysLocked(j.ID, true)
-		if err != nil {
-			return err
-		}
-		return m.commitRepositoryRetryBatch(next, true, nil, deletes, nil)
-	}
-	if err := m.commit(next); err != nil {
+	if err := m.commitTransitionRetryState(next, j.ID, resetInventory, resetUnresolved); err != nil {
 		return err
 	}
 	if state == Canceled && m.cancel != nil && m.runningID == j.ID {
@@ -724,6 +698,40 @@ func (m *Manager) commitTransition(j Job, state State, requestID string) error {
 	}
 	return nil
 }
+func resetRetryInventory(j *Job) {
+	// A permanent listing/snapshot verdict may become valid only when the
+	// PDS exposes a changed revision. An explicit retry therefore starts a
+	// new frozen inventory rather than treating an old denominator as live.
+	j.Cursor = ""
+	j.EnumeratedRepos = 0
+	j.TotalRepos = 0
+	j.TotalReposKnown = false
+	if len(j.CompletedRepos) == 0 {
+		j.Evidence = &AcquisitionEvidence{}
+	} else {
+		j.Evidence = nil
+	}
+	j.FailureRepository = ""
+}
+
+func (m *Manager) commitTransitionRetryState(next data, id string, resetInventory, resetUnresolved bool) error {
+	if resetInventory {
+		deletes, err := m.repositoryRetryDeleteKeysLocked(id, false)
+		if err != nil {
+			return err
+		}
+		return m.commitJobInventoryRetryBatch(next, id, inventory{Entries: map[string]string{}}, deletes)
+	}
+	if resetUnresolved {
+		deletes, err := m.repositoryRetryDeleteKeysLocked(id, true)
+		if err != nil {
+			return err
+		}
+		return m.commitRepositoryRetryBatch(next, true, nil, deletes, nil)
+	}
+	return m.commit(next)
+}
+
 func (m *Manager) List() []Job {
 	m.mu.Lock()
 	defer m.mu.Unlock()
