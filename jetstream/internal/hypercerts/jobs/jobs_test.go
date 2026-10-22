@@ -60,6 +60,40 @@ func TestJobsPolicyAtomicSchedulingAndCancellation(t *testing.T) {
 	}
 }
 
+func TestInventoryCheckpointCommitsProgressWithInventory(t *testing.T) {
+	const did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
+	injected := errors.New("injected inventory checkpoint failure")
+	fault := &store.KeyPrefixFault{Prefix: []byte(inventoryKeyPrefix), Op: store.WriteOpBatchCommit, Ordinal: 1, Err: injected}
+	m, db := newManagerWithOptions(t, t.TempDir(), store.WithFaultInjector(fault))
+	defer db.Close()
+	job, err := m.AddSource("https://pds.example")
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- m.Run(ctx, func(ctx context.Context, _ Job) error {
+			close(started)
+			<-ctx.Done()
+			return ctx.Err()
+		})
+	}()
+	<-started
+
+	require.ErrorIs(t, m.CheckpointInventory(job.ID, "next", map[string]string{did: "3l3qo2vutsw2b"}, true), injected)
+	current, err := m.Get(job.ID)
+	require.NoError(t, err)
+	require.Nil(t, current.LastProgressAt, "failed inventory batch must not publish progress")
+	require.False(t, current.TotalReposKnown)
+	inventory, err := m.readInventory(job.ID)
+	require.NoError(t, err)
+	require.Empty(t, inventory.Entries, "inventory and job progress commit together")
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+}
+
 func TestJobsPersistRepositoryTotalBeforeProgress(t *testing.T) {
 	m, db := newManager(t, t.TempDir())
 	defer db.Close()
@@ -88,6 +122,21 @@ func TestJobsPersistRepositoryTotalBeforeProgress(t *testing.T) {
 	require.Equal(t, 12, m.List()[0].TotalRepos)
 }
 
+func TestLegacyJobWithoutProgressTimestampStaysUnknownAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	m, db := newManager(t, dir)
+	job, err := m.AddSource("https://pds.example")
+	require.NoError(t, err)
+	require.Nil(t, job.LastProgressAt)
+	require.NoError(t, db.Close())
+
+	m, db = newManager(t, dir)
+	defer db.Close()
+	restored, err := m.Get(job.ID)
+	require.NoError(t, err)
+	require.Nil(t, restored.LastProgressAt, "missing legacy timestamp remains unknown")
+}
+
 func TestJobsCrashResumeAndUnavailableCoverage(t *testing.T) {
 	dir := t.TempDir()
 	m, db := newManager(t, dir)
@@ -110,11 +159,18 @@ func TestJobsCrashResumeAndUnavailableCoverage(t *testing.T) {
 	cancel()
 	<-done
 	require.Equal(t, Running, m.List()[0].State, "process loss leaves resumable running state")
+	checkpointed, err := m.Get(j.ID)
+	require.NoError(t, err)
+	require.NotNil(t, checkpointed.LastProgressAt)
+	lastProgressAt := *checkpointed.LastProgressAt
 	require.NoError(t, db.Close())
 	m, db = newManager(t, dir)
 	defer db.Close()
-	require.Equal(t, Pending, m.List()[0].State)
-	require.Equal(t, "3l3qo2vutsw2b", m.List()[0].CompletedRepos["did:plc:test"])
+	resumed, err := m.Get(j.ID)
+	require.NoError(t, err)
+	require.Equal(t, Pending, resumed.State)
+	require.Equal(t, "3l3qo2vutsw2b", resumed.CompletedRepos["did:plc:test"])
+	require.Equal(t, lastProgressAt, *resumed.LastProgressAt, "repository checkpoint time survives reopen")
 	ctx, cancel = context.WithCancel(t.Context())
 	defer cancel()
 	go func() {

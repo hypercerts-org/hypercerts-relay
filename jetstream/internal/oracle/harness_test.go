@@ -271,11 +271,13 @@ func testOracleDefaultLifecycle(t *testing.T) {
 		SubscribeSlowWindow:            time.Second,
 		SubscribeSlowMinRate:           1,
 		CursorBlockIndexCacheSize:      32,
-		CompactionInterval:             time.Hour,
-		CompactionTombstoneCap:         1,
-		BarrierBeforeCutover:           bootstrapTraffic.WaitDelivered,
-		BarrierAfterBootstrap:          afterBootstrap.Barrier,
-		BarrierAfterMerge:              afterMerge.Barrier,
+		// hypercerts: allow a periodic pass to cover rows appended after the
+		// last tombstone-triggered pass; synctest advances this timer virtually.
+		CompactionInterval:     time.Second,
+		CompactionTombstoneCap: 1,
+		BarrierBeforeCutover:   bootstrapTraffic.WaitDelivered,
+		BarrierAfterBootstrap:  afterBootstrap.Barrier,
+		BarrierAfterMerge:      afterMerge.Barrier,
 		OnBeforeCompactionPass: func(targetWatermark uint64) {
 			compaction.ObserveStart()
 			overDrop.ObserveBefore(targetWatermark)
@@ -471,7 +473,7 @@ func testOracleDefaultLifecycle(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, asyncEntry, 1)
 	asyncResyncAck.Wait(t, cfg, string(asyncEntry[0].DID), asyncEntry[0].Rev, run, oracleWaitTimeout(cfg))
-	steadyCompaction := compaction.WaitAfter(t, cfg, run, passesBeforeSteady, oracleWaitTimeout(cfg))
+	steadyCompaction := compaction.WaitAfter(t, cfg, run, passesBeforeSteady, accountStatusMaxSeq, oracleWaitTimeout(cfg))
 	require.Greaterf(t, steadyCompaction.Watermark, afterMergeCompaction.Watermark,
 		"steady compaction watermark did not advance: mode=%s seed=%d after_merge_watermark=%d steady_watermark=%d",
 		cfg.Mode, cfg.Seed, afterMergeCompaction.Watermark, steadyCompaction.Watermark)
@@ -1106,7 +1108,9 @@ func (r *compactionPassRecorder) Last(t *testing.T) jetstreamd.CompactionPassRes
 	return last
 }
 
-func (r *compactionPassRecorder) WaitAfter(t *testing.T, cfg Config, run *runtimeRun, after int, timeout time.Duration) jetstreamd.CompactionPassResult {
+// hypercerts: a completed pass can predate the account-status rows, so wait
+// for coverage as well as completion before the harness shuts down ingestion.
+func (r *compactionPassRecorder) WaitAfter(t *testing.T, cfg Config, run *runtimeRun, after int, minWatermark uint64, timeout time.Duration) jetstreamd.CompactionPassResult {
 	t.Helper()
 
 	timer := time.NewTimer(timeout)
@@ -1123,19 +1127,25 @@ func (r *compactionPassRecorder) WaitAfter(t *testing.T, cfg Config, run *runtim
 				t.Fatalf("compaction pass after %d failed: mode=%s seed=%d err=%v",
 					after, cfg.Mode, cfg.Seed, last.Err)
 			}
-			r.mu.Unlock()
-			return last
+			if last.Watermark >= minWatermark {
+				r.mu.Unlock()
+				return last
+			}
+		}
+		var watermark uint64
+		if len(r.results) > 0 {
+			watermark = r.results[len(r.results)-1].Watermark
 		}
 		seen := len(r.results)
 		r.mu.Unlock()
 
 		select {
 		case <-run.exited:
-			t.Fatalf("runtime exited while waiting for compaction pass after %d: mode=%s seed=%d seen=%d err=%v",
-				after, cfg.Mode, cfg.Seed, seen, run.err)
+			t.Fatalf("runtime exited while waiting for compaction pass after %d covering seq %d: mode=%s seed=%d seen=%d watermark=%d err=%v",
+				after, minWatermark, cfg.Mode, cfg.Seed, seen, watermark, run.err)
 		case <-timer.C:
-			t.Fatalf("timeout waiting for compaction pass after %d: mode=%s seed=%d seen=%d",
-				after, cfg.Mode, cfg.Seed, seen)
+			t.Fatalf("timeout waiting for compaction pass after %d covering seq %d: mode=%s seed=%d seen=%d watermark=%d; check periodic compaction and ingestion progress",
+				after, minWatermark, cfg.Mode, cfg.Seed, seen, watermark)
 		case <-tick.C:
 		}
 	}

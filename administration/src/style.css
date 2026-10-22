@@ -162,7 +162,7 @@ strong {
   position: sticky;
   top: 0;
   height: 100dvh;
-  overflow-y: auto;
+  overflow: visible;
   background: var(--color-brand-white);
   border-right: 1px solid var(--color-ui-separator);
   padding: 2rem;
@@ -188,7 +188,7 @@ strong {
 .shell > aside nav {
   flex: 1;
   min-height: 0;
-  overflow-y: auto;
+  overflow: auto;
   align-content: start;
   display: grid;
   gap: 0.25rem;
@@ -484,6 +484,19 @@ footer {
 }
 .refresh-status {
   font-size: var(--text-body-sm);
+}
+@media (min-width: 641px) and (max-height: 950px) {
+  .shell > aside { padding: 1.25rem 1.5rem; }
+  .product-label { margin-top: 1rem; }
+  .shell > aside nav { margin: 0.75rem 0 1rem; }
+  .shell > aside nav .nav-group { margin-top: 0.4rem; }
+  .shell > aside nav a { min-height: 36px; padding: 0.35rem 0.8rem; }
+  .account { padding-top: 0.75rem; }
+  .account-actions { margin-top: 0.5rem; }
+}
+@media (min-width: 641px) and (max-height: 680px) {
+  .shell > aside { position: static; height: auto; }
+  .shell > aside nav { flex: none; }
 }
 @media (max-width: 900px) {
   .shell {
