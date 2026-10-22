@@ -10,11 +10,11 @@ import (
 	"github.com/bluesky-social/jetstream/internal/status"
 )
 
-type coverageInputs interface {
+type statusInputsProvider interface {
 	StatusInputs() (map[string]bool, map[string]uint64, selection.Policy, []jobs.Job)
 }
 
-type coverageReporter struct{ source coverageInputs }
+type coverageReporter struct{ source statusInputsProvider }
 
 func (r coverageReporter) CurrentCoverage() (status.CoverageInfo, bool) {
 	if r.source == nil {
