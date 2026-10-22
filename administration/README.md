@@ -158,6 +158,8 @@ regardless of pagination or exact PDS filtering. Missing evidence takes preceden
 as unknown; otherwise non-complete work is incomplete, and only every-source
 completion is complete. No enabled sources yields unknown.
 
+The administration UI presents the authoritative aggregate for all enabled sources under the current policy, independent of page and exact-source filters. It shows nullable initial inventory, verified scanned, matching, successful no-match, unresolved and attributable-record counts as job-wide evidence—not per-collection progress. Null remains Unknown while zero is a measured value. Failure category, last progress timestamp, attempts, affected repository DID and explicit retry action are shown only when supplied; throttling and incomplete work do not imply a retry countdown or ETA. History and live freshness remain independently unknown; completed acquisition does not establish either. Acquisition retry has no durable retry timestamp, so operators must use the explicit job retry action when required.
+
 ## Rate policy
 
 Global and per-PDS values are integer **events/second**, inclusive range 1–1,000,000,
