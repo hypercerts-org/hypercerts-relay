@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -68,6 +69,8 @@ type SlurperConfig struct {
 	// callback functions. technically optional but effectively required
 	PersistCursorCallback     PersistCursorFunc
 	PersistHostStatusCallback PersistHostStatusFunc
+	// Test-only socket injection seam; production defaults remain public-only.
+	TestDialContext func(context.Context, string, string) (net.Conn, error)
 }
 
 func DefaultSlurperConfig() *SlurperConfig {
@@ -342,11 +345,12 @@ func (s *Slurper) subscribeWithRedialer(ctx context.Context, host *models.Host, 
 
 	d := websocket.Dialer{
 		HandshakeTimeout: time.Second * 5,
+		NetDialContext:   s.Config.TestDialContext,
 	}
 
 	// hypercerts: the acceptance build alone reaches private Docker PDS hosts;
-	// all normal builds keep SSRF protection for HTTPS sources.
-	if !host.NoSSL && !acceptancePrivateHostsEnabled() {
+	// all normal builds retain SSRF protection for source sockets.
+	if s.Config.TestDialContext == nil && !acceptancePrivateHostsEnabled() {
 		netDialer := ssrf.PublicOnlyDialer()
 		d.NetDialContext = netDialer.DialContext
 	}

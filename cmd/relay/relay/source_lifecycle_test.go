@@ -2,6 +2,7 @@ package relay
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -32,6 +33,7 @@ func newSourceLifecycleRelay(t *testing.T) (*Relay, sourceTestDB, chan int64) {
 	config.PersistCursorPeriod = time.Hour
 	config.PersistCursorCallback = r.PersistHostCursors
 	config.PersistHostStatusCallback = r.UpdateHostStatus
+	config.TestDialContext = (&net.Dialer{}).DialContext
 	slurper, err := NewSlurper(func(_ context.Context, evt *stream.XRPCStreamEvent, _ string, _ uint64) error {
 		processed <- evt.Sequence()
 		return nil
@@ -314,7 +316,9 @@ func TestSourceRemovalRetainsRawReplay(t *testing.T) {
 	persistence, err := diskpersist.NewDiskPersistence(filepath.Join(root, "events"), "", db, nil)
 	require.NoError(t, err)
 	events := eventmgr.NewEventManager(persistence)
-	r, err := NewRelay(db, events, directory, nil)
+	config := DefaultRelayConfig()
+	config.TestDialContext = (&net.Dialer{}).DialContext
+	r, err := NewRelay(db, events, directory, config)
 	require.NoError(t, err)
 	persistence.SetUidSource(r)
 	r.HostChecker = &HostClient{Client: &http.Client{Timeout: time.Second}}
@@ -363,18 +367,23 @@ func TestSourceRemovalRetainsRawReplay(t *testing.T) {
 	require.Equal(t, did.String(), replayed.Did)
 }
 
-func TestPublicSubscribeCannotCreateOrReviveManagedSources(t *testing.T) {
+func TestPublicSubscribeCanCreateNewButCannotReviveDisabledSources(t *testing.T) {
 	ctx := context.Background()
 	r, db, _ := newSourceLifecycleRelay(t)
 	unknown := newSourceFixture(t)
+	r.HostChecker = NewMockHostChecker()
+	r.HostChecker.(*MockHostChecker).Hosts["http://"+unknown.host] = true
 
-	require.Error(t, r.SubscribeToHost(ctx, unknown.host, true, false))
+	require.NoError(t, r.SubscribeToHost(ctx, unknown.host, true, false))
 	var unknownCount int64
 	require.NoError(t, db.Model(&models.Host{}).Where("hostname = ?", unknown.host).Count(&unknownCount).Error)
-	require.Zero(t, unknownCount)
-	requireNoSourceConnection(t, unknown)
+	require.EqualValues(t, 1, unknownCount)
+	var admitted models.Source
+	require.NoError(t, db.Where("host_id = (SELECT id FROM host WHERE hostname = ?)", unknown.host).First(&admitted).Error)
+	require.Equal(t, models.SourceValidationPassed, admitted.ValidationStatus)
 
 	disabledFixture := newSourceFixture(t)
+	r.HostChecker.(*MockHostChecker).Hosts["http://"+disabledFixture.host] = true
 	validated, connection := addPassedSource(t, r, disabledFixture)
 	disabled, err := r.SetSourceState(ctx, validated.HostID, validated.Revision, models.SourceStateDisabled)
 	require.NoError(t, err)

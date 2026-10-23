@@ -54,6 +54,8 @@ func MustSimpleRelay(dir identity.Directory, tmpd string, lenient bool) *SimpleR
 	relayConfig := relay.DefaultRelayConfig()
 	relayConfig.SkipAccountHostCheck = true
 	relayConfig.LenientSyncValidation = lenient
+	// Test fixture only: allow the deliberately local fake PDS websocket.
+	relayConfig.TestDialContext = (&net.Dialer{}).DialContext
 
 	db, err := cliutil.SetupDatabase("sqlite://:memory:", 40)
 	if err != nil {
