@@ -186,45 +186,45 @@ export class Services {
         accountLimit: command.accountLimit,
       },
     );
-    await this.call("jetstream", "/jobs", "POST", {
-      pds: command.pds,
-      reason: "quota_recovery",
-      requestId: id,
-      sourceRevision: relay.Revision,
-    });
+    const handoff = relay.Handoff;
+    if (handoff) {
+      return {
+        relay,
+        jetstream: {
+          pending: true,
+          revision: handoff.sourceRevision,
+          state: handoff.state,
+        },
+      };
+    }
+    if (relay.Validation?.Status === "passed") {
+      await this.call("jetstream", "/jobs", "POST", {
+        pds: command.pds,
+        reason: "quota_recovery",
+        requestId: id,
+      });
+    }
+    // Use Jetstream's stored source lifecycle as the authority for legacy
+    // requests; quota mutations do not advance Relay's source coordinate.
     return relay;
   }
   private async applySource(
     command: Extract<Command, { kind: "source" }>,
     progress: (value: unknown) => void,
   ) {
-    // Stop acquisition at Jetstream before disabling the raw source. Retry is safe.
-    if (command.state !== "enabled") {
-      try {
-        await this.call("jetstream", "/sources", "DELETE", {
-          pds: command.pds,
-        });
-      } catch (error) {
-        // A Relay-only source is already absent from Jetstream.
-        if (!(error instanceof ApiError && error.status === 404)) throw error;
-      }
-      progress({ jetstream: { enabled: false } });
-    }
     const relay = await this.call<RelaySourceView>("relay", "/source", "PUT", {
       pds: command.pds,
       state: command.state,
     });
-    progress({
-      relay,
-      ...(command.state !== "enabled" ? { jetstream: { enabled: false } } : {}),
-    });
-    const jetstream =
-      command.state === "enabled"
-        ? await this.call("jetstream", "/sources", "POST", {
-            pds: command.pds,
-            sourceRevision: relay.Revision,
-          })
-        : { enabled: false };
+    const handoff = relay.Handoff;
+    const jetstream = handoff
+      ? {
+          pending: true,
+          revision: handoff.sourceRevision,
+          state: handoff.state,
+        }
+      : { pending: false, enabled: command.state === "enabled" };
+    progress({ relay, jetstream });
     return { relay, jetstream };
   }
 }
@@ -279,6 +279,8 @@ async function readControlBody<T>(response: Response): Promise<T> {
 
 interface RelaySourceView {
   Revision: number;
+  Validation?: { Status: string };
+  Handoff?: { sourceRevision: number; state: string } | null;
 }
 
 interface CoveragePage {

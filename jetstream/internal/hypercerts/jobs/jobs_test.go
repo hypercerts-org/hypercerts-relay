@@ -30,6 +30,32 @@ func newManagerWithOptions(t *testing.T, dir string, opts ...store.Option) (*Man
 	return m, db
 }
 
+func TestRevisionedSourceRemovalFencesDelayedAdds(t *testing.T) {
+	dir := t.TempDir()
+	m, db := newManager(t, dir)
+	const pds = "https://revision-fence.example"
+
+	// A removal is durable even when an add/remove race means this manager has
+	// never observed the source as registered.
+	require.NoError(t, m.RemoveSourceWithRevision(pds, 5))
+	require.ErrorIs(t, func() error { _, err := m.AddSourceWithRevision(pds, 4); return err }(), ErrConflict)
+	require.ErrorIs(t, func() error { _, err := m.AddSourceWithRevision(pds, 5); return err }(), ErrConflict)
+
+	// Explicit re-admission is allowed only at a strictly newer coordinate.
+	job, err := m.AddSourceWithRevision(pds, 6)
+	require.NoError(t, err)
+	require.Equal(t, uint64(6), job.SourceRevision)
+	require.True(t, m.Sources()[pds])
+	require.NoError(t, db.Close())
+
+	m, db = newManager(t, dir)
+	defer db.Close()
+	require.True(t, m.Sources()[pds])
+	require.ErrorIs(t, func() error { _, err := m.AddSourceWithRevision(pds, 5); return err }(), ErrConflict)
+	_, err = m.AddSourceWithRevision(pds, 6)
+	require.NoError(t, err, "equal revision remains idempotent after explicit re-admission")
+}
+
 func TestJobsPolicyAtomicSchedulingAndCancellation(t *testing.T) {
 	m, db := newManager(t, t.TempDir())
 	defer db.Close()
@@ -223,6 +249,26 @@ func TestJobsRepeatedQuotaRecoveryStartsFreshWork(t *testing.T) {
 	require.Empty(t, second.CompletedRepos)
 }
 
+func TestSourceAcceptanceRetrySurvivesPolicyChangeAndRestart(t *testing.T) {
+	dir := t.TempDir()
+	m, db := newManager(t, dir)
+	const pds = "https://lost-ack.example"
+	original, err := m.AddSourceWithRevision(pds, 7)
+	require.NoError(t, err)
+	m.SetPolicyAdvanceSender(func(context.Context, string, uint64, uint64) error { return nil })
+	_, err = m.SetPolicy(t.Context(), 1, []string{"app.bsky.feed.like", "app.bsky.feed.post"})
+	require.NoError(t, err)
+	policyJobsBefore := len(m.List())
+	require.NoError(t, db.Close())
+
+	m, db = newManager(t, dir)
+	defer db.Close()
+	retry, err := m.AddSourceWithRevision(pds, 7)
+	require.NoError(t, err)
+	require.Equal(t, original.ID, retry.ID)
+	require.Equal(t, policyJobsBefore, len(m.List()), "retry must not schedule source_added under new policy")
+}
+
 func TestCompletedRecoveryReceiptRetriesAfterRestart(t *testing.T) {
 	dir := t.TempDir()
 	m, db := newManager(t, dir)
@@ -376,6 +422,39 @@ func TestSupersededPolicyJobDoesNotSubmitRecoveryReceipt(t *testing.T) {
 	}, 200*time.Millisecond, time.Millisecond)
 	cancel()
 	require.ErrorIs(t, <-done, context.Canceled)
+}
+
+func TestLegacyUnversionedQuotaRequestRetainsLifecycleRevision(t *testing.T) {
+	m, db := newManager(t, t.TempDir())
+	defer db.Close()
+	const pds = "https://legacy-quota.example"
+	_, err := m.AddSourceWithRevision(pds, 4)
+	require.NoError(t, err)
+	job, err := m.RequestOnce(pds, "quota_recovery", "legacy-request")
+	require.NoError(t, err)
+	require.Equal(t, uint64(4), job.SourceRevision)
+	require.Equal(t, uint64(4), m.SourceRevision(pds))
+	legacy, err := m.AddSourceWithRevision("https://legacy-enabled.example", 1)
+	require.NoError(t, err)
+	legacyPDS := legacy.PDS
+	require.NoError(t, m.RemoveSourceWithRevision(legacyPDS, 2))
+	_, err = m.RequestOnce(legacyPDS, "quota_recovery", "legacy-after-removal")
+	require.ErrorIs(t, err, ErrConflict)
+}
+
+func TestLegacyUnversionedQuotaRequestAfterPolicyAdvance(t *testing.T) {
+	m, db := newManager(t, t.TempDir())
+	defer db.Close()
+	const pds = "https://legacy-policy-quota.example"
+	_, err := m.AddSourceWithRevision(pds, 2)
+	require.NoError(t, err)
+	m.SetPolicyAdvanceSender(func(context.Context, string, uint64, uint64) error { return nil })
+	_, err = m.SetPolicy(t.Context(), 1, []string{"app.bsky.feed.like"})
+	require.NoError(t, err)
+	job, err := m.RequestOnce(pds, "quota_recovery", "legacy-policy-request")
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), job.SourceRevision)
+	require.Equal(t, uint64(2), m.SourceRevision(pds))
 }
 
 func TestPolicyChangeRequiresRelayRecoveryMirror(t *testing.T) {

@@ -20,6 +20,16 @@ An unavailable identity remains retryable. Permanent verification failures creat
 
 An ambiguous disk write or sync failure stops further persistence until restart. Startup discards only an incomplete trailing write before resuming; complete retained events remain replayable. Per-event file synchronization replaces buffered acknowledgments and can reduce throughput.
 
+## Relay-to-Jetstream source handoff
+
+The Relay's durable source lifecycle queue sends handoffs only when both
+`JETSTREAM_CONTROL_URL` and `JETSTREAM_CONTROL_TOKEN` are configured on the Relay
+process. If both are absent, delivery stays disabled and queued rows are retained.
+If exactly one is absent, Relay fails startup.
+This outbound token is separate from Jetstream's inbound `JETSTREAM_CONTROL_TOKEN_FILE`
+for its private control API; configure that on Jetstream as documented in
+[`jetstream/README.md`](jetstream/README.md).
+
 ## Managed PDS sources
 
 The Go adapter on `relay.Relay` separates durable desired state from connection state. It does not expose a new HTTP API or OAuth UI.

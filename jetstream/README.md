@@ -125,6 +125,13 @@ is enabled; the production `serve` command always enables it.
 
 ## Scoped PDS backfill jobs
 
+Relay sends durable source lifecycle handoffs using `JETSTREAM_CONTROL_URL` and
+`JETSTREAM_CONTROL_TOKEN`, configured together on the Relay process. When both
+are absent, handoff delivery is disabled and the Relay retains queued rows. If
+exactly one is absent, Relay fails startup. The
+Relay's outbound `JETSTREAM_CONTROL_TOKEN` is distinct from Jetstream's
+`JETSTREAM_CONTROL_TOKEN_FILE`, which supplies the inbound private API credential.
+
 On a new data directory, `JETSTREAM_PDS_SOURCES` (or `--pds-sources`) initializes
 explicit direct-PDS origins, separated by commas. HTTPS is required except for
 loopback fixtures. These are Jetstream acquisition targets; admitting a PDS into
@@ -148,7 +155,19 @@ per-collection revision boundaries are synced before repository progress is
 acknowledged. Delayed older live/retry rows cannot overwrite a completed
 snapshot; newer live rows win. Restart resumes a running job from its persisted
 page and repository progress. A crash before progress acknowledgment may replay
-work safely.
+work safely. Relay-owned desired-state changes are handed off through its durable
+source queue; Jetstream accepts each PDS lifecycle revision independently of the
+current collection-policy revision and deduplicates retries against that durable
+acceptance. Thus a lost POST acknowledgment remains safe across policy changes and
+Jetstream restarts. Relay removes a queued handoff only after a validated 202
+acceptance body for an enable (PDS, source revision, pending state, policy
+revision, and job identity) or an explicit 204 removal acknowledgment. Redirects,
+malformed or mismatched 2xx responses, and transport failures remain pending and
+are retried with backoff. A disable received before any enable leaves a durable
+tombstone; only a newer explicit enable can revive that PDS. Keep Jetstream's
+data directory persistent: losing it discards both the accepted lifecycle state
+and its fences, so Relay's durable queue may be replayed but cannot reconstruct
+older accepted policy history without operator reconciliation.
 
 Coverage is explicitly `current_state`: a PDS snapshot cannot prove historical
 event completeness. The private coverage endpoint returns schema v1 scoped to

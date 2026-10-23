@@ -137,6 +137,7 @@ type data struct {
 	Initialized        bool                         `json:"initialized"`
 	Sources            map[string]bool              `json:"sources"`
 	SourceRevisions    map[string]uint64            `json:"sourceRevisions,omitempty"`
+	SourceTombstones   map[string]uint64            `json:"sourceTombstones,omitempty"`
 	Jobs               map[string]Job               `json:"jobs"`
 	SnapshotRejections map[string]SnapshotRejection `json:"snapshotRejections"`
 }
@@ -190,6 +191,7 @@ func emptyData() data {
 	return data{
 		Sources:            map[string]bool{},
 		SourceRevisions:    map[string]uint64{},
+		SourceTombstones:   map[string]uint64{},
 		Jobs:               map[string]Job{},
 		SnapshotRejections: map[string]SnapshotRejection{},
 	}
@@ -216,6 +218,9 @@ func restorePersistedData(persisted *data) error {
 		return errors.New("invalid persisted job state")
 	}
 	ensureSourceRevisions(persisted)
+	if persisted.SourceTombstones == nil {
+		persisted.SourceTombstones = map[string]uint64{}
+	}
 	// hypercerts: Older job documents predate the direct-PDS rejection ledger.
 	if persisted.SnapshotRejections == nil {
 		persisted.SnapshotRejections = map[string]SnapshotRejection{}
@@ -358,7 +363,8 @@ func (m *Manager) AddSource(raw string) (Job, error) {
 }
 
 // AddSourceWithRevision remembers the Relay lifecycle coordinate that made an
-// explicitly admitted source eligible for a recovery acknowledgement.
+// explicitly admitted source eligible for a recovery acknowledgement. An
+// unversioned compatibility request does not bypass a durable source tombstone.
 func (m *Manager) AddSourceWithRevision(raw string, sourceRevision uint64) (Job, error) {
 	pds, err := normalizeSource(raw)
 	if err != nil {
@@ -368,8 +374,13 @@ func (m *Manager) AddSourceWithRevision(raw string, sourceRevision uint64) (Job,
 	defer m.mu.Unlock()
 	next := clone(m.data)
 	ensureSourceRevisions(&next)
-	if sourceRevision > 0 && sourceRevision < next.SourceRevisions[pds] {
+	if sourceRevision == 0 && next.SourceTombstones[pds] > 0 || sourceRevision > 0 && (sourceRevision < next.SourceRevisions[pds] || sourceRevision <= next.SourceTombstones[pds]) {
 		return Job{}, ErrConflict
+	}
+	if sourceRevision == 0 && next.SourceRevisions[pds] == 0 && next.SourceTombstones[pds] == 0 {
+		// Compatibility: old management clients did not version lifecycle
+		// commands, and older state may record enabled configuration as false.
+		next.Sources[pds] = true
 	}
 	advanced := sourceRevision > 0 && sourceRevision > next.SourceRevisions[pds]
 	if sourceRevision > 0 {
@@ -378,11 +389,30 @@ func (m *Manager) AddSourceWithRevision(raw string, sourceRevision uint64) (Job,
 	if advanced {
 		m.cancelStaleSourceJobs(&next, pds, sourceRevision)
 	}
+	// Legacy seeded sources may carry an explicit false Sources entry from
+	// older state without a tombstone; an unversioned add preserves that
+	// compatibility. Versioned removes still require a strictly newer revision.
+	if sourceRevision == 0 && next.SourceRevisions[pds] == 0 && next.SourceTombstones[pds] == 0 {
+		next.Sources[pds] = true
+	}
+	// An already-enabled matching lifecycle coordinate is idempotent even when
+	// policy has advanced since the original durable acceptance. Do not create
+	// a second source_added job for a lost HTTP acknowledgment.
+	if next.Sources[pds] && sourceRevision > 0 && sourceRevision == next.SourceRevisions[pds] {
+		for _, existing := range next.Jobs {
+			if existing.PDS == pds && existing.SourceRevision == sourceRevision && existing.Reason == "source_added" {
+				return clone(existing), nil
+			}
+		}
+	}
 	job := newJob(pds, m.policy.Current(), "source_added", next.SourceRevisions[pds])
 	if existing, ok := next.Jobs[job.ID]; ok && next.Sources[pds] {
 		return clone(existing), nil
 	}
 	next.Sources[pds] = true
+	if sourceRevision > next.SourceTombstones[pds] {
+		delete(next.SourceTombstones, pds)
+	}
 	if err := beginAcquisition(next, &job); err != nil {
 		return Job{}, err
 	}
@@ -396,16 +426,38 @@ func (m *Manager) AddSourceWithRevision(raw string, sourceRevision uint64) (Job,
 	return clone(job), nil
 }
 func (m *Manager) RemoveSource(raw string) error {
+	return m.RemoveSourceWithRevision(raw, 0)
+}
+
+// RemoveSourceWithRevision persists a fence even when the source was never
+// registered. A delayed add at this revision or earlier cannot revive it.
+func (m *Manager) RemoveSourceWithRevision(raw string, sourceRevision uint64) error {
 	pds, err := normalizeSource(raw)
 	if err != nil {
 		return err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.data.Sources[pds]; !ok {
-		return ErrNotFound
-	}
 	next := clone(m.data)
+	if sourceRevision == 0 {
+		sourceRevision = next.SourceRevisions[pds] + 1
+	}
+	if sourceRevision < next.SourceRevisions[pds] || sourceRevision < next.SourceTombstones[pds] {
+		return ErrConflict
+	}
+	if next.SourceTombstones == nil {
+		next.SourceTombstones = map[string]uint64{}
+	}
+	if next.SourceRevisions == nil {
+		next.SourceRevisions = map[string]uint64{}
+	}
+	next.SourceTombstones[pds] = sourceRevision
+	if sourceRevision > next.SourceRevisions[pds] {
+		next.SourceRevisions[pds] = sourceRevision
+	}
+	if next.Sources == nil {
+		next.Sources = map[string]bool{}
+	}
 	next.Sources[pds] = false
 	for id, j := range next.Jobs {
 		if j.PDS == pds && (j.State == Pending || j.State == Running) {
@@ -418,7 +470,7 @@ func (m *Manager) RemoveSource(raw string) error {
 	if err := m.commit(next); err != nil {
 		return err
 	}
-	if m.cancel != nil && m.data.Jobs[m.runningID].PDS == pds {
+	if m.cancel != nil && m.runningID != "" && m.data.Jobs[m.runningID].PDS == pds {
 		m.cancel()
 	}
 	return nil
@@ -495,8 +547,9 @@ func (m *Manager) RequestOnce(raw, reason, requestID string) (Job, error) {
 	return m.RequestOnceWithSourceRevision(raw, reason, requestID, 0)
 }
 
-// RequestOnceWithSourceRevision binds lifecycle/quota intent to the Relay
-// source version observed by the control plane.
+// RequestOnceWithSourceRevision binds lifecycle intent to a Relay source
+// revision when supplied. Legacy requests use the current enabled source state
+// without advancing the durable revision.
 func (m *Manager) RequestOnceWithSourceRevision(raw, reason, requestID string, sourceRevision uint64) (Job, error) {
 	if err := validateRequest(reason, requestID); err != nil {
 		return Job{}, err
@@ -507,19 +560,52 @@ func (m *Manager) RequestOnceWithSourceRevision(raw, reason, requestID string, s
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if sourceRevision > 0 && sourceRevision < m.data.SourceRevisions[pds] {
+	if sourceRevision > 0 && (sourceRevision < m.data.SourceRevisions[pds] || sourceRevision <= m.data.SourceTombstones[pds]) {
+		return Job{}, ErrConflict
+	}
+	legacyUnversioned := sourceRevision == 0
+	if sourceRevision == 0 {
+		sourceRevision = m.data.SourceRevisions[pds]
+	}
+	if sourceRevision > 0 && sourceRevision <= m.data.SourceTombstones[pds] {
 		return Job{}, ErrConflict
 	}
 	if existing, found, err := m.requestReceipt(pds, reason, requestID, sourceRevision); found {
 		return existing, err
 	}
 	if !m.data.Sources[pds] {
+		if !legacyUnversioned || m.data.SourceTombstones[pds] > 0 {
+			return Job{}, ErrConflict
+		}
+		// A legacy unversioned job request cannot prove source admission.
+		// Accept only an enabled source in the stored configuration, with no
+		// tombstone fence. A false/missing entry remains a conflict.
+		return Job{}, ErrConflict
+	}
+	if !legacyUnversioned && sourceRevision > 0 && sourceRevision != m.data.SourceRevisions[pds] {
 		return Job{}, ErrConflict
 	}
 	next := clone(m.data)
-	advanced := advanceSourceRevision(&next, pds, sourceRevision)
-	if advanced {
-		m.cancelStaleSourceJobs(&next, pds, sourceRevision)
+	// Legacy unversioned requests retain the source's known lifecycle revision;
+	// they must not manufacture or advance a lifecycle coordinate.
+	advanced := false
+	if legacyUnversioned {
+		sourceRevision = next.SourceRevisions[pds]
+		if sourceRevision == 0 {
+			for _, existing := range next.Jobs {
+				if existing.PDS == pds && existing.SourceRevision > sourceRevision {
+					sourceRevision = existing.SourceRevision
+				}
+			}
+		}
+		if sourceRevision > next.SourceRevisions[pds] {
+			next.SourceRevisions[pds] = sourceRevision
+		}
+	} else {
+		advanced = advanceSourceRevision(&next, pds, sourceRevision)
+		if advanced {
+			m.cancelStaleSourceJobs(&next, pds, sourceRevision)
+		}
 	}
 	job, err := requestJob(next, pds, reason, m.policy.Current(), next.SourceRevisions[pds])
 	if err != nil {
@@ -753,6 +839,12 @@ func (m *Manager) Get(id string) (Job, error) {
 	}
 	return clone(job), nil
 }
+func (m *Manager) SourceRevision(pds string) uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.data.SourceRevisions[pds]
+}
+
 func (m *Manager) Sources() map[string]bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
