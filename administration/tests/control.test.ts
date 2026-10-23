@@ -902,10 +902,10 @@ test("a source absent from Jetstream can still be disabled in Relay", async () =
     { kind: "source", pds: "https://relay-only.example", state: "disabled" },
     randomUUID(),
   );
-  assert.deepEqual(calls, ["jetstream", "relay"]);
+  assert.deepEqual(calls, ["relay"]);
   assert.deepEqual(result, {
     relay: { DesiredState: "disabled" },
-    jetstream: { enabled: false },
+    jetstream: { pending: false, enabled: false },
   });
 });
 

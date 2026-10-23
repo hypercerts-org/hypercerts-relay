@@ -99,3 +99,19 @@ type AccountSourceObservation struct {
 func (AccountSourceObservation) TableName() string {
 	return "account_source_observation"
 }
+
+// SourceHandoff is the durable latest desired state to deliver to Jetstream.
+// Its primary key coalesces updates per Relay source while revisions fence stale acknowledgements.
+type SourceHandoff struct {
+	HostID         uint64    `gorm:"column:host_id;primaryKey" json:"hostID"`
+	PDS            string    `gorm:"column:pds;not null" json:"pds"`
+	SourceRevision uint64    `gorm:"column:source_revision;not null" json:"sourceRevision"`
+	State          string    `gorm:"column:state;not null" json:"state"`
+	Attempts       uint      `gorm:"column:attempts;not null;default:0" json:"attempts"`
+	NextRetryAt    time.Time `gorm:"column:next_retry_at;not null;index" json:"nextRetryAt"`
+	UpdatedAt      time.Time `json:"updatedAt"`
+}
+
+func (SourceHandoff) TableName() string {
+	return "source_handoff"
+}

@@ -122,6 +122,16 @@ func run(args []string) error {
 					Value:   40,
 				},
 				&cli.StringFlag{
+					Name:    "jetstream-control-url",
+					Usage:   "private Jetstream control API base URL",
+					Sources: cli.EnvVars("JETSTREAM_CONTROL_URL"),
+				},
+				&cli.StringFlag{
+					Name:    "jetstream-control-token",
+					Usage:   "private Jetstream control API bearer token",
+					Sources: cli.EnvVars("JETSTREAM_CONTROL_TOKEN"),
+				},
+				&cli.StringFlag{
 					Name:    "bind",
 					Usage:   "IP or address, and port, to listen on for HTTP APIs (including firehose)",
 					Value:   ":2470",
@@ -401,6 +411,11 @@ func runRelay(ctx context.Context, cmd *cli.Command) error {
 	}
 
 	relayConfig := relay.DefaultRelayConfig()
+	relayConfig.JetstreamControlURL = cmd.String("jetstream-control-url")
+	relayConfig.JetstreamControlToken = cmd.String("jetstream-control-token")
+	if (relayConfig.JetstreamControlURL == "") != (relayConfig.JetstreamControlToken == "") {
+		return errors.New("JETSTREAM_CONTROL_URL and JETSTREAM_CONTROL_TOKEN must be configured together")
+	}
 	relayConfig.UserAgent = fmt.Sprintf("indigo-relay/%s (atproto-relay)", version.Version)
 	relayConfig.ConcurrencyPerHost = cmd.Int("host-concurrency")
 	relayConfig.DefaultRepoLimit = cmd.Int64("default-account-limit")
@@ -508,6 +523,12 @@ func runRelay(ctx context.Context, cmd *cli.Command) error {
 	if err := r.ResubscribeAllHosts(ctx); err != nil {
 		return err
 	}
+
+	handoffCtx, cancelHandoffs := context.WithCancel(ctx)
+	defer cancelHandoffs()
+	handoffDone := make(chan struct{})
+	go func() { defer close(handoffDone); r.RunSourceHandoffWorker(handoffCtx) }()
+	defer func() { cancelHandoffs(); <-handoffDone }()
 
 	// hypercerts: Management uses a separate private listener, never the Basic-auth UI.
 	stopControl, err := svc.startControl(ctx, os.Getenv("RELAY_CONTROL_ADDR"), os.Getenv("RELAY_CONTROL_TOKEN_FILE"))
