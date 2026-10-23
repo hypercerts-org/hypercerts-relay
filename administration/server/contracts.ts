@@ -132,10 +132,7 @@ export interface JobDiagnostics {
   maxRepositoryAttempts: number;
 }
 export type RepositoryRetryState =
-  | "ready"
-  | "in_flight"
-  | "retry_wait"
-  | "unresolved";
+  "ready" | "in_flight" | "retry_wait" | "unresolved";
 export interface RepositoryRetryFailure {
   category:
     | "timeout"
@@ -150,7 +147,8 @@ export interface RepositoryRetryFailure {
   code?: string;
 }
 export interface JobLastFailure {
-  category: "timeout" | "cancel" | "body_read" | "http" | "transport" | "unknown";
+  category:
+    "timeout" | "cancel" | "body_read" | "http" | "transport" | "unknown";
   httpStatus?: number;
   stage: "listRepos";
   failedAt: string;
@@ -184,6 +182,7 @@ export interface Job {
   lastProgressAt?: string;
   lastFailure?: JobLastFailure;
   coverage: string;
+  acquisition?: Acquisition;
   diagnostics: JobDiagnostics;
 }
 export class ApiError extends Error {
@@ -241,6 +240,9 @@ export interface CoverageSource {
   history: { state: "unknown" };
   live: { state: "unknown" };
   // Legacy execution fields exist only with matchingJob=true.
+  diagnostics?: JobDiagnostics;
+  lastProgressAt?: string;
+  lastFailure?: JobLastFailure;
   reason?: string;
   state?: string;
   completedRepos?: number | null;

@@ -1,12 +1,14 @@
 <script lang="ts">
   import { afterUpdate } from "svelte";
   import State from "./State.svelte";
+  import AcquisitionEvidence from "./AcquisitionEvidence.svelte";
   import AccountQuota from "./AccountQuota.svelte";
   import {
     api,
     sourceOrigin,
     type Source,
     type Coverage,
+    type CoveragePage,
     type JetstreamSummary,
     type Command,
   } from "./api";
@@ -22,12 +24,13 @@
     coverageUnavailable = false,
     detailRequest = 0,
     lookupRequest = 0;
-  $: filter = search.trim().toLowerCase().replace(/^https?:\/\//, "");
+  $: filter = search
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, "");
   $: jetstreamStats = coverage ?? selected?.JetstreamCoverage ?? null;
   $: displayedRows = filter
-    ? rows.filter((source) =>
-        source.Hostname.toLowerCase().includes(filter),
-      )
+    ? rows.filter((source) => source.Hostname.toLowerCase().includes(filter))
     : rows;
   afterUpdate(() => syncSelected(rows));
   $: syncSelected(rows);
@@ -35,7 +38,9 @@
     if (!selected) return;
     const previous = selected;
     const current = currentRows.find(
-      (source) => source.HostID === previous.HostID || sourceOrigin(source) === sourceOrigin(previous),
+      (source) =>
+        source.HostID === previous.HostID ||
+        sourceOrigin(source) === sourceOrigin(previous),
     );
     if (current && JSON.stringify(current) !== JSON.stringify(previous)) {
       detailRequest++;
@@ -53,7 +58,7 @@
   }
   async function refreshCoverage(origin: string, request: number) {
     try {
-      const result = await api<{ items: Coverage[] }>(
+      const result = await api<CoveragePage>(
         `/coverage?pds=${encodeURIComponent(origin)}`,
       );
       if (
@@ -133,13 +138,6 @@
       if (request === lookupRequest) error = (e as Error).message;
     }
   }
-  function coverageProgress(item: Coverage | JetstreamSummary) {
-    if (item.totalReposKnown)
-      return `${item.completedRepos} of ${item.totalRepos} repositories from the initial PDS listing scanned`;
-    return item.diagnostics.execution === "running"
-      ? "Listing repositories on the PDS; total not known yet"
-      : "Repository list unavailable; total unknown";
-  }
   function recordedTime(value?: string) {
     return value ? new Date(value).toLocaleString() : "Not recorded";
   }
@@ -149,14 +147,16 @@
   ) {
     if (unavailable) return "Unavailable";
     if (!item) return "Unknown";
-    return item.totalReposKnown ? String(item.totalRepos) : "Unknown";
+    const inventory = item.acquisition?.counts?.initialInventory;
+    return typeof inventory === "number" ? String(inventory) : "Unknown";
   }
   function jetstreamAccounts(
     item: Coverage | JetstreamSummary | null,
     unavailable = false,
   ) {
     if (unavailable) return "Unavailable";
-    return item?.totalReposKnown ? String(item.completedRepos) : "Unknown";
+    const scanned = item?.acquisition?.counts?.scanned;
+    return typeof scanned === "number" ? String(scanned) : "Unknown";
   }
 </script>
 
@@ -181,8 +181,8 @@
       bind:value={pds}
       required
     /><small
-      >HTTPS is assumed when no scheme is provided. Adding a source also schedules
-      backfill of selected collections.</small
+      >HTTPS is assumed when no scheme is provided. Adding a source also
+      schedules selected-collection acquisition.</small
     >
   </div>
   <button class="primary" disabled={busy}>Add source</button>
@@ -202,7 +202,9 @@
       bind:value={search}
       placeholder="pds.example"
       required
-    /><small>Typing filters the current page. Use the button to load an exact PDS.</small>
+    /><small
+      >Typing filters the current page. Use the button to load an exact PDS.</small
+    >
   </div>
   <button>Filter</button>
 </form>
@@ -230,7 +232,11 @@
       </div>
       <div>
         <dt>Relay connection</dt>
-        <dd><State value={selected.RuntimeState} /><small>Live Relay connectivity for this PDS..</small></dd>
+        <dd>
+          <State value={selected.RuntimeState} /><small
+            >Live Relay connectivity for this PDS..</small
+          >
+        </dd>
       </div>
       <div>
         <dt>Cursor</dt>
@@ -242,15 +248,29 @@
       </div>
       <div>
         <dt>Admission check</dt>
-        <dd>{selected.Validation.Status} {selected.Validation.Reason}<small>Validates that the PDS is reachable for the relay.</small></dd>
+        <dd>
+          {selected.Validation.Status}
+          {selected.Validation.Reason}<small
+            >Validates that the PDS is reachable for the relay.</small
+          >
+        </dd>
       </div>
       <div>
         <dt>Admission quota</dt>
-        <dd>{selected.AccountQuota.Limit} accounts<small>Maximum accounts Relay will crawl from this PDS, not the account total.</small></dd>
+        <dd>
+          {selected.AccountQuota.Limit} accounts<small
+            >Maximum accounts Relay will crawl from this PDS, not the account
+            total.</small
+          >
+        </dd>
       </div>
       <div>
         <dt>Relay-observed accounts</dt>
-        <dd>{selected.AccountQuota.Count}<small>Accounts seen since the relay started crawling it.</small></dd>
+        <dd>
+          {selected.AccountQuota.Count}<small
+            >Accounts seen since the relay started crawling it.</small
+          >
+        </dd>
       </div>
     </dl>
     <section class="detail" aria-label="Jetstream statistics">
@@ -259,47 +279,124 @@
         <div>
           <dt>Backfill status</dt>
           <dd>
-              {#if jetstreamStats}
-              <State value={jetstreamStats.state} />{#if coverage?.reason}<small>{coverage.reason.replaceAll("_", " ")}</small>{/if}{#if coverageUnavailable}<small>Latest detailed result unavailable; showing the source-table summary.</small>{/if}
+            {#if jetstreamStats}
+              <State
+                value={jetstreamStats.acquisition?.state ??
+                  jetstreamStats.state ??
+                  "unknown"}
+              />{#if jetstreamStats.acquisition?.diagnostics?.failureCategory}<small
+                  >{jetstreamStats.acquisition.diagnostics.failureCategory.replaceAll(
+                    "_",
+                    " ",
+                  )}</small
+                >{/if}{#if coverageUnavailable}<small
+                  >Latest detailed result unavailable; showing the source-table
+                  summary.</small
+                >{/if}
             {:else if coverageUnavailable}
-              Unavailable<small>Jetstream did not return coverage for this source.</small>
+              Unavailable<small
+                >Jetstream did not return coverage for this source.</small
+              >
             {:else}
-              Unknown<small>No Jetstream backfill result exists for this source.</small>
+              Unknown<small
+                >No Jetstream backfill result exists for this source.</small
+              >
             {/if}
           </dd>
         </div>
         <div>
           <dt>Total accounts</dt>
-          <dd>{totalAccounts(jetstreamStats, coverageUnavailable && !jetstreamStats)}<small>Active repositories listed at the start of the latest Jetstream job; this is not a live PDS account count.</small></dd>
+          <dd>
+            {totalAccounts(
+              jetstreamStats,
+              coverageUnavailable && !jetstreamStats,
+            )}<small
+              >Initial active-repository inventory captured for the latest
+              Jetstream job; it is not a live PDS census.</small
+            >
+          </dd>
         </div>
         <div>
           <dt>Jetstream accounts</dt>
-          <dd>{jetstreamAccounts(jetstreamStats, coverageUnavailable && !jetstreamStats)}<small>Repositories processed by the latest Jetstream backfill.</small></dd>
+          <dd>
+            {jetstreamAccounts(
+              jetstreamStats,
+              coverageUnavailable && !jetstreamStats,
+            )}<small
+              >Verified repositories scanned in current-policy acquisition.</small
+            >
+          </dd>
         </div>
         {#if jetstreamStats}
           <div>
             <dt>Backfill progress</dt>
-            <dd>{coverageProgress(jetstreamStats)}<small>Last progress: {recordedTime(jetstreamStats.lastProgressAt)}</small></dd>
+            <dd>
+              <AcquisitionEvidence acquisition={jetstreamStats.acquisition} />
+            </dd>
           </div>
           <div>
             <dt>Execution</dt>
-            <dd>{jetstreamStats.diagnostics.execution.replaceAll("_", " ")}<small>{jetstreamStats.diagnostics.reason?.replaceAll("_", " ") ?? "No current wait reason reported."}</small></dd>
+            <dd>
+              <small
+                >Last progress: {recordedTime(
+                  jetstreamStats.lastProgressAt,
+                )}</small
+              >{jetstreamStats.diagnostics?.execution.replaceAll("_", " ") ??
+                "Unknown"}<small
+                >{jetstreamStats.diagnostics?.reason?.replaceAll("_", " ") ??
+                  "No current wait reason reported."}</small
+              >
+            </dd>
           </div>
           <div>
             <dt>Unresolved repositories</dt>
-            <dd>{jetstreamStats.diagnostics.unresolvedRepos ?? "Unknown"}<small>Unknown until the PDS repository listing is complete.</small></dd>
+            <dd>
+              {jetstreamStats.diagnostics?.unresolvedRepos ?? "Unknown"}<small
+                >Unknown until the PDS repository listing is complete.</small
+              >
+            </dd>
           </div>
           <div>
             <dt>Repositories with retry state</dt>
-            <dd>{jetstreamStats.diagnostics.retryingRepos ?? "Unknown"}<small>Up to {jetstreamStats.diagnostics.maxRepositoryAttempts} attempts per repository; separate from job runs.</small></dd>
+            <dd>
+              {jetstreamStats.diagnostics?.retryingRepos ?? "Unknown"}<small
+                >Up to {jetstreamStats.diagnostics?.maxRepositoryAttempts ??
+                  "Unknown"} attempts per repository; separate from job runs.</small
+              >
+            </dd>
           </div>
           <div>
             <dt>Retry timing</dt>
-            <dd>{#if jetstreamStats.diagnostics.retryAt}Repository retry: {new Date(jetstreamStats.diagnostics.retryAt).toLocaleString()}{/if}{#if jetstreamStats.diagnostics.pdsCooldownUntil}<small>PDS-wide cooldown until {new Date(jetstreamStats.diagnostics.pdsCooldownUntil).toLocaleString()}</small>{:else if !jetstreamStats.diagnostics.retryAt}<small>No active retry or cooldown deadline reported.</small>{/if}</dd>
+            <dd>
+              {#if jetstreamStats.diagnostics?.retryAt}Repository retry: {new Date(
+                  jetstreamStats.diagnostics?.retryAt,
+                ).toLocaleString()}{/if}{#if jetstreamStats.diagnostics?.pdsCooldownUntil}<small
+                  >PDS-wide cooldown until {new Date(
+                    jetstreamStats.diagnostics?.pdsCooldownUntil,
+                  ).toLocaleString()}</small
+                >{:else if !jetstreamStats.diagnostics?.retryAt}<small
+                  >No legacy execution retry deadline reported; see acquisition
+                  diagnostics for recorded timing.</small
+                >{/if}
+            </dd>
           </div>
           <div>
             <dt>Current-state coverage</dt>
-            <dd>{jetstreamStats.coverage.replaceAll("_", " ")}<small>Current snapshot only; historical coverage is unknown.</small></dd>
+            <dd>
+              <State
+                value={jetstreamStats.acquisition?.state ?? "unknown"}
+              /><small
+                >Current acquisition snapshot only; history and live freshness
+                are independently unknown.</small
+              >
+            </dd>
+          </div>
+          <div>
+            <dt>History / live freshness</dt>
+            <dd>
+              History: {coverage?.history?.state ?? "Unknown"}; live freshness: {coverage
+                ?.live?.state ?? "Unknown"}
+            </dd>
           </div>
         {/if}
         {#if coverage}
@@ -307,9 +404,15 @@
             <dt>Collections</dt>
             <dd>
               <details>
-                <summary>{coverage.policy.collections.length} selected collections</summary>
+                <summary
+                  >{coverage.policy.collections.length} selected collections</summary
+                >
                 {#if coverage.policy.collections.length}
-                  <ul>{#each coverage.policy.collections as collection}<li>{collection}</li>{/each}</ul>
+                  <ul>
+                    {#each coverage.policy.collections as collection}<li>
+                        {collection}
+                      </li>{/each}
+                  </ul>
                 {:else}
                   <p>No collections selected.</p>
                 {/if}
@@ -360,15 +463,22 @@
   <table>
     <caption>Configured sources</caption><thead
       ><tr
-        ><th>Source</th><th>State / runtime connection</th><th>Admission check</th
-        ><th>Admission quota</th><th aria-label="Total accounts (Jetstream initial repository list)">Total accounts<small>Jetstream initial repository list</small></th><th aria-label="Relay accounts (observed)">Relay accounts<small>Observed</small></th><th aria-label="Jetstream accounts (processed)">Jetstream accounts<small>Processed</small></th><th>Cursor</th><th>Actions</th></tr
+        ><th>Source</th><th>State / runtime connection</th><th
+          >Admission check</th
+        ><th>Admission quota</th><th
+          aria-label="Total accounts (Jetstream initial inventory)"
+          >Total accounts<small>Jetstream initial inventory</small></th
+        ><th aria-label="Relay accounts (observed)"
+          >Relay accounts<small>Observed</small></th
+        ><th aria-label="Jetstream accounts (processed)"
+          >Jetstream accounts<small>Processed</small></th
+        ><th>Cursor</th><th>Actions</th></tr
       ></thead
     ><tbody>
       {#each displayedRows as source (source.HostID)}<tr
           ><td
-            ><button
-              class="text-button"
-              onclick={() => select(source)}>{source.Hostname}</button
+            ><button class="text-button" onclick={() => select(source)}
+              >{source.Hostname}</button
             ><small
               >{source.RecoveryRequired
                 ? "Recovery required"
@@ -378,11 +488,18 @@
             ><State value={source.DesiredState} /><State
               value={source.RuntimeState}
             /></td
-          ><td>{source.Validation.Status} {source.Validation.Reason}</td
-          ><td>{source.AccountQuota.Limit} accounts</td
-          ><td>{totalAccounts(source.JetstreamCoverage ?? null, !!source.JetstreamUnavailable)}</td
-          ><td>{source.AccountQuota.Count}</td
-          ><td>{jetstreamAccounts(source.JetstreamCoverage ?? null, !!source.JetstreamUnavailable)}</td
+          ><td>{source.Validation.Status} {source.Validation.Reason}</td><td
+            >{source.AccountQuota.Limit} accounts</td
+          ><td
+            >{totalAccounts(
+              source.JetstreamCoverage ?? null,
+              !!source.JetstreamUnavailable,
+            )}</td
+          ><td>{source.AccountQuota.Count}</td><td
+            >{jetstreamAccounts(
+              source.JetstreamCoverage ?? null,
+              !!source.JetstreamUnavailable,
+            )}</td
           ><td
             >{source.LastDurableCursor < 0
               ? "Not recorded"

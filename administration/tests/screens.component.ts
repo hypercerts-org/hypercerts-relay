@@ -1,5 +1,11 @@
 import { test, expect, vi, afterEach } from "vitest";
-import { render, screen, fireEvent, cleanup, within } from "@testing-library/svelte";
+import {
+  render,
+  screen,
+  fireEvent,
+  cleanup,
+  within,
+} from "@testing-library/svelte";
 import Sources from "../src/Sources.svelte";
 import Collections from "../src/Collections.svelte";
 import Operations from "../src/Operations.svelte";
@@ -75,10 +81,14 @@ test.each([
   expect(actions).toEqual(expected);
 });
 test("legacy jobs without saved inventory cannot open repository details", () => {
-  renderJobs([repositoryJob("legacy-job", "https://legacy.example", {
-    diagnostics: { unresolvedRepos: undefined },
-  })]);
-  const button = screen.getByRole("button", { name: "Repository list unavailable" }) as HTMLButtonElement;
+  renderJobs([
+    repositoryJob("legacy-job", "https://legacy.example", {
+      diagnostics: { unresolvedRepos: undefined },
+    }),
+  ]);
+  const button = screen.getByRole("button", {
+    name: "Repository list unavailable",
+  }) as HTMLButtonElement;
   expect(button.disabled).toBe(true);
 });
 test("quota drafts survive observations and reject stale or invalid changes", async () => {
@@ -404,6 +414,19 @@ test("jobs explain recovery types and use operator-facing progress labels", () =
           failedAt: "2026-09-09T00:01:00.000Z",
         },
         coverage: "partial",
+        acquisition: {
+          state: "running",
+          progressScope: "job_inventory",
+          counts: {
+            initialInventory: 10,
+            scanned: 3,
+            matching: 1,
+            noMatch: 2,
+            unresolved: 7,
+            attributableRecords: 1,
+          },
+          diagnostics: { lastProgressAt: null, attempts: 1 },
+        },
         diagnostics: {
           execution: "running",
           unresolvedRepos: 7,
@@ -418,35 +441,74 @@ test("jobs explain recovery types and use operator-facing progress labels", () =
   expect(screen.getByText("Collections")).toBeTruthy();
   expect(screen.getAllByText("Purpose")).toHaveLength(2);
   expect(screen.getAllByText("Quota recovery")).toHaveLength(2);
+  expect(screen.getByText("Acquisition evidence")).toBeTruthy();
   expect(screen.getByText("Status")).toBeTruthy();
-  expect(
-    screen.getByText(
-      "3 of 10 repositories processed",
-    ),
-  ).toBeTruthy();
+  expect(screen.getByText("3", { selector: "dd" })).toBeTruthy();
+  expect(screen.getByText("Progress scope: job inventory")).toBeTruthy();
+  expect(screen.getByText("3 of 10 repositories processed")).toBeTruthy();
   expect(screen.queryByText(/Revision/)).toBeNull();
   expect(
-    screen.getByText(`Last progress: ${new Date("2026-09-09T00:00:30.000Z").toLocaleString()}`),
+    screen.getByText(
+      `Last progress: ${new Date("2026-09-09T00:00:30.000Z").toLocaleString()}`,
+    ),
   ).toBeTruthy();
-  expect(screen.getByText("Could not list repositories: the PDS returned HTTP 503.")).toBeTruthy();
   expect(
-    screen.getByText(`Repository listing failed at: ${new Date("2026-09-09T00:01:00.000Z").toLocaleString()}`),
+    screen.getByText("Could not list repositories: the PDS returned HTTP 503."),
+  ).toBeTruthy();
+  expect(
+    screen.getByText(
+      `Repository listing failed at: ${new Date("2026-09-09T00:01:00.000Z").toLocaleString()}`,
+    ),
   ).toBeTruthy();
 });
 
 test.each([
-  ["http", 429, "Could not list repositories: the PDS returned HTTP 429 (rate limited)."],
-  ["transport", undefined, "Could not list repositories: transport failure during the listRepos request."],
-  ["timeout", undefined, "Could not list repositories: the listRepos request timed out."],
-  ["cancel", undefined, "Could not list repositories: the listRepos request was canceled."],
-  ["body_read", undefined, "Could not list repositories: the listRepos response could not be read."],
-  ["unknown", undefined, "Could not list repositories: an unknown error occurred during the listRepos request."],
-] as const)("job listing failure explains %s without guessing a different cause", (category, httpStatus, message) => {
-  renderJobs([repositoryJob("listing-failed", "https://pds.example", {
-    lastFailure: { category, httpStatus, stage: "listRepos", failedAt: "2026-09-09T00:01:00.000Z" },
-  })]);
-  expect(screen.getByText(message)).toBeTruthy();
-});
+  [
+    "http",
+    429,
+    "Could not list repositories: the PDS returned HTTP 429 (rate limited).",
+  ],
+  [
+    "transport",
+    undefined,
+    "Could not list repositories: transport failure during the listRepos request.",
+  ],
+  [
+    "timeout",
+    undefined,
+    "Could not list repositories: the listRepos request timed out.",
+  ],
+  [
+    "cancel",
+    undefined,
+    "Could not list repositories: the listRepos request was canceled.",
+  ],
+  [
+    "body_read",
+    undefined,
+    "Could not list repositories: the listRepos response could not be read.",
+  ],
+  [
+    "unknown",
+    undefined,
+    "Could not list repositories: an unknown error occurred during the listRepos request.",
+  ],
+] as const)(
+  "job listing failure explains %s without guessing a different cause",
+  (category, httpStatus, message) => {
+    renderJobs([
+      repositoryJob("listing-failed", "https://pds.example", {
+        lastFailure: {
+          category,
+          httpStatus,
+          stage: "listRepos",
+          failedAt: "2026-09-09T00:01:00.000Z",
+        },
+      }),
+    ]);
+    expect(screen.getByText(message)).toBeTruthy();
+  },
+);
 
 test("job execution diagnostics stay distinct from durable state and lazy details page safe retry data", async () => {
   const currentJob = repositoryJob("pending-job", "https://waiting.example", {
@@ -489,7 +551,8 @@ test("job execution diagnostics stay distinct from durable state and lazy detail
     }),
   ];
   const appendRequest = deferred<Response>();
-  const fetcher = vi.fn()
+  const fetcher = vi
+    .fn()
     .mockImplementationOnce(() => Promise.resolve(pages.shift()))
     .mockImplementationOnce(() => appendRequest.promise);
   vi.stubGlobal("fetch", fetcher);
@@ -608,51 +671,86 @@ test("job execution diagnostics stay distinct from durable state and lazy detail
     expect(within(stoppedRow!).getByText(/Execution: stopped/)).toBeTruthy();
     // Absent diagnostics are omitted rather than rendered as "Not recorded".
     expect(within(stoppedRow!).queryByText(/Last progress:/)).toBeNull();
-    expect(within(stoppedRow!).queryByText(/Repository listing fail/)).toBeNull();
+    expect(
+      within(stoppedRow!).queryByText(/Repository listing fail/),
+    ).toBeNull();
     const completeRow = screen.getByText("complete-job").closest("tr");
-    expect(within(completeRow!).queryByRole("button", { name: "Retry job" })).toBeNull();
+    expect(
+      within(completeRow!).queryByRole("button", { name: "Retry job" }),
+    ).toBeNull();
     expect(
       within(completeRow!).getByText(
         `Last progress: ${new Date("2026-09-09T00:00:30.000Z").toLocaleString()}`,
       ),
     ).toBeTruthy();
-    expect(within(completeRow!).queryByText(/Repository listing fail/)).toBeNull();
-    // A finished, single-run job shows only its count and last progress.
-    for (const noise of [/historical coverage/, /Job runs/, /attempts per repository/, /unresolved$/]) {
+    expect(
+      within(completeRow!).queryByText(/Repository listing fail/),
+    ).toBeNull();
+    // A finished, single-run job omits redundant execution diagnostics.
+    for (const noise of [
+      /historical coverage/,
+      /Job runs/,
+      /attempts per repository/,
+      /unresolved$/,
+    ]) {
       expect(within(completeRow!).queryByText(noise)).toBeNull();
     }
-    expect(within(completeRow!).getByText("3 of 3 repositories processed")).toBeTruthy();
-    expect(within(stoppedRow!).getByText("1 repositories unresolved")).toBeTruthy();
-    expect(within(stoppedRow!).getByText("Up to 3 attempts per repository")).toBeTruthy();
-    expect(within(stoppedRow!).getByRole("button", { name: "Retry job" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Repository list unavailable" })).toBeTruthy();
+    expect(
+      within(completeRow!).getByText("3 of 3 repositories processed"),
+    ).toBeTruthy();
+    expect(
+      within(stoppedRow!).getByText("1 repositories unresolved"),
+    ).toBeTruthy();
+    expect(
+      within(stoppedRow!).getByText("Up to 3 attempts per repository"),
+    ).toBeTruthy();
+    expect(
+      within(stoppedRow!).getByRole("button", { name: "Retry job" }),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Repository list unavailable" }),
+    ).toBeTruthy();
     expect(screen.queryByText("12 repositories processed")).toBeNull();
     expect(screen.getByText("Job runs: 4")).toBeTruthy();
-    expect(within(pendingRow!).getByText(/Up to 3 attempts per repository/)).toBeTruthy();
+    expect(
+      within(pendingRow!).getByText(/Up to 3 attempts per repository/),
+    ).toBeTruthy();
     expect(document.body.textContent).toContain(
       "Diagnostics describe current execution, not historical completeness",
     );
     await fireEvent.click(
       screen.getByRole("button", { name: "View unresolved repositories (2)" }),
     );
-    expect(await screen.findByText("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")).toBeTruthy();
+    expect(
+      await screen.findByText("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"),
+    ).toBeTruthy();
     expect(within(pendingRow!).getByText(/Execution: stopped/)).toBeTruthy();
     expect(screen.getByText(/Work is stopped/)).toBeTruthy();
     expect(screen.getByText(/HTTP 429.*getRepo\/request/)).toBeTruthy();
     expect(screen.getByText(/rate limited/)).toBeTruthy();
     expect(
-      screen.getByText(`Last failure: ${new Date("2026-09-09T00:00:30.000Z").toLocaleString()}`),
+      screen.getByText(
+        `Last failure: ${new Date("2026-09-09T00:00:30.000Z").toLocaleString()}`,
+      ),
     ).toBeTruthy();
-    const loadMore = screen.getByRole("button", { name: "Load more repositories" });
+    const loadMore = screen.getByRole("button", {
+      name: "Load more repositories",
+    });
     loadMore.focus();
     await fireEvent.click(loadMore);
     expect(screen.getByText("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Load more repositories" })).toBe(loadMore);
+    expect(screen.getByRole("button", { name: "Load more repositories" })).toBe(
+      loadMore,
+    );
     expect(loadMore.hasAttribute("disabled")).toBe(true);
     expect(document.activeElement).toBe(loadMore);
-    expect(screen.getByRole("status").textContent).toContain("Loading more repositories");
+    expect(screen.getByRole("status").textContent).toContain(
+      "Loading more repositories",
+    );
     appendRequest.resolve(pages.shift()!);
-    expect(await screen.findByText("did:plc:bbbbbbbbbbbbbbbbbbbbbbbb")).toBeTruthy();
+    expect(
+      await screen.findByText("did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"),
+    ).toBeTruthy();
     expect(screen.getByText("Last failure: Not recorded")).toBeTruthy();
     expect(fetcher).toHaveBeenCalledTimes(2);
     expect(fetcher.mock.calls[0][0]).toBe(
@@ -731,14 +829,18 @@ test("expired repository snapshot resets accumulated rows and offers a first-pag
       ],
     }),
   ];
-  const fetcher = vi.fn().mockImplementation(() => Promise.resolve(pages.shift()));
+  const fetcher = vi
+    .fn()
+    .mockImplementation(() => Promise.resolve(pages.shift()));
   vi.stubGlobal("fetch", fetcher);
   try {
     renderJobs([job]);
     await fireEvent.click(
       screen.getByRole("button", { name: "View unresolved repositories (2)" }),
     );
-    expect(await screen.findByText("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")).toBeTruthy();
+    expect(
+      await screen.findByText("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"),
+    ).toBeTruthy();
     await fireEvent.click(
       screen.getByRole("button", { name: "Load more repositories" }),
     );
@@ -750,7 +852,9 @@ test("expired repository snapshot resets accumulated rows and offers a first-pag
     await fireEvent.click(
       screen.getByRole("button", { name: "Restart repository details" }),
     );
-    expect(await screen.findByText("did:plc:bbbbbbbbbbbbbbbbbbbbbbbb")).toBeTruthy();
+    expect(
+      await screen.findByText("did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"),
+    ).toBeTruthy();
     const row = screen.getByText("expired-job").closest("tr");
     expect(row).toBeTruthy();
     expect(within(row!).getByText("Execution: running")).toBeTruthy();
@@ -856,7 +960,9 @@ test("reopening repository details keeps the newest first-page response and curs
     await fireEvent.click(
       screen.getByRole("button", { name: "Load more repositories" }),
     );
-    expect(await screen.findByText("did:plc:cccccccccccccccccccccccc")).toBeTruthy();
+    expect(
+      await screen.findByText("did:plc:cccccccccccccccccccccccc"),
+    ).toBeTruthy();
     expect(fetcher.mock.calls[2][0]).toBe(
       "/api/v1/jobs/race-job/repositories?limit=50&after=latest-cursor",
     );
@@ -955,10 +1061,14 @@ test("hiding repository details ignores a late job snapshot", async () => {
     expect(row).toBeTruthy();
     expect(within(row!).getByText("Reason: initial diagnostics")).toBeTruthy();
     expect(
-      within(row!).getByRole("button", { name: "View unresolved repositories (2)" }),
+      within(row!).getByRole("button", {
+        name: "View unresolved repositories (2)",
+      }),
     ).toBeTruthy();
     expect(within(row!).queryByText("Reason: late diagnostics")).toBeNull();
-    expect(screen.queryByRole("heading", { name: "Unresolved repositories" })).toBeNull();
+    expect(
+      screen.queryByRole("heading", { name: "Unresolved repositories" }),
+    ).toBeNull();
     expect(fetcher).toHaveBeenCalledTimes(1);
   } finally {
     cleanup();
@@ -967,9 +1077,13 @@ test("hiding repository details ignores a late job snapshot", async () => {
 });
 
 test("switching jobs revokes the previous repository request", async () => {
-  const firstJob = repositoryJob("first-switch-job", "https://first-switch.example", {
-    diagnostics: { reason: "initial_diagnostics" },
-  });
+  const firstJob = repositoryJob(
+    "first-switch-job",
+    "https://first-switch.example",
+    {
+      diagnostics: { reason: "initial_diagnostics" },
+    },
+  );
   const secondJob = {
     ...firstJob,
     id: "second-switch-job",
@@ -987,10 +1101,14 @@ test("switching jobs revokes the previous repository request", async () => {
     expect(firstRow).toBeTruthy();
     expect(secondRow).toBeTruthy();
     await fireEvent.click(
-      within(firstRow!).getByRole("button", { name: "View unresolved repositories (2)" }),
+      within(firstRow!).getByRole("button", {
+        name: "View unresolved repositories (2)",
+      }),
     );
     await fireEvent.click(
-      within(secondRow!).getByRole("button", { name: "View unresolved repositories (2)" }),
+      within(secondRow!).getByRole("button", {
+        name: "View unresolved repositories (2)",
+      }),
     );
 
     firstRequest.resolve(
@@ -1008,7 +1126,9 @@ test("switching jobs revokes the previous repository request", async () => {
     );
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
 
-    expect(within(firstRow!).getByText("Reason: initial diagnostics")).toBeTruthy();
+    expect(
+      within(firstRow!).getByText("Reason: initial diagnostics"),
+    ).toBeTruthy();
     expect(screen.getByRole("status").textContent).toContain(
       "Loading repository details",
     );
@@ -1040,55 +1160,97 @@ test("coverage groups collections by collapsed PDS and explains unknown history"
     screen: "coverage",
     submit: vi.fn(),
     action: vi.fn(),
-    coverage: [
-      {
-        pds: "https://pds.example",
-        policy: { revision: 1, collections: ["app.bsky.feed.post"] },
-        jobId: "older",
-        state: "incomplete",
-        completedRepos: 1,
-        totalRepos: 3,
-        totalReposKnown: true,
-        createdAt: "2026-09-08T00:00:00.000Z",
-        reason: "source_unavailable",
-        historicalPDSAttribution: "unknown",
-        coverage: "current_state",
-        diagnostics: {
-          execution: "stopped",
-          unresolvedRepos: 2,
-          retryingRepos: 0,
-          maxRepositoryAttempts: 3,
-        },
-      },
-      {
-        pds: "https://pds.example",
+    coverage: {
+      schemaVersion: 1,
+      scope: "enabled_sources_current_policy",
+      policy: { revision: 2, collections: ["app.bsky.feed.post"] },
+      aggregate: {
+        scope: "enabled_sources_current_policy",
         policy: { revision: 2, collections: ["app.bsky.feed.post"] },
-        jobId: "abc",
-        state: "complete",
-        completedRepos: 3,
-        totalRepos: 3,
-        totalReposKnown: true,
-        createdAt: "2026-09-09T00:00:00.000Z",
-        reason: null,
-        historicalPDSAttribution: "unknown",
-        coverage: "current_state",
-        diagnostics: {
-          execution: "complete",
-          unresolvedRepos: 0,
-          retryingRepos: 0,
-          maxRepositoryAttempts: 3,
-        },
+        enabledSources: 3,
+        state: "incomplete",
       },
-    ],
+      next: null,
+      items: [
+        {
+          pds: "https://pds.example",
+          sourceRevision: 1,
+          matchingJob: true,
+          acquisition: {
+            state: "failed",
+            progressScope: "job_inventory",
+            counts: {
+              initialInventory: 3,
+              scanned: 1,
+              matching: 1,
+              noMatch: 0,
+              unresolved: 2,
+              attributableRecords: 1,
+            },
+            diagnostics: {
+              failureCategory: "source_unavailable",
+              lastProgressAt: null,
+              attempts: 1,
+              retryAction: "explicit_retry",
+            },
+          },
+          history: { state: "unknown" },
+          live: { state: "unknown" },
+          policy: { revision: 1, collections: ["app.bsky.feed.post"] },
+          jobId: "older",
+          state: "incomplete",
+          completedRepos: 1,
+          totalRepos: 3,
+          totalReposKnown: true,
+          createdAt: "2026-09-08T00:00:00.000Z",
+          reason: "source_unavailable",
+          coverage: "current_state",
+        },
+        {
+          pds: "https://pds.example",
+          sourceRevision: 2,
+          matchingJob: true,
+          acquisition: {
+            state: "complete",
+            progressScope: "job_inventory",
+            counts: {
+              initialInventory: 3,
+              scanned: 3,
+              matching: 1,
+              noMatch: 2,
+              unresolved: 0,
+              attributableRecords: 2,
+            },
+            diagnostics: { lastProgressAt: null, attempts: 1 },
+          },
+          history: { state: "unknown" },
+          live: { state: "unknown" },
+          policy: { revision: 2, collections: ["app.bsky.feed.post"] },
+          jobId: "abc",
+          state: "complete",
+          completedRepos: 3,
+          totalRepos: 3,
+          totalReposKnown: true,
+          createdAt: "2026-09-09T00:00:00.000Z",
+          coverage: "current_state",
+        },
+      ],
+    },
   });
-  const group = screen.getByText("https://pds.example").closest("details");
-  expect(group?.hasAttribute("open")).toBe(false);
+  const groups = screen.getAllByText("https://pds.example");
+  expect(
+    groups.every(
+      (group) => group.closest("details")?.hasAttribute("open") === false,
+    ),
+  ).toBe(true);
   expect(document.body.textContent).toContain(
     "do not preserve which PDS supplied older records",
   );
-  expect(screen.getAllByText("app.bsky.feed.post")).toHaveLength(1);
-  expect(screen.getByText(/Policy revision 2; current state/)).toBeTruthy();
-  expect(screen.getByText(/Execution: complete/)).toBeTruthy();
+  expect(screen.getAllByText("app.bsky.feed.post")).toHaveLength(2);
+  expect(
+    screen.getByText(/All enabled sources \/ current policy/),
+  ).toBeTruthy();
+  expect(screen.getByText(/3 enabled sources/)).toBeTruthy();
   expect(
     screen.getByRole("link", { name: "Manage PDS instances" }),
   ).toBeTruthy();
@@ -1113,9 +1275,35 @@ test("selected source detail is loaded on demand without background polling", as
           ok: true,
           status: 200,
           json: async () => ({
+            schemaVersion: 1,
+            scope: "enabled_sources_current_policy",
+            policy: { revision: 2, collections: ["app.bsky.feed.post"] },
+            aggregate: {
+              scope: "enabled_sources_current_policy",
+              policy: { revision: 2, collections: ["app.bsky.feed.post"] },
+              enabledSources: 1,
+              state: "complete",
+            },
             items: [
               {
                 pds: "https://outside.example",
+                sourceRevision: 1,
+                matchingJob: true,
+                acquisition: {
+                  state: "complete",
+                  progressScope: "job_inventory",
+                  counts: {
+                    initialInventory: 13895,
+                    scanned: 13895,
+                    matching: 2,
+                    noMatch: 13893,
+                    unresolved: 0,
+                    attributableRecords: 43,
+                  },
+                  diagnostics: { lastProgressAt: null, attempts: 1 },
+                },
+                history: { state: "unknown" },
+                live: { state: "unknown" },
                 policy: { revision: 2, collections: ["app.bsky.feed.post"] },
                 jobId: "job-1",
                 state: "complete",
@@ -1125,7 +1313,6 @@ test("selected source detail is loaded on demand without background polling", as
                 createdAt: "2026-09-09T00:00:00.000Z",
                 lastProgressAt: "2026-09-09T00:00:30.000Z",
                 reason: null,
-                historicalPDSAttribution: "unknown",
                 coverage: "current_state",
                 diagnostics: {
                   execution: "complete",
@@ -1147,22 +1334,22 @@ test("selected source detail is loaded on demand without background polling", as
     });
     await fireEvent.click(screen.getByRole("button", { name: "Filter" }));
     expect(await screen.findByText("connected")).toBeTruthy();
-    expect(
-      await screen.findByText(
-        "43 of 13895 repositories from the initial PDS listing scanned",
-      ),
-    ).toBeTruthy();
-    expect(screen.getByText("13895")).toBeTruthy();
-    expect(screen.getByText("43")).toBeTruthy();
+    expect((await screen.findAllByText("13895")).length).toBeGreaterThan(0);
+    expect(screen.getAllByText("43").length).toBeGreaterThan(0);
     expect(screen.getByText("Execution")).toBeTruthy();
     expect(
-      screen.getByText(`Last progress: ${new Date("2026-09-09T00:00:30.000Z").toLocaleString()}`),
+      screen.getByText(
+        `Last progress: ${new Date("2026-09-09T00:00:30.000Z").toLocaleString()}`,
+      ),
     ).toBeTruthy();
     expect(document.body.textContent).toContain(
       "Up to 3 attempts per repository",
     );
     expect(document.body.textContent).toContain(
-      "Current snapshot only; historical coverage is unknown.",
+      "Current acquisition snapshot only; history and live freshness",
+    );
+    expect(document.body.textContent).toContain(
+      "History: unknown; live freshness: unknown",
     );
     const collections = screen
       .getByText("1 selected collections")
@@ -1205,9 +1392,35 @@ test("latest same-source detail refresh wins over an older response", async () =
     expect(fetcher).toHaveBeenCalledTimes(2);
     newCoverage.resolve(
       Response.json({
+        schemaVersion: 1,
+        scope: "enabled_sources_current_policy",
+        policy: { revision: 1, collections: ["app.bsky.feed.post"] },
+        aggregate: {
+          scope: "enabled_sources_current_policy",
+          policy: { revision: 1, collections: ["app.bsky.feed.post"] },
+          enabledSources: 1,
+          state: "complete",
+        },
         items: [
           {
             pds: "https://race.example",
+            sourceRevision: 1,
+            matchingJob: true,
+            acquisition: {
+              state: "complete",
+              progressScope: "job_inventory",
+              counts: {
+                initialInventory: 20,
+                scanned: 20,
+                matching: 2,
+                noMatch: 18,
+                unresolved: 0,
+                attributableRecords: 3,
+              },
+              diagnostics: { lastProgressAt: null, attempts: 1 },
+            },
+            history: { state: "unknown" },
+            live: { state: "unknown" },
             policy: { revision: 1, collections: ["app.bsky.feed.post"] },
             jobId: "new",
             state: "complete",
@@ -1215,8 +1428,6 @@ test("latest same-source detail refresh wins over an older response", async () =
             totalRepos: 20,
             totalReposKnown: true,
             createdAt: "2026-09-09T00:00:00.000Z",
-            reason: null,
-            historicalPDSAttribution: "unknown",
             coverage: "current_state",
             diagnostics: {
               execution: "complete",
@@ -1228,18 +1439,10 @@ test("latest same-source detail refresh wins over an older response", async () =
         ],
       }),
     );
-    expect(
-      await screen.findByText(
-        "20 of 20 repositories from the initial PDS listing scanned",
-      ),
-    ).toBeTruthy();
+    expect((await screen.findAllByText("20")).length).toBeGreaterThan(0);
     oldCoverage.reject(new Error("stale coverage failure"));
     await Promise.resolve();
-    expect(
-      screen.getByText(
-        "20 of 20 repositories from the initial PDS listing scanned",
-      ),
-    ).toBeTruthy();
+    expect(screen.getAllByText("20").length).toBeGreaterThan(0);
     expect(
       screen.queryByText("Jetstream did not return coverage for this source."),
     ).toBeNull();

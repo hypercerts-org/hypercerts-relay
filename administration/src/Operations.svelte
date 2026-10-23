@@ -1,5 +1,7 @@
 <script lang="ts">
   import State from "./State.svelte";
+  import AcquisitionEvidence from "./AcquisitionEvidence.svelte";
+  import type { CoveragePage } from "./api";
   import {
     api,
     target,
@@ -14,7 +16,7 @@
   export let screen: string;
   export let jobs: Job[] = [];
   export let changes: Operation[] = [];
-  export let coverage: Coverage[] = [];
+  export let coverage: (CoveragePage & { next: string | null }) | null = null;
   export let audit: Audit[] = [];
   export let submit: (command: Command) => Promise<void>;
   export let action: (id: string, action: "retry" | "cancel") => Promise<void>;
@@ -25,18 +27,14 @@
   export let busy = false;
   let pds = "",
     reason: "backfill" | "quota_recovery" = "backfill";
-  function coverageGroups(items: Coverage[]) {
-    const latest = new Map<string, Coverage>();
-    for (const item of items) {
-      const previous = latest.get(item.pds);
-      if (!previous || item.createdAt > previous.createdAt) latest.set(item.pds, item);
-    }
-    return [...latest.values()].map((item) => ({
+  function jobExecution(job: Job) {
+    return `Execution: ${job.diagnostics.execution.replaceAll("_", " ")}`;
+  }
+  function coverageGroups(page: typeof coverage) {
+    return (page?.items ?? []).map((item) => ({
       pds: item.pds,
       item,
-      collections: item.policy.collections.length
-        ? item.policy.collections
-        : ["No collections selected"],
+      collections: item.policy.collections,
     }));
   }
   function jobPurpose(job: Job) {
@@ -44,6 +42,7 @@
       ? "Quota recovery"
       : "Selected-collection backfill";
   }
+
   function jobProgress(job: Job) {
     if (!job.totalReposKnown) {
       return job.state === "running"
@@ -51,10 +50,6 @@
         : "Repository list unavailable; total unknown";
     }
     return `${job.completedRepos} of ${job.totalRepos} repositories processed`;
-  }
-  function currentStateScope(item: { coverage: string }) {
-    const scope = item.coverage.replaceAll("_", " ");
-    return `${scope}; historical coverage is unknown`;
   }
   function actorLabel(actor: { actor: string; actorHandle?: string | null }) {
     return actor.actorHandle ? `@${actor.actorHandle}` : actor.actor;
@@ -118,7 +113,10 @@
       repositoryRequestTokens.get(jobId) === requestToken;
     repositoryLoading = { ...repositoryLoading, [jobId]: true };
     repositoryErrors = { ...repositoryErrors, [jobId]: "" };
-    const after = append ? repositoryPages[jobId]?.nextCursor ?? "" : "";
+    let after = "";
+    if (append) {
+      after = repositoryPages[jobId]?.nextCursor ?? "";
+    }
     try {
       const page = await api<RepositoryDetailsPage>(
         `/jobs/${encodeURIComponent(jobId)}/repositories?limit=50${after ? `&after=${encodeURIComponent(after)}` : ""}`,
@@ -147,12 +145,14 @@
           repositoryJobs = snapshots;
           repositoryErrors = {
             ...repositoryErrors,
-            [jobId]: "Repository snapshot expired. Restart from the first page.",
+            [jobId]:
+              "Repository snapshot expired. Restart from the first page.",
           };
         } else if (message === "repository snapshot too large") {
           repositoryErrors = {
             ...repositoryErrors,
-            [jobId]: "This repository list exceeds the 50,000-row repository detail limit; no rows were loaded.",
+            [jobId]:
+              "This repository list exceeds the 50,000-row repository detail limit; no rows were loaded.",
           };
         } else {
           repositoryErrors = { ...repositoryErrors, [jobId]: message };
@@ -210,18 +210,19 @@
     <h1>Backfill jobs</h1>
     <p>
       Acquire selected current records directly from a PDS. Selected-collection
-      backfill fills the enabled collections for a source; quota recovery catches
-      up accounts that become admitted after a quota increase. Each PDS backfill
-      lists active repositories directly from that PDS; Relay-observed
-      account counts do not limit it. Job status comes from Jetstream.
+      backfill fills the enabled collections for a source; quota recovery
+      catches up accounts that become admitted after a quota increase. Each PDS
+      backfill inventories active repositories directly from that PDS;
+      Relay-observed account counts do not limit it. Job status comes from
+      Jetstream. Acquisition progress is job-wide, not measured per collection.
     </p>
   </div>
   <div class="notice">
     Diagnostics describe current execution, not historical completeness or the
     cause of an earlier coverage gap. Viewing never retries work. Retry is an
     explicit audited action: completed repositories are not processed again;
-    incomplete jobs reset retry attempts for eligible unfinished repositories; failed
-    jobs fetch a new repository list.
+    incomplete jobs reset retry attempts for eligible unfinished repositories;
+    failed jobs fetch a new repository list.
   </div>
   <form
     class="inline-form"
@@ -260,24 +261,68 @@
     <table>
       <caption>Jetstream jobs</caption><thead
         ><tr
-          ><th>PDS / Job id</th><th>Collections</th><th>Purpose</th><th>Progress</th><th>Status</th
-          ><th>Actions</th></tr
+          ><th>PDS / Job id</th><th>Collections</th><th>Purpose</th><th
+            >Acquisition evidence</th
+          ><th>Status</th><th>Actions</th></tr
         ></thead
       ><tbody
-        >{#each jobs as job}{@const currentJob = repositoryJobs[job.id] ?? job}<tr
+        >{#each jobs as job}{@const currentJob =
+            repositoryJobs[job.id] ?? job}<tr
             ><td>{currentJob.pds}<small>{currentJob.id}</small></td><td
-              >{currentJob.policy.collections.join(", ") || "No collections"}</td
+              >{currentJob.policy.collections.join(", ") ||
+                "No collections"}</td
             ><td>{jobPurpose(currentJob)}</td><td
-              >{jobProgress(currentJob)}{#if currentJob.lastProgressAt}<small>Last progress: {recordedTime(currentJob.lastProgressAt)}</small>{/if}{#if currentJob.attempts > 1}<small title="Counts scheduler runs, not repository download attempts.">Job runs: {currentJob.attempts}</small>{/if}{#if (currentJob.diagnostics.unresolvedRepos ?? 0) > 0}<small>{currentJob.diagnostics.unresolvedRepos} repositories unresolved</small><small>Up to {currentJob.diagnostics.maxRepositoryAttempts} attempts per repository</small>{/if}</td
+              ><AcquisitionEvidence acquisition={currentJob.acquisition} />
+              <p>History: Unknown; live freshness: Unknown</p>
+              <small>{jobProgress(currentJob)}</small
+              >{#if currentJob.lastProgressAt}<small
+                  >Last progress: {recordedTime(
+                    currentJob.lastProgressAt,
+                  )}</small
+                >{/if}{#if currentJob.attempts > 1}<small
+                  title="Counts scheduler runs, not repository download attempts."
+                  >Job runs: {currentJob.attempts}</small
+                >{/if}{#if (currentJob.diagnostics.unresolvedRepos ?? 0) > 0}<small
+                  >{currentJob.diagnostics.unresolvedRepos} repositories unresolved</small
+                ><small
+                  >Up to {currentJob.diagnostics.maxRepositoryAttempts} attempts per
+                  repository</small
+                >{/if}</td
             ><td
-              ><State value={currentJob.state} /><small>Execution: {currentJob.diagnostics.execution.replaceAll("_", " ")}</small>{#if currentJob.lastFailure}<small>{inventoryFailure(currentJob)}</small><small>Repository listing failed at: {recordedTime(currentJob.lastFailure.failedAt)}</small>{/if}{#if diagnosticReason(currentJob)}<small>Reason: {diagnosticReason(currentJob)}</small>{/if}{#if currentJob.diagnostics.retryAt}<small>Next repository retry: {timeLabel(currentJob.diagnostics.retryAt)}</small>{/if}{#if currentJob.diagnostics.pdsCooldownUntil}<small>PDS cooldown until: {timeLabel(currentJob.diagnostics.pdsCooldownUntil)}</small>{/if}{#if currentJob.diagnostics.retryingRepos}<small>Repositories with retry state: {currentJob.diagnostics.retryingRepos}</small>{/if}<small>{currentJob.errorCode?.replaceAll("_", " ") ?? ""}</small></td
+              ><State value={currentJob.state} /><small
+                >{jobExecution(currentJob)}</small
+              >{#if currentJob.lastFailure}<small
+                  >{inventoryFailure(currentJob)}</small
+                ><small
+                  >Repository listing failed at: {recordedTime(
+                    currentJob.lastFailure.failedAt,
+                  )}</small
+                >{/if}{#if diagnosticReason(currentJob)}<small
+                  >Reason: {diagnosticReason(currentJob)}</small
+                >{/if}{#if currentJob.diagnostics.retryAt}<small
+                  >Next repository retry: {timeLabel(
+                    currentJob.diagnostics.retryAt,
+                  )}</small
+                >{/if}{#if currentJob.diagnostics.pdsCooldownUntil}<small
+                  >PDS cooldown until: {timeLabel(
+                    currentJob.diagnostics.pdsCooldownUntil,
+                  )}</small
+                >{/if}{#if currentJob.diagnostics.retryingRepos}<small
+                  >Repositories with retry state: {currentJob.diagnostics
+                    .retryingRepos}</small
+                >{/if}<small
+                >{currentJob.errorCode?.replaceAll("_", " ") ?? ""}</small
+              ></td
             ><td
               ><div class="actions">
                 <button
-                  disabled={!currentJob.totalReposKnown || currentJob.diagnostics.unresolvedRepos === undefined || currentJob.diagnostics.unresolvedRepos === 0}
+                  disabled={!currentJob.totalReposKnown ||
+                    currentJob.diagnostics.unresolvedRepos === undefined ||
+                    currentJob.diagnostics.unresolvedRepos === 0}
                   aria-expanded={openRepositoryJob === currentJob.id}
                   onclick={() => void toggleRepositories(currentJob)}
-                  >{!currentJob.totalReposKnown || currentJob.diagnostics.unresolvedRepos === undefined
+                  >{!currentJob.totalReposKnown ||
+                  currentJob.diagnostics.unresolvedRepos === undefined
                     ? "Repository list unavailable"
                     : openRepositoryJob === currentJob.id
                       ? "Hide repository details"
@@ -285,38 +330,104 @@
                 >
                 {#if ["pending", "running"].includes(currentJob.state)}<button
                     disabled={busy}
-                    onclick={() => jobAction(currentJob.id, "cancel")}>Cancel job</button
+                    onclick={() => jobAction(currentJob.id, "cancel")}
+                    >Cancel job</button
                   >{:else if ["incomplete", "failed", "canceled"].includes(currentJob.state)}<button
                     disabled={busy}
-                    onclick={() => jobAction(currentJob.id, "retry")}>Retry job</button
+                    onclick={() => jobAction(currentJob.id, "retry")}
+                    >Retry job</button
                   >{/if}
               </div></td
             ></tr
-            >{#if openRepositoryJob === currentJob.id}<tr
+          >{#if openRepositoryJob === currentJob.id}<tr
               ><td colspan="6">
-                <section id={`repository-details-${currentJob.id}`} aria-label={`Unresolved repositories for ${currentJob.pds}`}>
+                <section
+                  id={`repository-details-${currentJob.id}`}
+                  aria-label={`Unresolved repositories for ${currentJob.pds}`}
+                >
                   <h3>Unresolved repositories</h3>
-                  {#if repositoryLoading[currentJob.id] && !repositoryPages[currentJob.id]?.repositories.length}<p role="status">Loading repository details…</p>
-                  {:else if repositoryErrors[currentJob.id]}<p role="alert">{repositoryErrors[currentJob.id]}</p>{#if repositoryErrors[currentJob.id].startsWith("Repository snapshot expired")}<button onclick={() => void loadRepositories(currentJob.id)}>Restart repository details</button>{:else if !repositoryErrors[currentJob.id].startsWith("This repository list exceeds")}<button onclick={() => void loadRepositories(currentJob.id)}>Retry loading details</button>{/if}
+                  {#if repositoryLoading[currentJob.id] && !repositoryPages[currentJob.id]?.repositories.length}<p
+                      role="status"
+                    >
+                      Loading repository details…
+                    </p>
+                  {:else if repositoryErrors[currentJob.id]}<p role="alert">
+                      {repositoryErrors[currentJob.id]}
+                    </p>
+                    {#if repositoryErrors[currentJob.id].startsWith("Repository snapshot expired")}<button
+                        onclick={() => void loadRepositories(currentJob.id)}
+                        >Restart repository details</button
+                      >{:else if !repositoryErrors[currentJob.id].startsWith("This repository list exceeds")}<button
+                        onclick={() => void loadRepositories(currentJob.id)}
+                        >Retry loading details</button
+                      >{/if}
                   {:else if repositoryPages[currentJob.id]?.repositories.length}
-                    <div class="table-wrap" role="region" aria-label={`Repository details for ${currentJob.pds}`} tabindex="0">
+                    <div
+                      class="table-wrap"
+                      role="region"
+                      aria-label={`Repository details for ${currentJob.pds}`}
+                      tabindex="0"
+                    >
                       <table>
-                        <caption>Repositories not yet completed for {currentJob.pds}</caption>
-                        <thead><tr><th>DID</th><th>Listed revision</th><th>Repository state</th><th>Retry attempts</th><th>Failure / next retry</th></tr></thead>
-                        <tbody>{#each repositoryPages[currentJob.id].repositories as detail (detail.did)}<tr>
-                          <td>{detail.did}</td><td>{detail.listedRevision}</td><td>{detail.state.replaceAll("_", " ")}</td>
-                          <td>{detail.attempts} of {currentJob.diagnostics.maxRepositoryAttempts} in this job/repository cycle</td>
-                          <td>{repositoryFailure(detail)}{#if detail.failure}<small>Last failure: {recordedTime(detail.failedAt)}</small>{/if}{#if detail.retryAt}<small>Retry deadline: {timeLabel(detail.retryAt)}</small>{/if}</td>
-                        </tr>{/each}</tbody>
+                        <caption
+                          >Repositories not yet completed for {currentJob.pds}</caption
+                        >
+                        <thead
+                          ><tr
+                            ><th>DID</th><th>Listed revision</th><th
+                              >Repository state</th
+                            ><th>Retry attempts</th><th>Failure / next retry</th
+                            ></tr
+                          ></thead
+                        >
+                        <tbody
+                          >{#each repositoryPages[currentJob.id].repositories as detail (detail.did)}<tr
+                            >
+                              <td>{detail.did}</td><td
+                                >{detail.listedRevision}</td
+                              ><td>{detail.state.replaceAll("_", " ")}</td>
+                              <td
+                                >{detail.attempts} of {currentJob.diagnostics
+                                  .maxRepositoryAttempts} in this job/repository cycle</td
+                              >
+                              <td
+                                >{repositoryFailure(
+                                  detail,
+                                )}{#if detail.failure}<small
+                                    >Last failure: {recordedTime(
+                                      detail.failedAt,
+                                    )}</small
+                                  >{/if}{#if detail.retryAt}<small
+                                    >Retry deadline: {timeLabel(
+                                      detail.retryAt,
+                                    )}</small
+                                  >{/if}</td
+                              >
+                            </tr>{/each}</tbody
+                        >
                       </table>
                     </div>
-                    {#if repositoryPages[currentJob.id].nextCursor}<button disabled={repositoryLoading[currentJob.id]} onclick={() => void loadRepositories(currentJob.id, true)}>Load more repositories</button>{/if}
-                    {#if repositoryLoading[currentJob.id]}<p role="status">Loading more repositories…</p>{/if}
-                  {:else}<p>No unfinished repositories in the saved repository list.</p>{/if}
-                  {#if ["incomplete", "failed", "canceled"].includes(currentJob.state)}<p>Work is stopped. Use the explicit Retry action only when you want Jetstream to resume eligible work.</p>{/if}
+                    {#if repositoryPages[currentJob.id].nextCursor}<button
+                        disabled={repositoryLoading[currentJob.id]}
+                        onclick={() =>
+                          void loadRepositories(currentJob.id, true)}
+                        >Load more repositories</button
+                      >{/if}
+                    {#if repositoryLoading[currentJob.id]}<p role="status">
+                        Loading more repositories…
+                      </p>{/if}
+                  {:else}<p>
+                      No unfinished repositories in the saved repository list.
+                    </p>{/if}
+                  {#if ["incomplete", "failed", "canceled"].includes(currentJob.state)}<p
+                    >
+                      Work is stopped. Use the explicit Retry action only when
+                      you want Jetstream to resume eligible work.
+                    </p>{/if}
                 </section>
-              </td></tr>{/if}
-          {:else}<tr
+              </td></tr
+            >{/if}
+        {:else}<tr
             ><td colspan="6" class="empty"
               >No jobs on this page. Submit a backfill for an enabled source.</td
             ></tr
@@ -329,8 +440,10 @@
     <p class="eyebrow">Retention evidence</p>
     <h1>Collection coverage</h1>
     <p>
-      Coverage is grouped by PDS. Expand a PDS to see each selected collection and
-      the latest current-state backfill result known for it.
+      Coverage is grouped by PDS and selected collections. Acquisition evidence
+      and progress come from the matching backfill job and are job-wide, not
+      measured separately for each collection. Expand a PDS to see the selected
+      collections and the current-state coverage known for that source.
     </p>
   </div>
   <div class="notice">
@@ -339,10 +452,38 @@
     the current PDS coverage shown below; it means the UI must not claim complete
     historical provenance.
   </div>
+  {#if coverage}
+    <section class="notice" aria-label="All enabled sources current policy">
+      <h2>All enabled sources / current policy</h2>
+      <State value={coverage.aggregate?.state ?? "unknown"} />
+      <p>
+        {coverage.aggregate?.enabledSources ?? "Unknown"} enabled sources; policy
+        revision {coverage.aggregate?.policy?.revision ?? "Unknown"}.
+      </p>
+      <p>
+        Snapshot scope: {coverage.scope?.replaceAll("_", " ") ?? "Unknown"};
+        snapshot policy revision {coverage.policy?.revision ?? "Unknown"}.
+      </p>
+    </section>
+  {:else}<p class="empty">Current-policy aggregate unavailable.</p>{/if}
   <section class="coverage-groups" aria-label="Coverage by PDS">
     {#each coverageGroups(coverage) as group}
       <details class="coverage-group">
         <summary>{group.pds}</summary>
+        <p>
+          Source revision {group.item.sourceRevision}; policy revision {group
+            .item.policy.revision}; matching job: {group.item.matchingJob
+            ? "Yes"
+            : "No"}{#if group.item.jobId}; job {group.item.jobId}{/if}
+        </p>
+        {#if group.item.policy.collections.length}{:else}<p>
+            No collections selected by this empty policy.
+          </p>{/if}
+        <AcquisitionEvidence acquisition={group.item.acquisition} />
+        <p>
+          History: {group.item.history?.state ?? "Unknown"}; live freshness: {group
+            .item.live?.state ?? "Unknown"}
+        </p>
         <!-- svelte-ignore a11y_no_noninteractive_tabindex (Scrollable tables need keyboard access; verified with axe and Chromium.) -->
         <div
           class="table-wrap"
@@ -354,27 +495,22 @@
             <caption>Collections retained for {group.pds}</caption><thead
               ><tr
                 ><th>Collection</th><th>Current-state coverage</th><th
-                  >Progress / limitations</th></tr
+                  >Progress / limitations</th
+                ></tr
               ></thead
             ><tbody
               >{#each group.collections as collection}
                 <tr
                   ><td>{collection}</td><td
-                    ><State value={group.item.state} /><small
-                      >PDS at the time of collection: {group.item.historicalPDSAttribution}</small
-                    ><small>Execution: {group.item.diagnostics.execution.replaceAll("_", " ")}{#if group.item.diagnostics.reason}; {group.item.diagnostics.reason.replaceAll("_", " ")}{/if}</small
-                    >{#if group.item.diagnostics.unresolvedRepos !== undefined}<small>{group.item.diagnostics.unresolvedRepos} repositories unresolved</small>{/if}{#if group.item.diagnostics.retryAt}<small>Next repository retry: {timeLabel(group.item.diagnostics.retryAt)}</small>{/if}{#if group.item.diagnostics.pdsCooldownUntil}<small>PDS cooldown until: {timeLabel(group.item.diagnostics.pdsCooldownUntil)}</small>{/if}</td
+                    ><State
+                      value={group.item.acquisition?.state ?? "unknown"}
+                    /><small
+                      >History: {group.item.history?.state ?? "Unknown"}; live
+                      freshness: {group.item.live?.state ?? "Unknown"}</small
+                    ></td
                   ><td
-                    >{group.item.totalReposKnown
-                      ? `${group.item.completedRepos} of ${group.item.totalRepos} repositories from the initial PDS listing processed`
-                      : group.item.diagnostics.execution === "running"
-                        ? "Listing repositories on the PDS; total not known yet"
-                        : "Repository list unavailable; total unknown"}<small
-                      >Policy revision {group.item.policy.revision}; {currentStateScope(group.item)}</small
-                    ><small
-                      >{group.item.reason?.replaceAll("_", " ") ||
-                        "No incomplete-input reason reported."}</small
-                    ><small>Job {group.item.jobId}</small></td
+                    >Acquisition progress is job-wide; not measured per
+                    collection.</td
                   ></tr
                 >
               {/each}</tbody
@@ -417,10 +553,14 @@
       ><tbody
         >{#each changes as change}<tr
             ><td>{target(change.command)}<small>{change.id}</small></td><td
-              ><span title={change.actor} tabindex="0">{actorLabel(change)}</span>
-              <button class="text-button" aria-label={`Copy DID for ${actorLabel(change)}`} onclick={() => copy(change)}>Copy DID</button><small
-                >{new Date(change.createdAt).toLocaleString()}</small
-              ></td
+              ><span title={change.actor} tabindex="0"
+                >{actorLabel(change)}</span
+              >
+              <button
+                class="text-button"
+                aria-label={`Copy DID for ${actorLabel(change)}`}
+                onclick={() => copy(change)}>Copy DID</button
+              ><small>{new Date(change.createdAt).toLocaleString()}</small></td
             ><td
               ><State value={change.state} /><small
                 >{change.error?.replaceAll("_", " ") ?? ""}</small
@@ -444,14 +584,11 @@
       >
     </table>
   </div>
-  {#if hasMoreChanges}<button disabled={busy} onclick={moreChanges}>Load more requested changes</button>{/if}
+  {#if hasMoreChanges}<button disabled={busy} onclick={moreChanges}
+      >Load more requested changes</button
+    >{/if}
   <!-- svelte-ignore a11y_no_noninteractive_tabindex (Scrollable tables need keyboard access; verified with axe and Chromium.) -->
-  <div
-    class="table-wrap"
-    role="region"
-    aria-label="Audit history"
-    tabindex="0"
-  >
+  <div class="table-wrap" role="region" aria-label="Audit history" tabindex="0">
     <table>
       <caption>Audit history</caption><thead
         ><tr
@@ -462,7 +599,11 @@
         >{#each audit as event}<tr
             ><td>{new Date(event.time).toLocaleString()}</td><td
               ><span title={event.actor} tabindex="0">{actorLabel(event)}</span>
-              <button class="text-button" aria-label={`Copy DID for ${actorLabel(event)}`} onclick={() => copy(event)}>Copy DID</button></td
+              <button
+                class="text-button"
+                aria-label={`Copy DID for ${actorLabel(event)}`}
+                onclick={() => copy(event)}>Copy DID</button
+              ></td
             ><td><State value={event.action} /></td><td
               >{event.operation ?? "Access change"}<small
                 >{String(event.detail.error ?? event.detail.did ?? "")}</small
@@ -475,7 +616,9 @@
       >
     </table>
   </div>
-  {#if hasMoreAudit}<button disabled={busy} onclick={moreAudit}>Load more audit history</button>{/if}
+  {#if hasMoreAudit}<button disabled={busy} onclick={moreAudit}
+      >Load more audit history</button
+    >{/if}
 {/if}
 
 <style>
