@@ -219,6 +219,20 @@ Reconciliation currently scans the archive
 under its rewrite lock, so large archives can pause live appends during an
 individual repository reconciliation.
 
+### Public status evidence
+
+The public `/status` page reports current-policy acquisition from the same coherent source, policy and job projection used by private control. It scopes rows to enabled sources and the current policy revision, and reports six nullable job-wide inventory counters: initial inventory, scanned, matching, no-match, unresolved, and attributable records. No-match is a successfully verified scan; a null counter is unknown evidence, not zero. Progress applies to the job inventory as a whole and does not attribute repository counts to individual collections.
+
+Legacy bootstrap aggregates remain a separately labeled observation and cannot establish current-policy acquisition. History and per-source live evidence remain unknown: neither a completed snapshot nor a recent global upstream event proves historical completeness or PDS freshness. Global event observation age is shown independently; a missing or future timestamp has unknown age. The status page does not imply retry ETAs or schedules where durable evidence is unavailable.
+
+A deterministic browser fixture serves the embedded public status template. With the existing Node >=24.18, administration Playwright, and Chromium dependencies available, run from the repository root:
+
+```sh
+PUBLIC_STATUS_BROWSER=1 go -C jetstream test ./internal/web -run '^TestPublicStatusBrowserFixture$' -count=1 -v
+```
+
+Without the explicit environment flag the same test performs HTTP fixture smoke checks only; it does not claim browser verification.
+
 ## Private service interface
 
 Mount a secret file containing a random service credential of at least 32 bytes,

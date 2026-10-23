@@ -563,6 +563,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		CursorLookback:        opts.CursorLookback,
 		IdentityResolver:      resolver,
 		ImportReporter:        importReporter{mgr: importMgr},
+		CoverageReporter:      coverageReporter{source: rt.BackfillJobs},
 		LastSeenUpstreamEvent: liveMetrics.LastSeenUpstreamEvent,
 	})
 	if err != nil {

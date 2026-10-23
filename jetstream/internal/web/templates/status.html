@@ -254,9 +254,34 @@ document.addEventListener("input", function (event) {
     </section>
 
     <section>
-      <h2>Backfill</h2>
+      <h2>Current-policy acquisition</h2>
+      {{if .Coverage}}
+        <p class="sub">Scope: {{.Coverage.Scope}}; policy revision {{.Coverage.Policy.Revision}}. Coverage is a current-state repository snapshot, not historical event completeness.</p>
+        {{range .Coverage.Sources}}
+        <article>
+          <h3><code>{{.PDS}}</code> — {{.State}}</h3>
+          <p>Source revision {{.SourceRevision}}; policy revision {{.PolicyRevision}}. Progress scope: {{.ProgressScope}} (job-wide inventory); selected collections: {{range $i, $c := .Collections}}{{if $i}}, {{end}}<code>{{$c}}</code>{{else}}none{{end}}.</p>
+          <dl>
+            <dt>Initial inventory</dt><dd>{{if .Counts.InitialInventory.Known}}{{.Counts.InitialInventory.Value}}{{else}}Unknown{{end}}</dd>
+            <dt>Scanned</dt><dd>{{if .Counts.Scanned.Known}}{{.Counts.Scanned.Value}}{{else}}Unknown{{end}}</dd>
+            <dt>Matching</dt><dd>{{if .Counts.Matching.Known}}{{.Counts.Matching.Value}}{{else}}Unknown{{end}}</dd>
+            <dt>No match</dt><dd>{{if .Counts.NoMatch.Known}}{{.Counts.NoMatch.Value}}{{else}}Unknown{{end}}</dd>
+            <dt>Unresolved</dt><dd>{{if .Counts.Unresolved.Known}}{{.Counts.Unresolved.Value}}{{else}}Unknown{{end}}</dd>
+            <dt>Attributable records</dt><dd>{{if .Counts.AttributableRecords.Known}}{{.Counts.AttributableRecords.Value}}{{else}}Unknown{{end}}</dd>
+            <dt>History</dt><dd>{{.HistoryState}}</dd><dt>Source live</dt><dd>{{.LiveState}}</dd>
+            {{if .FailureCategory}}<dt>Failure category</dt><dd>{{.FailureCategory}}</dd>{{end}}
+            {{if gt .Attempts 0}}<dt>Attempts</dt><dd>{{.Attempts}}</dd>{{end}}
+            <dt>Last progress</dt><dd>{{if .LastProgressAt}}{{.LastProgressAt.UTC.Format "2006-01-02 15:04:05 UTC"}}{{else}}Unknown{{end}}</dd>
+            {{if eq .RetryAction "explicit_retry"}}<dt>Recovery</dt><dd>An explicit retry is available through the operator control plane; no retry timing is known.</dd>{{end}}
+          </dl>
+        </article>
+        {{else}}<p>Current-policy acquisition is unknown: no enabled sources.</p>{{end}}
+      {{else}}
+        <p class="sub">Current-policy acquisition evidence unavailable.</p>
+      {{end}}
+      <h3>Legacy bootstrap observation</h3>
       {{if and (eq .Backfill.TotalDIDs 0) (eq .Backfill.HostsTotal 0)}}
-        <p class="sub">Backfill has not started.</p>
+        <p class="sub">Legacy bootstrap evidence unavailable.</p>
       {{else}}
         <dl>
           <dt>Discovered</dt><dd>{{humanInt .Backfill.TotalDIDs}} repos</dd>
@@ -288,7 +313,7 @@ document.addEventListener("input", function (event) {
     <h2>Live ingest</h2>
     <dl>
       <dt>Upstream cursor</dt><dd>{{if eq .Live.UpstreamCursor 0}}not yet started{{else}}{{humanInt64 .Live.UpstreamCursor}}{{end}}</dd>
-      <dt>Last upstream event</dt><dd>{{if .Live.LastSeenUpstreamEventAt.IsZero}}not yet observed{{else}}{{relativeTime .Live.LastSeenUpstreamEventAt .Now}}{{end}}</dd>
+      <dt>Global upstream event observation</dt><dd>{{if .Live.LastSeenUpstreamEventAt.IsZero}}Unknown{{else}}{{.Live.LastSeenUpstreamEventAt.UTC.Format "2006-01-02 15:04:05 UTC"}}{{if .Live.LastSeenUpstreamEventAgeSeconds}} ({{.Live.LastSeenUpstreamEventAgeSeconds}} seconds ago){{else}} (age unknown; clock skew possible){{end}}{{end}}</dd>
       <dt>Sequence allocated</dt><dd>{{humanInt .Live.NextSeq}} events</dd>
       {{if gt .Live.BootstrapSeq 0}}<dt>Bootstrap-time live seq</dt><dd>{{humanInt .Live.BootstrapSeq}}</dd>{{end}}
     </dl>
