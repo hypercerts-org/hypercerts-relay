@@ -1,11 +1,14 @@
-import type { Command, JobLastFailure, Policy } from "../server/contracts";
+import type { Command, CoverageSource } from "../server/contracts";
 export type {
   Command,
-  Job,
-  JobDiagnostics,
-  JobLastFailure,
   Operation,
   Policy,
+  Job,
+  Acquisition,
+  CoverageSource,
+  CoveragePage,
+  JobDiagnostics,
+  JobLastFailure,
   RepositoryDetail,
   RepositoryDetailsPage,
 } from "../server/contracts";
@@ -36,35 +39,8 @@ export interface Limit {
   unit: string;
   recovery: string;
 }
-export interface JetstreamSummary {
-  pds: string;
-  jobId: string;
-  state: string;
-  completedRepos: number;
-  totalRepos: number;
-  totalReposKnown: boolean;
-  createdAt: string;
-  lastProgressAt?: string;
-  lastFailure?: JobLastFailure;
-  coverage: string;
-  diagnostics: import("../server/contracts").JobDiagnostics;
-}
-export interface Coverage {
-  pds: string;
-  policy: Policy;
-  jobId: string;
-  state: string;
-  completedRepos: number;
-  totalRepos: number;
-  totalReposKnown: boolean;
-  createdAt: string;
-  reason: string | null;
-  historicalPDSAttribution: string;
-  lastProgressAt?: string;
-  lastFailure?: JobLastFailure;
-  coverage: string;
-  diagnostics: import("../server/contracts").JobDiagnostics;
-}
+export type JetstreamSummary = CoverageSource;
+export type Coverage = CoverageSource;
 export interface Audit {
   seq: number;
   actor: string;

@@ -38,6 +38,9 @@ type Options struct {
 	// the status page. Optional; nil means the import panel is omitted.
 	ImportReporter ImportReporter
 
+	// CoverageReporter projects current-policy acquisition evidence through a safe DTO.
+	CoverageReporter CoverageReporter
+
 	// LastSeenUpstreamEvent returns the last steady-state subscribeRepos event
 	// observation time. Optional; nil means the live freshness fields are empty.
 	LastSeenUpstreamEvent func() time.Time

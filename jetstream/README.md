@@ -151,13 +151,36 @@ page and repository progress. A crash before progress acknowledgment may replay
 work safely.
 
 Coverage is explicitly `current_state`: a PDS snapshot cannot prove historical
-event completeness. Job and coverage responses expose optional
+event completeness. The private coverage endpoint returns schema v1 scoped to
+enabled sources and the current collection-policy revision. Its aggregate covers
+every enabled source independent of pagination/filtering. Acquisition selection
+uses exact source/policy coordinates and durable acquisition generations; retries
+supersede earlier attempts without confusing historical event coverage with
+current-state evidence. Successful inventory and repository checkpoints retain
+acquisition counts and timestamps only when evidence is available. Job and coverage responses expose optional
 `lastProgressAt`, written atomically with a successful inventory or repository
 checkpoint. Failed
 attempts, claims, reads, failed writes, and repeated no-op inventory checkpoints
 do not advance it; older jobs without a recorded date remain unknown. Durable
 repository retry JSON exposes optional `failedAt`; a missing legacy date remains
 unknown rather than being synthesized.
+
+
+Coverage acquisition reports `retry_waiting` only for a pending job whose
+matching execution snapshot is waiting. Ready queued and running work report
+`running`; terminal outcomes take precedence over retained retry rows. Optional
+acquisition diagnostics `retryAt`, `pdsCooldownUntil`, and `waitReason`
+(`repository_retry` or `pds_cooldown`) describe recorded waits, with
+`retryAction: automatic_retry`. Missing deadlines remain absent. Execution state
+and its existing diagnostics on job list/detail responses are unchanged.
+
+Coverage captures source revisions, policy, job history and durable retry evidence
+at one manager-serialized boundary, then derives acquisition and aggregate before
+pagination. Classified listing failures take precedence over generic compatibility
+error codes. Acquisition `lastProgressAt` is the latest nonzero durable job or
+acquisition checkpoint date, never creation, read or failure time. Legacy jobs
+without attribution retain null acquisition counters even when a progress date
+is available. History and live evidence remain unknown.
 
 Each `listRepos` page is requested once. A listing timeout, transport error, or
 non-success HTTP response leaves the job `incomplete` with the compatibility
@@ -195,6 +218,20 @@ status and repository DID are included only when known.
 Reconciliation currently scans the archive
 under its rewrite lock, so large archives can pause live appends during an
 individual repository reconciliation.
+
+### Public status evidence
+
+The public `/status` page reports current-policy acquisition from the same coherent source, policy and job projection used by private control. It scopes rows to enabled sources and the current policy revision, and reports six nullable job-wide inventory counters: initial inventory, scanned, matching, no-match, unresolved, and attributable records. No-match is a successfully verified scan; a null counter is unknown evidence, not zero. Progress applies to the job inventory as a whole and does not attribute repository counts to individual collections.
+
+Legacy bootstrap aggregates remain a separately labeled observation and cannot establish current-policy acquisition. History and per-source live evidence remain unknown: neither a completed snapshot nor a recent global upstream event proves historical completeness or PDS freshness. Global event observation age is shown independently; a missing or future timestamp has unknown age. The status page does not imply retry ETAs or schedules where durable evidence is unavailable.
+
+A deterministic browser fixture serves the embedded public status template. With the existing Node >=24.18, administration Playwright, and Chromium dependencies available, run from the repository root:
+
+```sh
+PUBLIC_STATUS_BROWSER=1 go -C jetstream test ./internal/web -run '^TestPublicStatusBrowserFixture$' -count=1 -v
+```
+
+Without the explicit environment flag the same test performs HTTP fixture smoke checks only; it does not claim browser verification.
 
 ## Private service interface
 
@@ -278,7 +315,7 @@ All paths below start with `/hypercerts/v1`:
 | `POST /jobs` | `{"pds":"https://pds.example","reason":"backfill","requestId":"optional-idempotency-key"}` or reason `quota_recovery`; the same nonempty request ID returns its prior job, while unkeyed duplicate active work is reused and a later terminal recovery creates fresh work. |
 | `GET /jobs?limit=100&after=<cursor>` | Sorted page, maximum 200 jobs, optional `nextCursor`. Concurrent additions may require a fresh listing. |
 | `GET /snapshot-rejections?limit=100&after=<cursor>` | The most recent 1,000 bounded non-payload direct-PDS snapshot rejections, with optional repeated exact `pds` filters. Older rejections are evicted. Returns origin, policy/listed revisions, DID, kind/code and timestamp; never CAR bytes, records, tokens or storage keys. |
-| `GET /coverage?limit=100&after=<pds>` | Latest current-state job per PDS, sorted and paginated by PDS with optional exact `pds` filter. |
+| `GET /coverage?limit=100&after=<pds>` | Schema v1 evidence for enabled sources at the current policy and exact source revision, sorted and paginated by PDS with optional repeated exact `pds` filters. `summary=1` preserves authoritative source, acquisition, history and live evidence; the aggregate always covers all enabled sources, not just this page. Unmatched jobs leave counts null, never zero. |
 | `GET /jobs/{id}` | Durable state, progress, attempt count, coverage, and bounded execution diagnostics. |
 | `GET /jobs/{id}/repositories?limit=100&after=<opaque-cursor>` | Snapshot-consistent frozen repository coordinates and sanitized retry state, including optional `failedAt` for recorded failures; maximum 200 rows per page. Unknown inventory returns `409`; expired snapshots return `410`; projections over 50,000 rows return `413`. |
 | `POST /jobs/{id}/cancel` | Cancels pending/running work. |

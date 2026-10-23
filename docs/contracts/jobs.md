@@ -52,6 +52,23 @@ checkpoint writes, and no-op inventory checkpoints do not advance it. Durable
 without that date remains unknown. Repository retry rows are not part of the
 current job-summary HTTP routes.
 
+
+Coverage acquisition reports `retry_waiting` only for a pending job whose
+matching execution snapshot is waiting. Ready queued and running work report
+`running`; terminal outcomes take precedence over retained retry rows. Optional
+acquisition diagnostics `retryAt`, `pdsCooldownUntil`, and `waitReason`
+(`repository_retry` or `pds_cooldown`) describe recorded waits, with
+`retryAction: automatic_retry`. Missing deadlines remain absent. Execution state
+and its existing diagnostics on job list/detail responses are unchanged.
+
+Coverage captures source revisions, policy, job history and durable retry evidence
+at one manager-serialized boundary, then derives acquisition and aggregate before
+pagination. Classified listing failures take precedence over generic compatibility
+error codes. Acquisition `lastProgressAt` is the latest nonzero durable job or
+acquisition checkpoint date, never creation, read or failure time. Legacy jobs
+without attribution retain null acquisition counters even when a progress date
+is available. History and live evidence remain unknown.
+
 ## Completion semantics
 
 A completed job identifies the exact admitted PDS origin and policy revision

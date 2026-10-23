@@ -8,6 +8,7 @@ import {
   type JobDiagnostics,
   type JobLastFailure,
   type Policy,
+  type CoverageSource,
   type RepositoryDetailsPage,
 } from "./contracts.ts";
 
@@ -86,37 +87,17 @@ export class Services {
     );
   }
   async jobs(after = "", pds = "") {
-    const page = await this.call<{ jobs: Job[]; nextCursor?: string }>(
-      "jetstream",
-      `/jobs?limit=50&after=${encodeURIComponent(after)}&pds=${encodeURIComponent(pds)}`,
-    );
+    const page = await this.call<{ jobs: Job[]; nextCursor?: string }>("jetstream", `/jobs?limit=50&after=${encodeURIComponent(after)}&pds=${encodeURIComponent(pds)}`);
     return { ...page, jobs: page.jobs.map(normalizeJobDiagnostics) };
   }
   async repositoryDetails(id: string, after = "", limit = 100) {
-    const query = new URLSearchParams({ limit: String(limit) });
-    if (after) query.set("after", after);
-    const page = await this.call<RepositoryDetailsPage>(
-      "jetstream",
-      `/jobs/${encodeURIComponent(id)}/repositories?${query}`,
-    );
-    return {
-      ...page,
-      job: normalizeJobDiagnostics(page.job),
-      repositories: page.repositories.map((repository) => ({
-        ...repository,
-        failedAt: recordedTimestamp(repository.failedAt),
-      })),
-    };
+    const query = new URLSearchParams({ limit: String(limit) }); if (after) query.set("after", after);
+    const page = await this.call<RepositoryDetailsPage>("jetstream", `/jobs/${encodeURIComponent(id)}/repositories?${query}`);
+    return { ...page, job: normalizeJobDiagnostics(page.job), repositories: page.repositories.map((repository) => ({ ...repository, failedAt: recordedTimestamp(repository.failedAt) })) };
   }
   async coverage(after = "", pds = "") {
-    const page = await this.call<CoveragePage>(
-      "jetstream",
-      `/coverage?limit=50&after=${encodeURIComponent(after)}&pds=${encodeURIComponent(pds)}`,
-    );
-    return {
-      ...page,
-      items: page.items.map(normalizeJobDiagnostics),
-    };
+    const page = await this.call<CoveragePage>("jetstream", `/coverage?limit=50&after=${encodeURIComponent(after)}&pds=${encodeURIComponent(pds)}`);
+    return { ...page, items: page.items.map(normalizeCoverageDiagnostics) };
   }
   async coverageFor(pds: string[]) {
     const chunks = [] as string[][];
@@ -128,7 +109,7 @@ export class Services {
           summary: "1",
         });
         for (const origin of origins) query.append("pds", origin);
-        return this.call<CoverageSummaryPage>(
+        return this.call<CoveragePage>(
           "jetstream",
           `/coverage?${query}`,
           "GET",
@@ -138,11 +119,8 @@ export class Services {
         );
       }),
     );
-    return {
-      items: pages
-        .flatMap((page) => page.items)
-        .map(normalizeJobDiagnostics),
-    };
+    if (pages.length === 0) return { items: [] };
+    return { ...pages[0], items: pages.flatMap((page) => page.items.map(normalizeCoverageDiagnostics)) };
   }
   sources(after = "") {
     return this.call<Record<string, unknown>>(
@@ -303,40 +281,12 @@ interface RelaySourceView {
   Revision: number;
 }
 
-interface CoverageSummaryPage {
-  items: {
-    pds: string;
-    jobId: string;
-    state: string;
-    completedRepos: number;
-    totalRepos: number;
-    totalReposKnown: boolean;
-    errorCode?: string;
-    createdAt: string;
-    lastProgressAt?: string;
-    lastFailure?: JobLastFailure;
-    coverage: string;
-    diagnostics: JobDiagnostics;
-  }[];
-}
-
 interface CoveragePage {
-  items: {
-    pds: string;
-    policy: Policy;
-    jobId: string;
-    reason: string;
-    state: string;
-    completedRepos: number;
-    totalRepos: number;
-    totalReposKnown: boolean;
-    errorCode?: string;
-    createdAt: string;
-    lastProgressAt?: string;
-    lastFailure?: JobLastFailure;
-    coverage: string;
-    diagnostics: JobDiagnostics;
-  }[];
+  schemaVersion: 1;
+  scope: "enabled_sources_current_policy";
+  policy: Policy;
+  aggregate: { scope: "enabled_sources_current_policy"; policy: Policy; enabledSources: number; state: "unknown" | "incomplete" | "complete" };
+  items: (CoverageSource & { diagnostics?: JobDiagnostics; lastFailure?: JobLastFailure; lastProgressAt?: string })[];
   nextCursor?: string;
 }
 
@@ -386,13 +336,35 @@ function parseJobLastFailure(value: unknown): JobLastFailure | undefined {
 
 function normalizeJobDiagnostics<T extends {
   lastProgressAt?: string;
-  lastFailure?: JobLastFailure;
+  lastFailure?: unknown;
 }>(value: T): T {
+  const failure = parseJobLastFailure(value.lastFailure);
   return {
     ...value,
     lastProgressAt: recordedTimestamp(value.lastProgressAt),
-    lastFailure: parseJobLastFailure(value.lastFailure),
+    ...(failure ? { lastFailure: failure } : { lastFailure: undefined }),
   } as T;
+}
+
+function normalizeCoverageDiagnostics<T extends CoverageSource & {
+  lastProgressAt?: string;
+  lastFailure?: unknown;
+}>(value: T): T {
+  const normalized = normalizeJobDiagnostics(value);
+  if (!value.acquisition) return normalized;
+  const diagnostics = value.acquisition.diagnostics;
+  return {
+    ...normalized,
+    acquisition: {
+      ...value.acquisition,
+      diagnostics: {
+        ...diagnostics,
+        lastProgressAt: recordedTimestamp(diagnostics.lastProgressAt) ?? null,
+        retryAt: recordedTimestamp(diagnostics.retryAt),
+        pdsCooldownUntil: recordedTimestamp(diagnostics.pdsCooldownUntil),
+      },
+    },
+  };
 }
 
 async function readBoundedRemoteErrorBody(response: Response): Promise<unknown | null> {

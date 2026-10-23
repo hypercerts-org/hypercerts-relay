@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	statusmodel "github.com/bluesky-social/jetstream/internal/hypercerts/coverage"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/jobs"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 	"github.com/bluesky-social/jetstream/internal/ingest"
@@ -241,9 +242,10 @@ func TestPrivateCoverageExposesBoundedListingFailure(t *testing.T) {
 		FailedAt   time.Time `json:"failedAt"`
 	}
 	type coverageItem struct {
-		PDS         string       `json:"pds"`
-		ErrorCode   string       `json:"errorCode"`
-		LastFailure *failureView `json:"lastFailure"`
+		Acquisition statusmodel.Acquisition `json:"acquisition"`
+		PDS         string                  `json:"pds"`
+		ErrorCode   string                  `json:"errorCode"`
+		LastFailure *failureView            `json:"lastFailure"`
 	}
 	for _, path := range []string{
 		"/coverage?pds=" + url.QueryEscape(pds.URL),
@@ -261,6 +263,8 @@ func TestPrivateCoverageExposesBoundedListingFailure(t *testing.T) {
 		require.NotNil(t, page.Items[0].LastFailure)
 		require.Equal(t, "listRepos", page.Items[0].LastFailure.Stage)
 		require.Equal(t, "http", page.Items[0].LastFailure.Category)
+		require.Equal(t, "http", page.Items[0].Acquisition.Diagnostics.FailureCategory)
+		require.Equal(t, statusmodel.StoppedIncomplete, page.Items[0].Acquisition.State)
 		require.Equal(t, http.StatusServiceUnavailable, page.Items[0].LastFailure.HTTPStatus)
 		require.False(t, page.Items[0].LastFailure.FailedAt.IsZero())
 		require.Equal(t, time.UTC, page.Items[0].LastFailure.FailedAt.Location())
@@ -489,8 +493,8 @@ func TestLegacyKnownTotalJobWithoutInventoryRemainsReadable(t *testing.T) {
 	}
 	require.NoError(t, json.Unmarshal(coverage.Body.Bytes(), &coveragePage))
 	require.Len(t, coveragePage.Items, 1)
-	require.Equal(t, 1, coveragePage.Items[0].CompletedRepos)
-	require.Equal(t, 3, coveragePage.Items[0].TotalRepos)
+	require.Equal(t, 1, *coveragePage.Items[0].CompletedRepos)
+	require.Equal(t, 3, *coveragePage.Items[0].TotalRepos)
 	require.True(t, coveragePage.Items[0].TotalReposKnown)
 	require.Nil(t, coveragePage.Items[0].Diagnostics.UnresolvedRepos)
 
@@ -584,7 +588,7 @@ func TestPrivateLifecycleAndCoverage(t *testing.T) {
 	require.Equal(t, jobs.JobExecutionQueued, summaries.Items[0].Diagnostics.Execution)
 	require.Nil(t, summaries.Items[0].Diagnostics.UnresolvedRepos)
 	require.Equal(t, "https://pds.example", summaries.Items[1].PDS)
-	require.NotContains(t, filtered.Body.String(), "policy")
+	require.Contains(t, filtered.Body.String(), "schemaVersion")
 	require.Equal(t, 204, request(h, "DELETE", "/sources", `{"pds":"https://pds.example"}`, testToken).Code)
 }
 
@@ -658,6 +662,22 @@ func TestJobDiagnosticsUseSchedulerEligibilityAndTerminalState(t *testing.T) {
 	require.Equal(t, "pds_cooldown", cooldownDiagnostics["reason"])
 	require.NotContains(t, cooldownDiagnostics, "unresolvedRepos", "listing 429 did not produce a frozen inventory")
 	require.NotEmpty(t, cooldownDiagnostics["pdsCooldownUntil"])
+	for _, path := range []string{"/coverage?pds=" + url.QueryEscape(listing.URL), "/coverage?summary=1&pds=" + url.QueryEscape(listing.URL)} {
+		response := request(h, "GET", path, "", testToken)
+		require.Equal(t, 200, response.Code)
+		var page struct {
+			Items []coverageView `json:"items"`
+		}
+		require.NoError(t, json.Unmarshal(response.Body.Bytes(), &page))
+		require.Len(t, page.Items, 1)
+		a := page.Items[0].Acquisition
+		require.Equal(t, statusmodel.RetryWaiting, a.State)
+		require.Equal(t, "automatic_retry", a.Diagnostics.RetryAction)
+		require.Equal(t, "pds_cooldown", a.Diagnostics.WaitReason)
+		require.Equal(t, cooldown.Until, *a.Diagnostics.PDSCooldownUntil)
+		require.Nil(t, a.Diagnostics.RetryAt)
+		require.Equal(t, 0, *a.Counts.Scanned)
+	}
 
 	mixed, err := manager.AddSource("https://mixed.example")
 	require.NoError(t, err)
@@ -850,10 +870,10 @@ func TestJobDiagnosticsUseSchedulerEligibilityAndTerminalState(t *testing.T) {
 	require.NoError(t, json.Unmarshal(terminalCoverage.Body.Bytes(), &terminalCoveragePage))
 	require.Len(t, terminalCoveragePage.Items, 1)
 	require.Equal(t, jobs.JobExecutionStopped, terminalCoveragePage.Items[0].Diagnostics.Execution)
-	require.Equal(t, 1, terminalCoveragePage.Items[0].CompletedRepos)
-	require.Equal(t, 5, terminalCoveragePage.Items[0].TotalRepos)
+	require.Equal(t, 1, *terminalCoveragePage.Items[0].CompletedRepos)
+	require.Equal(t, 5, *terminalCoveragePage.Items[0].TotalRepos)
 	require.Equal(t, 4, *terminalCoveragePage.Items[0].Diagnostics.UnresolvedRepos)
-	require.Equal(t, terminalCoveragePage.Items[0].TotalRepos, terminalCoveragePage.Items[0].CompletedRepos+*terminalCoveragePage.Items[0].Diagnostics.UnresolvedRepos)
+	require.Equal(t, *terminalCoveragePage.Items[0].TotalRepos, *terminalCoveragePage.Items[0].CompletedRepos+*terminalCoveragePage.Items[0].Diagnostics.UnresolvedRepos)
 }
 
 func TestRepositoryDetailsOversizedSnapshotReturnsPayloadTooLarge(t *testing.T) {
@@ -1017,29 +1037,27 @@ func TestT10CoverageTruthfulness(t *testing.T) {
 }
 
 func TestCoverageSelectionPaginationAndSummary(t *testing.T) {
-	created := time.Date(2026, time.September, 15, 12, 0, 0, 0, time.UTC)
-	jobsList := []jobs.Job{
-		{ID: "a-old", PDS: "https://a.example", CreatedAt: created},
-		{ID: "a-new", PDS: "https://a.example", CreatedAt: created.Add(time.Second)},
-		{ID: "b-a", PDS: "https://b.example", CreatedAt: created},
-		{ID: "b-z", PDS: "https://b.example", CreatedAt: created},
-		{ID: "c-only", PDS: "https://c.example", CreatedAt: created},
+	h, manager := setup(t)
+	_, err := manager.AddSource("https://a.example")
+	require.NoError(t, err)
+	_, err = manager.AddSource("https://b.example")
+	require.NoError(t, err)
+	response := request(h, "GET", "/coverage?limit=1&summary=1&pds=https%3A%2F%2Fa.example", "", testToken)
+	require.Equal(t, 200, response.Code)
+	var page struct {
+		Items     []coverageView `json:"items"`
+		Aggregate struct {
+			State          string `json:"state"`
+			EnabledSources int    `json:"enabledSources"`
+		} `json:"aggregate"`
 	}
-
-	options, ok := parseCoverageOptions(httptest.NewRequest("GET", Prefix+"/coverage?limit=1&pds=https%3A%2F%2Fa.example&pds=https%3A%2F%2Fb.example&summary=1", nil))
-	require.True(t, ok)
-	require.True(t, options.summary)
-	selected := latestCoverageJobs(jobsList, options.requestedPDS)
-	require.Equal(t, []string{"a-new", "b-z"}, []string{selected[0].ID, selected[1].ID})
-
-	page, next := pageCoverage(selected, options.after, options.limit)
-	require.Len(t, page, 1)
-	require.Equal(t, "https://a.example", page[0].PDS)
-	require.Equal(t, "https://a.example", next)
-	require.Equal(t, "a-new", coverageSummaryPage(page, next).Items[0].JobID)
-
-	options, ok = parseCoverageOptions(httptest.NewRequest("GET", Prefix+"/coverage?limit=0", nil))
-	require.False(t, ok)
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &page))
+	require.Len(t, page.Items, 1)
+	require.Equal(t, 2, page.Aggregate.EnabledSources)
+	require.Equal(t, "incomplete", page.Aggregate.State)
+	for _, path := range []string{"/coverage?limit=0", "/coverage?after=" + strings.Repeat("x", 2049)} {
+		require.Equal(t, 400, request(h, "GET", path, "", testToken).Code)
+	}
 }
 
 func TestPrivateCompleteAndFailedResults(t *testing.T) {
@@ -1365,5 +1383,155 @@ func TestControlPlaneAcceptanceFixture(t *testing.T) {
 				return
 			}
 		}
+	}
+}
+
+func TestCoverageOldPolicyCannotCompleteAndDisabledSourcesDisappear(t *testing.T) {
+	h, m := setup(t)
+	j, err := m.AddSource("https://pds.example")
+	require.NoError(t, err)
+	require.NoError(t, m.Cancel(j.ID))
+	_, err = m.SetPolicy(t.Context(), 1, []string{"app.bsky.feed.like"})
+	require.NoError(t, err)
+	response := request(h, "GET", "/coverage", "", testToken)
+	var page struct {
+		Items     []coverageView `json:"items"`
+		Aggregate struct {
+			State string `json:"state"`
+		} `json:"aggregate"`
+	}
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &page))
+	require.Len(t, page.Items, 1)
+	require.Equal(t, uint64(2), page.Items[0].Policy.Revision)
+	require.NotEqual(t, j.ID, page.Items[0].JobID)
+	require.Equal(t, "incomplete", page.Aggregate.State)
+	require.NoError(t, m.RemoveSource(j.PDS))
+	response = request(h, "GET", "/coverage", "", testToken)
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &page))
+	require.Empty(t, page.Items)
+	require.Equal(t, "unknown", page.Aggregate.State)
+}
+
+func TestCoverageProjectionPreservesAuthoritativeEvidence(t *testing.T) {
+	for _, mode := range []string{"matching", "source_mismatch", "policy_mismatch", "no_job", "legacy"} {
+		t.Run(mode, func(t *testing.T) {
+			h, manager := setup(t)
+			job, err := manager.AddSourceWithRevision("https://projection.example", 7)
+			require.NoError(t, err)
+			enabled, revisions, policy, history := manager.StatusInputs()
+			switch mode {
+			case "source_mismatch":
+				revisions[job.PDS]++
+			case "policy_mismatch":
+				policy.Revision++
+			case "no_job":
+				history = nil
+			case "legacy":
+				history[0].Evidence = nil
+			}
+			authoritative := statusmodel.New(enabled, revisions, policy, history)
+			items, err := h.coverageViews(authoritative.Items)
+			require.NoError(t, err)
+			require.Len(t, items, 1)
+			for _, projection := range []coverageView{items[0], coverageSummary(items[0])} {
+				requireCoverageProjection(t, authoritative.Items[0], projection)
+			}
+			if mode == "legacy" {
+				require.Nil(t, items[0].Acquisition.Counts.Scanned)
+			}
+			if mode == "matching" {
+				requireCoverageEndpoints(t, h, authoritative.Items)
+			}
+		})
+	}
+}
+
+func requireCoverageProjection(t *testing.T, expected statusmodel.Source, projection coverageView) {
+	t.Helper()
+	encoded, err := json.Marshal(projection)
+	require.NoError(t, err)
+	var got statusmodel.Source
+	require.NoError(t, json.Unmarshal(encoded, &got))
+	require.Equal(t, expected, got)
+	if !got.MatchingJob {
+		require.Nil(t, projection.Diagnostics)
+		require.Nil(t, projection.LastFailure)
+		require.Nil(t, got.CompletedRepos)
+		require.Nil(t, got.TotalRepos)
+		require.Nil(t, got.Acquisition.Counts.Scanned)
+	}
+}
+
+func requireCoverageEndpoints(t *testing.T, h *Handler, expected []statusmodel.Source) {
+	t.Helper()
+	for _, path := range []string{"/coverage", "/coverage?summary=1"} {
+		response := request(h, "GET", path, "", testToken)
+		require.Equal(t, 200, response.Code)
+		var page struct {
+			Items []statusmodel.Source `json:"items"`
+		}
+		require.NoError(t, json.Unmarshal(response.Body.Bytes(), &page))
+		require.Equal(t, expected, page.Items)
+	}
+}
+
+func TestCoverageRepositoryWaitFromManager(t *testing.T) {
+	h, manager := setup(t)
+	job, err := manager.AddSourceWithRevision("https://retry.example", 7)
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	deadline := time.Now().UTC().Add(time.Hour)
+	go func() {
+		done <- manager.Run(ctx, func(_ context.Context, j jobs.Job) error {
+			if err := manager.CheckpointInventory(j.ID, "", map[string]string{"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa": "3l3qo2vutsw2b"}, true); err != nil {
+				return err
+			}
+			if _, err := manager.BeginRepositoryAttempt(j.ID, "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"); err != nil {
+				return err
+			}
+			if _, err := manager.RecordRepositoryFailure(j.ID, "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", jobs.RepositoryRetryFailure{Category: jobs.RepositoryFailureHTTP, HTTPStatus: 503, Stage: jobs.RepositoryFailureGetRepoRequest}, &deadline, nil); err != nil {
+				return err
+			}
+			return &jobs.InputError{Code: "source_unavailable", Unavailable: true}
+		})
+	}()
+	require.Eventually(t, func() bool { return mustGetControlJob(t, manager, job.ID).State == jobs.Incomplete }, time.Second, time.Millisecond)
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+	require.NoError(t, manager.Retry(job.ID))
+	for _, path := range []string{"/coverage", "/coverage?summary=1"} {
+		response := request(h, "GET", path, "", testToken)
+		require.Equal(t, 200, response.Code)
+		var page struct {
+			Items     []coverageView        `json:"items"`
+			Aggregate statusmodel.Aggregate `json:"aggregate"`
+		}
+		require.NoError(t, json.Unmarshal(response.Body.Bytes(), &page))
+		require.Len(t, page.Items, 1)
+		require.Equal(t, uint64(7), page.Items[0].SourceRevision)
+		require.Equal(t, statusmodel.RetryWaiting, page.Items[0].Acquisition.State)
+		require.Equal(t, "repository_retry", page.Items[0].Acquisition.Diagnostics.WaitReason)
+		require.Equal(t, deadline, *page.Items[0].Acquisition.Diagnostics.RetryAt)
+		require.Equal(t, "automatic_retry", page.Items[0].Acquisition.Diagnostics.RetryAction)
+		require.Equal(t, "incomplete", page.Aggregate.State)
+	}
+	for _, path := range []string{"/jobs", "/jobs/" + job.ID} {
+		response := request(h, "GET", path, "", testToken)
+		require.Equal(t, 200, response.Code)
+		var got jobView
+		if path == "/jobs" {
+			var page struct {
+				Jobs []jobView `json:"jobs"`
+			}
+			require.NoError(t, json.Unmarshal(response.Body.Bytes(), &page))
+			require.Len(t, page.Jobs, 1)
+			got = page.Jobs[0]
+		} else {
+			require.NoError(t, json.Unmarshal(response.Body.Bytes(), &got))
+		}
+		require.Equal(t, jobs.Pending, got.State)
+		require.Equal(t, jobs.JobExecutionWaiting, got.Diagnostics.Execution)
+		require.Equal(t, deadline, *got.Diagnostics.RetryAt)
 	}
 }

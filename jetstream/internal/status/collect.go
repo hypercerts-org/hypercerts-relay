@@ -87,8 +87,11 @@ func collectLive(s *store.Store, now time.Time, lastSeen func() time.Time) (Live
 	}
 	if lastSeen != nil {
 		stats.LastSeenUpstreamEventAt = lastSeen()
-		if !stats.LastSeenUpstreamEventAt.IsZero() && now.After(stats.LastSeenUpstreamEventAt) {
-			stats.LastSeenUpstreamEventAge = now.Sub(stats.LastSeenUpstreamEventAt)
+		if !stats.LastSeenUpstreamEventAt.IsZero() && !stats.LastSeenUpstreamEventAt.After(now) {
+			age := now.Sub(stats.LastSeenUpstreamEventAt)
+			stats.LastSeenUpstreamEventAge = age
+			seconds := int64(age / time.Second)
+			stats.LastSeenUpstreamEventAgeSeconds = &seconds
 		}
 	}
 	return stats, nil
@@ -749,6 +752,11 @@ func build(ctx context.Context, opts Options, startedAt time.Time) (*Snapshot, e
 	if opts.ImportReporter != nil {
 		if info, ok := opts.ImportReporter.CurrentImport(); ok {
 			snap.Import = &info
+		}
+	}
+	if opts.CoverageReporter != nil {
+		if info, ok := opts.CoverageReporter.CurrentCoverage(); ok {
+			snap.Coverage = &info
 		}
 	}
 

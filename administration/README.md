@@ -168,6 +168,8 @@ Viewing does not change jobs. Retry is an audited action that preserves complete
 work, resets eligible retries for incomplete jobs, and refreshes the inventory for
 failed jobs. The Backfill jobs table offers no Retry action for complete jobs.
 
+The administration UI presents the authoritative aggregate for all enabled sources under the current policy, independent of page and exact-source filters. It shows nullable initial inventory, verified scanned, matching, successful no-match, unresolved and attributable-record counts as job-wide evidence—not per-collection progress. Null remains Unknown while zero is a measured value. Failure category, last progress timestamp, attempts, affected repository DID and explicit retry action are shown only when supplied; throttling and incomplete work do not imply a retry countdown or ETA. History and live freshness remain independently unknown; completed acquisition does not establish either. Acquisition diagnostics show recorded repository retry and PDS cooldown deadlines and the current wait reason when supplied. Retry-waiting evidence without either deadline explicitly reports unknown timing; no countdown or ETA is inferred. Stopped work still requires the explicit job retry action when reported.
+
 ## Rate policy
 
 Global and per-PDS values are integer **events/second**, inclusive range 1–1,000,000,

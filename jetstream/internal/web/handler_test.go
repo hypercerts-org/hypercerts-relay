@@ -40,6 +40,8 @@ func (f *fakeRepoActions) VerifyRepo(_ context.Context, did string) (repoexport.
 	return f.verifyReport, f.verifyErr
 }
 
+func ptrInt64(v int64) *int64 { return &v }
+
 func newFixtureSnap() *status.Snapshot {
 	return &status.Snapshot{
 		GeneratedAt: time.Date(2026, 5, 25, 12, 0, 0, 0, time.UTC),
@@ -66,11 +68,12 @@ func newFixtureSnap() *status.Snapshot {
 			Duration:    3*24*time.Hour + 7*time.Hour + 5*time.Minute,
 		},
 		Live: status.LiveStats{
-			UpstreamCursor:           1234567,
-			NextSeq:                  999,
-			BootstrapSeq:             0,
-			LastSeenUpstreamEventAt:  time.Date(2026, 5, 25, 12, 0, 0, 0, time.UTC),
-			LastSeenUpstreamEventAge: 5 * time.Second,
+			UpstreamCursor:                  1234567,
+			NextSeq:                         999,
+			BootstrapSeq:                    0,
+			LastSeenUpstreamEventAt:         time.Date(2026, 5, 25, 12, 0, 0, 0, time.UTC),
+			LastSeenUpstreamEventAge:        5 * time.Second,
+			LastSeenUpstreamEventAgeSeconds: ptrInt64(5),
 		},
 		SegmentAggregate: &status.SegmentAggregate{
 			Trees: []status.TreeAggregate{
@@ -207,8 +210,8 @@ func TestHandler_RendersOK(t *testing.T) {
 	require.Contains(t, body, "5,000")        // OldestRetainedSeq formatted
 	require.Contains(t, body, "12,345")       // Network event count via humanInt
 	require.Contains(t, body, "[100, 1,233]") // Seq range
-	require.Contains(t, body, "Last upstream event")
-	require.Contains(t, body, "5s ago")
+	require.Contains(t, body, "Global upstream event observation")
+	require.Contains(t, body, "5 seconds ago")
 	require.Contains(t, body, "2026-05-24")
 	require.Contains(t, body, "Witnessed range")
 	require.Contains(t, body, "overflow-wrap: anywhere")
@@ -219,6 +222,30 @@ func TestHandler_RendersOK(t *testing.T) {
 	require.NotContains(t, strings.ToLower(body), "capacity")
 	require.NotContains(t, body, "Top failing hosts")
 	require.NotContains(t, body, `<h2>Collections</h2>`)
+}
+
+func TestHandler_PublicCoverageIsSafeAndPreservesZero(t *testing.T) {
+	t.Parallel()
+	s := newFixtureSnap()
+	zero := status.CoverageCount{Known: true, Value: 0}
+	s.Coverage = &status.CoverageInfo{Scope: "enabled_sources_current_policy", Policy: status.CoveragePolicy{Revision: 7, Collections: []string{"app.certified.actor.profile"}}, Sources: []status.CoverageSource{{
+		PDS: "https://pds.example", SourceRevision: 3, PolicyRevision: 7, Collections: []string{"app.certified.actor.profile"}, State: "complete", ProgressScope: "job_inventory",
+		Counts:       status.CoverageCounts{InitialInventory: zero, Scanned: zero, Matching: zero, NoMatch: zero, Unresolved: zero, AttributableRecords: zero},
+		HistoryState: "unknown", LiveState: "unknown",
+	}}}
+	h, err := web.New(web.Options{Snapshotter: &fakeSnapshotter{snap: s}})
+	require.NoError(t, err)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/status", nil))
+	body := rr.Body.String()
+	require.Equal(t, http.StatusOK, rr.Code)
+	require.Contains(t, body, "Current-policy acquisition")
+	require.Contains(t, body, "complete")
+	require.Contains(t, body, "History")
+	require.Contains(t, body, "Source live")
+	require.Contains(t, body, "0")
+	require.NotContains(t, body, "Backfill has not started")
+	require.NotContains(t, body, "jobId")
 }
 
 func TestHandler_OmitsImportPanelWhenNoImport(t *testing.T) {
