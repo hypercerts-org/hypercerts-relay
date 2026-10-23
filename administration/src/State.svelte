@@ -10,6 +10,10 @@
     "failing",
     "unavailable",
     "throttled",
+    "stopped_incomplete",
+    "retry_waiting",
+    "unknown",
+    "canceled",
   ].includes(value)}
   class:good={[
     "applied",

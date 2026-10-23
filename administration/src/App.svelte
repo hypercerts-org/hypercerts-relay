@@ -17,15 +17,36 @@
     type Policy,
     type Job,
     type Coverage,
+    type CoveragePage,
     type Audit,
     type Limit,
     type Administrator,
   } from "./api";
   const navigation = [
     { label: "", items: [["overview", "Overview"]] },
-    { label: "Relay", items: [["sources", "PDS sources"], ["limits", "Rate limits"]] },
-    { label: "Jetstream", items: [["collections", "Collections"], ["jobs", "Backfill jobs"], ["coverage", "Coverage"], ["archive-keys", "Consumer API keys"]] },
-    { label: "Administration", items: [["audit", "Audit log"], ["manage-adminis", "Administrators"]] },
+    {
+      label: "Relay",
+      items: [
+        ["sources", "PDS sources"],
+        ["limits", "Rate limits"],
+      ],
+    },
+    {
+      label: "Jetstream",
+      items: [
+        ["collections", "Collections"],
+        ["jobs", "Backfill jobs"],
+        ["coverage", "Coverage"],
+        ["archive-keys", "Consumer API keys"],
+      ],
+    },
+    {
+      label: "Administration",
+      items: [
+        ["audit", "Audit log"],
+        ["manage-adminis", "Administrators"],
+      ],
+    },
   ];
   const navigationItems = navigation.flatMap((group) => group.items);
   const route = location.pathname.split("/")[1] || "overview";
@@ -51,7 +72,7 @@
     policy: Policy = { revision: 1, collections: [] },
     jobs: Job[] = [],
     changes: Operation[] = [],
-    coverage: Coverage[] = [],
+    coverage: (CoveragePage & { next: string | null }) | null = null,
     audit: Audit[] = [],
     limits: Limit[] = [],
     globalLimits: Limit[] = [];
@@ -106,10 +127,10 @@
           break;
         }
         case "coverage": {
-          const r = await api<{ items: Coverage[]; next: string | null }>(
+          const r = await api<CoveragePage & { next: string | null }>(
             `/coverage?after=${encodeURIComponent(cursor)}&pds=${encodeURIComponent(pdsFilter)}`,
           );
-          coverage = r.items;
+          coverage = r;
           next = r.next;
           break;
         }
@@ -311,7 +332,10 @@
         {#each navigation as group}
           <div class:nav-group={Boolean(group.label)}>
             {#if group.label}<p>{group.label}</p>{/if}
-            {#each group.items as [key, label]}<a href={key === "overview" ? "/" : `/${key}`} aria-current={screen === key ? "page" : undefined}>{label}</a>{/each}
+            {#each group.items as [key, label]}<a
+                href={key === "overview" ? "/" : `/${key}`}
+                aria-current={screen === key ? "page" : undefined}>{label}</a
+              >{/each}
           </div>
         {/each}
       </nav>

@@ -268,14 +268,399 @@ test("archive key service calls keep Jetstream paths and error codes", async (t)
   );
   assert.deepEqual(JSON.parse(calls[1].body), input);
 });
+test("repository detail proxy keeps the private path, cursor and bearer boundary", async (t) => {
+  const calls: { path: string; authorization: string }[] = [];
+  const server = createServer((req, res) => {
+    calls.push({
+      path: req.url ?? "",
+      authorization: req.headers.authorization ?? "",
+    });
+    res.setHeader("Content-Type", "application/json");
+    res.end(
+      JSON.stringify({
+        job: {
+          id: "0123456789abcdef0123456789abcdef",
+          pds: "https://pds.example",
+          policy: { revision: 1, collections: [] },
+          reason: "backfill",
+          state: "incomplete",
+          completedRepos: 2,
+          totalRepos: 3,
+          totalReposKnown: true,
+          attempts: 1,
+          createdAt: "2026-09-15T00:00:00.000Z",
+          lastProgressAt: "2026-09-15T00:01:00.000Z",
+          lastFailure: {
+            category: "http",
+            httpStatus: 503,
+            stage: "listRepos",
+            failedAt: "2026-09-15T00:02:00.000Z",
+          },
+          coverage: "current_state",
+          diagnostics: {
+            execution: "stopped",
+            unresolvedRepos: 1,
+            retryingRepos: 0,
+            maxRepositoryAttempts: 3,
+          },
+        },
+        repositories: [],
+        nextCursor: "",
+      }),
+    );
+  }).listen(0, "127.0.0.1");
+  await new Promise<void>((resolve) => server.once("listening", resolve));
+  t.after(() => server.close());
+  const address = server.address() as { port: number };
+  const services = new Services(
+    { url: "http://127.0.0.1:1", token: "relay-control-token" },
+    {
+      url: `http://127.0.0.1:${address.port}`,
+      token: "jetstream-control-token",
+    },
+  );
+  const page = await services.repositoryDetails(
+    "0123456789abcdef0123456789abcdef",
+    "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+    25,
+  );
+  assert.equal(page.job.state, "incomplete");
+  assert.equal(page.job.diagnostics.execution, "stopped");
+  assert.equal(page.job.lastProgressAt, "2026-09-15T00:01:00.000Z");
+  assert.deepEqual(page.job.lastFailure, {
+    category: "http",
+    httpStatus: 503,
+    stage: "listRepos",
+    failedAt: "2026-09-15T00:02:00.000Z",
+  });
+  assert.deepEqual(page.repositories, []);
+  assert.equal(page.nextCursor, "");
+  const query = new URLSearchParams({
+    limit: "25",
+    after: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+  });
+  assert.deepEqual(calls, [
+    {
+      path: `/hypercerts/v1/jobs/0123456789abcdef0123456789abcdef/repositories?${query}`,
+      authorization: "Bearer jetstream-control-token",
+    },
+  ]);
+});
+test("job and coverage projections preserve bounded diagnostics and leave legacy timestamps unknown", async (t) => {
+  const presentAt = "2026-09-15T00:01:00.000Z";
+  const currentJob = {
+    id: "0123456789abcdef0123456789abcdef",
+    pds: "https://pds.example",
+    policy: { revision: 1, collections: [] },
+    reason: "backfill",
+    state: "incomplete",
+    completedRepos: 1,
+    totalRepos: 2,
+    totalReposKnown: true,
+    attempts: 1,
+    errorCode: "source_unavailable",
+    createdAt: "2026-09-15T00:00:00.000Z",
+    lastProgressAt: presentAt,
+    lastFailure: {
+      category: "http",
+      httpStatus: 503,
+      stage: "listRepos",
+      failedAt: "2026-09-15T00:02:00.000Z",
+      detail: "unrecognized remote diagnostic must not be projected",
+    },
+    coverage: "current_state",
+    diagnostics: { execution: "stopped", maxRepositoryAttempts: 3 },
+  };
+  const legacyJob = {
+    ...currentJob,
+    id: "1123456789abcdef0123456789abcdef",
+    lastProgressAt: "0001-01-01T00:00:00Z",
+    lastFailure: {
+      category: "http",
+      httpStatus: 503,
+      stage: "listRepos",
+      failedAt: "0001-01-01T00:00:00Z",
+    },
+  };
+  const server = createServer((req, res) => {
+    const url = new URL(req.url ?? "", "http://127.0.0.1");
+    res.setHeader("Content-Type", "application/json");
+    if (url.pathname.endsWith("/repositories")) {
+      res.end(JSON.stringify({
+        job: legacyJob,
+        repositories: [
+          {
+            did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+            listedRevision: "3l3qo2vutsw2b",
+            state: "unresolved",
+            attempts: 1,
+            failure: { category: "http", httpStatus: 503, stage: "getRepo/request" },
+            failedAt: presentAt,
+          },
+          {
+            did: "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb",
+            listedRevision: "3l3qo2vutsw2c",
+            state: "unresolved",
+            attempts: 1,
+            failure: { category: "timeout", stage: "getRepo/request" },
+            failedAt: "0001-01-01T00:00:00Z",
+          },
+        ],
+      }));
+      return;
+    }
+    if (url.pathname.endsWith("/jobs")) {
+      res.end(JSON.stringify({ jobs: [currentJob, legacyJob], nextCursor: "" }));
+      return;
+    }
+    if (url.searchParams.get("summary") === "1") {
+      res.end(JSON.stringify({ items: [{
+        pds: "https://pds.example",
+        jobId: currentJob.id,
+        state: "incomplete",
+        completedRepos: 1,
+        totalRepos: 2,
+        totalReposKnown: true,
+        createdAt: currentJob.createdAt,
+        lastProgressAt: presentAt,
+        lastFailure: currentJob.lastFailure,
+        coverage: "current_state",
+        diagnostics: currentJob.diagnostics,
+      }, { ...legacyJob, jobId: legacyJob.id }, { ...currentJob, lastFailure: { ...currentJob.lastFailure, stage: "raw remote stage" } }] }));
+      return;
+    }
+    res.end(JSON.stringify({ items: [{
+      pds: "https://pds.example",
+      policy: currentJob.policy,
+      jobId: currentJob.id,
+      reason: currentJob.reason,
+      state: currentJob.state,
+      completedRepos: currentJob.completedRepos,
+      totalRepos: currentJob.totalRepos,
+      totalReposKnown: currentJob.totalReposKnown,
+      createdAt: currentJob.createdAt,
+      lastProgressAt: "0001-01-01T00:00:00Z",
+      coverage: currentJob.coverage,
+      diagnostics: currentJob.diagnostics,
+    }] }));
+  }).listen(0, "127.0.0.1");
+  await new Promise<void>((resolve) => server.once("listening", resolve));
+  t.after(() => server.close());
+  const address = server.address() as { port: number };
+  const services = new Services(
+    { url: "http://127.0.0.1:1", token: "relay-control-token" },
+    {
+      url: `http://127.0.0.1:${address.port}`,
+      token: "jetstream-control-token",
+    },
+  );
+
+  const jobs = await services.jobs();
+  assert.equal(jobs.jobs[0].lastProgressAt, presentAt);
+  assert.equal(jobs.jobs[0].errorCode, "source_unavailable");
+  assert.deepEqual(jobs.jobs[0].lastFailure, {
+    category: "http",
+    httpStatus: 503,
+    stage: "listRepos",
+    failedAt: "2026-09-15T00:02:00.000Z",
+  });
+  assert.equal(jobs.jobs[1].lastProgressAt, undefined);
+  assert.equal(jobs.jobs[1].lastFailure, undefined);
+
+  const details = await services.repositoryDetails(currentJob.id);
+  assert.equal(details.job.lastProgressAt, undefined);
+  assert.equal(details.repositories[0].failedAt, presentAt);
+  assert.equal(details.repositories[1].failedAt, undefined);
+
+  const coverage = await services.coverage();
+  assert.equal(coverage.items[0].lastProgressAt, undefined);
+  const summaries = await services.coverageFor(["https://pds.example"]);
+  assert.equal(summaries.items[1].lastProgressAt, undefined);
+  assert.equal(summaries.items[1].lastFailure, undefined);
+  assert.equal(summaries.items[2].lastFailure, undefined);
+  assert.equal(summaries.items[0].lastProgressAt, presentAt);
+  assert.deepEqual(summaries.items[0].lastFailure, {
+    category: "http",
+    httpStatus: 503,
+    stage: "listRepos",
+    failedAt: "2026-09-15T00:02:00.000Z",
+  });
+});
+test("repository detail proxy bounds remote error bodies and preserves snapshot error codes", async (t) => {
+  const server = createServer((req, res) => {
+    const expired = req.url?.includes("limit=25");
+    const oversized = req.url?.includes("limit=27");
+    res.statusCode = expired || oversized ? 410 : 413;
+    res.setHeader("Content-Type", "application/json");
+    res.end(
+      JSON.stringify(
+        oversized
+          ? { error: "repository_snapshot_expired", detail: "x".repeat(8192) }
+          : {
+              error: expired
+                ? "repository_snapshot_expired"
+                : "repository_snapshot_too_large",
+            },
+      ),
+    );
+  }).listen(0, "127.0.0.1");
+  await new Promise<void>((resolve) => server.once("listening", resolve));
+  t.after(() => server.close());
+  const address = server.address() as { port: number };
+  const services = new Services(
+    { url: "http://127.0.0.1:1", token: "relay-control-token" },
+    {
+      url: `http://127.0.0.1:${address.port}`,
+      token: "jetstream-control-token",
+    },
+  );
+  await assert.rejects(
+    services.repositoryDetails("0123456789abcdef0123456789abcdef", "opaque", 25),
+    (error: unknown) => {
+      assert.ok(error instanceof ApiError);
+      assert.equal(error.status, 410);
+      assert.equal(error.code, "repository_snapshot_expired");
+      return true;
+    },
+  );
+  await assert.rejects(
+    services.repositoryDetails("0123456789abcdef0123456789abcdef", "", 26),
+    (error: unknown) => {
+      assert.ok(error instanceof ApiError);
+      assert.equal(error.status, 413);
+      assert.equal(error.code, "repository_snapshot_too_large");
+      return true;
+    },
+  );
+  await assert.rejects(
+    services.repositoryDetails("0123456789abcdef0123456789abcdef", "", 27),
+    (error: unknown) => {
+      assert.ok(error instanceof ApiError);
+      assert.equal(error.status, 410);
+      assert.equal(error.code, "jetstream_rejected_410");
+      return true;
+    },
+  );
+});
+test("administration repository detail route validates and proxies a read-only page", async (t) => {
+  const { request, services, store } = await fixture(t);
+  const seen: unknown[] = [];
+  services.repositoryDetails = (id, after = "", limit = 100) => {
+    seen.push([id, after, limit]);
+    return Promise.resolve({
+      job: {
+        id,
+        pds: "https://pds.example",
+        policy: { revision: 1, collections: [] },
+        reason: "backfill",
+        state: "incomplete",
+        completedRepos: 2,
+        totalRepos: 3,
+        totalReposKnown: true,
+        attempts: 1,
+        createdAt: "2026-09-15T00:00:00.000Z",
+        lastProgressAt: "2026-09-15T00:01:00.000Z",
+        lastFailure: {
+          category: "http",
+          httpStatus: 503,
+          stage: "listRepos",
+          failedAt: "2026-09-15T00:02:00.000Z",
+        },
+        coverage: "current_state",
+        diagnostics: {
+          execution: "stopped",
+          unresolvedRepos: 1,
+          retryingRepos: 0,
+          maxRepositoryAttempts: 3,
+        },
+      },
+      repositories: [
+        {
+          did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+          listedRevision: "3l3qo2vutsw2b",
+          state: "unresolved",
+          attempts: 3,
+          failure: {
+            category: "http",
+            httpStatus: 503,
+            stage: "getRepo/request",
+            code: "source_unavailable",
+          },
+          failedAt: "2026-09-15T00:03:00.000Z",
+        },
+      ],
+      nextCursor: "",
+    });
+  };
+  const id = "0123456789abcdef0123456789abcdef";
+  const after = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+  const response = await request(
+    `/api/v1/jobs/${id}/repositories?limit=25&after=${encodeURIComponent(after)}`,
+  );
+  assert.equal(response.status, 200);
+  const page = await response.json();
+  assert.equal(page.repositories[0].failure.category, "http");
+  assert.equal(page.job.state, "incomplete");
+  assert.equal(page.job.diagnostics.execution, "stopped");
+  assert.equal(page.repositories[0].failure.httpStatus, 503);
+  assert.equal(page.repositories[0].failedAt, "2026-09-15T00:03:00.000Z");
+  assert.equal(page.job.lastProgressAt, "2026-09-15T00:01:00.000Z");
+  assert.deepEqual(page.job.lastFailure, {
+    category: "http",
+    httpStatus: 503,
+    stage: "listRepos",
+    failedAt: "2026-09-15T00:02:00.000Z",
+  });
+  assert.deepEqual(seen, [[id, after, 25]]);
+  assert.equal(store.page("operations", "", 50).items.length, 0);
+  assert.equal(
+    (await request("/api/v1/jobs/not-a-job/repositories")).status,
+    400,
+  );
+  assert.equal(
+    (await request(`/api/v1/jobs/${id}/repositories?limit=101`)).status,
+    400,
+  );
+});
 test("T10 coverage preserves current-state limits, unknown historical provenance and Jetstream reason", async (t) => {
   const { request, services } = await fixture(t);
   services.coverage = async () => ({
+    schemaVersion: 1,
+    scope: "enabled_sources_current_policy",
+    policy: { revision: 2, collections: ["app.bsky.feed.post"] },
+    aggregate: {
+      scope: "enabled_sources_current_policy",
+      policy: { revision: 2, collections: ["app.bsky.feed.post"] },
+      enabledSources: 2,
+      state: "unknown",
+    },
     items: [
       {
         pds: "https://pds.example",
         policy: { revision: 2, collections: ["app.bsky.feed.post"] },
         jobId: "coverage-job",
+        sourceRevision: 3,
+        matchingJob: true,
+        acquisition: {
+          state: "stopped_incomplete",
+          progressScope: "job_inventory",
+          counts: {
+            initialInventory: 10,
+            scanned: 3,
+            matching: 1,
+            noMatch: 2,
+            unresolved: 7,
+            attributableRecords: 4,
+          },
+          diagnostics: {
+            failureCategory: "source_unavailable",
+            lastProgressAt: "2026-09-15T00:00:00.000Z",
+            attempts: 2,
+            retryAction: "explicit_retry",
+          },
+        },
+        history: { state: "unknown" },
+        live: { state: "unknown" },
         reason: "quota_recovery",
         state: "incomplete",
         completedRepos: 3,
@@ -283,7 +668,20 @@ test("T10 coverage preserves current-state limits, unknown historical provenance
         totalReposKnown: true,
         errorCode: "source_unavailable",
         createdAt: "2026-09-15T00:00:00.000Z",
+        lastProgressAt: "2026-09-15T00:01:00.000Z",
+        lastFailure: {
+          category: "http",
+          httpStatus: 503,
+          stage: "listRepos",
+          failedAt: "2026-09-15T00:02:00.000Z",
+        },
         coverage: "current_state",
+        diagnostics: {
+          execution: "stopped",
+          unresolvedRepos: 7,
+          retryingRepos: 0,
+          maxRepositoryAttempts: 3,
+        },
       },
     ],
     nextCursor: "next-page",
@@ -294,9 +692,58 @@ test("T10 coverage preserves current-state limits, unknown historical provenance
   const page = await response.json();
   assert.equal(page.items[0].reason, "quota_recovery");
   assert.equal(page.items[0].errorCode, "source_unavailable");
+  assert.equal(page.items[0].lastProgressAt, "2026-09-15T00:01:00.000Z");
+  assert.deepEqual(page.items[0].lastFailure, {
+    category: "http",
+    httpStatus: 503,
+    stage: "listRepos",
+    failedAt: "2026-09-15T00:02:00.000Z",
+  });
   assert.equal(page.items[0].coverage, "current_state");
   assert.equal(page.items[0].historicalPDSAttribution, "unknown");
+  assert.equal(page.items[0].diagnostics.unresolvedRepos, 7);
+  assert.equal(page.items[0].diagnostics.maxRepositoryAttempts, 3);
   assert.equal(page.next, "next-page");
+  const expected = await services.coverage();
+  assert.deepEqual(page.aggregate, expected.aggregate);
+  assert.equal(page.schemaVersion, 1);
+  assert.equal(page.scope, expected.scope);
+  assert.deepEqual(page.policy, expected.policy);
+  assert.deepEqual(page.items[0].acquisition, expected.items[0].acquisition);
+  assert.equal(page.items[0].sourceRevision, 3);
+  assert.equal(page.items[0].matchingJob, true);
+  assert.deepEqual(page.items[0].policy, expected.items[0].policy);
+  assert.equal(page.nextCursor, "next-page");
+  assert.deepEqual(page.items[0].history, { state: "unknown" });
+  assert.deepEqual(page.items[0].live, { state: "unknown" });
+  const missing = {
+    pds: "https://missing.example",
+    sourceRevision: 4,
+    policy: expected.policy,
+    matchingJob: false,
+    acquisition: {
+      state: "unknown" as const,
+      progressScope: "job_inventory" as const,
+      counts: {
+        initialInventory: null,
+        scanned: null,
+        matching: null,
+        noMatch: null,
+        unresolved: null,
+        attributableRecords: null,
+      },
+      diagnostics: { attempts: 0, lastProgressAt: null },
+    },
+    history: { state: "unknown" as const },
+    live: { state: "unknown" as const },
+  };
+  services.coverage = () => Promise.resolve({ ...expected, items: [missing] });
+  const unavailable = await (await request("/api/v1/coverage")).json();
+  assert.deepEqual(unavailable.items[0], {
+    ...missing,
+    historicalPDSAttribution: "unknown",
+  });
+  assert.deepEqual(unavailable.aggregate, expected.aggregate);
 });
 test("authentication, CSRF and immediate administrator removal guard durable mutations", async (t) => {
   const { store, request } = await fixture(t);
@@ -572,4 +1019,45 @@ test("admins manage other administrators with CSRF, immediate revocation and act
       [other, "administrator_remove"],
     ],
   );
+});
+
+test("coverage proxy preserves canonical retry states and normalizes nested dates", async (t) => {
+  const { request, services } = await fixture(t);
+  const retryAt = "2026-10-22T12:00:00Z", cooldown = "2026-10-22T12:01:00Z";
+  const source = {
+    pds: "https://pds.example", sourceRevision: 7,
+    policy: { revision: 3, collections: [] }, matchingJob: true, jobId: "a".repeat(32),
+    acquisition: {
+      state: "retry_waiting", progressScope: "job_inventory",
+      counts: { initialInventory: 2, scanned: null, matching: null, noMatch: null, unresolved: null, attributableRecords: null },
+      diagnostics: { attempts: 1, lastProgressAt: "0001-01-01T00:00:00Z", retryAction: "automatic_retry", retryAt, pdsCooldownUntil: cooldown, waitReason: "pds_cooldown", failureCategory: "http" },
+    },
+    history: { state: "unknown" }, live: { state: "unknown" },
+  };
+  const page = { schemaVersion: 1, scope: "enabled_sources_current_policy", policy: source.policy, items: [source], aggregate: { scope: "enabled_sources_current_policy", policy: source.policy, enabledSources: 2, state: "incomplete" } };
+  services.call = <T>() => Promise.resolve(page as T);
+  for (const result of [await services.coverage(), await services.coverageFor([source.pds])]) {
+    const item = result.items[0];
+    assert.equal(item.acquisition.state, "retry_waiting");
+    assert.equal(item.acquisition.diagnostics.retryAt, retryAt);
+    assert.equal(item.acquisition.diagnostics.pdsCooldownUntil, cooldown);
+    assert.equal(item.acquisition.diagnostics.lastProgressAt, null);
+    assert.equal(item.acquisition.diagnostics.waitReason, "pds_cooldown");
+    assert.equal(item.acquisition.diagnostics.retryAction, "automatic_retry");
+    assert.equal(item.acquisition.counts.scanned, null);
+  }
+  const response = await request("/api/v1/coverage");
+  assert.equal(response.status, 200);
+  const proxied = await response.json();
+  assert.equal(proxied.items[0].acquisition.state, "retry_waiting");
+  assert.equal(proxied.items[0].acquisition.diagnostics.retryAt, retryAt);
+  assert.equal(proxied.aggregate.enabledSources, 2);
+  assert.equal(proxied.aggregate.state, "incomplete");
+  source.acquisition.state = "complete";
+  source.acquisition.diagnostics.retryAt = "malformed";
+  source.acquisition.diagnostics.pdsCooldownUntil = "0001-01-01T00:00:00Z";
+  const terminal = (await services.coverage()).items[0];
+  assert.equal(terminal.acquisition.state, "complete");
+  assert.equal(terminal.acquisition.diagnostics.retryAt, undefined);
+  assert.equal(terminal.acquisition.diagnostics.pdsCooldownUntil, undefined);
 });

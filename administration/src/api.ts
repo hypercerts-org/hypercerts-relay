@@ -1,5 +1,17 @@
-import type { Command, Policy } from "../server/contracts";
-export type { Command, Operation, Policy, Job } from "../server/contracts";
+import type { Command, CoverageSource } from "../server/contracts";
+export type {
+  Command,
+  Operation,
+  Policy,
+  Job,
+  Acquisition,
+  CoverageSource,
+  CoveragePage,
+  JobDiagnostics,
+  JobLastFailure,
+  RepositoryDetail,
+  RepositoryDetailsPage,
+} from "../server/contracts";
 export interface Administrator {
   did: string;
   handle?: string | null;
@@ -27,29 +39,8 @@ export interface Limit {
   unit: string;
   recovery: string;
 }
-export interface JetstreamSummary {
-  pds: string;
-  jobId: string;
-  state: string;
-  completedRepos: number;
-  totalRepos: number;
-  totalReposKnown: boolean;
-  createdAt: string;
-  coverage: string;
-}
-export interface Coverage {
-  pds: string;
-  policy: Policy;
-  jobId: string;
-  state: string;
-  completedRepos: number;
-  totalRepos: number;
-  totalReposKnown: boolean;
-  createdAt: string;
-  reason: string | null;
-  historicalPDSAttribution: string;
-  coverage: string;
-}
+export type JetstreamSummary = CoverageSource;
+export type Coverage = CoverageSource;
 export interface Audit {
   seq: number;
   actor: string;

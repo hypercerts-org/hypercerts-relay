@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/hypercerts/archivekeys"
+	statusmodel "github.com/bluesky-social/jetstream/internal/hypercerts/coverage"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/jobs"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 )
@@ -62,6 +63,7 @@ func NewWithArchiveKeys(token string, manager *jobs.Manager, policy *selection.M
 	h.mux.HandleFunc("GET "+Prefix+"/snapshot-rejections", h.listSnapshotRejections)
 	h.mux.HandleFunc("GET "+Prefix+"/coverage", h.listCoverage)
 	h.mux.HandleFunc("GET "+Prefix+"/jobs/{id}", h.getJob)
+	h.mux.HandleFunc("GET "+Prefix+"/jobs/{id}/repositories", h.listRepositoryDetails)
 	h.mux.HandleFunc("POST "+Prefix+"/jobs", h.requestJob)
 	h.mux.HandleFunc("POST "+Prefix+"/jobs/{id}/cancel", h.cancelJob)
 	h.mux.HandleFunc("POST "+Prefix+"/jobs/{id}/retry", h.retryJob)
@@ -114,6 +116,12 @@ func failure(w http.ResponseWriter, err error) {
 	case errors.Is(err, jobs.ErrConflict) || errors.Is(err, selection.ErrRevision):
 		status = 409
 		code = "state_conflict"
+	case errors.Is(err, jobs.ErrRepositoryDetailsSnapshotExpired):
+		status = 410
+		code = "repository_snapshot_expired"
+	case errors.Is(err, jobs.ErrRepositoryDetailsSnapshotTooLarge):
+		status = 413
+		code = "repository_snapshot_too_large"
 	case errors.Is(err, jobs.ErrInvalidInput):
 		status = 400
 		code = "invalid_input"
@@ -156,7 +164,12 @@ func (h *Handler) addSource(w http.ResponseWriter, r *http.Request) {
 		failure(w, err)
 		return
 	}
-	reply(w, 202, view(j))
+	job, viewErr := h.jobView(j)
+	if viewErr != nil {
+		failure(w, viewErr)
+		return
+	}
+	reply(w, 202, job)
 }
 func (h *Handler) removeSource(w http.ResponseWriter, r *http.Request) {
 	var input struct {
@@ -186,7 +199,12 @@ func (h *Handler) requestJob(w http.ResponseWriter, r *http.Request) {
 		failure(w, err)
 		return
 	}
-	reply(w, 202, view(j))
+	job, viewErr := h.jobView(j)
+	if viewErr != nil {
+		failure(w, viewErr)
+		return
+	}
+	reply(w, 202, job)
 }
 func (h *Handler) cancelJob(w http.ResponseWriter, r *http.Request) {
 	if err := h.jobs.TransitionOnce(r.PathValue("id"), jobs.Canceled, r.Header.Get("Idempotency-Key")); err != nil {
@@ -202,14 +220,52 @@ func (h *Handler) retryJob(w http.ResponseWriter, r *http.Request) {
 	}
 	h.getJob(w, r)
 }
-func (h *Handler) getJob(w http.ResponseWriter, r *http.Request) {
-	for _, j := range h.jobs.List() {
-		if j.ID == r.PathValue("id") {
-			reply(w, 200, view(j))
+func (h *Handler) listRepositoryDetails(w http.ResponseWriter, r *http.Request) {
+	limit := 100
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > 200 {
+			reply(w, http.StatusBadRequest, map[string]string{"error": "invalid_limit"})
 			return
 		}
+		limit = n
 	}
-	failure(w, jobs.ErrNotFound)
+	snapshot, err := h.jobs.RepositoryDetails(r.PathValue("id"), r.URL.Query().Get("after"), limit)
+	if err != nil {
+		failure(w, err)
+		return
+	}
+	detailJob := view(snapshot.Snapshot.Job, snapshot.Snapshot.CompletedRepos, snapshot.Snapshot.Diagnostics)
+	reply(w, http.StatusOK, struct {
+		Job          jobView                 `json:"job"`
+		Repositories []jobs.RepositoryDetail `json:"repositories"`
+		NextCursor   string                  `json:"nextCursor,omitempty"`
+	}{detailJob, snapshot.Repositories, snapshot.NextCursor})
+}
+
+func (h *Handler) getJob(w http.ResponseWriter, r *http.Request) {
+	job, err := h.jobViewByID(r.PathValue("id"))
+	if err != nil {
+		failure(w, err)
+		return
+	}
+	reply(w, 200, job)
+}
+
+func (h *Handler) jobView(j jobs.Job) (jobView, error) {
+	snapshots, err := h.jobs.DiagnosticSnapshots([]string{j.ID})
+	if err != nil {
+		return jobView{}, err
+	}
+	return view(snapshots[0].Job, snapshots[0].CompletedRepos, snapshots[0].Diagnostics), nil
+}
+
+func (h *Handler) jobViewByID(id string) (jobView, error) {
+	snapshots, err := h.jobs.DiagnosticSnapshots([]string{id})
+	if err != nil {
+		return jobView{}, err
+	}
+	return view(snapshots[0].Job, snapshots[0].CompletedRepos, snapshots[0].Diagnostics), nil
 }
 func (h *Handler) listCoverage(w http.ResponseWriter, r *http.Request) {
 	options, ok := parseCoverageOptions(r)
@@ -217,12 +273,43 @@ func (h *Handler) listCoverage(w http.ResponseWriter, r *http.Request) {
 		reply(w, 400, map[string]string{"error": "invalid_limit"})
 		return
 	}
-	items, next := pageCoverage(latestCoverageJobs(h.jobs.List(), options.requestedPDS), options.after, options.limit)
-	if options.summary {
-		reply(w, 200, coverageSummaryPage(items, next))
+	enabled, revisions, policy, history, diagnostics, err := h.jobs.StatusDiagnosticInputs()
+	if err != nil {
+		failure(w, err)
 		return
 	}
-	reply(w, 200, coveragePage(items, next))
+	snapshot := statusmodel.New(enabled, revisions, policy, history, diagnostics...)
+	page, next := pageCoverageSources(snapshot.Items, options)
+	items, err := h.coverageViews(page, diagnostics...)
+	if err != nil {
+		failure(w, err)
+		return
+	}
+	snapshot.Items = nil
+	snapshot.NextCursor = next
+	if options.summary {
+		summaries := make([]coverageSummaryView, 0, len(items))
+		for _, item := range items {
+			summaries = append(summaries, coverageSummary(item))
+		}
+		reply(w, 200, struct {
+			Items         []coverageSummaryView `json:"items"`
+			NextCursor    string                `json:"nextCursor,omitempty"`
+			SchemaVersion int                   `json:"schemaVersion"`
+			Scope         string                `json:"scope"`
+			Policy        selection.Policy      `json:"policy"`
+			Aggregate     statusmodel.Aggregate `json:"aggregate"`
+		}{summaries, next, snapshot.SchemaVersion, snapshot.Scope, snapshot.Policy, snapshot.Aggregate})
+		return
+	}
+	reply(w, 200, struct {
+		Items         []coverageView        `json:"items"`
+		NextCursor    string                `json:"nextCursor,omitempty"`
+		SchemaVersion int                   `json:"schemaVersion"`
+		Scope         string                `json:"scope"`
+		Policy        selection.Policy      `json:"policy"`
+		Aggregate     statusmodel.Aggregate `json:"aggregate"`
+	}{items, next, snapshot.SchemaVersion, snapshot.Scope, snapshot.Policy, snapshot.Aggregate})
 }
 
 type coverageOptions struct {
@@ -241,7 +328,13 @@ func parseCoverageOptions(r *http.Request) (coverageOptions, bool) {
 		}
 		limit = n
 	}
-	requestedPDS := map[string]struct{}{}
+	if len(r.URL.Query().Get("after")) > maxSnapshotRejectionPDSLength {
+		return coverageOptions{}, false
+	}
+	requestedPDS, valid := snapshotRejectionPDSFilters(r.URL.Query()["pds"])
+	if !valid {
+		return coverageOptions{}, false
+	}
 	for _, pds := range r.URL.Query()["pds"] {
 		if pds != "" {
 			requestedPDS[pds] = struct{}{}
@@ -253,65 +346,6 @@ func parseCoverageOptions(r *http.Request) (coverageOptions, bool) {
 		after:        r.URL.Query().Get("after"),
 		summary:      r.URL.Query().Get("summary") == "1",
 	}, true
-}
-
-func latestCoverageJobs(jobsList []jobs.Job, requestedPDS map[string]struct{}) []jobs.Job {
-	latest := map[string]jobs.Job{}
-	for _, job := range jobsList {
-		if len(requestedPDS) > 0 {
-			if _, ok := requestedPDS[job.PDS]; !ok {
-				continue
-			}
-		}
-		previous, ok := latest[job.PDS]
-		if !ok || job.CreatedAt.After(previous.CreatedAt) || (job.CreatedAt.Equal(previous.CreatedAt) && job.ID > previous.ID) {
-			latest[job.PDS] = job
-		}
-	}
-	all := make([]jobs.Job, 0, len(latest))
-	for _, job := range latest {
-		all = append(all, job)
-	}
-	sort.Slice(all, func(i, j int) bool { return all[i].PDS < all[j].PDS })
-	return all
-}
-
-func pageCoverage(jobsList []jobs.Job, after string, limit int) ([]coverageView, string) {
-	out := make([]coverageView, 0, limit)
-	for _, job := range jobsList {
-		if job.PDS <= after {
-			continue
-		}
-		if len(out) == limit {
-			return out, out[len(out)-1].PDS
-		}
-		out = append(out, coverage(job))
-	}
-	return out, ""
-}
-
-func coveragePage(items []coverageView, next string) struct {
-	Items      []coverageView `json:"items"`
-	NextCursor string         `json:"nextCursor,omitempty"`
-} {
-	return struct {
-		Items      []coverageView `json:"items"`
-		NextCursor string         `json:"nextCursor,omitempty"`
-	}{items, next}
-}
-
-func coverageSummaryPage(items []coverageView, next string) struct {
-	Items      []coverageSummaryView `json:"items"`
-	NextCursor string                `json:"nextCursor,omitempty"`
-} {
-	summaries := make([]coverageSummaryView, 0, len(items))
-	for _, item := range items {
-		summaries = append(summaries, coverageSummary(item))
-	}
-	return struct {
-		Items      []coverageSummaryView `json:"items"`
-		NextCursor string                `json:"nextCursor,omitempty"`
-	}{summaries, next}
 }
 
 // rejectionView deliberately contains only the bounded, non-payload fields in
@@ -473,20 +507,33 @@ func (h *Handler) listJobs(w http.ResponseWriter, r *http.Request) {
 		limit = n
 	}
 	after := r.URL.Query().Get("after")
-	out := make([]jobView, 0, limit)
+	selected := make([]jobs.Job, 0, limit)
 	next := ""
-	for _, j := range h.jobs.List() {
+	for _, j := range h.jobs.ListForDiagnostics() {
 		if pds := r.URL.Query().Get("pds"); pds != "" && j.PDS != pds {
 			continue
 		}
 		if j.ID <= after {
 			continue
 		}
-		if len(out) == limit {
-			next = out[len(out)-1].ID
+		if len(selected) == limit {
+			next = selected[len(selected)-1].ID
 			break
 		}
-		out = append(out, view(j))
+		selected = append(selected, j)
+	}
+	ids := make([]string, 0, len(selected))
+	for _, j := range selected {
+		ids = append(ids, j.ID)
+	}
+	snapshots, err := h.jobs.DiagnosticSnapshots(ids)
+	if err != nil {
+		failure(w, err)
+		return
+	}
+	out := make([]jobView, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		out = append(out, view(snapshot.Job, snapshot.CompletedRepos, snapshot.Diagnostics))
 	}
 	reply(w, 200, struct {
 		Jobs       []jobView `json:"jobs"`
@@ -497,61 +544,80 @@ func (h *Handler) listJobs(w http.ResponseWriter, r *http.Request) {
 // jobView reports bounded progress counters instead of embedding every DID in
 // each response. Current-state coverage and historical coverage stay separate.
 type jobView struct {
-	ID              string           `json:"id"`
-	PDS             string           `json:"pds"`
-	Policy          selection.Policy `json:"policy"`
-	Reason          string           `json:"reason"`
-	State           jobs.State       `json:"state"`
-	Attempts        int              `json:"attempts"`
-	CompletedRepos  int              `json:"completedRepos"`
-	TotalRepos      int              `json:"totalRepos"`
-	TotalReposKnown bool             `json:"totalReposKnown"`
-	Cursor          string           `json:"cursor"`
-	ErrorCode       string           `json:"errorCode,omitempty"`
-	CreatedAt       time.Time        `json:"createdAt"`
-	StartedAt       time.Time        `json:"startedAt"`
-	FinishedAt      time.Time        `json:"finishedAt"`
-	Coverage        string           `json:"coverage"`
+	ID              string              `json:"id"`
+	PDS             string              `json:"pds"`
+	Policy          selection.Policy    `json:"policy"`
+	Reason          string              `json:"reason"`
+	State           jobs.State          `json:"state"`
+	Attempts        int                 `json:"attempts"`
+	CompletedRepos  int                 `json:"completedRepos"`
+	TotalRepos      int                 `json:"totalRepos"`
+	TotalReposKnown bool                `json:"totalReposKnown"`
+	Cursor          string              `json:"cursor"`
+	ErrorCode       string              `json:"errorCode,omitempty"`
+	LastFailure     *jobs.JobFailure    `json:"lastFailure,omitempty"`
+	CreatedAt       time.Time           `json:"createdAt"`
+	StartedAt       time.Time           `json:"startedAt"`
+	FinishedAt      time.Time           `json:"finishedAt"`
+	LastProgressAt  *time.Time          `json:"lastProgressAt,omitempty"`
+	Coverage        string              `json:"coverage"`
+	Diagnostics     jobs.JobDiagnostics `json:"diagnostics"`
 }
 
-func view(j jobs.Job) jobView {
-	return jobView{ID: j.ID, PDS: j.PDS, Policy: j.Policy, Reason: j.Reason, State: j.State, Attempts: j.Attempts, CompletedRepos: len(j.CompletedRepos), TotalRepos: j.TotalRepos, TotalReposKnown: j.TotalReposKnown, Cursor: j.Cursor, ErrorCode: j.ErrorCode, CreatedAt: j.CreatedAt, StartedAt: j.StartedAt, FinishedAt: j.FinishedAt, Coverage: j.Coverage}
+func view(j jobs.Job, completedRepos int, diagnostics jobs.JobDiagnostics) jobView {
+	return jobView{ID: j.ID, PDS: j.PDS, Policy: j.Policy, Reason: j.Reason, State: j.State, Attempts: j.Attempts, CompletedRepos: completedRepos, TotalRepos: j.TotalRepos, TotalReposKnown: j.TotalReposKnown, Cursor: j.Cursor, ErrorCode: j.ErrorCode, LastFailure: j.LastFailure, CreatedAt: j.CreatedAt, StartedAt: j.StartedAt, FinishedAt: j.FinishedAt, LastProgressAt: j.LastProgressAt, Coverage: j.Coverage, Diagnostics: diagnostics}
 }
 
 type coverageView struct {
-	PDS             string           `json:"pds"`
-	Policy          selection.Policy `json:"policy"`
-	JobID           string           `json:"jobId"`
-	Reason          string           `json:"reason"`
-	State           jobs.State       `json:"state"`
-	CompletedRepos  int              `json:"completedRepos"`
-	TotalRepos      int              `json:"totalRepos"`
-	TotalReposKnown bool             `json:"totalReposKnown"`
-	ErrorCode       string           `json:"errorCode,omitempty"`
-	CreatedAt       time.Time        `json:"createdAt"`
-	Coverage        string           `json:"coverage"`
+	statusmodel.Source
+	LastProgressAt *time.Time           `json:"lastProgressAt,omitempty"`
+	LastFailure    *jobs.JobFailure     `json:"lastFailure,omitempty"`
+	Diagnostics    *jobs.JobDiagnostics `json:"diagnostics,omitempty"`
 }
 
-func coverage(j jobs.Job) coverageView {
-	return coverageView{PDS: j.PDS, Policy: j.Policy, JobID: j.ID, Reason: j.Reason, State: j.State, CompletedRepos: len(j.CompletedRepos), TotalRepos: j.TotalRepos, TotalReposKnown: j.TotalReposKnown, ErrorCode: j.ErrorCode, CreatedAt: j.CreatedAt, Coverage: j.Coverage}
+type coverageSummaryView = coverageView
+
+func coverageSummary(view coverageView) coverageSummaryView { return view }
+
+func pageCoverageSources(rows []statusmodel.Source, options coverageOptions) ([]statusmodel.Source, string) {
+	page := make([]statusmodel.Source, 0, options.limit)
+	for _, row := range rows {
+		if row.PDS <= options.after {
+			continue
+		}
+		if len(options.requestedPDS) > 0 {
+			if _, found := options.requestedPDS[row.PDS]; !found {
+				continue
+			}
+		}
+		if len(page) == options.limit {
+			return page, page[len(page)-1].PDS
+		}
+		page = append(page, row)
+	}
+	return page, ""
 }
 
-// coverageSummaryView is a compact table-enrichment view. The full policy is
-// intentionally omitted because it is fetched only for the selected source.
-type coverageSummaryView struct {
-	PDS             string     `json:"pds"`
-	JobID           string     `json:"jobId"`
-	State           jobs.State `json:"state"`
-	CompletedRepos  int        `json:"completedRepos"`
-	TotalRepos      int        `json:"totalRepos"`
-	TotalReposKnown bool       `json:"totalReposKnown"`
-	ErrorCode       string     `json:"errorCode,omitempty"`
-	CreatedAt       time.Time  `json:"createdAt"`
-	Coverage        string     `json:"coverage"`
+func (h *Handler) coverageViews(rows []statusmodel.Source, snapshots ...jobs.JobDiagnosticSnapshot) ([]coverageView, error) {
+	byID := make(map[string]jobs.JobDiagnosticSnapshot, len(snapshots))
+	for _, snapshot := range snapshots {
+		byID[snapshot.Job.ID] = snapshot
+	}
+	items := make([]coverageView, 0, len(rows))
+	for _, row := range rows {
+		item := coverageView{Source: row}
+		if snapshot, found := byID[row.JobID]; found && matchingCoverageSnapshot(row, snapshot.Job) {
+			item.LastProgressAt = snapshot.Job.LastProgressAt
+			item.LastFailure = snapshot.Job.LastFailure
+			item.Diagnostics = &snapshot.Diagnostics
+		}
+		items = append(items, item)
+	}
+	return items, nil
 }
 
-func coverageSummary(view coverageView) coverageSummaryView {
-	return coverageSummaryView{PDS: view.PDS, JobID: view.JobID, State: view.State, CompletedRepos: view.CompletedRepos, TotalRepos: view.TotalRepos, TotalReposKnown: view.TotalReposKnown, ErrorCode: view.ErrorCode, CreatedAt: view.CreatedAt, Coverage: view.Coverage}
+func matchingCoverageSnapshot(row statusmodel.Source, job jobs.Job) bool {
+	return row.MatchingJob && row.JobID == job.ID && row.PDS == job.PDS && row.SourceRevision == job.SourceRevision && row.Policy.Revision == job.Policy.Revision
 }
 
 func (h *Handler) listArchiveKeys(w http.ResponseWriter, r *http.Request) {

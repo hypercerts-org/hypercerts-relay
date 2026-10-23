@@ -122,6 +122,51 @@ export interface Policy {
   revision: number;
   collections: string[];
 }
+export interface JobDiagnostics {
+  execution: "queued" | "running" | "waiting" | "stopped" | "complete";
+  reason?: string;
+  retryAt?: string;
+  pdsCooldownUntil?: string;
+  unresolvedRepos?: number;
+  retryingRepos?: number;
+  maxRepositoryAttempts: number;
+}
+export type RepositoryRetryState =
+  "ready" | "in_flight" | "retry_wait" | "unresolved";
+export interface RepositoryRetryFailure {
+  category:
+    | "timeout"
+    | "transport"
+    | "body_read"
+    | "http"
+    | "unknown"
+    | "interrupted"
+    | "rejected";
+  httpStatus?: number;
+  stage: "getRepo/request" | "getRepo/body";
+  code?: string;
+}
+export interface JobLastFailure {
+  category:
+    "timeout" | "cancel" | "body_read" | "http" | "transport" | "unknown";
+  httpStatus?: number;
+  stage: "listRepos";
+  failedAt: string;
+}
+export interface RepositoryDetail {
+  did: string;
+  listedRevision: string;
+  state: RepositoryRetryState;
+  attempts: number;
+  failure?: RepositoryRetryFailure;
+  failedAt?: string;
+  retryAt?: string;
+}
+export interface RepositoryDetailsPage {
+  job: Job;
+  repositories: RepositoryDetail[];
+  nextCursor?: string;
+}
 export interface Job {
   id: string;
   pds: string;
@@ -134,7 +179,11 @@ export interface Job {
   attempts: number;
   errorCode?: string;
   createdAt: string;
+  lastProgressAt?: string;
+  lastFailure?: JobLastFailure;
   coverage: string;
+  acquisition?: Acquisition;
+  diagnostics: JobDiagnostics;
 }
 export class ApiError extends Error {
   constructor(
@@ -148,4 +197,71 @@ export class ApiError extends Error {
 function compareCollections(a: string, b: string) {
   if (a === b) return 0;
   return a < b ? -1 : 1;
+}
+
+// Version 1 Go-owned snapshot; null means no durable evidence, never zero.
+export type AcquisitionState =
+  | "unknown"
+  | "running"
+  | "retry_waiting"
+  | "stopped_incomplete"
+  | "failed"
+  | "canceled"
+  | "complete";
+export interface Acquisition {
+  state: AcquisitionState;
+  progressScope: "job_inventory";
+  counts: {
+    initialInventory: number | null;
+    scanned: number | null;
+    matching: number | null;
+    noMatch: number | null;
+    unresolved: number | null;
+    attributableRecords: number | null;
+  };
+  diagnostics: {
+    failureCategory?: string;
+    lastProgressAt: string | null;
+    attempts: number;
+    affectedRepository?: string;
+    retryAction?: string;
+    retryAt?: string;
+    pdsCooldownUntil?: string;
+    waitReason?: "repository_retry" | "pds_cooldown";
+  };
+}
+export interface CoverageSource {
+  pds: string;
+  sourceRevision: number;
+  policy: Policy;
+  matchingJob: boolean;
+  jobId?: string;
+  acquisition: Acquisition;
+  history: { state: "unknown" };
+  live: { state: "unknown" };
+  // Legacy execution fields exist only with matchingJob=true.
+  diagnostics?: JobDiagnostics;
+  lastProgressAt?: string;
+  lastFailure?: JobLastFailure;
+  reason?: string;
+  state?: string;
+  completedRepos?: number | null;
+  totalRepos?: number | null;
+  totalReposKnown?: boolean;
+  errorCode?: string;
+  createdAt?: string;
+  coverage?: string;
+}
+export interface CoveragePage {
+  schemaVersion: 1;
+  scope: "enabled_sources_current_policy";
+  policy: Policy;
+  items: CoverageSource[];
+  aggregate: {
+    scope: "enabled_sources_current_policy";
+    policy: Policy;
+    enabledSources: number;
+    state: "unknown" | "incomplete" | "complete";
+  };
+  nextCursor?: string;
 }

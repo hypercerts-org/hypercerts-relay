@@ -1,6 +1,7 @@
 package status
 
 import (
+	"encoding/json"
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
@@ -22,6 +23,7 @@ type Snapshot struct {
 	Hosts            HostDiagnostics
 	Account          AccountLookup
 	Import           *ImportInfo
+	Coverage         *CoverageInfo
 }
 
 // ImportInfo is the status-page view of the current (or most recent)
@@ -52,8 +54,64 @@ type ImportInfo struct {
 // ImportReporter yields the current or most recent import job for the status
 // page. Implemented by the importer job manager (adapted in jetstreamd). ok is
 // false when no import has run.
-type ImportReporter interface {
-	CurrentImport() (ImportInfo, bool)
+type ImportReporter interface{ CurrentImport() (ImportInfo, bool) }
+
+// CoverageReporter projects current-policy acquisition evidence into a safe
+// public-status DTO. Its payload intentionally does not expose job internals.
+type CoverageReporter interface{ CurrentCoverage() (CoverageInfo, bool) }
+
+type CoveragePolicy struct {
+	Revision    uint64   `json:"revision"`
+	Collections []string `json:"collections"`
+}
+type CoverageAggregate struct {
+	Scope          string `json:"scope"`
+	PolicyRevision uint64 `json:"policyRevision"`
+	EnabledSources int    `json:"enabledSources"`
+	State          string `json:"state"`
+}
+type CoverageCount struct {
+	Known bool `json:"-"`
+	Value int  `json:"-"`
+}
+
+func (c CoverageCount) MarshalJSON() ([]byte, error) {
+	if !c.Known {
+		return []byte("null"), nil
+	}
+	return json.Marshal(c.Value)
+}
+
+type CoverageCounts struct {
+	InitialInventory    CoverageCount `json:"initialInventory"`
+	Scanned             CoverageCount `json:"scanned"`
+	Matching            CoverageCount `json:"matching"`
+	NoMatch             CoverageCount `json:"noMatch"`
+	Unresolved          CoverageCount `json:"unresolved"`
+	AttributableRecords CoverageCount `json:"attributableRecords"`
+}
+type CoverageSource struct {
+	PDS             string         `json:"pds"`
+	SourceRevision  uint64         `json:"sourceRevision"`
+	PolicyRevision  uint64         `json:"policyRevision"`
+	Collections     []string       `json:"collections"`
+	MatchingJob     bool           `json:"matchingJob"`
+	State           string         `json:"state"`
+	ProgressScope   string         `json:"progressScope"`
+	Counts          CoverageCounts `json:"counts"`
+	FailureCategory string         `json:"failureCategory,omitempty"`
+	Attempts        int            `json:"attempts"`
+	LastProgressAt  *time.Time     `json:"lastProgressAt"`
+	RetryAction     string         `json:"retryAction"`
+	HistoryState    string         `json:"historyState"`
+	LiveState       string         `json:"liveState"`
+}
+type CoverageInfo struct {
+	SchemaVersion int               `json:"schemaVersion"`
+	Scope         string            `json:"scope"`
+	Policy        CoveragePolicy    `json:"policy"`
+	Aggregate     CoverageAggregate `json:"aggregate"`
+	Sources       []CoverageSource  `json:"sources"`
 }
 
 // Request selects the status-page view and optional account lookup.
@@ -75,9 +133,7 @@ type ProcessInfo struct {
 	GoVersion string
 }
 
-// PhaseInfo holds the current persisted phase plus its transition
-// timestamp. PhaseEnteredAt is zero if no phase/entered_at key exists
-// (a process that pre-dates the field, or a fresh data dir).
+// PhaseInfo holds the current persisted phase plus its transition timestamp.
 type PhaseInfo struct {
 	Phase          lifecycle.Phase
 	PhaseEnteredAt time.Time
@@ -104,9 +160,7 @@ type BackfillStats struct {
 	TopRemainingHosts  []BackfillHostRow
 }
 
-// BackfillHostRow is one control-plane roster row selected for the backfill
-// summary. RemainingEstimate is floor-based and may be zero before drain when
-// the PDS contains more repos than the relay knew about.
+// BackfillHostRow is one control-plane roster row selected for the backfill summary.
 type BackfillHostRow struct {
 	Hostname           string
 	State              string
@@ -172,16 +226,29 @@ type AccountLookup struct {
 
 // LiveStats summarizes the upstream cursor and seq counters.
 type LiveStats struct {
-	UpstreamCursor           int64
-	NextSeq                  uint64
-	BootstrapSeq             uint64
-	LastSeenUpstreamEventAt  time.Time
-	LastSeenUpstreamEventAge time.Duration
+	UpstreamCursor                  int64
+	NextSeq                         uint64
+	BootstrapSeq                    uint64
+	LastSeenUpstreamEventAt         time.Time
+	LastSeenUpstreamEventAge        time.Duration
+	LastSeenUpstreamEventAgeSeconds *int64 `json:"lastSeenUpstreamEventAgeSeconds"`
 }
 
-// SegmentSummary mirrors segment.Inspection's user-facing fields,
-// converted to time.Time so renderers don't have to know about
-// unix-micros.
+// PebbleStats summarizes meta.pebble/ on disk plus per-prefix key counts.
+type PebbleStats struct {
+	DiskBytes      int64
+	KeyspaceCounts map[string]uint64
+}
+
+// CursorLookbackStats summarizes cursor replay observability.
+type CursorLookbackStats struct {
+	ConfiguredLookback   time.Duration
+	ManifestSegmentCount int
+	OldestRetainedSeq    uint64
+	OldestRetainedAt     time.Time
+}
+
+// SegmentSummary mirrors segment.Inspection's user-facing fields.
 type SegmentSummary struct {
 	Index           uint64
 	Sealed          bool
@@ -194,34 +261,4 @@ type SegmentSummary struct {
 	MinWitnessedAt  time.Time
 	MaxWitnessedAt  time.Time
 	SizeBytes       int64
-}
-
-// PebbleStats summarizes meta.pebble/ on disk plus per-prefix key
-// counts.
-type PebbleStats struct {
-	DiskBytes      int64
-	KeyspaceCounts map[string]uint64
-}
-
-// CursorLookbackStats summarizes the cursor-replay observability
-// surface: configured lookback duration, sealed-segment count, and
-// the oldest seq that's still within the lookback window. Empty
-// (zero values) when the manifest is unavailable or cursor lookback
-// is disabled.
-type CursorLookbackStats struct {
-	// ConfiguredLookback is the operator-set --cursor-lookback duration.
-	// Zero means cursor replay is disabled.
-	ConfiguredLookback time.Duration
-
-	// ManifestSegmentCount is the number of sealed segments tracked
-	// in the in-memory manifest.
-	ManifestSegmentCount int
-
-	// OldestRetainedSeq is the smallest seq still within the lookback
-	// window. Computed from manifest.LookbackFloor.
-	OldestRetainedSeq uint64
-
-	// OldestRetainedAt is the corresponding timestamp. Zero when no
-	// sealed segments exist.
-	OldestRetainedAt time.Time
 }

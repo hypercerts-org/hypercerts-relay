@@ -119,7 +119,8 @@ The browser-facing API is `/api/v1`; all endpoints below require authorization.
 | `POST /operations/{id}/retry`, `/cancel` | Retry failed/incomplete work or cancel work not yet applying; actor audited.                               |
 | `GET /sources`, `/source?pds=…`          | Relay's desired, validation, connection, admission-quota, Relay-observed-account and durable-cursor state. |
 | `GET /policy`                            | Jetstream's applied collection-policy revision.                                                            |
-| `GET /jobs`, `/coverage`                 | Jetstream job state and source/policy-scoped current-state coverage; optional exact `pds` filter.          |
+| `GET /jobs`, `/coverage`                 | Jetstream job state, bounded execution diagnostics, last progress and inventory-failure details, and source/policy-scoped current-state coverage; optional exact `pds` filter. |
+| `GET /jobs/{id}/repositories`            | Lazy, cursor-paginated unresolved repository details from Jetstream's frozen inventory, including recorded failure times. |
 | `GET /limits`, `/status`, `/audit`       | Applied policies, bounded service health, durable actor-attributed history.                                |
 
 Commands are discriminated by `kind`: `source` (`pds`, `state`), `collections`
@@ -140,19 +141,34 @@ for job submission and retry/cancel so lost responses cannot duplicate work.
 Unavailable services remain incomplete until an explicit retry. Source removal
 stops acquisition without deleting archives. Job progress remains owned by Jetstream.
 
-Coverage is a page of PDS/policy results with the exact selected collections, job
-ID, progress and incomplete reason. Historical PDS attribution is explicitly
-unknown; a completed current snapshot is not a historical event-completeness claim.
-Sources without jobs have unknown coverage. The Sources table presents the
-initial Jetstream inventory totals and processed repositories for the latest job
-beside Relay-observed accounts. Its compact coverage enrichment has a three-second
-private-service bound; on failure, Relay source state remains available and the
-Jetstream cells are marked unavailable. Source detail presents the same Jetstream
-current-state coverage alongside Relay connection state and durable cursors. Its
-admission quota is a limit only:
-Relay-observed accounts are shown separately and are not a census of the PDS or
-a limit on Jetstream backfill. The source-detail collection list is collapsed by
-default.
+Sources show the latest Jetstream job's progress beside Relay-observed accounts.
+Coverage describes current records, not complete event history. Unknown totals stay
+unknown; older jobs keep saved counts but cannot show repository details without a
+saved inventory. If Jetstream is unavailable, Relay source information stays visible.
+Account quotas limit Relay admission, not Jetstream backfill.
+
+Job `state` records the outcome; `diagnostics.execution` shows whether work is
+queued, running, waiting, stopped or complete. Ready work keeps a job queued;
+retry delays do not make a stopped job active. Job rows show the last recorded
+successful progress and bounded inventory-listing failure stage, category, HTTP
+status when available, and time. Repository details load on request, keep the same
+snapshot across pages, and show safe failure information and recorded failure times,
+never raw response bodies. Job rows omit the last-progress and listing-failure
+lines when Jetstream has not recorded them, as for older jobs. Repository details
+show “Not recorded” for a failure without a recorded time. No time is inferred
+from job creation or retry activity. Restart the listing if its
+snapshot expires. UI labels use “repository list” for the saved PDS listing and
+“attempts per repository” for download retries. “Job runs” counts scheduler runs,
+not repository download attempts. Job rows show the run count only above one, and
+the unresolved count and per-repository attempt limit only while repositories
+remain unresolved. The page notice, not each row, states that diagnostics describe
+current state rather than historical coverage; API field names and error codes are unchanged.
+
+Viewing does not change jobs. Retry is an audited action that preserves completed
+work, resets eligible retries for incomplete jobs, and refreshes the inventory for
+failed jobs. The Backfill jobs table offers no Retry action for complete jobs.
+
+The administration UI presents the authoritative aggregate for all enabled sources under the current policy, independent of page and exact-source filters. It shows nullable initial inventory, verified scanned, matching, successful no-match, unresolved and attributable-record counts as job-wide evidence—not per-collection progress. Null remains Unknown while zero is a measured value. Failure category, last progress timestamp, attempts, affected repository DID and explicit retry action are shown only when supplied; throttling and incomplete work do not imply a retry countdown or ETA. History and live freshness remain independently unknown; completed acquisition does not establish either. Acquisition diagnostics show recorded repository retry and PDS cooldown deadlines and the current wait reason when supplied. Retry-waiting evidence without either deadline explicitly reports unknown timing; no countdown or ETA is inferred. Stopped work still requires the explicit job retry action when reported.
 
 ## Rate policy
 

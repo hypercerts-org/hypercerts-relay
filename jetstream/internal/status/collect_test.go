@@ -139,7 +139,46 @@ func TestCollect_LiveLastSeenUpstreamEvent(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, snap.Live.LastSeenUpstreamEventAt.Equal(seen))
 	require.Equal(t, 17*time.Second, snap.Live.LastSeenUpstreamEventAge)
+	require.NotNil(t, snap.Live.LastSeenUpstreamEventAgeSeconds)
+	require.EqualValues(t, 17, *snap.Live.LastSeenUpstreamEventAgeSeconds)
 }
+
+func TestCollect_LiveLastSeenUpstreamEventAges(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name   string
+		offset time.Duration
+		want   *int64
+	}{
+		{name: "equal now", offset: 0, want: int64Pointer(0)},
+		{name: "stale", offset: -24 * time.Hour, want: int64Pointer(86400)},
+		{name: "absent", offset: 0, want: nil},
+		{name: "future", offset: time.Second, want: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dataDir := t.TempDir()
+			st, err := store.Open(dataDir, nil)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = st.Close() })
+			now := time.Date(2026, 7, 8, 12, 0, 30, 0, time.UTC)
+			seen := now.Add(tc.offset)
+			if tc.name == "absent" {
+				seen = time.Time{}
+			}
+			c, err := status.New(status.Options{Store: st, DataDir: dataDir, Now: func() time.Time { return now }, LastSeenUpstreamEvent: func() time.Time { return seen }})
+			require.NoError(t, err)
+			snap, err := c.Snapshot(context.Background())
+			require.NoError(t, err)
+			if tc.want == nil {
+				require.Nil(t, snap.Live.LastSeenUpstreamEventAgeSeconds)
+			} else {
+				require.Equal(t, *tc.want, *snap.Live.LastSeenUpstreamEventAgeSeconds)
+			}
+		})
+	}
+}
+
+func int64Pointer(v int64) *int64 { return &v }
 
 func TestCollect_PhaseAndEnteredAt(t *testing.T) {
 	t.Parallel()
