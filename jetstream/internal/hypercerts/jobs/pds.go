@@ -717,7 +717,7 @@ func (p PDSProcessor) repository(ctx context.Context, client *atmossync.Client, 
 		}
 		return err
 	}
-	return p.Manager.CheckpointRepository(job.ID, string(entry.DID), entry.Rev, commit.Rev, job.Cursor)
+	return p.Manager.CheckpointRepositoryAcquisition(job.ID, string(entry.DID), entry.Rev, commit.Rev, job.Cursor, len(snapshot.Records))
 }
 
 // repositoryReadErrors records a non-EOF getRepo body failure so it cannot
