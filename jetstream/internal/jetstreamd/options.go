@@ -52,9 +52,11 @@ type Options struct {
 	ArchiveKeyAuthEnabled bool
 	// hypercerts: The CLI always enables policy; initial collections apply only to new state.
 	CollectionSelection bool
-	InitialCollections  []string
-	PublicAddr          string
-	DebugAddr           string
+	// RequirePolicyAdoption gates managed policy mutation until steady-state binding.
+	RequirePolicyAdoption bool
+	InitialCollections    []string
+	PublicAddr            string
+	DebugAddr             string
 	// hypercerts: Explicitly opt in to profiling on the private listener.
 	EnablePprof bool
 	// AcceptancePrivateHosts activates disposable fixture behavior only when the

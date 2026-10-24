@@ -711,7 +711,7 @@ func (p PDSProcessor) repository(ctx context.Context, client *atmossync.Client, 
 	if err != nil {
 		return err
 	}
-	if err := p.Manager.Apply(job.ID, func() error { return p.Reconcile(ctx, snapshot) }); err != nil {
+	if err := p.Manager.ApplyContext(ctx, job.ID, func(admittedCtx context.Context) error { return p.Reconcile(admittedCtx, snapshot) }); err != nil {
 		if errors.Is(err, ingest.ErrAccountUnavailable) {
 			return &InputError{Code: "account_unavailable", Unavailable: true}
 		}
