@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos/api/comatproto"
@@ -21,6 +22,8 @@ type Snapshot struct {
 	Rev         string
 	Collections []string
 	Records     []segment.Event
+	// AppendMetadata attributes generated replacement and delete rows when set.
+	AppendMetadata *AttributionMetadata
 }
 
 type snapshotBoundary struct {
@@ -31,7 +34,7 @@ func snapshotKey(did string) []byte { return []byte("hypercerts/snapshot/" + did
 
 // snapshotSupersedes keeps delayed live/retry input below a durable snapshot
 // from overwriting newer materialized state. Verification still processes it.
-func (w *Writer) snapshotSupersedes(ev *segment.Event) (bool, error) {
+func (w *Writer) snapshotSupersedes(ev *segment.Event, metadata *AttributionMetadata) (bool, error) {
 	if w.cfg.CollectionPolicy == nil || ev.Rev == "" {
 		return false, nil
 	}
@@ -51,6 +54,12 @@ func (w *Writer) snapshotSupersedes(ev *segment.Event) (bool, error) {
 		return ev.Rev <= boundary.Revisions[ev.Collection], nil
 	}
 	if ev.Kind == segment.KindSync {
+		// A live marker is appended only after scoped reconciliation succeeds.
+		// Keep that observed lifecycle event, while synthetic/unattributed or
+		// non-live sync rows still fail closed after a snapshot boundary.
+		if metadata != nil && metadata.Provenance == attribution.ProvenanceLive && metadata.Source == nil {
+			return false, nil
+		}
 		return false, errors.New("whole-repo sync requires scoped reconciliation after a snapshot")
 	}
 	return false, nil
@@ -83,20 +92,47 @@ func (w *Writer) ReconcileSnapshot(ctx context.Context, snapshot Snapshot) error
 	if state.syncRev > snapshot.Rev {
 		return nil
 	} // A newer whole-repo replacement already won.
+	if w.cfg.Attribution != nil && snapshot.AppendMetadata == nil {
+		return fmt.Errorf("ingest: managed snapshot requires append metadata: %w", attribution.ErrInvalid)
+	}
+	if snapshot.AppendMetadata != nil && w.cfg.Attribution == nil {
+		return fmt.Errorf("ingest: snapshot append metadata requires attribution manager: %w", attribution.ErrInvalid)
+	}
 	rows, err := state.planReplacement(snapshot)
 	if err != nil {
 		return err
 	}
-	for i := range rows {
-		if err := ctx.Err(); err != nil {
-			return err
+	metadata := snapshot.AppendMetadata
+	if metadata != nil {
+		if metadata.Provenance == attribution.ProvenanceSnapshot || metadata.Provenance == attribution.ProvenanceReconciliation {
+			if metadata.Boundary.Seq == nil {
+				seq := w.nextSeq
+				metadata.Boundary.Seq = &seq
+			}
+			if metadata.Boundary.SnapshotID == nil {
+				id := snapshot.DID + "/" + snapshot.Rev
+				metadata.Boundary.SnapshotID = &id
+			}
 		}
-		if _, err := w.appendLocked(ctx, &rows[i]); err != nil {
-			return err
+		policyRevision := metadata.Policy.Revision
+		if err := attribution.Validate(attribution.Event{StreamID: metadata.StreamID, Seq: 1, PolicyRev: &policyRevision, Provenance: metadata.Provenance, Boundary: metadata.Boundary, Payload: json.RawMessage(`{"snapshot":true}`)}); err != nil {
+			return fmt.Errorf("ingest: invalid snapshot attribution: %w", err)
 		}
 	}
 	if err := w.flushAndRotateLocked(ctx); err != nil {
 		return err
+	}
+	if metadata != nil {
+		if err := w.appendBatchAttributedLocked(ctx, rows, metadata); err != nil {
+			return err
+		}
+	} else if err := w.appendBatchLocked(ctx, rows); err != nil {
+		return err
+	}
+	if len(rows) > 0 {
+		if err := w.flushAndRotateLocked(ctx); err != nil {
+			return err
+		}
 	}
 	return w.persistSnapshotBoundary(snapshot)
 }
@@ -293,7 +329,30 @@ func (w *Writer) ReconcileSync(ctx context.Context, did, rev string, rows []segm
 	if err != nil || !needed {
 		return false, err
 	}
-	snapshot := Snapshot{DID: did, Rev: rev, Collections: w.cfg.CollectionPolicy.Current().Collections}
+	if w.cfg.CollectionPolicy == nil {
+		return false, errors.New("scoped sync requires collection policy")
+	}
+	return w.ReconcileSyncWithCollections(ctx, did, rev, rows, w.cfg.CollectionPolicy.Current().Collections)
+}
+
+// ReconcileSyncWithCollections reconciles using the policy captured by the caller's admission.
+func (w *Writer) ReconcileSyncWithCollections(ctx context.Context, did, rev string, rows []segment.Event, collections []string) (bool, error) {
+	return w.ReconcileSyncWithCollectionsIfNeeded(ctx, did, rev, rows, collections, true)
+}
+
+// ReconcileSyncWithCollectionsIfNeeded applies a caller-captured policy while
+// reusing the decision made within the caller's admission lease.
+func (w *Writer) ReconcileSyncWithCollectionsIfNeeded(ctx context.Context, did, rev string, rows []segment.Event, collections []string, needed bool) (bool, error) {
+	if !needed {
+		return false, nil
+	}
+	return true, w.reconcileSync(ctx, did, rev, rows, collections)
+}
+
+// ReconcileSyncWithMetadata always reconciles a managed projection using the
+// policy and provenance captured by the caller's admission.
+func (w *Writer) ReconcileSyncWithMetadata(ctx context.Context, did, rev string, rows []segment.Event, collections []string, metadata AttributionMetadata) (bool, error) {
+	snapshot := Snapshot{DID: did, Rev: rev, Collections: slices.Clone(collections), AppendMetadata: &metadata}
 	for _, row := range rows {
 		if row.Kind.IsMaterialization() && slices.Contains(snapshot.Collections, row.Collection) {
 			snapshot.Records = append(snapshot.Records, row)
@@ -303,9 +362,23 @@ func (w *Writer) ReconcileSync(ctx context.Context, did, rev string, rows []segm
 	if reconcile == nil {
 		reconcile = w.ReconcileSnapshot
 	}
-	err = reconcile(ctx, snapshot)
+	return true, reconcile(ctx, snapshot)
+}
+
+func (w *Writer) reconcileSync(ctx context.Context, did, rev string, rows []segment.Event, collections []string) error {
+	snapshot := Snapshot{DID: did, Rev: rev, Collections: slices.Clone(collections)}
+	for _, row := range rows {
+		if row.Kind.IsMaterialization() && slices.Contains(snapshot.Collections, row.Collection) {
+			snapshot.Records = append(snapshot.Records, row)
+		}
+	}
+	reconcile := w.cfg.ReconcileSnapshot
+	if reconcile == nil {
+		reconcile = w.ReconcileSnapshot
+	}
+	err := reconcile(ctx, snapshot)
 	if errors.Is(err, ErrAccountUnavailable) {
-		err = nil
-	} // stale sync cannot revive an inactive account.
-	return true, err
+		return nil // stale sync cannot revive an inactive account.
+	}
+	return err
 }

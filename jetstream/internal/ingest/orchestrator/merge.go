@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/policygate"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream/internal/ingest/live"
@@ -62,7 +64,31 @@ func (o *Orchestrator) runMergePhases(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("orchestrator: merge: open dst writer: %w", err)
 	}
+	if o.cfg.Attribution != nil && o.cfg.CollectionPolicy != nil {
+		current := o.cfg.CollectionPolicy.Current()
+		policy := attribution.Policy{Revision: current.Revision, Collections: current.Collections}
+		var boundary *uint64
+		if next := dst.NextSeq(); next > 1 {
+			last := next - 1
+			boundary = &last
+		}
+		if err := o.cfg.Attribution.EnsureInitialPolicyHistory(policy, boundary); err != nil {
+			_ = dst.Close()
+			return fmt.Errorf("orchestrator: initialize merge policy history: %w", err)
+		}
+	}
+	if o.cfg.CollectionPolicy != nil {
+		gate := policygate.New(o.cfg.CollectionPolicy, dst, o.cfg.AttributionDomain)
+		o.policyGate.Store(gate)
+	}
 	runner := newMergeRunner(dst, o.cfg.Store, liveSegmentsDir, o.cfg.FS, o.cfg.Logger, o.cfg.Metrics, o.cfg.CrashInjector)
+	runner.sourceAttribution = o.cfg.BootstrapAttribution
+	runner.sourceDomain = o.cfg.BootstrapAttributionDomain
+	runner.sourceAttributionStreamID = o.cfg.AttributionStreamID
+	runner.destinationAttribution = o.cfg.Attribution
+	runner.destinationStreamID = o.cfg.AttributionStreamID
+	runner.policyGate = o.currentPolicyGate()
+	runner.collectionPolicy = o.cfg.CollectionPolicy
 	if err := o.runMergeIntoDestination(ctx, dst, runner, segmentsDir); err != nil {
 		return err
 	}
@@ -79,6 +105,11 @@ func (o *Orchestrator) prepareMergeSource(ctx context.Context, liveSegmentsDir s
 	cleaned, err := o.mergeRestartAfterCleanup(ctx, liveSegmentsDir)
 	if err != nil || cleaned {
 		return cleaned, err
+	}
+	if o.cfg.BootstrapAttribution != nil {
+		if err := ingest.RecoverAttributions(ingest.Config{SegmentsDir: liveSegmentsDir, DataDir: o.cfg.DataDir, FS: o.cfg.FS, Store: o.cfg.Store}, o.cfg.BootstrapAttribution, o.cfg.BootstrapAttributionDomain); err != nil {
+			return false, fmt.Errorf("orchestrator: merge: recover source attribution: %w", err)
+		}
 	}
 	if err := o.sealActiveMergeSource(ctx, liveSegmentsDir); err != nil {
 		return false, err
@@ -108,6 +139,9 @@ func (o *Orchestrator) mergeRestartAfterCleanup(ctx context.Context, liveSegment
 
 func (o *Orchestrator) openMergeDestination(segmentsDir string) (*ingest.Writer, error) {
 	return ingest.Open(ingest.Config{
+		CollectionPolicy:       o.cfg.CollectionPolicy,
+		Attribution:            o.cfg.Attribution,
+		AttributionDomain:      o.cfg.AttributionDomain,
 		SegmentsDir:            segmentsDir,
 		DataDir:                o.cfg.DataDir,
 		FS:                     o.cfg.FS,
@@ -158,11 +192,14 @@ func (o *Orchestrator) runMergePendingRepoRetry(ctx context.Context, dst *ingest
 		DropMetrics:   o.cfg.DropMetrics,
 		NewHostClient: o.cfg.BackfillNewHostClient,
 		// hypercerts: Merge recovery retry shares the runtime live-verifier directory.
-		Directory:   o.cfg.Directory,
-		Interval:    o.cfg.FailedRepoRetryInterval,
-		Workers:     o.cfg.FailedRepoRetryWorkers,
-		HostWorkers: o.cfg.FailedRepoRetryHostWorkers,
-		MaxDelay:    o.cfg.FailedRepoRetryMaxDelay,
+		Directory:           o.cfg.Directory,
+		Attribution:         o.cfg.Attribution,
+		AttributionStreamID: o.cfg.AttributionStreamID,
+		PolicyGate:          o.currentPolicyGate(),
+		Interval:            o.cfg.FailedRepoRetryInterval,
+		Workers:             o.cfg.FailedRepoRetryWorkers,
+		HostWorkers:         o.cfg.FailedRepoRetryHostWorkers,
+		MaxDelay:            o.cfg.FailedRepoRetryMaxDelay,
 	})
 	if err != nil {
 		return fmt.Errorf("orchestrator: merge: pending repo retry: %w", err)
@@ -241,6 +278,8 @@ func (o *Orchestrator) sealActiveMergeSource(ctx context.Context, liveSegmentsDi
 		FS:                     o.cfg.FS,
 		Store:                  o.cfg.Store,
 		SeqKey:                 live.BootstrapSeqKey,
+		Attribution:            o.cfg.BootstrapAttribution,
+		AttributionDomain:      o.cfg.BootstrapAttributionDomain,
 		Logger:                 o.cfg.Logger,
 		Metrics:                nil,
 		SegmentMetrics:         o.cfg.SegmentMetrics,

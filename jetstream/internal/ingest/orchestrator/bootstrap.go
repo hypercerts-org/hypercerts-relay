@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/policygate"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream/internal/ingest/live"
@@ -67,7 +69,9 @@ func (o *Orchestrator) runBootstrap(ctx context.Context) error {
 }
 
 func (o *Orchestrator) openBootstrapWriter(segmentsDir string) (*ingest.Writer, error) {
-	return ingest.Open(ingest.Config{
+	writer, err := ingest.Open(ingest.Config{
+		Attribution:       o.cfg.Attribution,
+		AttributionDomain: o.cfg.AttributionDomain,
 		// hypercerts: Gate direct-PDS bootstrap materialization before durable storage.
 		CollectionPolicy:       o.cfg.CollectionPolicy,
 		SegmentsDir:            segmentsDir,
@@ -81,30 +85,74 @@ func (o *Orchestrator) openBootstrapWriter(segmentsDir string) (*ingest.Writer, 
 		OnAfterSeal:            o.cfg.IngestOnAfterSeal,
 		SegmentIOFaultInjector: o.cfg.SegmentIOFaultInjector,
 	})
+	if err != nil {
+		return nil, err
+	}
+	if o.cfg.Attribution != nil && o.cfg.CollectionPolicy != nil {
+		current := o.cfg.CollectionPolicy.Current()
+		policy := attribution.Policy{Revision: current.Revision, Collections: current.Collections}
+		var boundary *uint64
+		if next := writer.NextSeq(); next > 1 {
+			last := next - 1
+			boundary = &last
+		}
+		if err := o.cfg.Attribution.EnsureInitialPolicyHistory(policy, boundary); err != nil {
+			_ = writer.Close()
+			return nil, fmt.Errorf("initialize selected-stream bootstrap policy history: %w", err)
+		}
+	}
+	if o.cfg.CollectionPolicy != nil {
+		gate := policygate.New(o.cfg.CollectionPolicy, writer, o.cfg.AttributionDomain)
+		o.policyGate.Store(gate)
+	}
+	return writer, nil
 }
 
 func (o *Orchestrator) openBootstrapLive(liveSegmentsDir string) (*live.Consumer, error) {
+	var initializePolicyGate func(*ingest.Writer) (*policygate.Gate, error)
+	if o.cfg.BootstrapAttribution != nil {
+		initializePolicyGate = func(writer *ingest.Writer) (*policygate.Gate, error) {
+			gate := policygate.New(o.cfg.CollectionPolicy, writer, o.cfg.BootstrapAttributionDomain)
+			if o.cfg.CollectionPolicy != nil {
+				current := o.cfg.CollectionPolicy.Current()
+				policy := attribution.Policy{Revision: current.Revision, Collections: current.Collections}
+				var boundary *uint64
+				if next := writer.NextSeq(); next > 1 {
+					last := next - 1
+					boundary = &last
+				}
+				if err := o.cfg.BootstrapAttribution.EnsureInitialPolicyHistory(policy, boundary); err != nil {
+					return nil, err
+				}
+			}
+			return gate, nil
+		}
+	}
 	return live.Open(live.Config{
 		// hypercerts: Bootstrap and restart share the same persisted collection policy.
-		CollectionPolicy:  o.cfg.CollectionPolicy,
-		DataDir:           o.cfg.DataDir,
-		SegmentsDir:       liveSegmentsDir,
-		FS:                o.cfg.FS,
-		Store:             o.cfg.Store,
-		SeqKey:            live.BootstrapSeqKey,
-		CursorKey:         live.CursorKey,
-		RelayURL:          o.cfg.RelayURL,
-		Logger:            o.cfg.Logger,
-		Metrics:           o.cfg.LiveMetrics,
-		DropMetrics:       o.cfg.DropMetrics,
-		Verifier:          o.cfg.Verifier,
-		SyncStateStore:    o.cfg.SyncStateStore,
-		MaxSegmentBytes:   o.cfg.BootstrapLiveMaxSegmentBytes,
-		MaxEventsPerBlock: o.cfg.BootstrapLiveMaxEventsPerBlock,
-		SegmentMetrics:    o.cfg.SegmentMetrics,
-		OnEvent:           o.cfg.OnBootstrapLiveEvent,
-		ReconnectBackoff:  o.cfg.LiveReconnectBackoff,
-		Dial:              o.cfg.LiveDial,
+		CollectionPolicy:     o.cfg.CollectionPolicy,
+		Attribution:          o.cfg.BootstrapAttribution,
+		AttributionDomain:    o.cfg.BootstrapAttributionDomain,
+		AttributionStreamID:  o.cfg.AttributionStreamID,
+		InitializePolicyGate: initializePolicyGate,
+		DataDir:              o.cfg.DataDir,
+		SegmentsDir:          liveSegmentsDir,
+		FS:                   o.cfg.FS,
+		Store:                o.cfg.Store,
+		SeqKey:               live.BootstrapSeqKey,
+		CursorKey:            live.CursorKey,
+		RelayURL:             o.cfg.RelayURL,
+		Logger:               o.cfg.Logger,
+		Metrics:              o.cfg.LiveMetrics,
+		DropMetrics:          o.cfg.DropMetrics,
+		Verifier:             o.cfg.Verifier,
+		SyncStateStore:       o.cfg.SyncStateStore,
+		MaxSegmentBytes:      o.cfg.BootstrapLiveMaxSegmentBytes,
+		MaxEventsPerBlock:    o.cfg.BootstrapLiveMaxEventsPerBlock,
+		SegmentMetrics:       o.cfg.SegmentMetrics,
+		OnEvent:              o.cfg.OnBootstrapLiveEvent,
+		ReconnectBackoff:     o.cfg.LiveReconnectBackoff,
+		Dial:                 o.cfg.LiveDial,
 
 		SegmentIOFaultInjector: o.cfg.SegmentIOFaultInjector,
 	})
@@ -163,10 +211,13 @@ func (o *Orchestrator) runBootstrapBackfill(ctx context.Context, bw *ingest.Writ
 		BackfillRepos:     o.cfg.BackfillRepos,
 		IdentityResolver:  o.cfg.Directory.Resolver,
 		// hypercerts: Bootstrap CAR verification shares the runtime live-verifier directory.
-		Directory:         o.cfg.Directory,
-		RetryBaseDelay:    o.cfg.BackfillRetryBaseDelay,
-		AfterRepoComplete: o.cfg.AfterRepoComplete,
-		CrashInjector:     o.cfg.CrashInjector,
+		Directory:           o.cfg.Directory,
+		Attribution:         o.cfg.Attribution,
+		AttributionStreamID: o.cfg.AttributionStreamID,
+		PolicyGate:          o.currentPolicyGate(),
+		RetryBaseDelay:      o.cfg.BackfillRetryBaseDelay,
+		AfterRepoComplete:   o.cfg.AfterRepoComplete,
+		CrashInjector:       o.cfg.CrashInjector,
 	})
 	if err != nil {
 		return err
@@ -244,11 +295,13 @@ func (o *Orchestrator) finishBootstrap(ctx context.Context, bootstrapLive *live.
 		}
 
 		sealW, err := ingest.Open(ingest.Config{
-			SegmentsDir: liveSegmentsDir,
-			DataDir:     o.cfg.DataDir,
-			FS:          o.cfg.FS,
-			Store:       o.cfg.Store,
-			SeqKey:      live.BootstrapSeqKey,
+			SegmentsDir:       liveSegmentsDir,
+			DataDir:           o.cfg.DataDir,
+			FS:                o.cfg.FS,
+			Store:             o.cfg.Store,
+			SeqKey:            live.BootstrapSeqKey,
+			Attribution:       o.cfg.BootstrapAttribution,
+			AttributionDomain: o.cfg.BootstrapAttributionDomain,
 			// Bare cfg.Logger; ingest.Open sets its own component.
 			Logger: o.cfg.Logger,
 			// Metrics nil to match the bootstrap-live consumer convention

@@ -16,10 +16,13 @@ A client opts in by supplying `contract=hypercerts-selected-v1` to the existing 
 
 For selected requests, `streamId` and `cursor` MUST be supplied together or both omitted. `streamId` is an opaque string. `cursor` is an integer selected-stream sequence and is an inclusive resume position: the event at that sequence may be replayed, and the client deduplicates it. Supplying only one member of the pair fails before streaming with `InvalidCursor`. A supplied stream identity that differs from the current stream fails with `StreamMismatch`; a cursor beyond the current sequence fails with `CursorOutOfRange`. If replay is disabled or the inclusive cursor precedes available replay, fail with `ReplayUnavailable`. Never silently begin at the tail.
 
-The existing event envelope retains `kind`, `did`, `time_us`, `seq`, and event-specific fields of `xrpc.v1.json`. A selected sequenced event adds this metadata (JSON types shown):
+The wire contract remains the existing typed `xrpc.v1.json` payload framed by its time envelope. A selected record is the existing `#commit` payload (including `$type` and `time`); selected metadata is added inside that typed payload, not as a new outer envelope or replacement event type. In abbreviated JSON form:
 
 ```json
 {
+  "$type": "com.atproto.sync.subscribeRepos#commit",
+  "time": "2026-01-01T00:00:00Z",
+  "seq": 123,
   "hypercerts": {
     "streamId": "opaque-stream-id",
     "policyRev": 12,
@@ -27,6 +30,8 @@ The existing event envelope retains `kind`, `did`, `time_us`, `seq`, and event-s
   }
 }
 ```
+
+All ordinary upstream fields and typed-payload behavior remain unchanged; the example omits the commit's other standard fields.
 
 `streamId` is a non-empty opaque string stable across restart and changes only when the stream is deliberately reinitialized as a distinct stream. `policyRev` is a non-negative integer revision; `null` is reserved for legacy rows whose revision is unknown. `provenance` is one of the exact strings `live`, `snapshot`, `reconciliation`, or `legacy-unknown`. Live means observed live raw input; snapshot and reconciliation mean state materialized from those processes and MUST NOT imply historical raw-event verification. Legacy rows created before these fields were tracked use `policyRev: null` and `provenance: "legacy-unknown"`, never the current revision or fabricated raw attribution.
 
@@ -36,7 +41,7 @@ Every newly sequenced selected event MUST carry this metadata. If the implementa
 
 The selection policy is an exact set of collection NSIDs. A record event is selected only if its collection is enabled under the effective policy at that event's ordered position. A policy revision is immutable once committed. Persist its contents and adoption boundary before reporting adoption successful.
 
-Policy adoption MUST be ordered with event ingestion and durably record `effectiveAfterSeq`, an integer sequence boundary. The new policy applies only to events with `seq > effectiveAfterSeq`, until the next revision's boundary. An adoption that occurs before the first event has `effectiveAfterSeq: null` and MUST be emitted as an unsequenced `info` frame before the first event governed by that revision. The frame uses the existing Jetstream info envelope (`kind: "info"`, `name`, optional `message`) and puts selected-contract fields under `hypercerts`, for example:
+Policy adoption MUST be ordered with event ingestion and durably record `effectiveAfterSeq`, an integer sequence boundary. The new policy applies only to events with `seq > effectiveAfterSeq`, until the next revision's boundary. An adoption that occurs before the first event has `effectiveAfterSeq: null` and MUST be emitted as an unsequenced `info` frame before the first event governed by that revision. The frame uses the existing Jetstream info envelope (`kind: "info"`, `name`, optional `message`) in the existing `xrpc.v1.json` message framing. Keep the established `info.name: "PolicyAdopted"`; there is no new `initialPolicyAdopted` name. Selected-contract fields belong inside the typed info payload under `hypercerts`, for example:
 
 ```json
 {
@@ -63,7 +68,7 @@ No automatic archive purge may be triggered by policy removal or replacement. Re
 
 Selected record create, update, and delete events follow the selected collection policy. Preserve lifecycle markers needed to maintain the consumer's selected-DID view: include an account or identity marker when the DID is currently or previously selected, and retain source-known lifecycle markers in the selected stream where necessary to preserve existing lifecycle behavior. A marker does not authorize excluded collection payloads to leak into the stream.
 
-An identity refresh updates identity information; it MUST NOT purge the consumer's account state. An account-inactive marker hides the account from the current active view but MUST retain its prior history. A sync marker affects only the DID's selected scope and MUST state why reconciliation is needed. A sequenced sync marker may carry `hypercerts.reconciliationRequired: true` and `hypercerts.scope`, where `scope` identifies the affected DID and/or collection set; these fields are selected-contract metadata, not additions to ordinary upstream v2 events. It MUST NOT be presented as proof of a complete sync or trigger fabricated completion. Consumers MUST NOT interpret lifecycle markers as permission to purge unrelated or unselected collections. Policy change is not a delete and MUST NOT synthesize per-record deletes.
+An identity refresh updates identity information; it MUST NOT purge the consumer's account state. An account-inactive marker hides the account from the current active view but MUST retain its prior history. A sync marker affects only the DID's selected scope and MUST state why reconciliation is needed. Selected subscriptions carry the sync event's DID, witnessed time, and revision, but MUST omit upstream CAR blocks and operation lists so excluded record payloads cannot cross the selected boundary. A sequenced sync marker carries `hypercerts.reconciliationRequired: true` and `hypercerts.scope` with the DID and exact collections admitted by the policy governing that marker; these fields are selected-contract metadata, not additions to ordinary upstream v2 events. It MUST NOT be presented as proof of a complete sync or trigger fabricated completion. Identity refresh remains a lifecycle update and MUST NOT purge account state. Consumers MUST NOT interpret lifecycle markers as permission to purge unrelated or unselected collections. Policy change is not a delete and MUST NOT synthesize per-record deletes.
 
 Snapshot reconciliation is distinct from observed stream delivery. Snapshot-derived events MUST carry snapshot or reconciliation provenance and identify their reconciliation boundary. For a snapshot event the boundary is in `hypercerts.reconciliationBoundary`; it is a typed value whose JSON representation is either a non-negative selected-stream sequence integer or an object containing `seq` (non-negative integer or `null`) and/or `snapshotId` (non-empty string). The object MUST contain at least one of those fields. This reference identifies the source/durable reconciliation boundary; it is not itself a stream cursor or a substitute for the event's sequence. Arrival of an older snapshot after a newer live event MUST NOT roll back newer state. The implementation must fence snapshot publication against later live writes (or otherwise compare durable ordering) and preserve this rule across crashes.
 
@@ -92,22 +97,27 @@ The first selected stream frame is `info` and MUST precede data. Its mandatory f
 
 ```json
 {
-  "type": "info",
-  "contract": "hypercerts-selected-v1",
-  "streamId": "opaque-stream-id",
-  "policyRev": 12,
-  "effectiveAfterSeq": 400,
-  "collections": ["app.example.record"],
-  "replayFloor": 350,
-  "historyMode": "materialized",
-  "originalHistoryFromSeq": null,
-  "coverage": "unknown",
-  "gaps": []
+  "kind": "info",
+  "name": "SelectedFeed",
+  "message": "Selected stream capability",
+  "hypercerts": {
+    "contract": "hypercerts-selected-v1",
+    "streamId": "opaque-stream-id",
+    "policyRev": 12,
+    "effectiveAfterSeq": 400,
+    "collections": ["app.example.record"],
+    "replayFloor": 350,
+    "historyMode": "materialized",
+    "originalHistoryFromSeq": null,
+    "coverage": "unknown",
+    "gaps": []
+  }
 }
 ```
 
 Field types and semantics:
 
+- `kind` and `name`: existing `xrpc.v1.json` info envelope fields (`info` and `SelectedFeed`); `hypercerts` carries the selected contract fields inside the typed info payload.
 - `contract`: the negotiated contract identifier.
 - `streamId`: current persistent stream identity.
 - `policyRev`: current non-negative integer revision.

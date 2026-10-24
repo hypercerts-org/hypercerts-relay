@@ -15,6 +15,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/policygate"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/obs"
 	"github.com/bluesky-social/jetstream/internal/store"
@@ -81,6 +84,10 @@ func Open(cfg Config) (*Consumer, error) {
 		logger: cfg.Logger.With(slog.String("component", "livestream/consumer")),
 	}
 
+	if cfg.Attribution != nil && cfg.PolicyGate == nil && cfg.InitializePolicyGate == nil {
+		return nil, fmt.Errorf("livestream: attribution requires policy gate")
+	}
+
 	// Tombstone observation runs as the writer's OnAppend hook —
 	// under the writer mutex, after seq assignment, before the block
 	// can flush or the segment seal — NOT after Append returns. The
@@ -123,6 +130,8 @@ func Open(cfg Config) (*Consumer, error) {
 		// hypercerts: The writer also gates sync replacements and retry materializations.
 		CollectionPolicy:      cfg.CollectionPolicy,
 		ReconcileSnapshot:     cfg.ReconcileSnapshot,
+		Attribution:           cfg.Attribution,
+		AttributionDomain:     cfg.AttributionDomain,
 		SegmentsDir:           cfg.SegmentsDir,
 		FS:                    cfg.FS,
 		DataDir:               cfg.DataDir,
@@ -151,6 +160,18 @@ func Open(cfg Config) (*Consumer, error) {
 		return nil, fmt.Errorf("livestream: open writer: %w", err)
 	}
 	c.writer = w
+	if cfg.InitializePolicyGate != nil {
+		gate, err := cfg.InitializePolicyGate(w)
+		if err != nil {
+			_ = w.Close()
+			return nil, fmt.Errorf("livestream: initialize policy gate: %w", err)
+		}
+		if gate == nil {
+			_ = w.Close()
+			return nil, fmt.Errorf("livestream: initialize policy gate: nil gate")
+		}
+		c.cfg.PolicyGate = gate
+	}
 
 	return c, nil
 }
@@ -721,9 +742,49 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 
 			// hypercerts: A full sync must preserve newer per-collection snapshots.
 			if len(segEvts) > 0 && segEvts[0].Kind == segment.KindSync {
-				handled, err := c.writer.ReconcileSync(ctx, segEvts[0].DID, segEvts[0].Rev, segEvts[1:])
-				if err != nil {
-					return err
+				handled := false
+				var reconcileErr error
+				if c.cfg.Attribution != nil {
+					if c.cfg.PolicyGate == nil || c.cfg.CollectionPolicy == nil {
+						return fmt.Errorf("livestream: managed admission gate unavailable: %w", attribution.ErrInvalid)
+					}
+					reconcileErr = c.cfg.PolicyGate.Admit(ctx, func(policy selection.Policy) error {
+						admittedCtx := policygate.WithAdmission(ctx, policy)
+						if c.cfg.ReconcileSnapshot == nil {
+							return fmt.Errorf("livestream: managed snapshot reconciler unavailable: %w", attribution.ErrInvalid)
+						}
+						metadata := ingest.AttributionMetadata{
+							StreamID: c.cfg.AttributionStreamID, Policy: attribution.Policy{Revision: policy.Revision, Collections: append([]string(nil), policy.Collections...)},
+							Provenance: attribution.ProvenanceReconciliation,
+						}
+						handled, reconcileErr = c.writer.ReconcileSyncWithMetadata(admittedCtx, segEvts[0].DID, segEvts[0].Rev, segEvts[1:], policy.Collections, metadata)
+						if reconcileErr != nil {
+							return reconcileErr
+						}
+						if policy.Revision == 0 {
+							return fmt.Errorf("livestream: missing policy history: %w", attribution.ErrInvalid)
+						}
+						fullPolicy, err := c.cfg.Attribution.LookupPolicy(policy.Revision)
+						if err != nil {
+							return fmt.Errorf("livestream: lookup policy history: %w", err)
+						}
+						return c.writer.AppendAttributed(admittedCtx, &segEvts[0], ingest.AttributionMetadata{
+							StreamID: c.cfg.AttributionStreamID, Policy: fullPolicy,
+							Provenance: attribution.ProvenanceLive,
+						})
+					})
+				} else {
+					handled, reconcileErr = c.writer.ReconcileSync(ctx, segEvts[0].DID, segEvts[0].Rev, segEvts[1:])
+				}
+				if reconcileErr != nil {
+					return reconcileErr
+				}
+				if c.cfg.Attribution != nil {
+					// The sync marker was appended under the same policy admission
+					// as reconciliation, including successful empty/no-op results.
+					c.promoteSyncState(segEvts)
+					c.noteUpstreamSeq(evt.Seq)
+					continue
 				}
 				if handled {
 					c.promoteSyncState(segEvts)
@@ -758,8 +819,38 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 				}
 				// Append runs the tombstone Observe hook internally
 				// (ingest.Config.OnAppend) before any flush/seal.
-				if err := c.writer.Append(ctx, &segEvts[i]); err != nil {
-					return fmt.Errorf("livestream: append: %w", err)
+				appendEvent := func(policy selection.Policy) error {
+					if c.cfg.Attribution == nil {
+						return c.writer.Append(ctx, &segEvts[i])
+					}
+					if policy.Revision == 0 {
+						return fmt.Errorf("livestream: missing policy history: %w", attribution.ErrInvalid)
+					}
+					if !policyAllows(policy.Collections, &segEvts[i]) {
+						segEvts[i].Seq = 0
+						return nil
+					}
+					fullPolicy, err := c.cfg.Attribution.LookupPolicy(policy.Revision)
+					if err != nil {
+						return fmt.Errorf("livestream: lookup policy history: %w", err)
+					}
+					return c.writer.AppendAttributed(ctx, &segEvts[i], ingest.AttributionMetadata{
+						StreamID:   c.cfg.AttributionStreamID,
+						Policy:     fullPolicy,
+						Provenance: attribution.ProvenanceLive,
+					})
+				}
+				var appendErr error
+				if c.cfg.Attribution != nil {
+					if c.cfg.PolicyGate == nil || c.cfg.CollectionPolicy == nil {
+						return fmt.Errorf("livestream: managed admission gate unavailable: %w", attribution.ErrInvalid)
+					}
+					appendErr = c.cfg.PolicyGate.Admit(ctx, appendEvent)
+				} else {
+					appendErr = appendEvent(selection.Policy{})
+				}
+				if appendErr != nil {
+					return fmt.Errorf("livestream: append: %w", appendErr)
 				}
 				c.maybeTriggerCompaction()
 
@@ -820,3 +911,6 @@ func (c *Consumer) noteUpstreamSeq(seq int64) {
 func (c *Consumer) Writer() *ingest.Writer {
 	return c.writer
 }
+
+// PolicyGate returns the gate initialized with this consumer's writer.
+func (c *Consumer) PolicyGate() *policygate.Gate { return c.cfg.PolicyGate }

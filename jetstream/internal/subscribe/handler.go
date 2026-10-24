@@ -16,6 +16,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/bluesky-social/jetstream/api/jetstream"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/manifest"
@@ -40,11 +42,13 @@ const (
 // wired exactly once at process startup, so a panic at construction
 // time is the right granularity.
 type Subscription struct {
-	Tail     *Tail
-	Store    *store.Store
-	Manifest *manifest.Manifest // optional; required for cursor replay
-	Writer   *ingest.Writer     // optional; required for cursor replay
-	FS       vfs.FS
+	// SelectedConfig supplies durable negotiation state for selected clients.
+	SelectedConfig SelectedConfigProvider
+	Tail           *Tail
+	Store          *store.Store
+	Manifest       *manifest.Manifest // optional; required for cursor replay
+	Writer         *ingest.Writer     // optional; required for cursor replay
+	FS             vfs.FS
 	// WriterRef, when non-nil, supersedes Writer. Resolved at request
 	// time; supports cmd/jetstream's deferred-writer-publication
 	// pattern where the orchestrator publishes the writer pointer
@@ -79,7 +83,10 @@ type Subscription struct {
 	// The default false preserves Jetstream v1 behavior on /subscribe.
 	// These are deliberately one flag: the policies describe one endpoint
 	// contract and must not be mixed and matched.
-	V2 bool
+	V2                  bool
+	SelectedAttribution *attribution.Manager
+	SelectedPolicy      *selection.Manager
+	SelectedStreamID    string
 }
 
 // eventFilter is the per-delivery predicate surface shared by the v1
@@ -169,6 +176,66 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 		return
 	}
 
+	selected := values.Has("contract")
+	var selectedConfig SelectedConfig
+	var selectedRequest SelectedRequest
+	if selected {
+		if !deps.V2 || deps.SelectedConfig == nil {
+			httpError(w, deps, http.StatusBadRequest, "UnsupportedContract", "selected stream is unavailable")
+			return
+		}
+		contracts := values["contract"]
+		if len(contracts) != 1 || contracts[0] != SelectedContract {
+			httpError(w, deps, http.StatusBadRequest, "UnsupportedContract", "contract selector must be exactly hypercerts-selected-v1")
+			return
+		}
+		streams := values["streamId"]
+		cursors := values["cursor"]
+		var configErr error
+		selectedConfig, configErr = deps.SelectedConfig.SelectedConfig()
+		if configErr != nil || selectedConfig.StreamID == "" {
+			httpError(w, deps, http.StatusServiceUnavailable, "ServiceUnavailable", "selected stream is not ready")
+			return
+		}
+		if (values.Has("streamId") != values.Has("cursor")) || (values.Has("streamId") && (len(streams) != 1 || len(cursors) != 1 || streams[0] == "" || cursors[0] == "")) {
+			httpError(w, deps, http.StatusBadRequest, "InvalidCursor", "streamId and cursor must both be provided and non-empty")
+			return
+		}
+		if len(contracts) > 1 || len(streams) > 1 || len(cursors) > 1 {
+			httpError(w, deps, http.StatusBadRequest, "InvalidRequest", "duplicate selected stream parameter")
+			return
+		}
+		contract, stream, cursor := "", "", ""
+		if len(contracts) == 1 {
+			contract = contracts[0]
+		}
+		if len(streams) == 1 {
+			stream = streams[0]
+		}
+		if len(cursors) == 1 {
+			cursor = cursors[0]
+		}
+		var parseErr error
+		selectedRequest, parseErr = ParseSelectedRequest(contract, stream, cursor, selectedConfig)
+		if parseErr != nil {
+			name := "InvalidRequest"
+			switch {
+			case errors.Is(parseErr, ErrUnsupportedContract):
+				name = "UnsupportedContract"
+			case errors.Is(parseErr, ErrStreamMismatch):
+				name = "StreamMismatch"
+			case errors.Is(parseErr, ErrCursorOutOfRange):
+				name = "CursorOutOfRange"
+			case errors.Is(parseErr, ErrReplayUnavailable):
+				name = "ReplayUnavailable"
+			case errors.Is(parseErr, ErrInvalidCursor):
+				name = "InvalidCursor"
+			}
+			httpError(w, deps, http.StatusBadRequest, name, parseErr.Error())
+			return
+		}
+	}
+
 	// Compression negotiation. The two endpoints have deliberately
 	// different contracts (#294):
 	//
@@ -249,6 +316,8 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 
 	var cursorPlan CursorPlan
 	switch {
+	case selected:
+		cursorPlan = CursorPlan{Mode: ModeLive}
 	case deps.Lookback <= 0:
 		// Cursor lookback is disabled by configuration. The service runs
 		// pure-live: seqs start at 0 and the live tip comes from the ring,
@@ -325,6 +394,13 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 		cursorPlan = plan
 	}
 
+	if selected {
+		cursorPlan = CursorPlan{Mode: ModeLive}
+		if selectedRequest.Cursor != nil {
+			cursorPlan = CursorPlan{Mode: ModeReplaySeq, StartSeq: *selectedRequest.Cursor}
+		}
+	}
+
 	// Classify the cursor mode for metrics.
 	mode := "live"
 	switch cursorPlan.Mode {
@@ -372,6 +448,15 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 	var acceptSubprotocols []string
 	if deps.V2 {
 		acceptSubprotocols = negotiateSubprotocol(r)
+	}
+	if selected {
+		acceptSubprotocols = []string{v2Subprotocol}
+		for _, token := range r.Header.Values("Sec-WebSocket-Protocol") {
+			for offer := range strings.SplitSeq(token, ",") {
+				if strings.TrimSpace(offer) == SelectedContract { /* selector token opts in; protocol remains xrpc.v1.json */
+				}
+			}
+		}
 	}
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		OriginPatterns:  []string{"*"},
@@ -466,6 +551,19 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 	startSeq := cursorPlan.StartSeq
 	if cursorPlan.Mode == ModeLive {
 		startSeq = deps.Tail.Tip()
+	}
+	if selected {
+		gaps := selectedConfig.Gaps
+		if gaps == nil {
+			gaps = []SelectedGap{}
+		}
+		info := map[string]any{"contract": SelectedContract, "streamId": selectedConfig.StreamID, "policyRev": selectedConfig.PolicyRevision, "collections": selectedConfig.Collections, "effectiveAfterSeq": selectedConfig.PolicyEffectiveAfterSeq, "replayFloor": selectedConfig.ReplayFloor, "historyMode": "materialized", "originalHistoryFromSeq": selectedConfig.OriginalHistoryFromSeq, "coverage": selectedConfig.Coverage, "gaps": gaps}
+		frame, encErr := EncodeV2SelectedInfo("SelectedFeed", "Selected stream capability", info)
+		if encErr != nil || !writeFrame(ctx, conn, wantZstd, frame) {
+			return
+		}
+		runSelectedSubscriberLoop(ctx, conn, deps, initialV2Filter, selectedConfig, startSeq, wantZstd, logger)
+		return
 	}
 
 	// A clamped v2 timestamp cursor starts at the retention floor, not

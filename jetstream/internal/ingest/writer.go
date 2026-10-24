@@ -10,6 +10,7 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
 	"github.com/bluesky-social/jetstream/internal/obs"
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/segment"
@@ -26,6 +27,7 @@ const seqNextKey = "seq/next"
 
 // Writer owns the active segment file and the seq counter. It is
 // safe for concurrent use.
+
 type Writer struct {
 	cfg Config
 
@@ -42,6 +44,8 @@ type Writer struct {
 	readLog        *ReadableLog
 	closed         bool
 
+	pendingAttributions []attribution.Prepared
+
 	async            *asyncFlushPipeline
 	asyncJobs        sync.WaitGroup
 	nextAsyncFlushID uint64
@@ -55,37 +59,30 @@ func Open(cfg Config) (*Writer, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
+	if cfg.Attribution != nil {
+		if err := cfg.Attribution.ValidateBinding(cfg.Store, cfg.AttributionDomain); err != nil {
+			return nil, fmt.Errorf("ingest: attribution binding: %w", err)
+		}
+		if err := recoverAttributions(cfg); err != nil {
+			return nil, fmt.Errorf("ingest: recover attribution: %w", err)
+		}
+	}
 	cfg.applyDefaults()
 	cfg.Logger = cfg.Logger.With(slog.String("component", "ingest/writer"))
 
 	if err := mkdirAllFS(cfg.FS, cfg.SegmentsDir, 0o755); err != nil {
 		return nil, cfg.wrapSegmentPersistenceError("creating segments directory", err)
 	}
-
 	idx, hasExisting, err := scanSegmentsDir(cfg.FS, cfg.SegmentsDir)
 	if err != nil {
 		return nil, err
 	}
-
 	w := &Writer{cfg: cfg, activeIdx: idx}
-
 	var maxSeq uint64
 	var foundEvents bool
-
-	// Segment paths use filepath.Join, not cfg.FS's PathJoin, even when a
-	// vfs.FS is injected. The two agree on every '/'-separated filesystem
-	// (all our prod targets and the strict-mem oracle FS, which uses
-	// path.Join); they diverge only on Windows separators, which we do not
-	// support. Keeping filepath.Join here matches the rest of the package.
 	if hasExisting {
 		path := filepath.Join(cfg.SegmentsDir, SegmentFilename(idx))
-		seg, segErr := segment.New(segment.Config{
-			Path:              path,
-			FS:                cfg.FS,
-			MaxEventsPerBlock: cfg.MaxEventsPerBlock,
-			Metrics:           cfg.SegmentMetrics,
-			IOFaultInjector:   cfg.SegmentIOFaultInjector,
-		})
+		seg, segErr := segment.New(segment.Config{Path: path, FS: cfg.FS, MaxEventsPerBlock: cfg.MaxEventsPerBlock, Metrics: cfg.SegmentMetrics, IOFaultInjector: cfg.SegmentIOFaultInjector})
 		switch {
 		case segErr == nil:
 			w.active = seg
@@ -95,29 +92,12 @@ func Open(cfg Config) (*Writer, error) {
 				return nil, fmt.Errorf("ingest: stat %s: %w", path, statErr)
 			}
 			w.activeBytes = info.Size() - int64(segment.ReservedHeaderBytes)
-
 			maxSeq, foundEvents, err = segment.ScanMaxSeqFS(cfg.FS, path)
 			if err != nil {
 				_ = seg.Close()
 				return nil, fmt.Errorf("ingest: scan_max_seq %s: %w", path, err)
 			}
 		case errors.Is(segErr, segment.ErrSegmentSealed):
-			// The highest-index segment is already sealed (e.g. the
-			// orchestrator sealed it at cutover). Read its header MaxSeq so
-			// the reconcile below can floor nextSeq past it — symmetric with
-			// the active-branch ScanMaxSeq above. Normally seq/next was
-			// persisted before the seal (rotateLocked flushes the counter,
-			// then seals), so this is a no-op; but if the counter is missing
-			// or an illegal 0, this is what stops the next append from reusing
-			// a seq the sealed segment already contains.
-			//
-			// Open via the checksum-verifying Reader, NOT ReadSealedHeader:
-			// this floor IS a corruption safety net, so it must not itself
-			// trust an unverified header. ReadSealedHeader only validates
-			// magic/version; it does not verify the xxh3 over header+footer,
-			// which covers MaxSeq/EventCount. A corrupt MaxSeq read blindly
-			// would floor nextSeq off garbage (silent seq reuse or a seq gap).
-			// segment.Open fails loud on a bad checksum — crash > corruption.
 			r, openErr := segment.Open(segment.ReaderConfig{Path: path, FS: cfg.FS})
 			if openErr != nil {
 				return nil, fmt.Errorf("ingest: open sealed %s: %w", path, openErr)
@@ -126,63 +106,27 @@ func Open(cfg Config) (*Writer, error) {
 			if closeErr := r.Close(); closeErr != nil {
 				return nil, fmt.Errorf("ingest: close sealed %s: %w", path, closeErr)
 			}
-			// Gate on MaxSeq, not EventCount: a fully-compacted segment validly
-			// has EventCount==0 (every row dropped) while a rewrite PRESERVES the
-			// original MaxSeq envelope (segment/rewrite.go restores MinSeq/MaxSeq
-			// even when all rows are dropped). That historical envelope still owns
-			// seqs (MinSeq..MaxSeq], so the floor must advance past it. Seqs start
-			// at 1 (design §R8), so MaxSeq==0 is the unambiguous "never held an
-			// event" sentinel — a truly empty fresh-sealed segment, which correctly
-			// falls through to the nextSeq=1 floor below. Without this an
-			// EventCount==0/MaxSeq>0 highest segment plus a missing/illegal-0
-			// seq/next would floor nextSeq to 1 and reuse the envelope's seqs.
 			if hdr.MaxSeq > 0 {
 				maxSeq, foundEvents = hdr.MaxSeq, true
 			}
-
 			w.activeIdx = idx + 1
 			path = filepath.Join(cfg.SegmentsDir, SegmentFilename(w.activeIdx))
-			seg, segErr = segment.New(segment.Config{
-				Path:              path,
-				FS:                cfg.FS,
-				MaxEventsPerBlock: cfg.MaxEventsPerBlock,
-				Metrics:           cfg.SegmentMetrics,
-				IOFaultInjector:   cfg.SegmentIOFaultInjector,
-			})
+			seg, segErr = segment.New(segment.Config{Path: path, FS: cfg.FS, MaxEventsPerBlock: cfg.MaxEventsPerBlock, Metrics: cfg.SegmentMetrics, IOFaultInjector: cfg.SegmentIOFaultInjector})
 			if segErr != nil {
 				return nil, cfg.wrapSegmentPersistenceError("opening next active segment", fmt.Errorf("ingest: open next segment %s: %w", path, segErr))
 			}
-			w.active = seg
-			w.activeBytes = 0
+			w.active, w.activeBytes = seg, 0
 		default:
 			return nil, cfg.wrapSegmentPersistenceError("opening existing active segment", fmt.Errorf("ingest: open existing %s: %w", path, segErr))
 		}
 	} else {
 		path := filepath.Join(cfg.SegmentsDir, SegmentFilename(0))
-		seg, segErr := segment.New(segment.Config{
-			Path:              path,
-			FS:                cfg.FS,
-			MaxEventsPerBlock: cfg.MaxEventsPerBlock,
-			Metrics:           cfg.SegmentMetrics,
-			IOFaultInjector:   cfg.SegmentIOFaultInjector,
-		})
+		seg, segErr := segment.New(segment.Config{Path: path, FS: cfg.FS, MaxEventsPerBlock: cfg.MaxEventsPerBlock, Metrics: cfg.SegmentMetrics, IOFaultInjector: cfg.SegmentIOFaultInjector})
 		if segErr != nil {
 			return nil, cfg.wrapSegmentPersistenceError("creating active segment", fmt.Errorf("ingest: create %s: %w", path, segErr))
 		}
-		w.active = seg
-		w.activeBytes = 0
+		w.active, w.activeBytes = seg, 0
 	}
-
-	// If the highest segment yielded no seq envelope — a truly empty active
-	// segment (ScanMaxSeq found nothing) OR an empty / compacted-to-empty sealed
-	// segment (MaxSeq==0) — the recovery floor must still account for seqs owned
-	// by LOWER sealed segments. Segments are seq-monotonic in creation order, so
-	// the highest non-empty segment below idx holds the global max envelope.
-	// Without this, a missing or illegal-0 seq/next would floor nextSeq to 1 and
-	// reuse seqs those lower segments already own (the exact corruption this
-	// recovery path defends against). Only runs in that rare recovery case: a
-	// healthy highest segment with events sets foundEvents=true above, and a
-	// fresh dir has no existing segments.
 	if !foundEvents && hasExisting {
 		tailMax, tailFound, tailErr := recoverSealedTailMaxSeq(cfg.FS, cfg.SegmentsDir, idx)
 		if tailErr != nil {
@@ -193,13 +137,11 @@ func Open(cfg Config) (*Writer, error) {
 			maxSeq, foundEvents = tailMax, true
 		}
 	}
-
 	pebbleSeq, err := loadNextSeq(cfg.Store, cfg.SeqKey)
 	if err != nil {
 		_ = w.active.Close()
 		return nil, err
 	}
-
 	reconciled := pebbleSeq
 	if foundEvents && maxSeq+1 > reconciled {
 		reconciled = maxSeq + 1
@@ -210,37 +152,17 @@ func Open(cfg Config) (*Writer, error) {
 			return nil, cfg.wrapSegmentPersistenceError("reconciling durable seq metadata", err)
 		}
 	}
-	// nextSeq is never 0: seq 0 is the pure "nothing yet" sentinel (design §R8)
-	// and is never allocated to an event. reconciled == 0 here means no recovered
-	// events AND a persisted counter of 0 — either a fresh dir (absent counter,
-	// GetUint64LE -> 0) or an illegal persisted seq/next=0 (no current build
-	// writes one; only a pre-seed build or on-disk corruption could). Both floor
-	// to 1, so the first-ever event is seq 1. Floored in memory only — placed
-	// after the reconcile save above, so Open still never writes pebble for a
-	// fresh dir; the first block flush (or Close) persists the counter as usual.
-	// The crash-recovery reconcile (maxSeq+1) yields >= 2 when foundEvents, so
-	// this is a no-op on any dir that recovered events.
 	if reconciled < 1 {
 		reconciled = 1
 	}
-	w.nextSeq = reconciled
-	w.durableNextSeq = reconciled
+	w.nextSeq, w.durableNextSeq = reconciled, reconciled
 	w.readLog = newReadableLog(reconciled, cfg.ReadLogRetentionBytes, cfg.Metrics)
-
 	w.cfg.Metrics.setActiveSegBytes(w.activeBytes)
 	w.cfg.Metrics.setNextSeq(w.nextSeq)
-
 	if cfg.AsyncFlushWorkers > 0 {
 		w.async = newAsyncFlushPipeline(w, cfg.AsyncFlushWorkers)
 	}
-
-	w.cfg.Logger.Info("opened",
-		"segments_dir", cfg.SegmentsDir,
-		"active_index", w.activeIdx,
-		"active_bytes", w.activeBytes,
-		"next_seq", w.nextSeq,
-	)
-
+	w.cfg.Logger.Info("opened", "segments_dir", cfg.SegmentsDir, "active_index", w.activeIdx, "active_bytes", w.activeBytes, "next_seq", w.nextSeq)
 	return w, nil
 }
 
@@ -334,10 +256,72 @@ func (w *Writer) SealActiveAndClose() error {
 // a phantom allocation. Goroutine-safe.
 // hypercerts: A policy-filtered row succeeds with Seq=0 and writes no bytes.
 func (w *Writer) Append(ctx context.Context, ev *segment.Event) error {
+	if w.cfg.Attribution != nil {
+		return fmt.Errorf("ingest: attributed writer requires AppendAttributed metadata")
+	}
+	return w.append(ctx, ev, nil)
+}
+
+// AppendAttributed appends an event and its provenance in the same durable batch.
+func (w *Writer) AppendAttributed(ctx context.Context, ev *segment.Event, metadata AttributionMetadata) error {
+	if w.cfg.Attribution == nil {
+		return fmt.Errorf("ingest: attribution manager is required")
+	}
+	if metadata.StreamID == "" || metadata.Policy.Revision == 0 {
+		return fmt.Errorf("ingest: invalid attribution metadata: %w", attribution.ErrInvalid)
+	}
+	return w.append(ctx, ev, &metadata)
+}
+
+// AppendImported appends an event while retaining provenance from its source stream.
+func (w *Writer) AppendImported(ctx context.Context, ev *segment.Event, source attribution.Event, domain string, destination AttributionMetadata, sourcePolicy ...attribution.Policy) error {
+	if w.cfg.Attribution == nil || ev == nil || domain == "" || attribution.Validate(source) != nil || len(sourcePolicy) > 1 {
+		return fmt.Errorf("ingest: invalid imported attribution: %w", attribution.ErrInvalid)
+	}
+	var policy *attribution.Policy
+	if source.PolicyRev != nil {
+		if len(sourcePolicy) != 1 || sourcePolicy[0].Revision != *source.PolicyRev {
+			return fmt.Errorf("ingest: source policy required: %w", attribution.ErrInvalid)
+		}
+		copy := sourcePolicy[0]
+		policy = &copy
+	} else if len(sourcePolicy) != 0 {
+		return fmt.Errorf("ingest: unexpected source policy: %w", attribution.ErrInvalid)
+	}
+	if attribution.ValidateSegment(*ev, destination.StreamID, destination.Policy, destination.Provenance, destination.Boundary) != nil {
+		return fmt.Errorf("ingest: invalid destination attribution: %w", attribution.ErrInvalid)
+	}
+	metadata := destination
+	imported := &attribution.ImportedSource{Domain: domain, StreamID: source.StreamID, Seq: source.Seq, PolicyRev: source.PolicyRev, Provenance: source.Provenance, Boundary: source.Boundary, Policy: policy, WitnessedAt: ev.WitnessedAt, IndexedAt: ev.IndexedAt, SegmentFingerprint: attribution.FingerprintSegment(*ev)}
+	if source.Source != nil {
+		imported.WitnessedAt = source.Source.WitnessedAt
+		imported.IndexedAt = source.Source.IndexedAt
+		imported.SegmentFingerprint = source.Source.SegmentFingerprint
+	}
+	metadata.Source = imported
+	return w.append(ctx, ev, &metadata)
+}
+
+type AttributionMetadata struct {
+	StreamID   string
+	Policy     attribution.Policy
+	Provenance attribution.Provenance
+	Boundary   attribution.Boundary
+	Source     *attribution.ImportedSource
+}
+
+type ImportedMetadata struct {
+	Domain       string
+	Source       attribution.Event
+	SourcePolicy *attribution.Policy
+	Destination  AttributionMetadata
+}
+
+func (w *Writer) append(ctx context.Context, ev *segment.Event, metadata *AttributionMetadata) error {
 	if w.async != nil {
 		w.drainMu.Lock()
 		w.mu.Lock()
-		job, err := w.appendLocked(ctx, ev)
+		job, err := w.appendAttributedLocked(ctx, ev, metadata)
 		w.mu.Unlock()
 		if err == nil {
 			w.submitAsyncFlushes([]*asyncFlushJob{job})
@@ -357,7 +341,7 @@ func (w *Writer) Append(ctx context.Context, ev *segment.Event) error {
 	err := func() error {
 		w.mu.Lock()
 		defer w.mu.Unlock()
-		_, err := w.appendLocked(ctx, ev)
+		_, err := w.appendAttributedLocked(ctx, ev, metadata)
 		return err
 	}()
 	if err != nil {
@@ -366,47 +350,178 @@ func (w *Writer) Append(ctx context.Context, ev *segment.Event) error {
 	return nil
 }
 
-// AppendBatch writes a bounded caller-provided event batch while holding the
-// writer lock once. On success, mutates each event's Seq in place to the
-// allocated value. On an error before an event is appended, that event and all
-// later events are left untouched. If a flush or hook fails after appending an
-// event, the error semantics match Append.
-// hypercerts: Filtered rows are left with Seq=0; only retained rows allocate sequences.
+// AppendBatch writes events after validating and preparing the complete batch.
 func (w *Writer) AppendBatch(ctx context.Context, events []segment.Event) error {
+	return w.appendBatch(ctx, events, nil)
+}
+
+// AppendBatchAttributed appends a batch with shared provenance and policy metadata.
+func (w *Writer) AppendBatchAttributed(ctx context.Context, events []segment.Event, metadata AttributionMetadata) error {
+	if w.cfg.Attribution == nil {
+		return fmt.Errorf("ingest: attribution manager is required")
+	}
+	return w.appendBatch(ctx, events, &metadata)
+}
+
+func (w *Writer) appendBatch(ctx context.Context, events []segment.Event, metadata *AttributionMetadata) error {
 	if len(events) == 0 {
 		return nil
 	}
-
-	w.drainMu.Lock()
-	w.mu.Lock()
-	var jobs []*asyncFlushJob
-	var appendErr error
-
-	for i := range events {
-		job, err := w.appendLocked(ctx, &events[i])
-		if job != nil {
-			jobs = append(jobs, job)
-		}
+	if w.async != nil {
+		w.drainMu.Lock()
+		w.mu.Lock()
+		jobs, err := w.appendBatchCoreLocked(ctx, events, metadata)
+		w.mu.Unlock()
 		if err != nil {
-			appendErr = err
-			break
+			w.drainMu.Unlock()
+			return err
 		}
+		w.submitAsyncFlushes(jobs)
+		err = w.waitSubmittedAsyncFlushes(jobs)
+		w.drainMu.Unlock()
+		if err != nil {
+			return err
+		}
+		return w.rotateIfFull(ctx)
 	}
-	w.mu.Unlock()
-	w.submitAsyncFlushes(jobs)
-	w.drainMu.Unlock()
+	w.drainMu.Lock()
+	defer w.drainMu.Unlock()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	_, err := w.appendBatchCoreLocked(ctx, events, metadata)
+	return err
+}
 
-	flushErr := w.waitSubmittedAsyncFlushes(jobs)
-	if appendErr != nil {
-		return appendErr
+// appendBatchLocked appends while the caller owns both drainMu and mu.
+func (w *Writer) appendBatchLocked(ctx context.Context, events []segment.Event) error {
+	return w.appendBatchLockedWithMetadata(ctx, events, nil)
+}
+
+func (w *Writer) appendBatchAttributedLocked(ctx context.Context, events []segment.Event, metadata *AttributionMetadata) error {
+	return w.appendBatchLockedWithMetadata(ctx, events, metadata)
+}
+
+func (w *Writer) appendBatchLockedWithMetadata(ctx context.Context, events []segment.Event, metadata *AttributionMetadata) error {
+	jobs, err := w.appendBatchCoreLocked(ctx, events, metadata)
+	if err != nil {
+		return err
 	}
-	if flushErr != nil {
-		return flushErr
+	if w.async != nil {
+		w.submitAsyncFlushes(jobs)
+		return w.waitSubmittedAsyncFlushes(jobs)
 	}
 	return w.rotateIfFull(ctx)
 }
 
+// appendBatchCoreLocked prepares the full transaction before writing rows.
+func (w *Writer) appendBatchCoreLocked(ctx context.Context, events []segment.Event, metadata *AttributionMetadata) ([]*asyncFlushJob, error) {
+	if w.closed {
+		return nil, ErrClosed
+	}
+	if w.cfg.Attribution != nil && metadata == nil {
+		return nil, fmt.Errorf("ingest: attributed writer requires batch metadata")
+	}
+	if metadata != nil && (metadata.StreamID == "" || metadata.Policy.Revision == 0) {
+		return nil, fmt.Errorf("ingest: invalid attribution metadata: %w", attribution.ErrInvalid)
+	}
+	type acceptedCandidate struct {
+		event         segment.Event
+		originalIndex int
+		prepared      attribution.Prepared
+	}
+	candidates := make([]acceptedCandidate, 0, len(events))
+	for i := range events {
+		if err := segment.ValidateEvent(events[i]); err != nil {
+			return nil, err
+		}
+		candidate := events[i]
+		if !w.cfg.CollectionPolicy.Allows(&candidate) {
+			continue
+		}
+		if superseded, err := w.snapshotSupersedes(&candidate, metadata); err != nil {
+			return nil, err
+		} else if superseded {
+			continue
+		}
+		if metadata != nil && metadata.Source != nil && (metadata.Source.Seq != events[i].Seq || metadata.Source.SegmentFingerprint != attribution.FingerprintSegment(events[i])) {
+			return nil, fmt.Errorf("ingest: imported source sequence mismatch: %w", attribution.ErrInvalid)
+		}
+		candidate.Seq = w.nextSeq + uint64(len(candidates))
+		if w.cfg.TimestampStamper != nil {
+			if err := w.cfg.TimestampStamper.Stamp(ctx, &candidate); err != nil {
+				return nil, fmt.Errorf("ingest: timestamp stamp: %w", err)
+			}
+		}
+		if metadata != nil {
+			if err := attribution.ValidateSegment(candidate, metadata.StreamID, metadata.Policy, metadata.Provenance, metadata.Boundary); err != nil {
+				return nil, fmt.Errorf("ingest: validate attribution: %w", err)
+			}
+		}
+		candidates = append(candidates, acceptedCandidate{event: candidate, originalIndex: i})
+	}
+	// Run all persistence-bearing preparations before the first segment write.
+	for i := range candidates {
+		if metadata == nil {
+			break
+		}
+		prepared, err := w.cfg.Attribution.PrepareSegment(candidates[i].event, metadata.StreamID, metadata.Policy, metadata.Provenance, metadata.Boundary, metadata.Source)
+		if err != nil {
+			return nil, w.wrapSegmentPersistenceError("preparing batch attribution", fmt.Errorf("ingest: prepare attribution: %w", err))
+		}
+		candidates[i].prepared = prepared
+	}
+	var jobs []*asyncFlushJob
+	for i := range candidates {
+		accepted := &candidates[i]
+		full, err := w.active.Append(accepted.event)
+		if err != nil {
+			return jobs, w.wrapSegmentPersistenceError("appending batch event", fmt.Errorf("ingest: append: %w", err))
+		}
+		event := &events[accepted.originalIndex]
+		event.Seq, event.IndexedAt = accepted.event.Seq, accepted.event.IndexedAt
+		if metadata != nil {
+			w.pendingAttributions = append(w.pendingAttributions, accepted.prepared)
+		}
+		w.nextSeq++
+		w.cfg.Metrics.incEventsAppended()
+		w.cfg.Metrics.setNextSeq(w.nextSeq)
+		w.readLog.append(&accepted.event)
+		if w.cfg.OnAppend != nil {
+			if err := w.cfg.OnAppend(event); err != nil {
+				return jobs, fmt.Errorf("ingest: on_append: %w", err)
+			}
+		}
+		if full {
+			if w.async != nil {
+				job, err := w.prepareAsyncFlushLocked()
+				if err != nil {
+					return jobs, err
+				}
+				jobs = append(jobs, job)
+			} else if err := w.flushAndRotateLocked(ctx); err != nil {
+				return jobs, err
+			}
+		}
+	}
+	return jobs, nil
+}
 func (w *Writer) appendLocked(ctx context.Context, ev *segment.Event) (*asyncFlushJob, error) {
+	if w.cfg.Attribution != nil {
+		return nil, fmt.Errorf("ingest: attributed writer requires AppendAttributed metadata")
+	}
+	return w.appendAttributedLocked(ctx, ev, nil)
+}
+
+func (w *Writer) appendAttributedLocked(ctx context.Context, ev *segment.Event, metadata *AttributionMetadata) (*asyncFlushJob, error) {
+	if metadata != nil && w.cfg.Attribution == nil {
+		return nil, fmt.Errorf("ingest: attribution manager is required")
+	}
+	if w.cfg.Attribution != nil && metadata == nil {
+		return nil, fmt.Errorf("ingest: attributed writer requires AppendAttributed metadata")
+	}
+	if metadata != nil && (metadata.StreamID == "" || metadata.Policy.Revision == 0) {
+		return nil, fmt.Errorf("ingest: invalid attribution metadata: %w", attribution.ErrInvalid)
+	}
 	if w.closed {
 		w.cfg.Metrics.incAppendErrors()
 		return nil, ErrClosed
@@ -418,19 +533,30 @@ func (w *Writer) appendLocked(ctx context.Context, ev *segment.Event) (*asyncFlu
 		return nil, nil
 	}
 	// hypercerts: A verified scoped snapshot can be ahead of delayed live input.
-	if superseded, err := w.snapshotSupersedes(ev); err != nil {
+	if superseded, err := w.snapshotSupersedes(ev, metadata); err != nil {
 		return nil, err
 	} else if superseded {
 		ev.Seq = 0
 		return nil, nil
 	}
 
+	if metadata != nil && metadata.Source != nil && metadata.Source.Seq != ev.Seq {
+		return nil, fmt.Errorf("ingest: imported source sequence mismatch: %w", attribution.ErrInvalid)
+	}
 	candidate := *ev
 	candidate.Seq = w.nextSeq
 	if w.cfg.TimestampStamper != nil {
 		if err := w.cfg.TimestampStamper.Stamp(ctx, &candidate); err != nil {
 			w.cfg.Metrics.incAppendErrors()
 			return nil, fmt.Errorf("ingest: timestamp stamp: %w", err)
+		}
+	}
+	var prepared attribution.Prepared
+	if metadata != nil {
+		var prepareErr error
+		prepared, prepareErr = w.cfg.Attribution.PrepareSegment(candidate, metadata.StreamID, metadata.Policy, metadata.Provenance, metadata.Boundary, metadata.Source)
+		if prepareErr != nil {
+			return nil, fmt.Errorf("ingest: prepare attribution: %w", prepareErr)
 		}
 	}
 	full, err := w.active.Append(candidate)
@@ -440,6 +566,9 @@ func (w *Writer) appendLocked(ctx context.Context, ev *segment.Event) (*asyncFlu
 	}
 	ev.Seq = candidate.Seq
 	ev.IndexedAt = candidate.IndexedAt
+	if metadata != nil {
+		w.pendingAttributions = append(w.pendingAttributions, prepared)
+	}
 	w.nextSeq++
 	w.cfg.Metrics.incEventsAppended()
 	w.cfg.Metrics.setNextSeq(w.nextSeq)
@@ -554,6 +683,13 @@ func (w *Writer) drainSync(ctx context.Context) error {
 		if err := w.flushAndRotateLocked(ctx); err != nil {
 			return err
 		}
+	} else if len(w.pendingAttributions) > 0 {
+		pending := w.pendingAttributions
+		if err := w.commitDurableBatchWithAttributionsLocked(ctx, w.nextSeq, true, w.sampleDurableBatchPrepareValueLocked(), pending); err != nil {
+			return err
+		}
+		w.pruneCommittedAttributions(pending)
+		return nil
 	}
 	return w.commitDurableBatchLocked(ctx, w.durableNextSeq, true, w.sampleDurableBatchPrepareValueLocked())
 }
@@ -626,6 +762,23 @@ func (w *Writer) flushAndRotateLocked(ctx context.Context) error {
 // fsync the pending block, then pebble.Sync seq/next and durable-batch
 // metadata.
 // The caller MUST hold w.mu.
+func (w *Writer) pruneCommittedAttributions(committed []attribution.Prepared) {
+	if len(committed) == 0 {
+		return
+	}
+	committedSeqs := make(map[uint64]struct{}, len(committed))
+	for _, prepared := range committed {
+		committedSeqs[prepared.Event.Seq] = struct{}{}
+	}
+	remaining := w.pendingAttributions[:0]
+	for _, prepared := range w.pendingAttributions {
+		if _, ok := committedSeqs[prepared.Event.Seq]; !ok {
+			remaining = append(remaining, prepared)
+		}
+	}
+	w.pendingAttributions = remaining
+}
+
 func (w *Writer) flushBlockLocked(ctx context.Context) error {
 	prepareValue := w.sampleDurableBatchPrepareValueLocked()
 	if err := w.active.Flush(); err != nil {
@@ -633,8 +786,21 @@ func (w *Writer) flushBlockLocked(ctx context.Context) error {
 	}
 	w.cfg.Metrics.incBlocksFlushed()
 
-	if err := w.commitDurableBatchLocked(ctx, w.nextSeq, false, prepareValue); err != nil {
+	var attributions []attribution.Prepared
+	if w.cfg.Attribution != nil && len(w.pendingAttributions) > 0 {
+		// Commit only metadata whose rows have reached durability, independent of
+		// unrelated legacy rows in the active segment block.
+		for _, pending := range w.pendingAttributions {
+			if pending.Event.Seq >= w.activeDurableTailSeqLocked() && pending.Event.Seq < w.nextSeq {
+				attributions = append(attributions, pending)
+			}
+		}
+	}
+	if err := w.commitDurableBatchWithAttributionsLocked(ctx, w.nextSeq, false, prepareValue, attributions); err != nil {
 		return err
+	}
+	if len(attributions) > 0 {
+		w.pruneCommittedAttributions(attributions)
 	}
 	return nil
 }
@@ -903,6 +1069,13 @@ func stageNextSeq(b *pebble.Batch, key string, v uint64) error {
 	return nil
 }
 
+func (w *Writer) activeDurableTailSeqLocked() uint64 {
+	if w.readLog != nil {
+		return w.readLog.DurableSeq()
+	}
+	return w.durableNextSeq
+}
+
 func (w *Writer) sampleDurableBatchPrepareValueLocked() any {
 	if w.cfg.DurableBatchPrepareValue == nil {
 		return nil
@@ -911,6 +1084,10 @@ func (w *Writer) sampleDurableBatchPrepareValueLocked() any {
 }
 
 func (w *Writer) commitDurableBatchLocked(ctx context.Context, nextSeq uint64, force bool, prepareValue any) error {
+	return w.commitDurableBatchWithAttributionsLocked(ctx, nextSeq, force, prepareValue, w.pendingAttributions)
+}
+
+func (w *Writer) commitDurableBatchWithAttributionsLocked(ctx context.Context, nextSeq uint64, force bool, prepareValue any, pending []attribution.Prepared) error {
 	// The block this commit describes is already fsynced by the time we get
 	// here (flushBlockLocked / commitAsyncFlush / the drain paths all flush
 	// first). The durable metadata commit must therefore run to completion
@@ -922,32 +1099,51 @@ func (w *Writer) commitDurableBatchLocked(ctx context.Context, nextSeq uint64, f
 	// cancellation, matching the async path's context.Background() intent.
 	ctx = context.WithoutCancel(ctx)
 
-	b := w.cfg.Store.NewBatch()
-	defer func() { _ = b.Close() }()
-
-	if err := stageNextSeq(b, w.cfg.SeqKey, nextSeq); err != nil {
-		return err
-	}
 	var afterCommit func()
 	var afterDone func(error)
 	var commitErr error
-	if w.cfg.OnDurableBatch != nil {
-		cb, done, err := w.cfg.OnDurableBatch(ctx, b, nextSeq, force, prepareValue)
-		if err != nil {
-			return fmt.Errorf("ingest: on_durable_batch: %w", err)
+	commit := func(b *pebble.Batch) error {
+		if err := stageNextSeq(b, w.cfg.SeqKey, nextSeq); err != nil {
+			return err
 		}
-		afterCommit = cb
-		afterDone = done
+		if w.cfg.OnDurableBatch != nil {
+			cb, done, err := w.cfg.OnDurableBatch(ctx, b, nextSeq, force, prepareValue)
+			afterDone = done
+			if err != nil {
+				return fmt.Errorf("ingest: on_durable_batch: %w", err)
+			}
+			afterCommit = cb
+		}
+		return nil
 	}
 	defer func() {
 		if afterDone != nil {
 			afterDone(commitErr)
 		}
 	}()
-
-	commitErr = w.cfg.Store.Commit(b, store.SyncWrites)
+	previousDurableSeq := w.activeDurableTailSeqLocked()
+	filtered := make([]attribution.Prepared, 0, len(pending))
+	for _, prepared := range pending {
+		if prepared.Event.Seq >= previousDurableSeq && prepared.Event.Seq < nextSeq {
+			filtered = append(filtered, prepared)
+		}
+	}
+	if w.cfg.Attribution != nil && len(filtered) > 0 {
+		commitErr = w.cfg.Attribution.CommitBatch(filtered, commit)
+	} else {
+		b := w.cfg.Store.NewBatch()
+		defer func() { _ = b.Close() }()
+		if err := commit(b); err != nil {
+			commitErr = err
+			return err
+		}
+		commitErr = w.cfg.Store.Commit(b, store.SyncWrites)
+	}
 	if commitErr != nil {
 		return w.wrapSegmentPersistenceError("committing durable metadata batch", fmt.Errorf("ingest: commit durable batch: %w", commitErr))
+	}
+	if len(filtered) > 0 {
+		w.pruneCommittedAttributions(filtered)
 	}
 	w.durableNextSeq = nextSeq
 	w.readLog.advanceDurable(nextSeq)

@@ -19,8 +19,10 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/hypercerts/archivekeys"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/control"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/jobs"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/policygate"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 	identcache "github.com/bluesky-social/jetstream/internal/identity"
 	"github.com/bluesky-social/jetstream/internal/importer"
@@ -83,6 +85,9 @@ type Runtime struct {
 	runDone   chan struct{}
 
 	closeMu sync.Mutex
+
+	jobsRunCancel context.CancelFunc
+	jobsRunDone   chan struct{}
 }
 
 // Build constructs the production service graph without starting listeners or
@@ -237,7 +242,14 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	}
 	rt.metaStore = metaStore
 	// hypercerts: Restore policy before any archive producer starts.
+	var selectedStreamID string
+	var eventAttribution *attribution.Manager
+	var bootstrapAttribution *attribution.Manager
 	if opts.CollectionSelection {
+		selectedStreamID, err = attribution.OpenSelectedStreamIdentity(metaStore)
+		if err != nil {
+			return fail(fmt.Errorf("serve: initialize selected stream identity: %w", err))
+		}
 		rt.CollectionPolicy, err = selection.Open(metaStore, opts.InitialCollections)
 		if err != nil {
 			return fail(err)
@@ -246,8 +258,17 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		if err != nil {
 			return fail(err)
 		}
+		rt.BackfillJobs.AddRequirePolicyAdoption(opts.RequirePolicyAdoption)
 		if err := rt.BackfillJobs.SeedSources(opts.InitialPDSSources); err != nil {
 			return fail(err)
+		}
+		eventAttribution, err = attribution.Open(metaStore, selectedStreamID, "selected-stream")
+		if err != nil {
+			return fail(fmt.Errorf("serve: open selected stream attribution: %w", err))
+		}
+		bootstrapAttribution, err = attribution.Open(metaStore, selectedStreamID, "bootstrap-live")
+		if err != nil {
+			return fail(fmt.Errorf("serve: open bootstrap-live attribution: %w", err))
 		}
 	}
 
@@ -423,16 +444,44 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	}
 	orch, err := orchestrator.New(orchestrator.Config{
 		// hypercerts: A single policy owner spans bootstrap, live, retries and restart.
-		CollectionPolicy: rt.CollectionPolicy,
-		DataDir:          opts.DataDir,
-		FS:               opts.StorageFS,
-		Store:            metaStore,
-		RelayURL:         opts.RelayURL,
-		HTTPClient:       xrpcClient.HTTPClient.Val(),
-		Directory:        directory,
-		Verifier:         verifier,
-		SyncStateStore:   stateStore,
-		Tombstones:       tombstones,
+		CollectionPolicy:           rt.CollectionPolicy,
+		BackfillJobs:               rt.BackfillJobs,
+		Attribution:                eventAttribution,
+		AttributionDomain:          "selected-stream",
+		AttributionStreamID:        selectedStreamID,
+		BootstrapAttribution:       bootstrapAttribution,
+		BootstrapAttributionDomain: "bootstrap-live",
+		PolicyGate:                 nil,
+		InitializePolicyGate: func(w *ingest.Writer) (*policygate.Gate, error) {
+			if rt.CollectionPolicy == nil {
+				return policygate.New(nil, w, "selected-stream"), nil
+			}
+			if eventAttribution == nil {
+				return nil, fmt.Errorf("selected-stream attribution unavailable")
+			}
+			gate := policygate.New(rt.CollectionPolicy, w, "selected-stream")
+			if err := gate.Adopt(ctx, "selected-stream", func(boundary *uint64) error {
+				current := rt.CollectionPolicy.Current()
+				return eventAttribution.EnsureInitialPolicyHistory(attribution.Policy{
+					Revision: current.Revision, Collections: current.Collections,
+				}, boundary)
+			}); err != nil {
+				return nil, fmt.Errorf("initialize selected-stream policy history: %w", err)
+			}
+			if rt.BackfillJobs != nil {
+				rt.BackfillJobs.BindPolicyAdoption(gate, eventAttribution, "selected-stream")
+			}
+			return gate, nil
+		},
+		DataDir:        opts.DataDir,
+		FS:             opts.StorageFS,
+		Store:          metaStore,
+		RelayURL:       opts.RelayURL,
+		HTTPClient:     xrpcClient.HTTPClient.Val(),
+		Directory:      directory,
+		Verifier:       verifier,
+		SyncStateStore: stateStore,
+		Tombstones:     tombstones,
 		// Bare logger; orchestrator.New attaches component=orchestrator
 		// itself, and its children (live, ingest, backfill) attach
 		// their own component on top of the bare parent.
@@ -618,6 +667,54 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		}))
 	}
 
+	selectedProvider := subscribe.SelectedConfigProvider(nil)
+	if opts.CollectionSelection {
+		selectedProvider = subscribe.SelectedConfigProviderFunc(func() (subscribe.SelectedConfig, error) {
+			writer := writerPtr.Load()
+			if writer == nil || rt.CollectionPolicy == nil || eventAttribution == nil {
+				return subscribe.SelectedConfig{}, errors.New("selected stream not ready")
+			}
+			history, err := eventAttribution.ReadPolicyHistory()
+			if err != nil {
+				return subscribe.SelectedConfig{}, err
+			}
+			policy := rt.CollectionPolicy.Current()
+			readLog := writer.ReadLog()
+			durable := readLog.DurableSeq()
+			tip := uint64(0)
+			if durable > 0 {
+				tip = durable - 1
+			}
+			var replayFloor *uint64
+			if opts.CursorLookback > 0 {
+				floor := uint64(0)
+				floor, _ = mft.LookbackFloor(opts.CursorLookback)
+				// The active segment and hot readable log may contain
+				// committed events newer than the last sealed manifest
+				// entry. Never advertise durable-next as a replay floor:
+				// it would exclude those events while they remain replayable.
+				if _, ok := mft.SegmentForSeq(floor); !ok {
+					if durable == 0 {
+						floor = 0
+					} else if floor >= durable {
+						floor = durable - 1
+					}
+				}
+				replayFloor = &floor
+			}
+			var effectiveAfter *uint64
+			if history, err := eventAttribution.ReadPolicyHistory(); err == nil {
+				for _, historical := range history {
+					if historical.Revision == policy.Revision && historical.EffectiveAfterSeq != nil {
+						boundary := *historical.EffectiveAfterSeq
+						effectiveAfter = &boundary
+						break
+					}
+				}
+			}
+			return subscribe.SelectedConfig{StreamID: selectedStreamID, PolicyRevision: policy.Revision, PolicyEffectiveAfterSeq: effectiveAfter, Collections: policy.Collections, EffectiveAfterSeq: effectiveAfter, ReplayFloor: replayFloor, CurrentSeq: tip, ReplayEnabled: opts.CursorLookback > 0, HistoryMode: "materialized", Coverage: "unknown", Gaps: subscribe.PolicyGaps(history)}, nil
+		})
+	}
 	// HandlerDeps.WriterRef is read at request time via writerPtr.Load();
 	// before steady-state, lifecycle.IsSteadyState gates with 503 so
 	// nil-pointer reads are harmless.
@@ -636,15 +733,19 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	// "/xrpc/" xrpcserver subtree registered below, so the bespoke
 	// handler owns this one NSID while atmos xrpcserver keeps the rest.
 	srv.RegisterPublicRoute("GET /xrpc/network.bsky.jetstream.subscribeEvents", subscribe.NewHandler(subscribe.Subscription{
-		Tail:      tail,
-		Store:     metaStore,
-		Manifest:  mft,
-		FS:        opts.StorageFS,
-		WriterRef: &writerPtr,
-		Logger:    processLogger,
-		Metrics:   subscribeMetrics,
-		Lookback:  opts.CursorLookback,
-		V2:        true,
+		Tail:                tail,
+		Store:               metaStore,
+		Manifest:            mft,
+		FS:                  opts.StorageFS,
+		WriterRef:           &writerPtr,
+		Logger:              processLogger,
+		Metrics:             subscribeMetrics,
+		Lookback:            opts.CursorLookback,
+		V2:                  true,
+		SelectedConfig:      selectedProvider,
+		SelectedAttribution: eventAttribution,
+		SelectedPolicy:      rt.CollectionPolicy,
+		SelectedStreamID:    selectedStreamID,
 	}))
 
 	// XRPC surface: whole-file segment download + listing. The atmos
@@ -797,7 +898,13 @@ func (r *Runtime) Run(ctx context.Context) (runErr error) {
 			if err := r.WaitSteadyState(gctx); err != nil {
 				return err
 			}
-			return r.BackfillJobs.Run(gctx, r.jobProcessor)
+			jobsCtx, cancel := context.WithCancel(gctx)
+			jobsDone := make(chan struct{})
+			r.runMu.Lock()
+			r.jobsRunCancel, r.jobsRunDone = cancel, jobsDone
+			r.runMu.Unlock()
+			defer close(jobsDone)
+			return r.BackfillJobs.Run(jobsCtx, r.jobProcessor)
 		}))
 	}
 
@@ -982,15 +1089,26 @@ func (r *Runtime) stopRun(ctx context.Context) error {
 	r.runMu.Lock()
 	cancel := r.runCancel
 	done := r.runDone
+	jobsCancel, jobsDone := r.jobsRunCancel, r.jobsRunDone
 	r.runMu.Unlock()
 	if cancel != nil {
 		cancel()
+	}
+	if jobsCancel != nil {
+		jobsCancel()
 	}
 	if done == nil {
 		return nil
 	}
 	select {
 	case <-done:
+		if jobsDone != nil {
+			select {
+			case <-jobsDone:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -1004,6 +1122,12 @@ func (r *Runtime) cancelImportRun() {
 	r.closeMu.Unlock()
 	if cancel != nil {
 		cancel()
+	}
+	r.runMu.Lock()
+	jobsCancel := r.jobsRunCancel
+	r.runMu.Unlock()
+	if jobsCancel != nil {
+		jobsCancel()
 	}
 }
 

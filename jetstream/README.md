@@ -117,6 +117,25 @@ and required identity/account/sync markers are retained. Filtered-only commits
 still advance the durable source/verifier boundary. Archive merging and compaction
 do not apply the current acquisition policy to previously retained rows.
 
+### Selected `subscribeEvents` contract
+
+Clients may opt into `hypercerts-selected-v1` with the `contract` query parameter
+on `network.bsky.jetstream.subscribeEvents`. The selector is validated before
+WebSocket upgrade; ordinary clients that omit it retain the upstream v2 event
+shape. Selected clients receive `SelectedFeed` and ordered `PolicyAdopted` info
+frames, plus per-event stream, policy and provenance metadata. A selected `#sync`
+frame carries its DID, revision and exact admitted collection scope with
+`reconciliationRequired: true`; its upstream CAR blocks and unselected operation
+payloads are never sent. Identity and account lifecycle markers remain available
+for selected DIDs and identity refresh must not be treated as account deletion.
+
+The first capability frame is truthful materialized history only: no original
+history boundary or complete-coverage claim. Selected `streamId` and numeric
+`cursor` resume coordinates must be supplied together, and selected cursors are
+validated without timestamp heuristics. See the
+[Selected Stream Contract v1](../docs/contracts/selected-stream-v1.md) for the
+wire fields and stable negotiation/replay errors.
+
 This boundary concerns Jetstream record materialization. Raw Relay/Rainbow data
 and transient full-repository CAR downloads can contain excluded records; this
 does not promise their absence from upstream storage or transient input buffers.

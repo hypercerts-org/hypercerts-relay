@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"path/filepath"
 
+	"github.com/bluesky-social/jetstream/internal/hypercerts/policygate"
+	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
 	"github.com/bluesky-social/jetstream/internal/ingest/live"
 	"github.com/bluesky-social/jetstream/internal/obs"
@@ -53,17 +55,35 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 			tombstoneCap = 0
 		}
 
+		initializePolicyGate := o.cfg.InitializePolicyGate
+		if initializePolicyGate != nil {
+			initializePolicyGate = func(writer *ingest.Writer) (*policygate.Gate, error) {
+				gate, err := o.cfg.InitializePolicyGate(writer)
+				if err != nil {
+					return nil, err
+				}
+				if gate != nil {
+					o.policyGate.Store(gate)
+				}
+				return gate, nil
+			}
+		}
 		c, err := live.Open(live.Config{
 			// hypercerts: Bootstrap and restart share the same persisted collection policy.
-			CollectionPolicy:  o.cfg.CollectionPolicy,
-			ReconcileSnapshot: o.ReconcileSnapshot,
-			DataDir:           o.cfg.DataDir,
-			SegmentsDir:       segmentsDir,
-			FS:                o.cfg.FS,
-			Store:             o.cfg.Store,
-			SeqKey:            live.SteadySeqKey,
-			CursorKey:         live.CursorKey,
-			RelayURL:          o.cfg.RelayURL,
+			CollectionPolicy:     o.cfg.CollectionPolicy,
+			ReconcileSnapshot:    o.ReconcileSnapshot,
+			PolicyGate:           o.currentPolicyGate(),
+			Attribution:          o.cfg.Attribution,
+			AttributionDomain:    o.cfg.AttributionDomain,
+			AttributionStreamID:  o.cfg.AttributionStreamID,
+			InitializePolicyGate: initializePolicyGate,
+			DataDir:              o.cfg.DataDir,
+			SegmentsDir:          segmentsDir,
+			FS:                   o.cfg.FS,
+			Store:                o.cfg.Store,
+			SeqKey:               live.SteadySeqKey,
+			CursorKey:            live.CursorKey,
+			RelayURL:             o.cfg.RelayURL,
 			// Bare cfg.Logger; live.Open sets its own component.
 			Logger:                o.cfg.Logger,
 			Metrics:               o.cfg.LiveMetrics,
@@ -86,6 +106,9 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 			SegmentIOFaultInjector: o.cfg.SegmentIOFaultInjector,
 		})
 		if err != nil {
+			if o.cfg.OnManagedLiveError != nil && o.cfg.Attribution != nil {
+				o.cfg.OnManagedLiveError(err)
+			}
 			return fmt.Errorf("orchestrator: open steady-state live consumer: %w", err)
 		}
 		defer func() {
@@ -128,11 +151,14 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 					DropMetrics:   o.cfg.DropMetrics,
 					NewHostClient: o.cfg.BackfillNewHostClient,
 					// hypercerts: Steady retry shares the runtime live-verifier directory.
-					Directory:   o.cfg.Directory,
-					Interval:    o.cfg.FailedRepoRetryInterval,
-					Workers:     o.cfg.FailedRepoRetryWorkers,
-					HostWorkers: o.cfg.FailedRepoRetryHostWorkers,
-					MaxDelay:    o.cfg.FailedRepoRetryMaxDelay,
+					Directory:           o.cfg.Directory,
+					Attribution:         o.cfg.Attribution,
+					AttributionStreamID: o.cfg.AttributionStreamID,
+					PolicyGate:          c.PolicyGate(),
+					Interval:            o.cfg.FailedRepoRetryInterval,
+					Workers:             o.cfg.FailedRepoRetryWorkers,
+					HostWorkers:         o.cfg.FailedRepoRetryHostWorkers,
+					MaxDelay:            o.cfg.FailedRepoRetryMaxDelay,
 				})
 				if errors.Is(err, context.Canceled) {
 					return nil

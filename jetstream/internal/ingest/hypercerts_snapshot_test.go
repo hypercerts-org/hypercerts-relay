@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/internal/tombstone"
@@ -77,6 +78,68 @@ func TestHypercertsScopedSnapshotPreservesConcurrentAndOtherCollections(t *testi
 	require.Equal(t, 1, removed)
 }
 
+func TestHypercertsManagedSnapshotWritesRowsAndAttribution(t *testing.T) {
+	w := newTestWriter(t, Config{CollectionPolicy: nil})
+	manager, err := attribution.Open(w.cfg.Store, "stream", "snapshot-attribution")
+	require.NoError(t, err)
+	w.cfg.Attribution = manager
+	w.cfg.AttributionDomain = "snapshot-attribution"
+	w.cfg.CollectionPolicy, err = selection.Open(w.cfg.Store, []string{"org.example.record"})
+	require.NoError(t, err)
+	policy := attribution.Policy{Revision: 1, Collections: []string{"org.example.record"}}
+	snapshot := Snapshot{
+		DID: "did:plc:snapshot-attribution", Rev: "rev2", Collections: []string{"org.example.record"},
+		Records:        []segment.Event{{Kind: segment.KindCreateResync, DID: "did:plc:snapshot-attribution", Rev: "rev2", Collection: "org.example.record", Rkey: "present", Payload: []byte(`{"value":true}`)}},
+		AppendMetadata: &AttributionMetadata{StreamID: "stream", Policy: policy, Provenance: attribution.ProvenanceSnapshot},
+	}
+	// Seed prior state so reconciliation must emit an actual generated delete.
+	old := segment.Event{Kind: segment.KindCreate, DID: snapshot.DID, Rev: "rev1", Collection: "org.example.record", Rkey: "removed", Payload: []byte(`{"old":true}`)}
+	old.Seq = w.nextSeq
+	boundarySeq := uint64(1)
+	boundaryID := "prior-snapshot"
+	preparedOld, err := manager.PrepareSegment(old, "stream", policy, attribution.ProvenanceSnapshot, attribution.Boundary{Seq: &boundarySeq, SnapshotID: &boundaryID})
+	require.NoError(t, err)
+	old.Seq = preparedOld.Event.Seq
+	_, err = w.active.Append(old)
+	require.NoError(t, err)
+	w.nextSeq++
+	w.cfg.Metrics.setNextSeq(w.nextSeq)
+	w.readLog.append(&old)
+	require.NoError(t, w.Flush(context.Background()))
+	before := w.NextSeq()
+	require.NoError(t, w.ReconcileSnapshot(context.Background(), snapshot))
+	require.Equal(t, before+2, w.NextSeq(), "snapshot replacement and generated delete are appended")
+	require.NoError(t, w.Flush(context.Background()))
+	files, err := SegmentFiles(w.cfg.SegmentsDir)
+	require.NoError(t, err)
+	var replacement, generatedDelete *segment.Event
+	for _, file := range files {
+		require.NoError(t, segment.WalkActive(file.Path, func(events []segment.Event) error {
+			for i := range events {
+				row := events[i]
+				if row.Seq < before {
+					continue
+				}
+				if row.Rkey == "present" && row.Kind == segment.KindUpdate {
+					replacement = &row
+				}
+				if row.Rkey == "removed" && row.Kind == segment.KindDelete {
+					generatedDelete = &row
+				}
+			}
+			return nil
+		}))
+	}
+	require.NotNil(t, replacement)
+	require.NotNil(t, generatedDelete)
+	for _, row := range []*segment.Event{replacement, generatedDelete} {
+		got, err := manager.Lookup(row.Seq)
+		require.NoError(t, err)
+		require.Equal(t, attribution.ProvenanceSnapshot, got.Provenance)
+		require.EqualValues(t, 1, *got.PolicyRev)
+	}
+}
+
 func TestHypercertsMixedSnapshotSyncAndConcurrentAccountDeletion(t *testing.T) {
 	dir := t.TempDir()
 	db, err := store.Open(dir, nil)
@@ -92,7 +155,6 @@ func TestHypercertsMixedSnapshotSyncAndConcurrentAccountDeletion(t *testing.T) {
 	require.NoError(t, w.ReconcileSnapshot(t.Context(), Snapshot{DID: did, Rev: post.Rev, Collections: []string{post.Collection}, Records: []segment.Event{post}}))
 	_, err = policy.Update(1, []string{"app.bsky.feed.post", "app.bsky.feed.like"}, nil)
 	require.NoError(t, err)
-	// A newly selected collection has older retained data and no snapshot boundary.
 	like := segment.Event{DID: did, Rev: "3l3qo2vutsw2b", Kind: segment.KindCreate, Collection: "app.bsky.feed.like", Rkey: "missing"}
 	require.NoError(t, w.Append(t.Context(), &like))
 	handled, err := w.ReconcileSync(t.Context(), did, "3l3qo2vutsw2c", nil)
@@ -151,8 +213,6 @@ func TestHypercertsFirstSyncAlwaysUsesSnapshotSerialization(t *testing.T) {
 	}})
 	require.NoError(t, err)
 	defer w.Close()
-	// No boundary exists yet. A first concurrent job cannot change the dispatch
-	// decision: the whole sync must already use the same rewrite-locked callback.
 	handled, err := w.ReconcileSync(t.Context(), "did:plc:first", "3l3qo2vutsw2c", nil)
 	require.NoError(t, err)
 	require.True(t, handled)

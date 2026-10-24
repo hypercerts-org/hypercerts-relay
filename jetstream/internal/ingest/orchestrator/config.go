@@ -3,10 +3,14 @@ package orchestrator
 import (
 	"context"
 	"fmt"
-	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/jobs"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/policygate"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
 	"github.com/bluesky-social/jetstream/internal/ingest"
@@ -43,6 +47,16 @@ type CompactionPassResult struct {
 type Config struct {
 	// hypercerts: Filter record materialization with the shared durable policy.
 	CollectionPolicy *selection.Manager
+	// Optional managed attribution is deliberately off unless a manager is supplied.
+	BackfillJobs               *jobs.Manager
+	Attribution                *attribution.Manager
+	AttributionDomain          string
+	AttributionStreamID        string
+	BootstrapAttribution       *attribution.Manager
+	BootstrapAttributionDomain string
+	PolicyGate                 *policygate.Gate
+	InitializePolicyGate       func(*ingest.Writer) (*policygate.Gate, error)
+	OnManagedLiveError         func(error)
 	// DataDir is the root data directory. The orchestrator writes to
 	// <DataDir>/segments and <DataDir>/backfill/live_segments.
 	DataDir string

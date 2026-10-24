@@ -12,6 +12,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/policygate"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/cockroachdb/pebble"
@@ -44,6 +46,10 @@ type RetryConfig struct {
 	NewHostClient func(string) (*atmossync.Client, error)
 	// hypercerts: optional identity verification for retry complete CARs.
 	Directory *atmosidentity.Directory
+	// Optional admission serializes full retry projection with policy adoption.
+	PolicyGate          *policygate.Gate
+	Attribution         *attribution.Manager
+	AttributionStreamID string
 
 	// DropMetrics is the shared ingest validation-drop counter family,
 	// forwarded to the SegmentHandler. Optional.
@@ -139,6 +145,9 @@ func RunPendingRepoRetryPass(ctx context.Context, cfg RetryConfig) error {
 }
 
 func newRetryRunner(cfg RetryConfig) (*retryRunner, error) {
+	if cfg.Attribution != nil && (cfg.PolicyGate == nil || cfg.AttributionStreamID == "") {
+		return nil, ErrManagedPolicyConfig
+	}
 	if cfg.Store == nil {
 		return nil, fmt.Errorf("backfill: retry: Store is required")
 	}
@@ -189,6 +198,9 @@ func newRetryRunner(cfg RetryConfig) (*retryRunner, error) {
 		st = NewStore(cfg.Store, cfg.Metrics)
 	}
 	handler := NewSegmentHandler(cfg.Writer, cfg.Logger, cfg.Metrics)
+	handler.policyGate = cfg.PolicyGate
+	handler.attribution = cfg.Attribution
+	handler.streamID = cfg.AttributionStreamID
 	handler.SetDropMetrics(cfg.DropMetrics)
 	return &retryRunner{
 		cfg:         cfg,

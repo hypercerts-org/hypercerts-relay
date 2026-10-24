@@ -1082,7 +1082,7 @@ func (s *JetstreamSubscribeEvents_Identity) UnmarshalJSONAt(data []byte, pos int
 
 // JetstreamSubscribeEvents_Info is a "info" in the network.bsky.jetstream.subscribeEvents schema.
 //
-// An advisory, non-fatal notice about the stream (mirrors com.atproto.sync.subscribeRepos#info). Carries no seq and does not advance the cursor. OutdatedCursor is sent as the first frame when a unix-microseconds timestamp cursor below the retention floor was clamped up to the floor; the message names the seq actually resumed from.
+// An advisory, non-fatal notice about the stream (mirrors com.atproto.sync.subscribeRepos#info). Carries no seq and does not advance the cursor. Selected subscriptions may send SelectedFeed first, then PolicyAdopted or Reconciliation notices with selected metadata. OutdatedCursor is sent for ordinary v2 timestamp resumes below the retention floor.
 type JetstreamSubscribeEvents_Info struct {
 	LexiconTypeID string            `json:"$type,omitempty"`
 	Message       gt.Option[string] `json:"message,omitzero"`
@@ -1544,9 +1544,474 @@ func (u *JetstreamSubscribeEvents_Message) UnmarshalCBORAt(data []byte, pos int)
 	}
 }
 
+// JetstreamSubscribeEvents_SelectedMetadata is a "selectedMetadata" in the network.bsky.jetstream.subscribeEvents schema.
+//
+// Optional Hypercerts metadata present only when contract=hypercerts-selected-v1 is negotiated. Ordinary v2 frames omit it.
+type JetstreamSubscribeEvents_SelectedMetadata struct {
+	LexiconTypeID          string            `json:"$type,omitempty"`
+	PolicyRev              gt.Option[int64]  `json:"policyRev,omitzero"`
+	Provenance             gt.Option[string] `json:"provenance,omitzero"`
+	ReconciliationBoundary json.RawMessage   `json:"reconciliationBoundary,omitempty"`
+	ReconciliationRequired gt.Option[bool]   `json:"reconciliationRequired,omitzero"`
+	Scope                  json.RawMessage   `json:"scope,omitempty"`
+	StreamId               gt.Option[string] `json:"streamId,omitzero"`
+
+	// extra preserves unknown fields for same-format round-trips.
+	extra []extraField
+}
+
+// Precomputed CBOR key tokens for JetstreamSubscribeEvents_SelectedMetadata.
+var (
+	cborKey_JetstreamSubscribeEvents_SelectedMetadata_dollar_type            = cbor.AppendTextKey(nil, "$type")
+	cborKey_JetstreamSubscribeEvents_SelectedMetadata_scope                  = cbor.AppendTextKey(nil, "scope")
+	cborKey_JetstreamSubscribeEvents_SelectedMetadata_streamId               = cbor.AppendTextKey(nil, "streamId")
+	cborKey_JetstreamSubscribeEvents_SelectedMetadata_policyRev              = cbor.AppendTextKey(nil, "policyRev")
+	cborKey_JetstreamSubscribeEvents_SelectedMetadata_provenance             = cbor.AppendTextKey(nil, "provenance")
+	cborKey_JetstreamSubscribeEvents_SelectedMetadata_reconciliationBoundary = cbor.AppendTextKey(nil, "reconciliationBoundary")
+	cborKey_JetstreamSubscribeEvents_SelectedMetadata_reconciliationRequired = cbor.AppendTextKey(nil, "reconciliationRequired")
+)
+
+func (s *JetstreamSubscribeEvents_SelectedMetadata) MarshalCBOR() ([]byte, error) {
+	return s.AppendCBOR(make([]byte, 0, 256))
+}
+
+func (s *JetstreamSubscribeEvents_SelectedMetadata) AppendCBOR(buf []byte) ([]byte, error) {
+	n := 0 + countExtra(s.extra, extraEncodingCBOR)
+	if s.LexiconTypeID != "" {
+		n++
+	}
+	if s.Scope != nil {
+		n++
+	}
+	if s.StreamId.HasVal() {
+		n++
+	}
+	if s.PolicyRev.HasVal() {
+		n++
+	}
+	if s.Provenance.HasVal() {
+		n++
+	}
+	if s.ReconciliationBoundary != nil {
+		n++
+	}
+	if s.ReconciliationRequired.HasVal() {
+		n++
+	}
+	buf = cbor.AppendMapHeader(buf, uint64(n))
+	if len(s.extra) > 0 {
+		ei := 0
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "$type", buf)
+		if s.LexiconTypeID != "" {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedMetadata_dollar_type...)
+			buf = cbor.AppendText(buf, s.LexiconTypeID)
+		}
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "scope", buf)
+		if s.Scope != nil {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedMetadata_scope...)
+			buf = cbor.AppendNull(buf)
+		}
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "streamId", buf)
+		if s.StreamId.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedMetadata_streamId...)
+			buf = cbor.AppendText(buf, s.StreamId.Val())
+		}
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "policyRev", buf)
+		if s.PolicyRev.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedMetadata_policyRev...)
+			buf = cbor.AppendInt(buf, s.PolicyRev.Val())
+		}
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "provenance", buf)
+		if s.Provenance.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedMetadata_provenance...)
+			buf = cbor.AppendText(buf, s.Provenance.Val())
+		}
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "reconciliationBoundary", buf)
+		if s.ReconciliationBoundary != nil {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedMetadata_reconciliationBoundary...)
+			buf = cbor.AppendNull(buf)
+		}
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "reconciliationRequired", buf)
+		if s.ReconciliationRequired.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedMetadata_reconciliationRequired...)
+			buf = cbor.AppendBool(buf, s.ReconciliationRequired.Val())
+		}
+		_, buf = appendCBORExtrasBefore(s.extra, ei, "", buf)
+	} else {
+		if s.LexiconTypeID != "" {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedMetadata_dollar_type...)
+			buf = cbor.AppendText(buf, s.LexiconTypeID)
+		}
+		if s.Scope != nil {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedMetadata_scope...)
+			buf = cbor.AppendNull(buf)
+		}
+		if s.StreamId.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedMetadata_streamId...)
+			buf = cbor.AppendText(buf, s.StreamId.Val())
+		}
+		if s.PolicyRev.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedMetadata_policyRev...)
+			buf = cbor.AppendInt(buf, s.PolicyRev.Val())
+		}
+		if s.Provenance.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedMetadata_provenance...)
+			buf = cbor.AppendText(buf, s.Provenance.Val())
+		}
+		if s.ReconciliationBoundary != nil {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedMetadata_reconciliationBoundary...)
+			buf = cbor.AppendNull(buf)
+		}
+		if s.ReconciliationRequired.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedMetadata_reconciliationRequired...)
+			buf = cbor.AppendBool(buf, s.ReconciliationRequired.Val())
+		}
+	}
+	return buf, nil
+}
+
+func (s *JetstreamSubscribeEvents_SelectedMetadata) UnmarshalCBOR(data []byte) error {
+	_, err := s.UnmarshalCBORAt(data, 0)
+	return err
+}
+
+func (s *JetstreamSubscribeEvents_SelectedMetadata) UnmarshalCBORAt(data []byte, pos int) (int, error) {
+	s.extra = clearExtra(s.extra, extraEncodingCBOR)
+	count, pos, err := cbor.ReadMapHeader(data, pos)
+	if err != nil {
+		return 0, err
+	}
+	for i := uint64(0); i < count; i++ {
+		keyStart, keyEnd, newPos, err := cbor.ReadTextKey(data, pos)
+		if err != nil {
+			return 0, err
+		}
+		pos = newPos
+		switch keyEnd - keyStart {
+		case 5:
+			if string(data[keyStart:keyEnd]) == "$type" {
+				s.LexiconTypeID, pos, err = cbor.ReadText(data, pos)
+				if err != nil {
+					return 0, err
+				}
+			} else if string(data[keyStart:keyEnd]) == "scope" {
+				pos, err = cbor.SkipValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+			} else {
+				valueStart := pos
+				pos, err = cbor.SkipValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
+			}
+		case 8:
+			if string(data[keyStart:keyEnd]) == "streamId" {
+				if cbor.IsNull(data, pos) {
+					pos++
+				} else {
+					var v string
+					v, pos, err = cbor.ReadText(data, pos)
+					if err != nil {
+						return 0, err
+					}
+					s.StreamId = gt.Some(v)
+				}
+			} else {
+				valueStart := pos
+				pos, err = cbor.SkipValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
+			}
+		case 9:
+			if string(data[keyStart:keyEnd]) == "policyRev" {
+				if cbor.IsNull(data, pos) {
+					pos++
+				} else {
+					var v int64
+					v, pos, err = cbor.ReadInt(data, pos)
+					if err != nil {
+						return 0, err
+					}
+					s.PolicyRev = gt.Some(v)
+				}
+			} else {
+				valueStart := pos
+				pos, err = cbor.SkipValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
+			}
+		case 10:
+			if string(data[keyStart:keyEnd]) == "provenance" {
+				if cbor.IsNull(data, pos) {
+					pos++
+				} else {
+					var v string
+					v, pos, err = cbor.ReadText(data, pos)
+					if err != nil {
+						return 0, err
+					}
+					s.Provenance = gt.Some(v)
+				}
+			} else {
+				valueStart := pos
+				pos, err = cbor.SkipValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
+			}
+		case 22:
+			if string(data[keyStart:keyEnd]) == "reconciliationBoundary" {
+				pos, err = cbor.SkipValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+			} else if string(data[keyStart:keyEnd]) == "reconciliationRequired" {
+				if cbor.IsNull(data, pos) {
+					pos++
+				} else {
+					var v bool
+					v, pos, err = cbor.ReadBool(data, pos)
+					if err != nil {
+						return 0, err
+					}
+					s.ReconciliationRequired = gt.Some(v)
+				}
+			} else {
+				valueStart := pos
+				pos, err = cbor.SkipValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
+			}
+		default:
+			valueStart := pos
+			pos, err = cbor.SkipValue(data, pos)
+			if err != nil {
+				return 0, err
+			}
+			s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
+		}
+	}
+	return pos, nil
+}
+
+// Precomputed JSON key tokens for JetstreamSubscribeEvents_SelectedMetadata.
+var (
+	jsonKey_JetstreamSubscribeEvents_SelectedMetadata_dollar_type            = []byte("\"$type\":")
+	jsonKey_JetstreamSubscribeEvents_SelectedMetadata_policyRev              = []byte("\"policyRev\":")
+	jsonKey_JetstreamSubscribeEvents_SelectedMetadata_provenance             = []byte("\"provenance\":")
+	jsonKey_JetstreamSubscribeEvents_SelectedMetadata_reconciliationBoundary = []byte("\"reconciliationBoundary\":")
+	jsonKey_JetstreamSubscribeEvents_SelectedMetadata_reconciliationRequired = []byte("\"reconciliationRequired\":")
+	jsonKey_JetstreamSubscribeEvents_SelectedMetadata_scope                  = []byte("\"scope\":")
+	jsonKey_JetstreamSubscribeEvents_SelectedMetadata_streamId               = []byte("\"streamId\":")
+)
+
+func (s *JetstreamSubscribeEvents_SelectedMetadata) MarshalJSON() ([]byte, error) {
+	return s.AppendJSON(make([]byte, 0, 256))
+}
+
+func (s *JetstreamSubscribeEvents_SelectedMetadata) AppendJSON(buf []byte) ([]byte, error) {
+	buf = append(buf, '{')
+	first := true
+	if s.LexiconTypeID != "" {
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_SelectedMetadata_dollar_type...)
+		buf = cbor.AppendJSONString(buf, s.LexiconTypeID)
+		first = false
+	}
+	if s.PolicyRev.HasVal() {
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_SelectedMetadata_policyRev...)
+		buf = cbor.AppendJSONInt(buf, s.PolicyRev.Val())
+		first = false
+	}
+	if s.Provenance.HasVal() {
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_SelectedMetadata_provenance...)
+		buf = cbor.AppendJSONString(buf, s.Provenance.Val())
+		first = false
+	}
+	if s.ReconciliationBoundary != nil {
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_SelectedMetadata_reconciliationBoundary...)
+		buf = append(buf, s.ReconciliationBoundary...)
+		first = false
+	}
+	if s.ReconciliationRequired.HasVal() {
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_SelectedMetadata_reconciliationRequired...)
+		buf = cbor.AppendJSONBool(buf, s.ReconciliationRequired.Val())
+		first = false
+	}
+	if s.Scope != nil {
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_SelectedMetadata_scope...)
+		buf = append(buf, s.Scope...)
+		first = false
+	}
+	if s.StreamId.HasVal() {
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_SelectedMetadata_streamId...)
+		buf = cbor.AppendJSONString(buf, s.StreamId.Val())
+		first = false
+	}
+	for _, ef := range s.extra {
+		if ef.Encoding != extraEncodingJSON {
+			continue
+		}
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = cbor.AppendJSONString(buf, ef.Key)
+		buf = append(buf, ':')
+		buf = append(buf, ef.Value...)
+		first = false
+	}
+	buf = append(buf, '}')
+	return buf, nil
+}
+
+func (s *JetstreamSubscribeEvents_SelectedMetadata) UnmarshalJSON(data []byte) error {
+	_, err := s.UnmarshalJSONAt(data, 0)
+	return err
+}
+
+func (s *JetstreamSubscribeEvents_SelectedMetadata) UnmarshalJSONAt(data []byte, pos int) (int, error) {
+	s.extra = clearExtra(s.extra, extraEncodingJSON)
+	var err error
+	pos, err = cbor.ReadJSONObjectStart(data, pos)
+	if err != nil {
+		return 0, err
+	}
+	for {
+		var done bool
+		pos, done = cbor.ReadJSONObjectEnd(data, pos)
+		if done {
+			return pos, nil
+		}
+		var key string
+		key, pos, err = cbor.ReadJSONKey(data, pos)
+		if err != nil {
+			return 0, err
+		}
+		switch key {
+		case "$type":
+			s.LexiconTypeID, pos, err = cbor.ReadJSONString(data, pos)
+			if err != nil {
+				return 0, err
+			}
+		case "policyRev":
+			if cbor.IsJSONNull(data, pos) {
+				pos, err = cbor.SkipJSONNull(data, pos)
+				if err != nil {
+					return 0, err
+				}
+			} else {
+				var v int64
+				v, pos, err = cbor.ReadJSONInt(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.PolicyRev = gt.Some(v)
+			}
+		case "provenance":
+			if cbor.IsJSONNull(data, pos) {
+				pos, err = cbor.SkipJSONNull(data, pos)
+				if err != nil {
+					return 0, err
+				}
+			} else {
+				var v string
+				v, pos, err = cbor.ReadJSONString(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.Provenance = gt.Some(v)
+			}
+		case "reconciliationBoundary":
+			{
+				start := pos
+				pos, err = cbor.SkipJSONValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.ReconciliationBoundary = json.RawMessage(data[start:pos])
+			}
+		case "reconciliationRequired":
+			if cbor.IsJSONNull(data, pos) {
+				pos, err = cbor.SkipJSONNull(data, pos)
+				if err != nil {
+					return 0, err
+				}
+			} else {
+				var v bool
+				v, pos, err = cbor.ReadJSONBool(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.ReconciliationRequired = gt.Some(v)
+			}
+		case "scope":
+			{
+				start := pos
+				pos, err = cbor.SkipJSONValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.Scope = json.RawMessage(data[start:pos])
+			}
+		case "streamId":
+			if cbor.IsJSONNull(data, pos) {
+				pos, err = cbor.SkipJSONNull(data, pos)
+				if err != nil {
+					return 0, err
+				}
+			} else {
+				var v string
+				v, pos, err = cbor.ReadJSONString(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.StreamId = gt.Some(v)
+			}
+		default:
+			valueStart := pos
+			pos, err = cbor.SkipJSONValue(data, pos)
+			if err != nil {
+				return 0, err
+			}
+			s.extra = append(s.extra, extraField{Key: key, Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingJSON})
+		}
+		pos = cbor.SkipJSONComma(data, pos)
+	}
+}
+
 // JetstreamSubscribeEvents_Sync is a "sync" in the network.bsky.jetstream.subscribeEvents schema.
 //
-// An archived #sync event (broken commit chain; consumers should resync the repo), wrapping the upstream firehose event verbatim. Never emitted on the legacy v1 /subscribe wire.
+// An archived #sync event (broken commit chain; consumers should resync the repo). Ordinary v2 subscriptions receive the upstream event; selected-contract subscriptions receive lifecycle metadata without CAR blocks or unselected operation payloads. Never emitted on the legacy v1 /subscribe wire.
 type JetstreamSubscribeEvents_Sync struct {
 	LexiconTypeID string                             `json:"$type,omitempty"`
 	DID           string                             `json:"did"`
