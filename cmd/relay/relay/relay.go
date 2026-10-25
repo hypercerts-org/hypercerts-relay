@@ -3,6 +3,7 @@ package relay
 import (
 	"context"
 	"log/slog"
+	"net"
 	"sync"
 
 	"github.com/bluesky-social/indigo/atproto/identity"
@@ -26,10 +27,12 @@ type Relay struct {
 	HostChecker HostChecker
 	Config      RelayConfig
 	// hypercerts: Serialize each account across source connections during migration.
-	eventLocks [256]sync.Mutex
-	sourcesLk  sync.Mutex
-	rates      *ratePolicies // hypercerts: Durable source/global event admission policy.
-	admission  rateAdmissionState
+	eventLocks    [256]sync.Mutex
+	sourcesLk     sync.Mutex
+	publicChecks  map[uint64]struct{}
+	publicCheckLk sync.Mutex
+	rates         *ratePolicies // hypercerts: Durable source/global event admission policy.
+	admission     rateAdmissionState
 
 	// Management of Socket Consumers
 	consumersLk    sync.RWMutex
@@ -53,6 +56,8 @@ type RelayConfig struct {
 	// RequireRateAdmission fences source sockets and raw-frame admission to the
 	// process holding D04's renewable single-active Relay lease.
 	RequireRateAdmission bool
+	// Test-only socket injection for local fixtures; nil keeps SSRF defenses enabled.
+	TestDialContext func(context.Context, string, string) (net.Conn, error)
 
 	// If true, skip validation that messages for a given account (DID) are coming from the expected upstream host (PDS). Currently only used in tests; might be used for intermediate relays in the future.
 	SkipAccountHostCheck bool
@@ -82,12 +87,13 @@ func NewRelay(db *gorm.DB, evtman *eventmgr.EventManager, dir identity.Directory
 	// NOTE: discarded second argument is not an `error` type
 
 	r := &Relay{
-		db:          db,
-		Dir:         dir,
-		Logger:      slog.Default().With("system", "relay"),
-		Events:      evtman,
-		HostChecker: hc,
-		Config:      *config,
+		db:           db,
+		Dir:          dir,
+		Logger:       slog.Default().With("system", "relay"),
+		Events:       evtman,
+		HostChecker:  hc,
+		Config:       *config,
+		publicChecks: make(map[uint64]struct{}),
 
 		consumers: make(map[uint64]*SocketConsumer),
 
@@ -108,6 +114,7 @@ func NewRelay(db *gorm.DB, evtman *eventmgr.EventManager, dir identity.Directory
 	slurpConfig.WaitRateCapacity = r.waitRateCapacity
 	slurpConfig.RequireRateAdmission = r.requireRateAdmission
 	slurpConfig.ConcurrencyPerHost = config.ConcurrencyPerHost
+	slurpConfig.TestDialContext = config.TestDialContext
 
 	// register callbacks to persist cursors and host state in database
 	slurpConfig.PersistCursorCallback = r.PersistHostCursors

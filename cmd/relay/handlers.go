@@ -47,6 +47,16 @@ func (s *Service) handleComAtprotoSyncRequestCrawl(c echo.Context, body *comatpr
 		}
 	}
 
+	// hypercerts: Public requests register the desired source before atomic validation.
+	if !admin {
+		origin := "https://" + hostname
+		if noSSL {
+			origin = "http://" + hostname
+		}
+		if _, err := s.relay.AddPublicSource(ctx, origin); err != nil {
+			return requestCrawlError(c, err)
+		}
+	}
 	// hypercerts: Delegate admission and validation to the durable source policy.
 	if err := s.relay.SubscribeToHost(ctx, hostname, noSSL, admin); err != nil {
 		return requestCrawlError(c, err)
@@ -64,6 +74,10 @@ func (s *Service) handleComAtprotoSyncRequestCrawl(c echo.Context, body *comatpr
 
 func requestCrawlError(c echo.Context, err error) error {
 	switch {
+	case errors.Is(err, relay.ErrNewHostsDisabled):
+		return c.JSON(http.StatusTooManyRequests, atclient.ErrorBody{Name: "RateLimitExceeded", Message: "daily public source admission limit reached"})
+	case errors.Is(err, relay.ErrSourceRevisionConflict):
+		return c.JSON(http.StatusConflict, atclient.ErrorBody{Name: "Conflict", Message: "source admission changed; retry request"})
 	case errors.Is(err, relay.ErrHostNotFound), errors.Is(err, relay.ErrSourceNotFound):
 		return c.JSON(http.StatusNotFound, atclient.ErrorBody{Name: "HostNotFound", Message: "managed source not found"})
 	case errors.Is(err, relay.ErrSourceDisabled):

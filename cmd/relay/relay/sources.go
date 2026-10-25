@@ -117,10 +117,18 @@ type SourceAccountsPage struct {
 	NextAfterDID string
 }
 
-// AddSource records a new administrative source without retaining raw URL
-// material. A repeat for the same normalized hostname is a no-op that still
-// reconciles its desired socket state.
+// AddSource records an administrative source without retaining raw URL material.
+// A repeat for the same normalized hostname is a no-op that still reconciles its desired socket state.
 func (r *Relay) AddSource(ctx context.Context, rawURL string) (*SourceView, error) {
+	return r.addSource(ctx, rawURL, false)
+}
+
+// AddPublicSource applies the new-host limiter atomically with source creation.
+func (r *Relay) AddPublicSource(ctx context.Context, rawURL string) (*SourceView, error) {
+	return r.addSource(ctx, rawURL, true)
+}
+
+func (r *Relay) addSource(ctx context.Context, rawURL string, public bool) (*SourceView, error) {
 	hostname, noSSL, err := ParseHostname(rawURL)
 	if err != nil {
 		return nil, ErrInvalidSourceURL
@@ -140,6 +148,20 @@ func (r *Relay) AddSource(ctx context.Context, rawURL string) (*SourceView, erro
 	var host models.Host
 	var source models.Source
 	err = r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Check for a durable source first: existing sources never consume the new-host limiter.
+		if err := tx.Joins("JOIN host ON host.id = source.host_id").Where("host.hostname = ?", hostname).First(&source).Error; err == nil {
+			if err := tx.Where("id = ?", source.HostID).First(&host).Error; err != nil {
+				return fmt.Errorf("loading source host: %w", err)
+			}
+			return nil
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return fmt.Errorf("loading source: %w", err)
+		}
+		if public && r.HostPerDayLimiter != nil {
+			if !r.HostPerDayLimiter.Allow() {
+				return ErrNewHostsDisabled
+			}
+		}
 		if err := r.ensureSourceHost(tx, &host, hostname, noSSL); err != nil {
 			return err
 		}
@@ -212,28 +234,46 @@ func (r *Relay) ensureSourceHost(tx *gorm.DB, host *models.Host, hostname string
 // failure code.
 func (r *Relay) ValidateSource(ctx context.Context, hostID, expectedRevision uint64) (*SourceView, error) {
 	r.sourcesLk.Lock()
-	defer r.sourcesLk.Unlock()
-
 	source, host, err := r.sourceAndHostLocked(ctx, hostID)
 	if err != nil {
+		r.sourcesLk.Unlock()
 		return nil, err
 	}
 	if source.Revision != expectedRevision {
-		if source.Revision == expectedRevision+1 && source.LastOperation == "validate" {
-			if err := r.reconcileSourceLocked(ctx, source, host); err != nil {
-				return nil, err
+		if source.Revision == expectedRevision+1 && source.LastOperation == "validate" && source.State == models.SourceStateEnabled {
+			reconcileErr := r.reconcileSourceLocked(ctx, source, host)
+			view, viewErr := r.sourceViewLocked(ctx, source, host)
+			failed := source.ValidationStatus == models.SourceValidationFailed
+			r.sourcesLk.Unlock()
+			if reconcileErr != nil {
+				return nil, reconcileErr
 			}
-			view, err := r.sourceViewLocked(ctx, source, host)
-			if err != nil {
-				return nil, err
+			if viewErr != nil {
+				return nil, viewErr
 			}
-			if source.ValidationStatus == models.SourceValidationFailed {
+			if failed {
 				return view, ErrSourceValidationFailed
 			}
 			return view, nil
 		}
+		r.sourcesLk.Unlock()
 		return nil, ErrSourceRevisionConflict
 	}
+
+	r.publicCheckLk.Lock()
+	if r.publicChecks == nil {
+		r.publicChecks = make(map[uint64]struct{})
+	}
+	if _, pending := r.publicChecks[hostID]; pending {
+		r.publicCheckLk.Unlock()
+		r.sourcesLk.Unlock()
+		return nil, ErrSourceRevisionConflict
+	}
+	r.publicChecks[hostID] = struct{}{}
+	r.publicCheckLk.Unlock()
+	revision, checkHost := source.Revision, sourceHostURL(host)
+	r.sourcesLk.Unlock()
+	defer func() { r.publicCheckLk.Lock(); delete(r.publicChecks, hostID); r.publicCheckLk.Unlock() }()
 
 	status := models.SourceValidationPassed
 	reason := models.SourceValidationReasonNone
@@ -242,15 +282,24 @@ func (r *Relay) ValidateSource(ctx context.Context, hostID, expectedRevision uin
 	if r.HostChecker == nil {
 		status = models.SourceValidationFailed
 		reason = models.SourceValidationReasonCheckerMissing
-	} else if err := r.HostChecker.CheckHost(checkCtx, sourceHostURL(host)); err != nil {
+	} else if err := r.HostChecker.CheckHost(checkCtx, checkHost); err != nil {
 		status = models.SourceValidationFailed
 		reason = models.SourceValidationReasonHostCheckFailed
 	}
 
+	finalizeCtx, finalizeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer finalizeCancel()
+	r.sourcesLk.Lock()
+	defer r.sourcesLk.Unlock()
+	current, host, err := r.sourceAndHostLocked(finalizeCtx, hostID)
+	if err != nil || current.Revision != revision || current.State != models.SourceStateEnabled {
+		return nil, ErrSourceRevisionConflict
+	}
+	source = current
 	now := time.Now().UTC()
-	updatedRevision := source.Revision + 1
-	result := r.db.WithContext(ctx).Model(&models.Source{}).
-		Where("host_id = ? AND revision = ?", source.HostID, source.Revision).
+	updatedRevision := revision + 1
+	result := r.db.WithContext(finalizeCtx).Model(&models.Source{}).
+		Where("host_id = ? AND revision = ? AND state = ?", source.HostID, revision, models.SourceStateEnabled).
 		Updates(map[string]interface{}{
 			"validation_status":     status,
 			"validation_checked_at": now,
@@ -273,17 +322,17 @@ func (r *Relay) ValidateSource(ctx context.Context, hostID, expectedRevision uin
 	source.Revision = updatedRevision
 	source.LastOperation = "validate"
 	source.RecoveryRequired = true
-	view, err := r.sourceViewLocked(ctx, source, host)
+	view, err := r.sourceViewLocked(finalizeCtx, source, host)
 	if err != nil {
 		return nil, err
 	}
-	if err := r.reconcileSourceLocked(ctx, source, host); err != nil {
+	if err := r.reconcileSourceLocked(finalizeCtx, source, host); err != nil {
 		return view, err
 	}
 	if status == models.SourceValidationFailed {
 		return view, ErrSourceValidationFailed
 	}
-	return r.sourceViewLocked(ctx, source, host)
+	return r.sourceViewLocked(finalizeCtx, source, host)
 }
 
 // SetSourceState records desired state before starting or stopping a socket. A
