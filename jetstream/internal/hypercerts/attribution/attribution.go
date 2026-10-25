@@ -426,16 +426,65 @@ func (m *Manager) Commit(p Prepared, policy Policy, commitMetadata func(*pebble.
 }
 func mustEncode(v any) []byte { b, _ := json.Marshal(v); return b }
 func (m *Manager) CommitBatch(prepared []Prepared, commitMetadata func(*pebble.Batch) error) error {
+	return m.implementWithPreparedCommit(prepared, func(stage func(*pebble.Batch) error) error {
+		batch := m.db.NewBatch()
+		defer batch.Close()
+		if err := stage(batch); err != nil {
+			return err
+		}
+		if commitMetadata != nil {
+			if err := commitMetadata(batch); err != nil {
+				return err
+			}
+		}
+		return m.db.Commit(batch, store.SyncWrites)
+	})
+}
+
+// ImplementWithPreparedCommit stages attribution into the caller-owned batch and
+// holds the manager lock until owner returns, including through its commit.
+func (m *Manager) ImplementWithPreparedCommit(prepared []Prepared, owner func(func(*pebble.Batch) error) error) error {
+	if owner == nil {
+		return ErrInvalid
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.commitBatchLocked(prepared, commitMetadata)
+	return m.implementWithPreparedCommitLocked(prepared, owner)
 }
-func (m *Manager) commitBatchLocked(prepared []Prepared, commitMetadata func(*pebble.Batch) error) error {
+
+func (m *Manager) implementWithPreparedCommit(prepared []Prepared, owner func(func(*pebble.Batch) error) error) error {
+	if owner == nil {
+		return ErrInvalid
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.implementWithPreparedCommitLocked(prepared, owner)
+}
+
+func (m *Manager) implementWithPreparedCommitLocked(prepared []Prepared, owner func(func(*pebble.Batch) error) error) error {
+	staged, active := false, true
+	stage := func(batch *pebble.Batch) error {
+		if !active || staged || batch == nil {
+			return ErrInvalid
+		}
+		staged, active = true, false
+		return m.stagePreparedLocked(prepared, batch)
+	}
+	if err := owner(stage); err != nil {
+		active = false
+		return err
+	}
+	active = false
+	if !staged {
+		return ErrInvalid
+	}
+	return nil
+}
+
+func (m *Manager) stagePreparedLocked(prepared []Prepared, batch *pebble.Batch) error {
 	if len(prepared) == 0 {
 		return ErrInvalid
 	}
-	batch := m.db.NewBatch()
-	defer batch.Close()
 	seenEvents, seenPolicies := make(map[uint64][]byte), make(map[uint64][]byte)
 	var minimumSeq uint64
 	for i, p := range prepared {
@@ -524,8 +573,16 @@ func (m *Manager) commitBatchLocked(prepared []Prepared, commitMetadata func(*pe
 	if err = batch.Set(m.key("activation"), activation, nil); err != nil {
 		return err
 	}
+	return nil
+}
+func (m *Manager) commitBatchLocked(prepared []Prepared, commitMetadata func(*pebble.Batch) error) error {
+	batch := m.db.NewBatch()
+	defer batch.Close()
+	if err := m.stagePreparedLocked(prepared, batch); err != nil {
+		return err
+	}
 	if commitMetadata != nil {
-		if err = commitMetadata(batch); err != nil {
+		if err := commitMetadata(batch); err != nil {
 			return err
 		}
 	}

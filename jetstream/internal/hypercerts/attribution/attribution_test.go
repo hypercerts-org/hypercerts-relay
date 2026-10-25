@@ -141,6 +141,108 @@ func TestWithPolicyCommitRequiresOneShotAndRejectsPreexistingMutations(t *testin
 	require.NoError(t, m.WithPolicyCommit(policy, func(stage func(*pebble.Batch) error) error { b := m.db.NewBatch(); defer b.Close(); return stage(b) }))
 }
 
+func TestImplementWithPreparedCommitStagesIntoOwnerBatchAndCommitsAtomically(t *testing.T) {
+	db, m := openTest(t)
+	p, err := m.Prepare(sampleEvent(), samplePolicy())
+	require.NoError(t, err)
+	metadataKey := []byte("history/projection/checkpoint")
+	ownerCommitted := false
+	require.NoError(t, m.ImplementWithPreparedCommit([]Prepared{p}, func(stage func(*pebble.Batch) error) error {
+		batch := db.NewBatch()
+		defer batch.Close()
+		require.NoError(t, batch.Set(metadataKey, []byte("next"), nil))
+		require.NoError(t, stage(batch))
+		ownerCommitted = true
+		return db.Commit(batch, store.SyncWrites)
+	}))
+	require.True(t, ownerCommitted)
+	_, err = m.Lookup(7)
+	require.NoError(t, err)
+	value, closer, err := db.Get(metadataKey)
+	require.NoError(t, err)
+	require.Equal(t, []byte("next"), value)
+	require.NoError(t, closer.Close())
+}
+
+func TestImplementWithPreparedCommitCallbackFailureAndMalformedInputDoNotCommit(t *testing.T) {
+	db, m := openTest(t)
+	p, err := m.Prepare(sampleEvent(), samplePolicy())
+	require.NoError(t, err)
+	boom := errors.New("owner failed")
+	commitCalls := 0
+	err = m.ImplementWithPreparedCommit([]Prepared{p}, func(stage func(*pebble.Batch) error) error {
+		batch := db.NewBatch()
+		defer batch.Close()
+		if err := stage(batch); err != nil {
+			return err
+		}
+		return boom
+	})
+	require.ErrorIs(t, err, boom)
+	_, err = m.Lookup(7)
+	require.ErrorIs(t, err, ErrLegacyUnknown)
+	bad := p
+	bad.Fingerprint = "malformed"
+	err = m.ImplementWithPreparedCommit([]Prepared{bad}, func(stage func(*pebble.Batch) error) error {
+		batch := db.NewBatch()
+		defer batch.Close()
+		if err := stage(batch); err != nil {
+			return err
+		}
+		commitCalls++
+		return db.Commit(batch, store.SyncWrites)
+	})
+	require.ErrorIs(t, err, ErrInvalid)
+	require.Zero(t, commitCalls)
+	_, err = m.Lookup(7)
+	require.ErrorIs(t, err, ErrLegacyUnknown)
+}
+
+func TestImplementWithPreparedCommitSerializesThroughOwnerCommit(t *testing.T) {
+	db, first := openTest(t)
+	second, err := Open(db, "crypto-identity", "selected-stream")
+	require.NoError(t, err)
+	p1, err := first.Prepare(sampleEvent(), samplePolicy())
+	require.NoError(t, err)
+	e := sampleEvent()
+	e.Seq = 8
+	p2, err := second.Prepare(e, samplePolicy())
+	require.NoError(t, err)
+	entered, release, firstDone := make(chan struct{}), make(chan struct{}), make(chan error, 1)
+	go func() {
+		firstDone <- first.ImplementWithPreparedCommit([]Prepared{p1}, func(stage func(*pebble.Batch) error) error {
+			batch := db.NewBatch()
+			defer batch.Close()
+			if err := stage(batch); err != nil {
+				return err
+			}
+			close(entered)
+			<-release
+			return db.Commit(batch, store.SyncWrites)
+		})
+	}()
+	<-entered
+	secondDone := make(chan error, 1)
+	go func() {
+		secondDone <- second.ImplementWithPreparedCommit([]Prepared{p2}, func(stage func(*pebble.Batch) error) error {
+			batch := db.NewBatch()
+			defer batch.Close()
+			if err := stage(batch); err != nil {
+				return err
+			}
+			return db.Commit(batch, store.SyncWrites)
+		})
+	}()
+	select {
+	case err := <-secondDone:
+		t.Fatalf("second manager passed blocked owner commit: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(release)
+	require.NoError(t, <-firstDone)
+	require.NoError(t, <-secondDone)
+}
+
 func TestCommitRequiresPolicyArgumentToMatchPreparedPolicy(t *testing.T) {
 	_, m := openTest(t)
 	p, err := m.Prepare(sampleEvent(), samplePolicy())
