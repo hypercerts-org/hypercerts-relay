@@ -34,6 +34,7 @@ func newSourceRelay(t *testing.T) (*Relay, sourceTestDB) {
 		&models.RecoveryReceipt{},
 		&models.Account{},
 		&models.AccountSourceObservation{},
+		&models.SourceHandoff{},
 	))
 	r.Config = *DefaultRelayConfig()
 	r.HostChecker = NewMockHostChecker()
@@ -225,6 +226,32 @@ func TestSetSourceStateUsesRevisionAndPreservesHost(t *testing.T) {
 	var storedSource models.Source
 	require.NoError(t, db.Where("host_id = ?", host.ID).First(&storedSource).Error)
 	require.Equal(t, models.SourceStateRemoved, storedSource.State)
+}
+
+func TestSourceHandoffEnqueuedAtomicallyForValidatedLifecycle(t *testing.T) {
+	ctx := context.Background()
+	r, db := newSourceRelay(t)
+	r.HostChecker.(*MockHostChecker).Hosts["https://handoff.example.com"] = true
+	view, err := r.AddSource(ctx, "https://handoff.example.com")
+	require.NoError(t, err)
+	var count int64
+	require.NoError(t, db.Model(&models.SourceHandoff{}).Count(&count).Error)
+	require.Zero(t, count, "unvalidated source must not be handed off")
+
+	view, err = r.ValidateSource(ctx, view.HostID, view.Revision)
+	require.NoError(t, err)
+	var handoff models.SourceHandoff
+	require.NoError(t, db.First(&handoff, "host_id = ?", view.HostID).Error)
+	require.Equal(t, view.Revision, handoff.SourceRevision)
+	require.Equal(t, string(models.SourceStateEnabled), handoff.State)
+	require.Equal(t, "https://handoff.example.com", handoff.PDS)
+
+	view, err = r.SetSourceState(ctx, view.HostID, view.Revision, models.SourceStateDisabled)
+	require.NoError(t, err)
+	require.NoError(t, db.First(&handoff, "host_id = ?", view.HostID).Error)
+	require.Equal(t, view.Revision, handoff.SourceRevision)
+	require.Equal(t, string(models.SourceStateDisabled), handoff.State)
+	require.Zero(t, handoff.Attempts)
 }
 
 func TestAddSourceIsIdempotentWithoutTLSDowngrade(t *testing.T) {

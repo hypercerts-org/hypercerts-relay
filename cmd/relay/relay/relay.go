@@ -55,7 +55,9 @@ type RelayConfig struct {
 	HostPerDayLimit       int64
 	// RequireRateAdmission fences source sockets and raw-frame admission to the
 	// process holding D04's renewable single-active Relay lease.
-	RequireRateAdmission bool
+	RequireRateAdmission  bool
+	JetstreamControlURL   string
+	JetstreamControlToken string
 	// Test-only socket injection for local fixtures; nil keeps SSRF defenses enabled.
 	TestDialContext func(context.Context, string, string) (net.Conn, error)
 
@@ -147,7 +149,7 @@ func (r *Relay) MigrateDatabase() error {
 		return err
 	}
 	// hypercerts: Preserve source policy and the cross-service completion boundary separately from runtime host status.
-	if err := r.db.AutoMigrate(models.Source{}, models.RecoveryReceipt{}, models.AccountSourceObservation{}); err != nil {
+	if err := r.db.AutoMigrate(models.Source{}, models.RecoveryReceipt{}, models.AccountSourceObservation{}, models.SourceHandoff{}); err != nil {
 		return err
 	}
 	return r.db.Exec(`INSERT INTO source (host_id, state, revision, validation_status, recovery_required, last_operation)

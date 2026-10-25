@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/indigo/cmd/relay/relay/models"
+	"gorm.io/gorm"
 )
 
 const publicValidationCooldown = time.Minute
@@ -96,10 +97,9 @@ func (r *Relay) AdmitPublicSource(ctx context.Context, rawURL string) error {
 	revision, scheme := source.Revision, host.NoSSL
 	r.sourcesLk.Unlock()
 	defer func() { r.publicCheckLk.Lock(); delete(r.publicChecks, host.ID); r.publicCheckLk.Unlock() }()
-
 	checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	checkErr := error(nil)
+	var checkErr error
 	if r.HostChecker == nil {
 		checkErr = ErrSourceValidationFailed
 	} else {
@@ -109,7 +109,6 @@ func (r *Relay) AdmitPublicSource(ctx context.Context, rawURL string) error {
 		}
 		checkErr = r.HostChecker.CheckHost(checkCtx, url)
 	}
-
 	finalizeCtx, finalizeCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer finalizeCancel()
 	r.sourcesLk.Lock()
@@ -133,19 +132,28 @@ func (r *Relay) AdmitPublicSource(ctx context.Context, rawURL string) error {
 		status, reason = models.SourceValidationFailed, models.SourceValidationReasonHostCheckFailed
 	}
 	now := time.Now().UTC()
-	updated := r.db.WithContext(finalizeCtx).Model(&models.Source{}).Where("host_id = ? AND revision = ? AND state = ?", source.HostID, revision, models.SourceStateEnabled).Updates(map[string]any{
-		"validation_status": status, "validation_checked_at": now, "validation_reason": reason,
-		"revision": revision + 1, "last_operation": "validate", "recovery_required": true,
+	updatedRevision := revision + 1
+	err = r.db.WithContext(finalizeCtx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&models.Source{}).Where("host_id = ? AND revision = ? AND state = ?", source.HostID, revision, models.SourceStateEnabled).Updates(map[string]any{
+			"validation_status": status, "validation_checked_at": now, "validation_reason": reason,
+			"revision": updatedRevision, "last_operation": "validate", "recovery_required": true,
+		})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return ErrSourceRevisionConflict
+		}
+		if status == models.SourceValidationPassed {
+			return enqueueSourceHandoff(tx, host, updatedRevision, models.SourceStateEnabled)
+		}
+		return enqueueSourceHandoff(tx, host, updatedRevision, models.SourceStateDisabled)
 	})
-	if updated.Error != nil {
-		return updated.Error
-	}
-	if updated.RowsAffected != 1 {
-		return ErrSourceRevisionConflict
+	if err != nil {
+		return err
 	}
 	source.ValidationStatus, source.ValidationCheckedAt, source.ValidationReason = status, &now, reason
-	source.Revision++
-	source.LastOperation, source.RecoveryRequired = "validate", true
+	source.Revision, source.LastOperation, source.RecoveryRequired = updatedRevision, "validate", true
 	if err := r.reconcileSourceLocked(finalizeCtx, source, host); err != nil {
 		return err
 	}
