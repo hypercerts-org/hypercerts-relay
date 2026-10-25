@@ -6,11 +6,16 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/policygate"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/obs"
 	"github.com/bluesky-social/jetstream/internal/store"
@@ -19,15 +24,22 @@ import (
 )
 
 type mergeRunner struct {
-	dst           *ingest.Writer
-	store         *store.Store
-	sourceDir     string
-	fs            vfs.FS
-	logger        *slog.Logger
-	metrics       *Metrics
-	crashInjector crashpoint.Injector
-	now           func() time.Time // overridable for tests
-	cache         *repoStatusLookup
+	dst                       *ingest.Writer
+	store                     *store.Store
+	sourceDir                 string
+	fs                        vfs.FS
+	logger                    *slog.Logger
+	metrics                   *Metrics
+	crashInjector             crashpoint.Injector
+	now                       func() time.Time // overridable for tests
+	cache                     *repoStatusLookup
+	sourceAttribution         *attribution.Manager
+	sourceDomain              string
+	sourceAttributionStreamID string
+	destinationAttribution    *attribution.Manager
+	destinationStreamID       string
+	policyGate                *policygate.Gate
+	collectionPolicy          *selection.Manager
 }
 
 // newMergeRunner builds a drain runner. injector is the test-only crash
@@ -35,37 +47,21 @@ type mergeRunner struct {
 // o.cfg.CrashInjector, which is nil in production, making every
 // simulateCrash checkpoint a no-op. Pass nil to disable injection.
 func newMergeRunner(dst *ingest.Writer, st *store.Store, sourceDir string, fs vfs.FS, logger *slog.Logger, m *Metrics, injector crashpoint.Injector) *mergeRunner {
-	r := &mergeRunner{
-		dst:           dst,
-		store:         st,
-		sourceDir:     sourceDir,
-		fs:            fs,
-		logger:        logger.With(slog.String("component", "orchestrator/merge")),
-		metrics:       m,
-		crashInjector: injector,
-		now:           func() time.Time { return time.Now().UTC() },
-	}
+	r := &mergeRunner{dst: dst, store: st, sourceDir: sourceDir, fs: fs, logger: logger.With(slog.String("component", "orchestrator/merge")), metrics: m, crashInjector: injector, now: func() time.Time { return time.Now().UTC() }}
 	r.cache = newRepoStatusLookup(st, m.incMergeDIDLookups)
 	return r
 }
 
-// run drains every source seg whose index >= the persisted cursor,
-// committing per-source. Returns nil on full drain; returns
-// ctx.Err() if the context is cancelled mid-drain so the
-// orchestrator can distinguish a clean stop from real failure.
 func (r *mergeRunner) run(ctx context.Context) error {
 	return obs.Span(ctx, func(ctx context.Context) error {
 		fromIdx, err := loadMergeCursor(r.store)
 		if err != nil {
 			return err
 		}
-
 		all, err := ingest.SegmentFilesFS(r.fs, r.sourceDir)
 		if err != nil {
 			return fmt.Errorf("orchestrator: merge: list source segments: %w", err)
 		}
-
-		// Skip already-drained sources; verify contiguity from fromIdx.
 		var todo []ingest.SegmentFile
 		expectIdx := fromIdx
 		for _, sf := range all {
@@ -78,7 +74,6 @@ func (r *mergeRunner) run(ctx context.Context) error {
 			todo = append(todo, sf)
 			expectIdx++
 		}
-
 		for _, sf := range todo {
 			if err := ctx.Err(); err != nil {
 				return err
@@ -107,11 +102,19 @@ func (r *mergeRunner) simulateCrash(ctx context.Context, point crashpoint.Point)
 	return r.crashInjector.SimulateCrash(ctx, point)
 }
 
-// processSourceSegment opens one source seg, iterates its blocks,
-// applies the keep/drop predicate, appends survivors with re-stamped
-// WitnessedAt, returns the per-DID last-seen rev map. dst.Flush is
-// called before returning so the cursor commit that follows is
-// ordered after a fsync (§5.2).
+func sourcePolicyFrom(manager *attribution.Manager, source attribution.Event) ([]attribution.Policy, error) {
+	if source.PolicyRev == nil {
+		return nil, nil
+	}
+	policy, err := manager.LookupPolicy(*source.PolicyRev)
+	if err != nil {
+		return nil, err
+	}
+	return []attribution.Policy{policy}, nil
+}
+
+// processSourceSegment copies selected rows while preserving source evidence;
+// the destination flush precedes the durable source cursor commit.
 func (r *mergeRunner) processSourceSegment(ctx context.Context, sf ingest.SegmentFile) (map[string]string, error) {
 	return obs.Span2(ctx, func(ctx context.Context) (map[string]string, error) {
 		rd, err := segment.Open(segment.ReaderConfig{Path: sf.Path, FS: r.fs})
@@ -119,11 +122,8 @@ func (r *mergeRunner) processSourceSegment(ctx context.Context, sf ingest.Segmen
 			return nil, fmt.Errorf("orchestrator: merge: open %s: %w", sf.Path, err)
 		}
 		defer func() { _ = rd.Close() }()
-
-		blockCount := int(rd.Header().BlockCount)
 		perDID := make(map[string]string)
-
-		for i := range blockCount {
+		for i := range int(rd.Header().BlockCount) {
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
@@ -141,19 +141,75 @@ func (r *mergeRunner) processSourceSegment(ctx context.Context, sf ingest.Segmen
 					r.metrics.incMergeEventsDropped()
 					continue
 				}
-				ev.WitnessedAt = r.now().UnixMicro() // §3.4 re-stamp
-				if err := r.dst.Append(ctx, ev); err != nil {
-					return nil, fmt.Errorf("orchestrator: merge: append: %w", err)
+				if r.sourceAttribution != nil && r.destinationAttribution != nil {
+					original := *ev
+					source, lookupErr := r.sourceAttribution.Lookup(original.Seq)
+					legacyUnknown := errors.Is(lookupErr, attribution.ErrLegacyUnknown)
+					if lookupErr != nil && !legacyUnknown {
+						return nil, fmt.Errorf("orchestrator: merge: lookup source attribution seq %d: %w", original.Seq, lookupErr)
+					}
+					if legacyUnknown {
+						source = attribution.Event{StreamID: r.sourceAttributionStreamID, Seq: original.Seq, Provenance: attribution.ProvenanceLegacyUnknown}
+					}
+					if len(source.Payload) == 0 {
+						payload, err := json.Marshal(struct {
+							Operation string `json:"operation"`
+						}{Operation: fmt.Sprint(original.Kind)})
+						if err != nil {
+							return nil, fmt.Errorf("orchestrator: merge: encode legacy source operation: %w", err)
+						}
+						source.Payload = payload
+					}
+					sourcePolicy, err := sourcePolicyFrom(r.sourceAttribution, source)
+					if err != nil {
+						return nil, fmt.Errorf("orchestrator: merge: lookup source policy: %w", err)
+					}
+					appendImported := func(destination ingest.AttributionMetadata) error {
+						witnessedAt, indexedAt := ev.WitnessedAt, ev.IndexedAt
+						if destination.Boundary.Seq == nil || destination.Boundary.SnapshotID == nil {
+							boundary, id := r.dst.NextSeq(), "merge/reconciliation"
+							destination.Boundary = attribution.Boundary{Seq: &boundary, SnapshotID: &id}
+						}
+						ev.WitnessedAt = r.now().UnixMicro()
+						source.Source = &attribution.ImportedSource{WitnessedAt: witnessedAt, IndexedAt: indexedAt, SegmentFingerprint: attribution.FingerprintSegment(original)}
+						return r.dst.AppendImported(ctx, ev, source, r.sourceDomain, destination, sourcePolicy...)
+					}
+					var appendErr error
+					if r.collectionPolicy == nil {
+						full, err := r.destinationAttribution.LookupPolicy(1)
+						if err != nil {
+							appendErr = err
+						} else {
+							appendErr = appendImported(ingest.AttributionMetadata{StreamID: r.destinationStreamID, Policy: full, Provenance: attribution.ProvenanceReconciliation})
+						}
+					} else if r.policyGate != nil {
+						appendErr = r.policyGate.Admit(ctx, func(current selection.Policy) error {
+							full, err := r.destinationAttribution.LookupPolicy(current.Revision)
+							if err != nil {
+								return err
+							}
+							return appendImported(ingest.AttributionMetadata{StreamID: r.destinationStreamID, Policy: full, Provenance: attribution.ProvenanceReconciliation})
+						})
+					} else {
+						appendErr = fmt.Errorf("orchestrator: merge: managed policy gate unavailable")
+					}
+					if appendErr != nil {
+						return nil, fmt.Errorf("orchestrator: merge: append imported: %w", appendErr)
+					}
+				} else {
+					ev.WitnessedAt = r.now().UnixMicro()
+					if err := r.dst.Append(ctx, ev); err != nil {
+						return nil, fmt.Errorf("orchestrator: merge: append: %w", err)
+					}
 				}
-				r.metrics.incMergeEventsKept()
-				if isBackfillRevFilteredKind(ev.Kind) && ev.Rev != "" {
-					perDID[ev.DID] = ev.Rev
+				if ev.Seq != 0 {
+					r.metrics.incMergeEventsKept()
+					if isBackfillRevFilteredKind(ev.Kind) && ev.Rev != "" {
+						perDID[ev.DID] = ev.Rev
+					}
 				}
 			}
 		}
-
-		// Force any pending dst block to fsync before the cursor
-		// commit (durability ordering, spec §5.2).
 		if err := r.dst.Flush(ctx); err != nil {
 			return nil, fmt.Errorf("orchestrator: merge: flush dst: %w", err)
 		}

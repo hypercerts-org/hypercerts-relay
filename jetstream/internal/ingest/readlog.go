@@ -158,7 +158,10 @@ func (l *ReadableLog) advanceDurable(nextSeq uint64) {
 	}
 	l.durable = nextSeq
 	l.evictLocked()
+	old := l.notify
+	l.notify = make(chan struct{})
 	l.publishMetricsLocked()
+	close(old)
 }
 
 func (l *ReadableLog) evictLocked() {
@@ -175,6 +178,44 @@ func (l *ReadableLog) evictLocked() {
 	if l.baseSeq > l.durable {
 		panic(fmt.Sprintf("ingest: readable log floor %d advanced beyond durable %d", l.baseSeq, l.durable))
 	}
+}
+
+// ReadCommittedFrom returns only entries with Seq < durable. At a committed
+// tip it returns the current notification channel, which closes on durable
+// advancement, including metadata-only terminal commits. A cursor below FloorSeq
+// must be read from cold durable storage. The boundary is exclusive: returned
+// entries always satisfy Seq < DurableSeq.
+func (l *ReadableLog) ReadCommittedFrom(cursor uint64, max int) (entries []*ReadLogEntry, notify <-chan struct{}, ok bool, atTip bool) {
+	if l == nil {
+		return nil, nil, false, false
+	}
+	if max <= 0 {
+		max = 1
+	}
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	limit := l.durable
+	if cursor >= limit {
+		return nil, l.notify, false, true
+	}
+	if cursor < l.baseSeq {
+		return nil, nil, false, false
+	}
+	idx := cursor - l.baseSeq
+	if idx >= uint64(len(l.entries)) {
+		panic(fmt.Sprintf("ingest: readable log corrupt index %d len %d base %d tip %d", idx, len(l.entries), l.baseSeq, l.tipSeq))
+	}
+	end := limit - l.baseSeq
+	if end > uint64(len(l.entries)) {
+		panic(fmt.Sprintf("ingest: readable log durable range exceeds resident entries: end %d len %d", end, len(l.entries)))
+	}
+	out := l.entries[idx:end]
+	if len(out) > max {
+		out = out[:max]
+	}
+	entries = make([]*ReadLogEntry, len(out))
+	copy(entries, out)
+	return entries, nil, true, false
 }
 
 // ReadFrom returns a copied resident suffix for cursor when cursor is inside
@@ -218,15 +259,6 @@ func (l *ReadableLog) FloorSeq() uint64 {
 	return l.baseSeq
 }
 
-func (l *ReadableLog) TipSeq() uint64 {
-	if l == nil {
-		return 0
-	}
-	l.mu.RLock()
-	defer l.mu.RUnlock()
-	return l.tipSeq
-}
-
 func (l *ReadableLog) DurableSeq() uint64 {
 	if l == nil {
 		return 0
@@ -234,6 +266,15 @@ func (l *ReadableLog) DurableSeq() uint64 {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	return l.durable
+}
+
+func (l *ReadableLog) TipSeq() uint64 {
+	if l == nil {
+		return 0
+	}
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.tipSeq
 }
 
 func (l *ReadableLog) PendingForDID(did string) []segment.Event {

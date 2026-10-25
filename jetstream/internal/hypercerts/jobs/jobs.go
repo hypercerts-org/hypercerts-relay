@@ -16,6 +16,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/policygate"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/cockroachdb/pebble"
@@ -48,6 +50,7 @@ var ErrInvalidInput = errors.New("invalid job input")
 var ErrPolicyMirrorRequired = errors.New("Relay policy mirror is required for a Relay-bound source")
 var ErrReceiptStale = errors.New("recovery receipt rejected as stale")
 var ErrReceiptSourceMissing = errors.New("recovery receipt source no longer exists")
+var ErrPolicyAdoptionNotReady = errors.New("collection policy adoption is not ready")
 
 // AcquisitionEvidence is checkpoint-owned evidence for one frozen inventory.
 // A nil pointer on older jobs means attribution is unknown, never zero.
@@ -154,6 +157,13 @@ type Manager struct {
 	runningID                 string
 	receiptSender             ReceiptSender
 	policyAdvancer            PolicyAdvanceSender
+	gate                      *policygate.Gate
+	attribution               *attribution.Manager
+	attributionDomain         string
+	requirePolicyAdoption     bool
+	receiptRunning            map[string]bool
+	receiptCancel             context.CancelFunc
+	receiptDone               chan struct{}
 }
 
 // ReceiptSender submits a completed job's bounded recovery coordinate to the
@@ -168,7 +178,7 @@ func Open(db *store.Store, policy *selection.Manager) (*Manager, error) {
 	if policy == nil {
 		return nil, errors.New("jobs require collection policy")
 	}
-	m := &Manager{db: db, policy: policy, wake: make(chan struct{}, 1)}
+	m := &Manager{db: db, policy: policy, wake: make(chan struct{}, 1), receiptRunning: map[string]bool{}}
 	persisted, found, err := readPersistedData(db)
 	if err != nil {
 		return nil, err
@@ -353,7 +363,10 @@ func (m *Manager) SeedSources(sources []string) error {
 		next.Jobs[j.ID] = j
 	}
 	next.Initialized = true
-	return m.commit(next)
+	if err := m.commit(next); err != nil {
+		return err
+	}
+	return nil
 }
 
 // AddSource admits an explicit direct-PDS acquisition target and schedules its
@@ -475,7 +488,43 @@ func (m *Manager) RemoveSourceWithRevision(raw string, sourceRevision uint64) er
 	}
 	return nil
 }
+func (m *Manager) AddRequirePolicyAdoption(required bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.requirePolicyAdoption = required
+}
+
+func (m *Manager) BindPolicyAdoption(gate *policygate.Gate, history *attribution.Manager, domain string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.gate, m.attribution, m.attributionDomain = gate, history, domain
+}
+
 func (m *Manager) SetPolicy(ctx context.Context, expected uint64, collections []string) (selection.Policy, error) {
+	collections, err := selection.Normalize(collections)
+	if err != nil {
+		return selection.Policy{}, err
+	}
+	m.mu.Lock()
+	gate, history, domain := m.gate, m.attribution, m.attributionDomain
+	requireAdoption := m.requirePolicyAdoption
+	m.mu.Unlock()
+	if gate == nil || history == nil || domain == "" {
+		if requireAdoption {
+			return selection.Policy{}, ErrPolicyAdoptionNotReady
+		}
+		return m.setPolicyLocked(ctx, expected, collections, nil, false)
+	}
+	var result selection.Policy
+	err = gate.Adopt(ctx, domain, func(boundary *uint64) error {
+		var updateErr error
+		result, updateErr = m.setPolicyLocked(ctx, expected, collections, boundary, true)
+		return updateErr
+	})
+	return result, err
+}
+
+func (m *Manager) setPolicyLocked(ctx context.Context, expected uint64, collections []string, boundary *uint64, boundAdoption bool) (selection.Policy, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	collections, err := selection.Normalize(collections)
@@ -506,30 +555,49 @@ func (m *Manager) SetPolicy(ctx context.Context, expected uint64, collections []
 	}
 	next := clone(m.data)
 	ensureSourceRevisions(&next)
-	policy, err := m.policy.Update(expected, collections, func(policy selection.Policy, b *pebble.Batch) error {
-		for id, j := range next.Jobs {
-			if j.State == Pending || j.State == Running {
-				j.State = Canceled
-				j.ErrorCode = "policy_changed"
-				j.FinishedAt = time.Now().UTC()
-				next.Jobs[id] = j
-			}
-		}
-		for pds, enabled := range next.Sources {
-			if enabled {
-				j := newJob(pds, policy, "policy_changed", next.SourceRevisions[pds])
-				if err := beginAcquisition(next, &j); err != nil {
+	var policy selection.Policy
+	update := func(stagePolicy func(*pebble.Batch) error) error {
+		var updateErr error
+		policy, updateErr = m.policy.Update(expected, collections, func(candidate selection.Policy, b *pebble.Batch) error {
+			policy = candidate
+			if stagePolicy != nil {
+				if candidate.Revision != expected+1 {
+					return selection.ErrRevision
+				}
+				if err := stagePolicy(b); err != nil {
 					return err
 				}
-				next.Jobs[j.ID] = j
 			}
-		}
-		encoded, err := json.Marshal(next)
-		if err != nil {
-			return err
-		}
-		return b.Set([]byte(stateKey), encoded, nil)
-	})
+			for id, j := range next.Jobs {
+				if j.State == Pending || j.State == Running {
+					j.State = Canceled
+					j.ErrorCode = "policy_changed"
+					j.FinishedAt = time.Now().UTC()
+					next.Jobs[id] = j
+				}
+			}
+			for pds, enabled := range next.Sources {
+				if enabled {
+					j := newJob(pds, policy, "policy_changed", next.SourceRevisions[pds])
+					if err := beginAcquisition(next, &j); err != nil {
+						return err
+					}
+					next.Jobs[j.ID] = j
+				}
+			}
+			encoded, err := json.Marshal(next)
+			if err != nil {
+				return err
+			}
+			return b.Set([]byte(stateKey), encoded, nil)
+		})
+		return updateErr
+	}
+	if boundAdoption && m.attribution != nil {
+		err = m.attribution.WithPolicyCommit(attribution.Policy{Revision: expected + 1, Collections: collections, EffectiveAfterSeq: boundary}, update)
+	} else {
+		err = update(nil)
+	}
 	if err != nil {
 		return selection.Policy{}, err
 	}
@@ -1049,12 +1117,33 @@ func (m *Manager) active(id string) bool {
 
 // Apply holds the policy/source cancellation boundary through the archive write.
 func (m *Manager) Apply(id string, write func() error) error {
+	return m.ApplyContext(context.Background(), id, func(context.Context) error { return write() })
+}
+
+func (m *Manager) ApplyContext(ctx context.Context, id string, write func(context.Context) error) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if !m.active(id) {
+		m.mu.Unlock()
 		return ErrConflict
 	}
-	return write()
+	gate := m.gate
+	m.mu.Unlock()
+	if gate == nil {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if !m.active(id) {
+			return ErrConflict
+		}
+		return write(ctx)
+	}
+	return gate.Admit(ctx, func(policy selection.Policy) error {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if !m.active(id) || m.policy.Current().Revision != policy.Revision {
+			return ErrConflict
+		}
+		return write(policygate.WithAdmission(ctx, policy))
+	})
 }
 
 // SetTotalRepos records a known PDS snapshot size. PDSProcessor normally uses
@@ -1280,12 +1369,33 @@ type InputError struct {
 func (e *InputError) Error() string { return e.Code }
 
 func (m *Manager) Run(ctx context.Context, process Processor) error {
+	var receipts sync.WaitGroup
 	if err := m.startRunner(); err != nil {
 		return err
 	}
-	defer m.stopRunner()
+	runCtx, cancel := context.WithCancel(ctx)
+	runDone := make(chan struct{})
+	m.mu.Lock()
+	m.receiptCancel, m.receiptDone = cancel, runDone
+	m.mu.Unlock()
+	defer func() {
+		cancel()
+		receipts.Wait()
+		close(runDone)
+		m.mu.Lock()
+		m.receiptCancel, m.receiptDone = nil, nil
+		m.mu.Unlock()
+		m.stopRunner()
+	}()
 	for {
-		if err := m.runPass(ctx, process); err != nil {
+		if err := m.runPass(runCtx, process, &receipts); err != nil {
+			m.mu.Lock()
+			cancelReceipts := m.receiptCancel
+			m.mu.Unlock()
+			if cancelReceipts != nil {
+				cancelReceipts()
+			}
+			receipts.Wait()
 			return err
 		}
 	}
@@ -1418,7 +1528,7 @@ func (m *Manager) persistJobOutcome(ctx context.Context, id string, processErr e
 	return failure, warningJobID, nil
 }
 
-func (m *Manager) flushReceipts(ctx context.Context) error {
+func (m *Manager) flushReceipts(ctx context.Context, receipts *sync.WaitGroup) error {
 	m.mu.Lock()
 	sender := m.receiptSender
 	pending := make([]Job, 0)
@@ -1439,7 +1549,8 @@ func (m *Manager) flushReceipts(ctx context.Context) error {
 					changed = true
 					continue
 				}
-				if !job.ReceiptRetryAt.After(now) {
+				if !job.ReceiptRetryAt.After(now) && !m.receiptRunning[job.ID] {
+					m.receiptRunning[job.ID] = true
 					pending = append(pending, clone(job))
 				}
 			}
@@ -1453,26 +1564,62 @@ func (m *Manager) flushReceipts(ctx context.Context) error {
 	}
 	m.mu.Unlock()
 	for _, job := range pending {
-		if err := sender(ctx, job); err != nil {
-			if err := m.recordReceiptFailure(job, err); err != nil {
-				return err
-			}
-			continue
-		}
-		m.mu.Lock()
-		next := clone(m.data)
-		current, ok := next.Jobs[job.ID]
-		if ok && current.State == Complete && current.ReceiptPending && current.SourceRevision == job.SourceRevision {
-			current.ReceiptPending = false
-			current.ReceiptRetryAt = time.Time{}
-			current.ReceiptError = ""
-			next.Jobs[job.ID] = current
-			if err := m.commit(next); err != nil {
+		receipts.Add(1)
+		go func(job Job) {
+			defer receipts.Done()
+			defer func() {
+				m.mu.Lock()
+				delete(m.receiptRunning, job.ID)
 				m.mu.Unlock()
-				return err
+			}()
+			m.mu.Lock()
+			receiptDone := m.receiptDone
+			m.mu.Unlock()
+			receiptCtx := ctx
+			if receiptDone != nil {
+				var cancel context.CancelFunc
+				receiptCtx, cancel = context.WithCancel(ctx)
+				go func(done <-chan struct{}) {
+					select {
+					case <-ctx.Done():
+					case <-done:
+					}
+					cancel()
+				}(receiptDone)
 			}
-		}
-		m.mu.Unlock()
+
+			err := sender(receiptCtx, job)
+			if receiptCtx.Err() != nil {
+				return
+			}
+			if err != nil {
+				if persistErr := m.recordReceiptFailure(job, err); persistErr != nil {
+					slog.Error("persist receipt failure", "err", persistErr)
+				}
+				m.signalScheduler()
+				return
+			}
+			if receiptCtx.Err() != nil {
+				return
+			}
+			m.mu.Lock()
+			next := clone(m.data)
+			current, ok := next.Jobs[job.ID]
+			if receiptCtx.Err() == nil && ok && current.State == Complete && current.ReceiptPending && current.SourceRevision == job.SourceRevision {
+				current.ReceiptPending = false
+				current.ReceiptRetryAt = time.Time{}
+				if current.Policy.Revision != m.policy.Current().Revision {
+					current.ReceiptError = "policy_superseded"
+				} else {
+					current.ReceiptError = ""
+				}
+				next.Jobs[job.ID] = current
+				if err := m.commit(next); err != nil {
+					slog.Error("persist receipt success", "err", err)
+				}
+			}
+			m.mu.Unlock()
+		}(job)
 	}
 	return nil
 }
@@ -1656,11 +1803,11 @@ func (m *Manager) stopRunner() {
 	m.running = false
 }
 
-func (m *Manager) runPass(ctx context.Context, process Processor) error {
+func (m *Manager) runPass(ctx context.Context, process Processor, receipts *sync.WaitGroup) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := m.flushReceipts(ctx); err != nil {
+	if err := m.flushReceipts(ctx, receipts); err != nil {
 		return err
 	}
 	worked, err := m.runNext(ctx, process)

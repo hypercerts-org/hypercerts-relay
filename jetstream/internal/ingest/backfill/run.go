@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/policygate"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/obs"
 	"github.com/bluesky-social/jetstream/internal/store"
@@ -34,13 +36,16 @@ const (
 )
 
 type Config struct {
-	Store       *store.Store
-	Writer      *ingest.Writer
-	HTTPClient  *http.Client
-	RelayURL    string
-	Logger      *slog.Logger
-	Metrics     *Metrics
-	DropMetrics *ingest.DropMetrics
+	Store               *store.Store
+	Writer              *ingest.Writer
+	HTTPClient          *http.Client
+	RelayURL            string
+	Logger              *slog.Logger
+	Metrics             *Metrics
+	DropMetrics         *ingest.DropMetrics
+	Attribution         *attribution.Manager
+	AttributionStreamID string
+	PolicyGate          *policygate.Gate
 
 	AfterRepoComplete func(context.Context, atmos.DID) error
 	CrashInjector     crashpoint.Injector
@@ -119,6 +124,9 @@ func Run(ctx context.Context, cfg Config) error {
 		cfg.Writer.SetDurableBatchHook(completions.StageDurable)
 
 		handler := NewSegmentHandler(cfg.Writer, cfg.Logger, cfg.Metrics)
+		handler.attribution = cfg.Attribution
+		handler.streamID = cfg.AttributionStreamID
+		handler.policyGate = cfg.PolicyGate
 		handler.onWriterError = recordFatal
 		handler.SetCompletionBatcher(completions)
 		handler.SetDropMetrics(cfg.DropMetrics)
@@ -339,6 +347,9 @@ func isLoopbackHost(host string) bool {
 }
 
 func (cfg Config) validate() error {
+	if cfg.Attribution != nil && (cfg.PolicyGate == nil || cfg.AttributionStreamID == "") {
+		return ErrManagedPolicyConfig
+	}
 	if cfg.Store == nil {
 		return fmt.Errorf("backfill: Config.Store is required")
 	}

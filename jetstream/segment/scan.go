@@ -31,6 +31,19 @@ func ScanMaxSeq(path string) (maxSeq uint64, found bool, err error) {
 
 // ScanMaxSeqFS is ScanMaxSeq against fs. Nil fs uses the host OS filesystem.
 func ScanMaxSeqFS(fs vfs.FS, path string) (maxSeq uint64, found bool, err error) {
+	return extractScanActiveFS(fs, path, nil)
+}
+
+// ScanActiveFS scans fully durable blocks from an active segment, ignoring a
+// torn trailing frame. Sealed segments are rejected; use Reader for those.
+func ScanActiveFS(fs vfs.FS, path string, visit func([]Event) error) error {
+	_, _, err := extractScanActiveFS(fs, path, visit)
+	return err
+}
+
+// extractScanActiveFS scans fully durable blocks from an active segment. visit
+// receives each decoded block before its sequence envelope is accumulated.
+func extractScanActiveFS(fs vfs.FS, path string, visit func([]Event) error) (maxSeq uint64, found bool, err error) {
 	f, err := openSegmentReadOnly(fs, path)
 	if err != nil {
 		return 0, false, fmt.Errorf("segment: scan open %s: %w", path, err)
@@ -84,6 +97,11 @@ func ScanMaxSeqFS(fs vfs.FS, path string) (maxSeq uint64, found bool, err error)
 		}
 		if len(events) == 0 {
 			return maxSeq, found, nil
+		}
+		if visit != nil {
+			if err := visit(events); err != nil {
+				return 0, false, err
+			}
 		}
 		for _, ev := range events {
 			if !found || ev.Seq > maxSeq {

@@ -14,6 +14,7 @@ package live
 
 import (
 	"fmt"
+	"slices"
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/segment"
@@ -32,6 +33,10 @@ import (
 // in the slice are still archivable); callers should fall through
 // rather than discard the result. See the consumer's processBatch
 // for the canonical handling.
+func policyAllows(collections []string, ev *segment.Event) bool {
+	return !ev.Kind.IsCommit() || slices.Contains(collections, ev.Collection)
+}
+
 func ConvertEvent(evt streaming.Event, witnessedAt int64) ([]segment.Event, error) {
 	switch {
 	case evt.Resync != streaming.ResyncNone && evt.Sync == nil:

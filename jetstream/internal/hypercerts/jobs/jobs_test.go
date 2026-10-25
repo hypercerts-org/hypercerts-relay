@@ -8,9 +8,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/policygate"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/stretchr/testify/require"
@@ -56,9 +59,97 @@ func TestRevisionedSourceRemovalFencesDelayedAdds(t *testing.T) {
 	require.NoError(t, err, "equal revision remains idempotent after explicit re-admission")
 }
 
+func TestBoundPolicyAdoptionRecordsHistoryWithoutBoundary(t *testing.T) {
+	dir := t.TempDir()
+	m, db := newManager(t, dir)
+	drainer := &testPolicyDrainer{next: 1}
+	history, err := attribution.Open(db, "crypto", "selected")
+	require.NoError(t, err)
+	m.BindPolicyAdoption(policygate.New(m.policy, drainer, "selected"), history, "selected")
+	adopted, err := m.SetPolicy(t.Context(), 1, []string{"app.bsky.feed.like"})
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), adopted.Revision)
+	policies, err := history.ReadPolicyHistory()
+	require.NoError(t, err)
+	require.Len(t, policies, 1)
+	require.Nil(t, policies[0].EffectiveAfterSeq)
+	require.Zero(t, mustActivation(t, history), "policy staging must not activate event attribution")
+	require.NoError(t, db.Close())
+
+	m, db = newManager(t, dir)
+	defer db.Close()
+	history, err = attribution.Open(db, "crypto", "selected")
+	require.NoError(t, err)
+	policies, err = history.ReadPolicyHistory()
+	require.NoError(t, err)
+	require.Len(t, policies, 1)
+	require.Nil(t, policies[0].EffectiveAfterSeq)
+	require.Equal(t, uint64(2), m.policy.Current().Revision)
+}
+
+func TestApplyAdmitsBeforeTakingJobsLock(t *testing.T) {
+	m, db := newManager(t, t.TempDir())
+	defer db.Close()
+	job, err := m.AddSource("https://pds.example")
+	require.NoError(t, err)
+	job, err = m.Request("https://pds.example", "backfill")
+	require.NoError(t, err)
+	m.mu.Lock()
+	job.State = Running
+	m.data.Jobs[job.ID] = job
+	m.mu.Unlock()
+	drainer := &testPolicyDrainer{next: 1}
+	history, err := attribution.Open(db, "crypto", "selected")
+	require.NoError(t, err)
+	m.BindPolicyAdoption(policygate.New(m.policy, drainer, "selected"), history, "selected")
+
+	finished := make(chan error, 1)
+	go func() {
+		finished <- m.ApplyContext(t.Context(), job.ID, func(ctx context.Context) error {
+			_, ok := policygate.Admission(ctx)
+			require.True(t, ok)
+			return nil
+		})
+	}()
+	select {
+	case err := <-finished:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("policy admission and jobs lock deadlocked")
+	}
+}
+
+func TestBoundPolicyNoopDoesNotAddHistory(t *testing.T) {
+	m, db := newManager(t, t.TempDir())
+	defer db.Close()
+	history, err := attribution.Open(db, "crypto", "selected")
+	require.NoError(t, err)
+	m.BindPolicyAdoption(policygate.New(m.policy, &testPolicyDrainer{next: 1}, "selected"), history, "selected")
+	policy, err := m.SetPolicy(t.Context(), 1, []string{"app.bsky.feed.post"})
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), policy.Revision)
+	policies, err := history.ReadPolicyHistory()
+	require.NoError(t, err)
+	require.Empty(t, policies)
+}
+
+type testPolicyDrainer struct{ next uint64 }
+
+func (d *testPolicyDrainer) DrainDurability(context.Context) error { return nil }
+func (d *testPolicyDrainer) NextSeq() uint64                       { return d.next }
+func mustActivation(t *testing.T, m *attribution.Manager) uint64 {
+	t.Helper()
+	n, err := m.ActivationSeq()
+	require.NoError(t, err)
+	return n
+}
+
 func TestJobsPolicyAtomicSchedulingAndCancellation(t *testing.T) {
 	m, db := newManager(t, t.TempDir())
 	defer db.Close()
+	manager, err := attribution.Open(db, "selected", "test-stream")
+	require.NoError(t, err)
+	m.BindPolicyAdoption(policygate.New(m.policy, &testPolicyDrainer{next: 1}, "selected"), manager, "selected")
 	j, err := m.AddSource("https://pds.example")
 	require.NoError(t, err)
 	again, err := m.AddSource("https://pds.example/")
@@ -252,6 +343,9 @@ func TestJobsRepeatedQuotaRecoveryStartsFreshWork(t *testing.T) {
 func TestSourceAcceptanceRetrySurvivesPolicyChangeAndRestart(t *testing.T) {
 	dir := t.TempDir()
 	m, db := newManager(t, dir)
+	history, err := attribution.Open(db, "selected", "test-stream")
+	require.NoError(t, err)
+	m.BindPolicyAdoption(policygate.New(m.policy, &testPolicyDrainer{next: 1}, "selected"), history, "selected")
 	const pds = "https://lost-ack.example"
 	original, err := m.AddSourceWithRevision(pds, 7)
 	require.NoError(t, err)
@@ -275,16 +369,23 @@ func TestCompletedRecoveryReceiptRetriesAfterRestart(t *testing.T) {
 	job, err := m.AddSourceWithRevision("https://pds.example", 7)
 	require.NoError(t, err)
 	m.SetReceiptSender(func(context.Context, Job) error { return errors.New("relay unavailable") })
+	started := make(chan struct{})
+	var startedOnce sync.Once
+	m.SetReceiptSender(func(context.Context, Job) error {
+		startedOnce.Do(func() { close(started) })
+		return errors.New("relay unavailable")
+	})
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() { done <- m.Run(ctx, func(context.Context, Job) error { return nil }) }()
-	require.Eventually(t, func() bool {
-		current, getErr := m.Get(job.ID)
-		return getErr == nil && current.State == Complete && current.ReceiptPending && current.ReceiptAttempts == 1
-	}, time.Second, time.Millisecond)
+	<-started
 	cancel()
 	require.ErrorIs(t, <-done, context.Canceled)
 	current, err := m.Get(job.ID)
+	require.NoError(t, err)
+	require.Equal(t, Complete, current.State)
+	require.True(t, current.ReceiptPending)
+	current, err = m.Get(job.ID)
 	require.NoError(t, err)
 	require.Equal(t, Complete, current.State)
 	require.True(t, current.ReceiptPending)
@@ -292,9 +393,12 @@ func TestCompletedRecoveryReceiptRetriesAfterRestart(t *testing.T) {
 
 	m, db = newManager(t, dir)
 	defer db.Close()
-	received := make(chan Job, 1)
+	received := make(chan Job, len(m.List()))
 	m.SetReceiptSender(func(_ context.Context, receipt Job) error {
-		received <- receipt
+		select {
+		case received <- receipt:
+		default:
+		}
 		return nil
 	})
 	ctx, cancel = context.WithCancel(t.Context())
@@ -390,12 +494,27 @@ func TestSupersededPolicyJobDoesNotSubmitRecoveryReceipt(t *testing.T) {
 	defer db.Close()
 	job, err := m.AddSourceWithRevision("https://pds.example", 4)
 	require.NoError(t, err)
-	m.SetReceiptSender(func(context.Context, Job) error { return errors.New("temporary receipt failure") })
 	m.SetPolicyAdvanceSender(func(context.Context, string, uint64, uint64) error { return nil })
 
+	blocked := make(chan struct{})
+	resume := make(chan struct{})
+	m.SetReceiptSender(func(ctx context.Context, _ Job) error {
+		select {
+		case <-blocked:
+		default:
+			close(blocked)
+		}
+		select {
+		case <-resume:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() { done <- m.Run(ctx, func(context.Context, Job) error { return nil }) }()
+	<-blocked
 	require.Eventually(t, func() bool {
 		current, getErr := m.Get(job.ID)
 		return getErr == nil && current.State == Complete && current.ReceiptPending
@@ -403,6 +522,7 @@ func TestSupersededPolicyJobDoesNotSubmitRecoveryReceipt(t *testing.T) {
 
 	_, err = m.SetPolicy(t.Context(), m.policy.Current().Revision, []string{"app.bsky.feed.like", "app.bsky.feed.post"})
 	require.NoError(t, err)
+	close(resume)
 	receipts := make(chan Job, 1)
 	m.SetReceiptSender(func(_ context.Context, received Job) error {
 		receipts <- received
@@ -410,7 +530,11 @@ func TestSupersededPolicyJobDoesNotSubmitRecoveryReceipt(t *testing.T) {
 	})
 	require.Eventually(t, func() bool {
 		current, getErr := m.Get(job.ID)
-		return getErr == nil && current.State == Complete && !current.ReceiptPending && current.ReceiptError == "policy_superseded"
+		if getErr == nil && current.State == Complete && !current.ReceiptPending && current.ReceiptError == "policy_superseded" {
+			return true
+		}
+		m.signalScheduler()
+		return false
 	}, time.Second, time.Millisecond)
 	require.Never(t, func() bool {
 		select {
