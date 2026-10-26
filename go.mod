@@ -24,7 +24,7 @@ require (
 	github.com/lestrrat-go/jwx/v2 v2.1.7
 	github.com/mr-tron/base58 v1.3.0
 	github.com/multiformats/go-multihash v0.2.3
-	github.com/orandin/slog-gorm v1.3.2
+	github.com/orandin/slog-gorm v1.4.0
 	github.com/prometheus/client_golang v1.24.1
 	github.com/prometheus/client_model v0.6.2
 	github.com/stretchr/testify v1.11.1
