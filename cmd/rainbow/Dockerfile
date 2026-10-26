@@ -2,7 +2,7 @@ ARG VERSION=0.9.0
 ARG COMMIT=unknown
 ARG DATE=unknown
 
-FROM golang:1.26.10-bookworm AS build-env
+FROM golang:1.27.3-bookworm AS build-env
 ARG VERSION
 
 ENV DEBIAN_FRONTEND=noninteractive
