@@ -233,7 +233,9 @@ func TestAddSourceIsIdempotentWithoutTLSDowngrade(t *testing.T) {
 
 	first, err := r.AddSource(ctx, "https://source.example.com")
 	require.NoError(t, err)
-	second, err := r.AddSource(ctx, "http://source.example.com")
+	_, err = r.AddSource(ctx, "http://source.example.com")
+	require.ErrorIs(t, err, ErrInvalidSourceURL)
+	second, err := r.AddSource(ctx, "https://source.example.com")
 	require.NoError(t, err)
 	require.Equal(t, first.HostID, second.HostID)
 	require.Equal(t, uint64(1), second.Revision)

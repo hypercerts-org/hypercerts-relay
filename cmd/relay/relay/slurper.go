@@ -276,6 +276,10 @@ func (s *Slurper) CheckIfSubscribed(hostname string) bool {
 //
 // NOTE: the `host` parameter (a database row) contains metadata about the host at a point in time. Subsequent changes to the database aren't reflected in that struct, and changes to the struct don't get persisted to database.
 func (s *Slurper) Subscribe(host *models.Host) error {
+	// hypercerts: Persisted source schemes must pass transport policy before any socket starts.
+	if err := sourceTransportAllowed(host.Hostname, host.NoSSL, s.Config != nil && s.Config.TestDialContext != nil); err != nil {
+		return err
+	}
 	s.subsLk.Lock()
 	defer s.subsLk.Unlock()
 	if s.closed {
@@ -372,6 +376,10 @@ func (s *Slurper) subscribeWithRedialer(ctx context.Context, host *models.Host, 
 			}
 		}
 
+		if err := sourceTransportAllowed(host.Hostname, host.NoSSL, s.Config.TestDialContext != nil); err != nil {
+			sub.setState("failing")
+			return
+		}
 		u := host.SubscribeReposURL()
 		if cursor > 0 {
 			u = fmt.Sprintf("%s?cursor=%d", u, cursor)

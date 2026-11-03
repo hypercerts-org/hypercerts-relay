@@ -34,6 +34,7 @@ func newSourceLifecycleRelay(t *testing.T) (*Relay, sourceTestDB, chan int64) {
 	config.PersistCursorCallback = r.PersistHostCursors
 	config.PersistHostStatusCallback = r.UpdateHostStatus
 	config.TestDialContext = (&net.Dialer{}).DialContext
+	r.Config.TestDialContext = config.TestDialContext
 	slurper, err := NewSlurper(func(_ context.Context, evt *stream.XRPCStreamEvent, _ string, _ uint64) error {
 		processed <- evt.Sequence()
 		return nil

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -277,9 +278,9 @@ func TestRequestCrawlPolicyOrder(t *testing.T) {
 	}{
 		{"disabled before malformed", "", false, true, false, http.StatusForbidden, "public requestCrawl not allowed on this relay"},
 		{"malformed admin", "", true, true, false, http.StatusBadRequest, "hostname field is empty or invalid"},
-		{"SSL before localhost", "http://localhost:1234", false, false, false, http.StatusBadRequest, "this relay requires host SSL"},
+		{"HTTP public", "http://pds.example.com", false, false, false, http.StatusBadRequest, "PDS sources require HTTPS"},
 		{"public localhost", "http://localhost:1234", false, false, true, http.StatusBadRequest, "can not configure localhost via public endpoint"},
-		{"admin localhost", "http://localhost:1234", true, true, false, http.StatusOK, ""},
+		{"admin localhost", "http://localhost:1234", true, true, false, http.StatusBadRequest, "PDS sources require HTTPS"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -300,5 +301,28 @@ func TestRequestCrawlPolicyOrder(t *testing.T) {
 				require.Zero(t, sources)
 			}
 		})
+	}
+}
+
+func TestRequestCrawlRejectsPlaintextRegardlessOfPrivilegeOrFlag(t *testing.T) {
+	for _, admin := range []bool{false, true} {
+		for _, insecure := range []bool{false, true} {
+			for _, origin := range []string{"http://pds.example.com", "ws://pds.example.com"} {
+				t.Run(fmt.Sprintf("%s/admin=%t/flag=%t", origin, admin, insecure), func(t *testing.T) {
+					svc, r, db := newSourceHandlerService(t)
+					checker := &countingHostChecker{}
+					r.HostChecker = checker
+					svc.config.AllowInsecureHosts = insecure
+					rec := invokeRequestCrawl(t, svc, origin, admin)
+					require.Equal(t, http.StatusBadRequest, rec.Code)
+					require.Zero(t, checker.checkCalls)
+					for _, row := range []any{&models.Host{}, &models.Source{}} {
+						var count int64
+						require.NoError(t, db.Model(row).Count(&count).Error)
+						require.Zero(t, count)
+					}
+				})
+			}
+		}
 	}
 }

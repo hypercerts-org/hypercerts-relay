@@ -134,6 +134,10 @@ func (r *Relay) addSource(ctx context.Context, rawURL string, public bool) (*Sou
 		return nil, ErrInvalidSourceURL
 	}
 
+	if _, err := r.sourceURL(hostname, noSSL); err != nil {
+		return nil, err
+	}
+
 	r.sourcesLk.Lock()
 	defer r.sourcesLk.Unlock()
 
@@ -148,7 +152,11 @@ func (r *Relay) addSource(ctx context.Context, rawURL string, public bool) (*Sou
 	var host models.Host
 	var source models.Source
 	err = r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		return r.loadOrCreateSource(tx, &host, &source, hostname, noSSL, public)
+		if err := r.loadOrCreateSource(tx, &host, &source, hostname, noSSL, public); err != nil {
+			return err
+		}
+		_, err := r.sourceURL(host.Hostname, host.NoSSL)
+		return err
 	})
 	if err != nil {
 		return nil, err
@@ -260,7 +268,8 @@ func (r *Relay) ValidateSource(ctx context.Context, hostID, expectedRevision uin
 		r.sourcesLk.Unlock()
 		return nil, err
 	}
-	revision, checkHost := source.Revision, sourceHostURL(host)
+	revision := source.Revision
+	checkHost, transportErr := r.sourceURL(host.Hostname, host.NoSSL)
 	r.sourcesLk.Unlock()
 	defer r.endSourceCheck(hostID)
 
@@ -271,6 +280,9 @@ func (r *Relay) ValidateSource(ctx context.Context, hostID, expectedRevision uin
 	if r.HostChecker == nil {
 		status = models.SourceValidationFailed
 		reason = models.SourceValidationReasonCheckerMissing
+	} else if transportErr != nil {
+		status = models.SourceValidationFailed
+		reason = models.SourceValidationReasonHostCheckFailed
 	} else if err := r.HostChecker.CheckHost(checkCtx, checkHost); err != nil {
 		status = models.SourceValidationFailed
 		reason = models.SourceValidationReasonHostCheckFailed
@@ -567,6 +579,9 @@ func validRecoveryCoordinate(value string, maximum int) bool {
 
 // checkSourceEnablement enforces validation and bans before acquisition is enabled.
 func (r *Relay) checkSourceEnablement(ctx context.Context, source *models.Source, host *models.Host) error {
+	if _, err := r.sourceURL(host.Hostname, host.NoSSL); err != nil {
+		return err
+	}
 	if source.ValidationStatus != models.SourceValidationPassed {
 		return ErrSourceValidationFailed
 	}
@@ -834,6 +849,16 @@ func (r *Relay) sourceViewLocked(ctx context.Context, source *models.Source, hos
 }
 
 func (r *Relay) reconcileSourceLocked(ctx context.Context, source *models.Source, host *models.Host) error {
+	if source.State == models.SourceStateEnabled && source.ValidationStatus == models.SourceValidationPassed {
+		if _, err := r.sourceURL(host.Hostname, host.NoSSL); err != nil {
+			if r.Slurper != nil {
+				if stopErr := r.Slurper.StopSource(ctx, host.Hostname); stopErr != nil {
+					return stopErr
+				}
+			}
+			return err
+		}
+	}
 	if r.Slurper == nil {
 		return nil
 	}
@@ -900,10 +925,7 @@ func (r *Relay) sourceDomainIsBanned(ctx context.Context, hostname string) (bool
 }
 
 func sourceHostURL(host *models.Host) string {
-	if host.NoSSL {
-		return "http://" + host.Hostname
-	}
-	return "https://" + host.Hostname
+	return host.BaseURL()
 }
 
 // SetSourceBlocked delegates legacy block actions to the durable source policy.

@@ -11,12 +11,12 @@ const publicValidationCooldown = time.Minute
 
 // hypercerts: Public admission validates synchronously; disabled policy stays authoritative.
 func (r *Relay) SubscribeToHost(ctx context.Context, hostname string, noSSL, adminForce bool) error {
-	url := "https://" + hostname
-	if noSSL {
-		url = "http://" + hostname
+	origin, err := r.sourceURL(hostname, noSSL)
+	if err != nil {
+		return err
 	}
 	if adminForce {
-		source, err := r.AddSource(ctx, url)
+		source, err := r.AddSource(ctx, origin)
 		if err != nil {
 			return err
 		}
@@ -37,17 +37,20 @@ func (r *Relay) SubscribeToHost(ctx context.Context, hostname string, noSSL, adm
 		}
 		return nil
 	}
-	if _, err := r.AddPublicSource(ctx, url); err != nil {
+	if _, err := r.AddPublicSource(ctx, origin); err != nil {
 		return err
 	}
-	return r.AdmitPublicSource(ctx, url)
+	return r.AdmitPublicSource(ctx, origin)
 }
 
 // AdmitPublicSource validates outside sourcesLk so unrelated policy changes are not blocked by network IO.
 func (r *Relay) AdmitPublicSource(ctx context.Context, rawURL string) error {
-	hostname, _, err := ParseHostname(rawURL)
+	hostname, noSSL, err := ParseHostname(rawURL)
 	if err != nil {
 		return ErrInvalidSourceURL
+	}
+	if _, err := r.sourceURL(hostname, noSSL); err != nil {
+		return err
 	}
 	source, host, err := r.preparePublicSourceCheck(ctx, hostname)
 	if err != nil || source == nil {
@@ -63,11 +66,12 @@ func (r *Relay) AdmitPublicSource(ctx context.Context, rawURL string) error {
 	if checkerMissing {
 		checkErr = ErrSourceValidationFailed
 	} else {
-		url := "https://" + hostname
-		if scheme {
-			url = "http://" + hostname
+		origin, err := r.sourceURL(hostname, scheme)
+		if err != nil {
+			checkErr = err
+		} else {
+			checkErr = r.HostChecker.CheckHost(checkCtx, origin)
 		}
-		checkErr = r.HostChecker.CheckHost(checkCtx, url)
 	}
 
 	return r.finalizePublicSourceCheck(host.ID, hostname, revision, scheme, checkErr, checkerMissing)

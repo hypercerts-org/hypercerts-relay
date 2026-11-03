@@ -28,24 +28,10 @@ func (s *Service) handleComAtprotoSyncRequestCrawl(c echo.Context, body *comatpr
 		return c.JSON(http.StatusBadRequest, atclient.ErrorBody{Name: "BadRequest", Message: "hostname field is empty or invalid"})
 	}
 
-	if noSSL && !s.config.AllowInsecureHosts && !admin {
-		return c.JSON(http.StatusBadRequest, atclient.ErrorBody{Name: "BadRequest", Message: "this relay requires host SSL"})
-	}
-
 	if allowed, err := s.checkRequestCrawlDomain(c, hostname, admin); !allowed {
 		return err
 	}
 
-	// hypercerts: Public requests register the desired source before atomic validation.
-	if !admin {
-		origin := "https://" + hostname
-		if noSSL {
-			origin = "http://" + hostname
-		}
-		if _, err := s.relay.AddPublicSource(ctx, origin); err != nil {
-			return requestCrawlError(c, err)
-		}
-	}
 	// hypercerts: Delegate admission and validation to the durable source policy.
 	if err := s.relay.SubscribeToHost(ctx, hostname, noSSL, admin); err != nil {
 		return requestCrawlError(c, err)
@@ -80,6 +66,8 @@ func (s *Service) checkRequestCrawlDomain(c echo.Context, hostname string, admin
 
 func requestCrawlError(c echo.Context, err error) error {
 	switch {
+	case errors.Is(err, relay.ErrInvalidSourceURL):
+		return c.JSON(http.StatusBadRequest, atclient.ErrorBody{Name: "BadRequest", Message: "PDS sources require HTTPS"})
 	case errors.Is(err, relay.ErrNewHostsDisabled):
 		return c.JSON(http.StatusTooManyRequests, atclient.ErrorBody{Name: "RateLimitExceeded", Message: "daily public source admission limit reached"})
 	case errors.Is(err, relay.ErrSourceRevisionConflict):
