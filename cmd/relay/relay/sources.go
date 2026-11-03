@@ -248,39 +248,21 @@ func (r *Relay) ValidateSource(ctx context.Context, hostID, expectedRevision uin
 	}
 	if source.Revision != expectedRevision {
 		if source.Revision == expectedRevision+1 && source.LastOperation == "validate" && source.State == models.SourceStateEnabled {
-			reconcileErr := r.reconcileSourceLocked(ctx, source, host)
-			view, viewErr := r.sourceViewLocked(ctx, source, host)
-			failed := source.ValidationStatus == models.SourceValidationFailed
+			view, err := r.replaySourceValidationLocked(ctx, source, host)
 			r.sourcesLk.Unlock()
-			if reconcileErr != nil {
-				return nil, reconcileErr
-			}
-			if viewErr != nil {
-				return nil, viewErr
-			}
-			if failed {
-				return view, ErrSourceValidationFailed
-			}
-			return view, nil
+			return view, err
 		}
 		r.sourcesLk.Unlock()
 		return nil, ErrSourceRevisionConflict
 	}
 
-	r.publicCheckLk.Lock()
-	if r.publicChecks == nil {
-		r.publicChecks = make(map[uint64]struct{})
-	}
-	if _, pending := r.publicChecks[hostID]; pending {
-		r.publicCheckLk.Unlock()
+	if err := r.beginSourceCheck(hostID); err != nil {
 		r.sourcesLk.Unlock()
-		return nil, ErrSourceRevisionConflict
+		return nil, err
 	}
-	r.publicChecks[hostID] = struct{}{}
-	r.publicCheckLk.Unlock()
 	revision, checkHost := source.Revision, sourceHostURL(host)
 	r.sourcesLk.Unlock()
-	defer func() { r.publicCheckLk.Lock(); delete(r.publicChecks, hostID); r.publicCheckLk.Unlock() }()
+	defer r.endSourceCheck(hostID)
 
 	status := models.SourceValidationPassed
 	reason := models.SourceValidationReasonNone
@@ -294,6 +276,26 @@ func (r *Relay) ValidateSource(ctx context.Context, hostID, expectedRevision uin
 		reason = models.SourceValidationReasonHostCheckFailed
 	}
 
+	return r.finalizeSourceValidation(hostID, revision, status, reason)
+}
+
+func (r *Relay) replaySourceValidationLocked(ctx context.Context, source *models.Source, host *models.Host) (*SourceView, error) {
+	reconcileErr := r.reconcileSourceLocked(ctx, source, host)
+	view, viewErr := r.sourceViewLocked(ctx, source, host)
+	failed := source.ValidationStatus == models.SourceValidationFailed
+	if reconcileErr != nil {
+		return nil, reconcileErr
+	}
+	if viewErr != nil {
+		return nil, viewErr
+	}
+	if failed {
+		return view, ErrSourceValidationFailed
+	}
+	return view, nil
+}
+
+func (r *Relay) finalizeSourceValidation(hostID, revision uint64, status models.SourceValidationStatus, reason models.SourceValidationReason) (*SourceView, error) {
 	finalizeCtx, finalizeCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer finalizeCancel()
 	r.sourcesLk.Lock()
@@ -302,7 +304,7 @@ func (r *Relay) ValidateSource(ctx context.Context, hostID, expectedRevision uin
 	if err != nil || current.Revision != revision || current.State != models.SourceStateEnabled {
 		return nil, ErrSourceRevisionConflict
 	}
-	source = current
+	source := current
 	now := time.Now().UTC()
 	updatedRevision := revision + 1
 	result := r.db.WithContext(finalizeCtx).Model(&models.Source{}).
@@ -340,6 +342,25 @@ func (r *Relay) ValidateSource(ctx context.Context, hostID, expectedRevision uin
 		return view, ErrSourceValidationFailed
 	}
 	return r.sourceViewLocked(finalizeCtx, source, host)
+}
+
+func (r *Relay) beginSourceCheck(hostID uint64) error {
+	r.publicCheckLk.Lock()
+	defer r.publicCheckLk.Unlock()
+	if r.publicChecks == nil {
+		r.publicChecks = make(map[uint64]struct{})
+	}
+	if _, pending := r.publicChecks[hostID]; pending {
+		return ErrSourceRevisionConflict
+	}
+	r.publicChecks[hostID] = struct{}{}
+	return nil
+}
+
+func (r *Relay) endSourceCheck(hostID uint64) {
+	r.publicCheckLk.Lock()
+	delete(r.publicChecks, hostID)
+	r.publicCheckLk.Unlock()
 }
 
 // SetSourceState records desired state before starting or stopping a socket. A

@@ -419,3 +419,44 @@ func TestListSourceAccountsBoundsThrottledAdmissions(t *testing.T) {
 func timeNow() time.Time {
 	return time.Now().UTC()
 }
+
+func TestValidateSourceMissingCheckerPersistsAndReplaysReason(t *testing.T) {
+	r, db := newSourceRelay(t)
+	source, err := r.AddSource(context.Background(), "https://missing-admin-checker.example.com")
+	require.NoError(t, err)
+	r.HostChecker = nil
+	view, err := r.ValidateSource(context.Background(), source.HostID, source.Revision)
+	require.ErrorIs(t, err, ErrSourceValidationFailed)
+	require.Equal(t, models.SourceValidationReasonCheckerMissing, view.Validation.Reason)
+	require.Equal(t, source.Revision+1, view.Revision)
+	require.NotNil(t, view.Validation.CheckedAt)
+	replayed, err := r.ValidateSource(context.Background(), source.HostID, source.Revision)
+	require.ErrorIs(t, err, ErrSourceValidationFailed)
+	require.Equal(t, view, replayed)
+	var stored models.Source
+	require.NoError(t, db.Where("host_id = ?", source.HostID).First(&stored).Error)
+	require.Equal(t, models.SourceValidationReasonCheckerMissing, stored.ValidationReason)
+	require.NotContains(t, r.publicChecks, source.HostID)
+}
+
+func TestSourceCheckReservationSharedBetweenAdmissionAndValidation(t *testing.T) {
+	r, _ := newSourceRelay(t)
+	source, err := r.AddSource(context.Background(), "https://shared-check.example.com")
+	require.NoError(t, err)
+	checker := &blockingHostChecker{started: make(chan struct{}, 1), release: make(chan struct{})}
+	r.HostChecker = checker
+	result := make(chan error, 1)
+	go func() {
+		_, err := r.ValidateSource(context.Background(), source.HostID, source.Revision)
+		result <- err
+	}()
+	<-checker.started
+	require.ErrorIs(t, r.AdmitPublicSource(context.Background(), "https://shared-check.example.com"), ErrSourceRevisionConflict)
+	_, err = r.ValidateSource(context.Background(), source.HostID, source.Revision)
+	require.ErrorIs(t, err, ErrSourceRevisionConflict)
+	close(checker.release)
+	require.NoError(t, <-result)
+	require.NotContains(t, r.publicChecks, source.HostID)
+	require.NoError(t, r.AdmitPublicSource(context.Background(), "https://shared-check.example.com"))
+	require.EqualValues(t, 1, checker.checks.Load())
+}
