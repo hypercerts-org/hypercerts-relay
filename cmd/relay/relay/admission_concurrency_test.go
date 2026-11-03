@@ -156,6 +156,23 @@ func TestPublicAdmissionCanceledCheckPersistsFailureAndCooldown(t *testing.T) {
 	require.EqualValues(t, 1, checker.checks.Load())
 }
 
+func TestPublicAdmissionMissingCheckerPersistsReason(t *testing.T) {
+	r, db := newSourceRelay(t)
+	host := &models.Host{Hostname: "missing-checker.example.com", Status: models.HostStatusActive}
+	require.NoError(t, db.Create(host))
+	require.NoError(t, db.Create(&models.Source{HostID: host.ID, State: models.SourceStateEnabled, Revision: 1, ValidationStatus: models.SourceValidationPending}))
+	r.HostChecker = nil
+
+	require.ErrorIs(t, r.AdmitPublicSource(context.Background(), "https://missing-checker.example.com"), ErrSourceValidationFailed)
+
+	var failed models.Source
+	require.NoError(t, db.Where("host_id = ?", host.ID).First(&failed).Error)
+	require.Equal(t, models.SourceValidationFailed, failed.ValidationStatus)
+	require.Equal(t, models.SourceValidationReasonCheckerMissing, failed.ValidationReason)
+	require.NotNil(t, failed.ValidationCheckedAt)
+	require.Equal(t, uint64(2), failed.Revision)
+}
+
 func TestPublicAdmissionFailureCooldownExpiresAndPersists(t *testing.T) {
 	r, db := newSourceRelay(t)
 	host := &models.Host{Hostname: "cooldown.example.com", Status: models.HostStatusActive}

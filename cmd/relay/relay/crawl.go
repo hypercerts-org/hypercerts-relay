@@ -100,7 +100,8 @@ func (r *Relay) AdmitPublicSource(ctx context.Context, rawURL string) error {
 	checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	checkErr := error(nil)
-	if r.HostChecker == nil {
+	checkerMissing := r.HostChecker == nil
+	if checkerMissing {
 		checkErr = ErrSourceValidationFailed
 	} else {
 		url := "https://" + hostname
@@ -131,6 +132,9 @@ func (r *Relay) AdmitPublicSource(ctx context.Context, rawURL string) error {
 	status, reason := models.SourceValidationPassed, models.SourceValidationReasonNone
 	if checkErr != nil {
 		status, reason = models.SourceValidationFailed, models.SourceValidationReasonHostCheckFailed
+		if checkerMissing {
+			reason = models.SourceValidationReasonCheckerMissing
+		}
 	}
 	now := time.Now().UTC()
 	updated := r.db.WithContext(finalizeCtx).Model(&models.Source{}).Where("host_id = ? AND revision = ? AND state = ?", source.HostID, revision, models.SourceStateEnabled).Updates(map[string]any{
