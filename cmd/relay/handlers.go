@@ -32,19 +32,8 @@ func (s *Service) handleComAtprotoSyncRequestCrawl(c echo.Context, body *comatpr
 		return c.JSON(http.StatusBadRequest, atclient.ErrorBody{Name: "BadRequest", Message: "this relay requires host SSL"})
 	}
 
-	if strings.HasPrefix(hostname, "localhost:") {
-		if !admin {
-			return c.JSON(http.StatusBadRequest, atclient.ErrorBody{Name: "BadRequest", Message: "can not configure localhost via public endpoint"})
-		}
-		// else, allowed
-	} else {
-		banned, err := s.relay.DomainIsBanned(ctx, hostname)
-		if err != nil {
-			return err
-		}
-		if banned {
-			return c.JSON(http.StatusForbidden, atclient.ErrorBody{Name: "DomainBan", Message: "hostname is not allowed"})
-		}
+	if allowed, err := s.checkRequestCrawlDomain(c, hostname, admin); !allowed {
+		return err
 	}
 
 	// hypercerts: Public requests register the desired source before atomic validation.
@@ -70,6 +59,23 @@ func (s *Service) handleComAtprotoSyncRequestCrawl(c echo.Context, body *comatpr
 	go s.ForwardSiblingRequest(c, b)
 
 	return nil
+}
+
+func (s *Service) checkRequestCrawlDomain(c echo.Context, hostname string, admin bool) (bool, error) {
+	if strings.HasPrefix(hostname, "localhost:") {
+		if !admin {
+			return false, c.JSON(http.StatusBadRequest, atclient.ErrorBody{Name: "BadRequest", Message: "can not configure localhost via public endpoint"})
+		}
+		return true, nil
+	}
+	banned, err := s.relay.DomainIsBanned(c.Request().Context(), hostname)
+	if err != nil {
+		return false, err
+	}
+	if banned {
+		return false, c.JSON(http.StatusForbidden, atclient.ErrorBody{Name: "DomainBan", Message: "hostname is not allowed"})
+	}
+	return true, nil
 }
 
 func requestCrawlError(c echo.Context, err error) error {

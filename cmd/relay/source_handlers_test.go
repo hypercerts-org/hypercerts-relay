@@ -264,3 +264,41 @@ func TestAdminRequestCrawlDuplicateValidationIsIdempotent(t *testing.T) {
 	require.NoError(t, db.Model(&models.Source{}).Count(&count).Error)
 	require.EqualValues(t, 1, count)
 }
+
+func TestRequestCrawlPolicyOrder(t *testing.T) {
+	cases := []struct {
+		name     string
+		hostname string
+		admin    bool
+		disabled bool
+		insecure bool
+		status   int
+		message  string
+	}{
+		{"disabled before malformed", "", false, true, false, http.StatusForbidden, "public requestCrawl not allowed on this relay"},
+		{"malformed admin", "", true, true, false, http.StatusBadRequest, "hostname field is empty or invalid"},
+		{"SSL before localhost", "http://localhost:1234", false, false, false, http.StatusBadRequest, "this relay requires host SSL"},
+		{"public localhost", "http://localhost:1234", false, false, true, http.StatusBadRequest, "can not configure localhost via public endpoint"},
+		{"admin localhost", "http://localhost:1234", true, true, false, http.StatusOK, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, r, db := newSourceHandlerService(t)
+			checker := &countingHostChecker{}
+			r.HostChecker = checker
+			svc.config.DisableRequestCrawl = tc.disabled
+			svc.config.AllowInsecureHosts = tc.insecure
+			rec := invokeRequestCrawl(t, svc, tc.hostname, tc.admin)
+			require.Equal(t, tc.status, rec.Code)
+			if tc.message != "" {
+				var body map[string]string
+				require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+				require.Equal(t, tc.message, body["message"])
+				require.Zero(t, checker.checkCalls)
+				var sources int64
+				require.NoError(t, db.Model(&models.Source{}).Count(&sources).Error)
+				require.Zero(t, sources)
+			}
+		})
+	}
+}
