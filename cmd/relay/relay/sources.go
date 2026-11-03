@@ -148,47 +148,7 @@ func (r *Relay) addSource(ctx context.Context, rawURL string, public bool) (*Sou
 	var host models.Host
 	var source models.Source
 	err = r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		// Check for a durable source first: existing sources never consume the new-host limiter.
-		if err := tx.Joins("JOIN host ON host.id = source.host_id").Where("host.hostname = ?", hostname).First(&source).Error; err == nil {
-			if err := tx.Where("id = ?", source.HostID).First(&host).Error; err != nil {
-				return fmt.Errorf("loading source host: %w", err)
-			}
-			return nil
-		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
-			return fmt.Errorf("loading source: %w", err)
-		}
-		if public && r.HostPerDayLimiter != nil {
-			if !r.HostPerDayLimiter.Allow() {
-				return ErrNewHostsDisabled
-			}
-		}
-		if err := r.ensureSourceHost(tx, &host, hostname, noSSL); err != nil {
-			return err
-		}
-
-		err := tx.Where(sourceHostIDPredicate, host.ID).First(&source).Error
-		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-			return fmt.Errorf("loading source: %w", err)
-		}
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			state := models.SourceStateEnabled
-			if host.Status == models.HostStatusBanned {
-				state = models.SourceStateDisabled
-			}
-			source = models.Source{
-				HostID:           host.ID,
-				State:            state,
-				Revision:         1,
-				ValidationStatus: models.SourceValidationPending,
-				ValidationReason: models.SourceValidationReasonNone,
-				RecoveryRequired: true,
-				LastOperation:    "add",
-			}
-			if err := tx.Create(&source).Error; err != nil {
-				return fmt.Errorf("creating source: %w", err)
-			}
-		}
-		return nil
+		return r.loadOrCreateSource(tx, &host, &source, hostname, noSSL, public)
 	})
 	if err != nil {
 		return nil, err
@@ -202,6 +162,53 @@ func (r *Relay) addSource(ctx context.Context, rawURL string, public bool) (*Sou
 		return view, err
 	}
 	return r.sourceViewLocked(ctx, &source, &host)
+}
+
+func (r *Relay) loadOrCreateSource(tx *gorm.DB, host *models.Host, source *models.Source, hostname string, noSSL, public bool) error {
+	if err := tx.Joins("JOIN host ON host.id = source.host_id").Where("host.hostname = ?", hostname).First(source).Error; err == nil {
+		if err := tx.Where("id = ?", source.HostID).First(host).Error; err != nil {
+			return fmt.Errorf("loading source host: %w", err)
+		}
+		return nil
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return fmt.Errorf("loading source: %w", err)
+	}
+	if public && r.HostPerDayLimiter != nil {
+		if !r.HostPerDayLimiter.Allow() {
+			return ErrNewHostsDisabled
+		}
+	}
+	if err := r.ensureSourceHost(tx, host, hostname, noSSL); err != nil {
+		return err
+	}
+
+	return ensureSourceRow(tx, host, source)
+}
+
+func ensureSourceRow(tx *gorm.DB, host *models.Host, source *models.Source) error {
+	err := tx.Where(sourceHostIDPredicate, host.ID).First(source).Error
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return fmt.Errorf("loading source: %w", err)
+	}
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		state := models.SourceStateEnabled
+		if host.Status == models.HostStatusBanned {
+			state = models.SourceStateDisabled
+		}
+		*source = models.Source{
+			HostID:           host.ID,
+			State:            state,
+			Revision:         1,
+			ValidationStatus: models.SourceValidationPending,
+			ValidationReason: models.SourceValidationReasonNone,
+			RecoveryRequired: true,
+			LastOperation:    "add",
+		}
+		if err := tx.Create(source).Error; err != nil {
+			return fmt.Errorf("creating source: %w", err)
+		}
+	}
+	return nil
 }
 
 // ensureSourceHost loads or creates the host within the caller's source transaction.
