@@ -190,6 +190,10 @@ func deliverSelected(ctx context.Context, conn *websocket.Conn, ev *segment.Even
 		logger.Error("selected event encoding failed", "seq", ev.Seq, "err", err)
 		return err
 	}
+	if max := filter.MaxMessageSizeBytes(); max > 0 && uint64(len(body)) > uint64(max) {
+		deps.Metrics.incEventsOversize()
+		return nil
+	}
 	msgType := websocket.MessageText
 	if compress {
 		body = compressFrameV2(body)
