@@ -210,85 +210,7 @@ func (h *SegmentHandler) handleRepo(ctx context.Context, did atmos.DID, r *repo.
 		trace.SpanFromContext(ctx).SetAttributes(attribute.String("did", string(did)))
 		start := time.Now()
 		defer func() { h.metrics.observeHandleRepo(start, retErr) }()
-		if _, err := atmos.ParseTID(commit.Rev); err != nil {
-			h.dropMetrics.IncDropped(ingest.DropSourceBackfill, ingest.DropReasonInvalidRev)
-			return fmt.Errorf("backfill: did=%s: commit rev is not a valid TID: %w", did, err)
-		}
-		now := h.now().UTC()
-		witnessedAt := now.UnixMicro()
-		appended := false
-		lastSeq := uint64(0)
-		batch := make([]segment.Event, 0, segmentHandlerAppendBatchSize)
-		if prependSync {
-			ev, err := syncTombstoneEvent(did, commit, witnessedAt, now)
-			if err != nil {
-				return err
-			}
-			batch = append(batch, ev)
-			if err := h.validateRepoMaterializations(ctx, did, r, commit, materializedKind, witnessedAt); err != nil {
-				return err
-			}
-		}
-		flushBatch := func() error {
-			if len(batch) == 0 {
-				return nil
-			}
-			var err error
-			if metadata != nil {
-				err = h.writer.AppendBatchAttributed(ctx, batch, *metadata)
-			} else {
-				err = h.writer.AppendBatch(ctx, batch)
-			}
-			if err != nil {
-				err = fmt.Errorf("backfill: did=%s append batch: %w", did, err)
-				h.abortOnWriterError(err)
-				return err
-			}
-			for _, ev := range batch {
-				if ev.Seq > 0 {
-					lastSeq = ev.Seq
-					appended = true
-				}
-			}
-			batch = batch[:0]
-			return nil
-		}
-		if err := r.Tree.Walk(func(key string, cid cbor.CID) error {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			collection, rkey, ok := h.validRecordPath(ctx, did, key)
-			if !ok || metadata != nil && !containsCollection(metadata.Policy.Collections, collection) {
-				return nil
-			}
-			payload, err := r.Store.GetBlock(cid)
-			if err != nil {
-				return fmt.Errorf("backfill: did=%s get block %s/%s: %w", did, collection, rkey, err)
-			}
-			ev := segment.Event{WitnessedAt: witnessedAt, Kind: materializedKind, DID: string(did), Collection: collection, Rkey: rkey, Rev: commit.Rev, Payload: payload}
-			if err := segment.ValidateEvent(ev); err != nil {
-				if errors.Is(err, segment.ErrFieldTooLong) {
-					h.dropMetrics.IncDropped(ingest.DropSourceBackfill, ingest.DropReasonFieldTooLong)
-					h.logger.WarnContext(ctx, "dropped unarchivable upstream record", "did", string(did), "did_len", len(string(did)), "collection_len", len(collection), "rkey_len", len(rkey), "rev_len", len(commit.Rev), "payload_len", len(payload), "err", err)
-					return nil
-				}
-				return fmt.Errorf("backfill: did=%s invalid segment event %s/%s: %w", did, collection, rkey, err)
-			}
-			batch = append(batch, ev)
-			if len(batch) >= segmentHandlerAppendBatchSize {
-				return flushBatch()
-			}
-			return nil
-		}); err != nil {
-			return err
-		}
-		if err := flushBatch(); err != nil {
-			return err
-		}
-		if h.completions != nil {
-			h.completions.RecordWatermark(did, lastSeq, appended)
-		}
-		return nil
+		return h.projectRepo(ctx, did, r, commit, materializedKind, prependSync, metadata)
 	})
 }
 
@@ -360,4 +282,118 @@ func (h *SegmentHandler) abortOnWriterError(err error) {
 	if h.onWriterError != nil {
 		h.onWriterError(err)
 	}
+}
+
+func (h *SegmentHandler) repoMaterialization(ctx context.Context, did atmos.DID, r *repo.Repo, commit *repo.Commit, materializedKind segment.Kind, witnessedAt int64, key string, cid cbor.CID, metadata *ingest.AttributionMetadata) (*segment.Event, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	collection, rkey, ok := h.validRecordPath(ctx, did, key)
+	if !ok || metadata != nil && !containsCollection(metadata.Policy.Collections, collection) {
+		return nil, nil
+	}
+	payload, err := r.Store.GetBlock(cid)
+	if err != nil {
+		return nil, fmt.Errorf("backfill: did=%s get block %s/%s: %w", did, collection, rkey, err)
+	}
+	ev := segment.Event{WitnessedAt: witnessedAt, Kind: materializedKind, DID: string(did), Collection: collection, Rkey: rkey, Rev: commit.Rev, Payload: payload}
+	if err := segment.ValidateEvent(ev); err != nil {
+		if errors.Is(err, segment.ErrFieldTooLong) {
+			h.dropMetrics.IncDropped(ingest.DropSourceBackfill, ingest.DropReasonFieldTooLong)
+			h.logger.WarnContext(ctx, "dropped unarchivable upstream record", "did", string(did), "did_len", len(string(did)), "collection_len", len(collection), "rkey_len", len(rkey), "rev_len", len(commit.Rev), "payload_len", len(payload), "err", err)
+			return nil, nil
+		}
+		return nil, fmt.Errorf("backfill: did=%s invalid segment event %s/%s: %w", did, collection, rkey, err)
+	}
+	return &ev, nil
+}
+
+func (h *SegmentHandler) appendRepoBatch(ctx context.Context, did atmos.DID, batch []segment.Event, metadata *ingest.AttributionMetadata) (uint64, bool, error) {
+	if len(batch) == 0 {
+		return 0, false, nil
+	}
+	var err error
+	if metadata != nil {
+		err = h.writer.AppendBatchAttributed(ctx, batch, *metadata)
+	} else {
+		err = h.writer.AppendBatch(ctx, batch)
+	}
+	if err != nil {
+		err = fmt.Errorf("backfill: did=%s append batch: %w", did, err)
+		h.abortOnWriterError(err)
+		return 0, false, err
+	}
+	var lastSeq uint64
+	var appended bool
+	for _, ev := range batch {
+		if ev.Seq > 0 {
+			lastSeq, appended = ev.Seq, true
+		}
+	}
+	return lastSeq, appended, nil
+}
+
+func (h *SegmentHandler) walkRepoBatches(ctx context.Context, did atmos.DID, r *repo.Repo, commit *repo.Commit, materializedKind segment.Kind, witnessedAt int64, metadata *ingest.AttributionMetadata, batch *[]segment.Event, flushBatch func() error) error {
+	return r.Tree.Walk(func(key string, cid cbor.CID) error {
+		ev, err := h.repoMaterialization(ctx, did, r, commit, materializedKind, witnessedAt, key, cid, metadata)
+		if err != nil || ev == nil {
+			return err
+		}
+		*batch = append(*batch, *ev)
+		if len(*batch) >= segmentHandlerAppendBatchSize {
+			return flushBatch()
+		}
+		return nil
+	})
+}
+
+func (h *SegmentHandler) repoSyncPrefix(ctx context.Context, did atmos.DID, r *repo.Repo, commit *repo.Commit, kind segment.Kind, witnessedAt int64, now time.Time) (segment.Event, error) {
+	ev, err := syncTombstoneEvent(did, commit, witnessedAt, now)
+	if err != nil {
+		return segment.Event{}, err
+	}
+	if err := h.validateRepoMaterializations(ctx, did, r, commit, kind, witnessedAt); err != nil {
+		return segment.Event{}, err
+	}
+	return ev, nil
+}
+
+func (h *SegmentHandler) projectRepo(ctx context.Context, did atmos.DID, r *repo.Repo, commit *repo.Commit, materializedKind segment.Kind, prependSync bool, metadata *ingest.AttributionMetadata) error {
+	if _, err := atmos.ParseTID(commit.Rev); err != nil {
+		h.dropMetrics.IncDropped(ingest.DropSourceBackfill, ingest.DropReasonInvalidRev)
+		return fmt.Errorf("backfill: did=%s: commit rev is not a valid TID: %w", did, err)
+	}
+	now := h.now().UTC()
+	witnessedAt := now.UnixMicro()
+	appended := false
+	lastSeq := uint64(0)
+	batch := make([]segment.Event, 0, segmentHandlerAppendBatchSize)
+	if prependSync {
+		prefix, err := h.repoSyncPrefix(ctx, did, r, commit, materializedKind, witnessedAt, now)
+		if err != nil {
+			return err
+		}
+		batch = append(batch, prefix)
+	}
+	flushBatch := func() error {
+		seq, wrote, err := h.appendRepoBatch(ctx, did, batch, metadata)
+		if err != nil {
+			return err
+		}
+		if wrote {
+			lastSeq, appended = seq, true
+		}
+		batch = batch[:0]
+		return nil
+	}
+	if err := h.walkRepoBatches(ctx, did, r, commit, materializedKind, witnessedAt, metadata, &batch, flushBatch); err != nil {
+		return err
+	}
+	if err := flushBatch(); err != nil {
+		return err
+	}
+	if h.completions != nil {
+		h.completions.RecordWatermark(did, lastSeq, appended)
+	}
+	return nil
 }

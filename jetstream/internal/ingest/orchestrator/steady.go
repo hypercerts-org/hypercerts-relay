@@ -55,19 +55,6 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 			tombstoneCap = 0
 		}
 
-		initializePolicyGate := o.cfg.InitializePolicyGate
-		if initializePolicyGate != nil {
-			initializePolicyGate = func(writer *ingest.Writer) (*policygate.Gate, error) {
-				gate, err := o.cfg.InitializePolicyGate(writer)
-				if err != nil {
-					return nil, err
-				}
-				if gate != nil {
-					o.policyGate.Store(gate)
-				}
-				return gate, nil
-			}
-		}
 		c, err := live.Open(live.Config{
 			// hypercerts: Bootstrap and restart share the same persisted collection policy.
 			CollectionPolicy:     o.cfg.CollectionPolicy,
@@ -76,7 +63,7 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 			Attribution:          o.cfg.Attribution,
 			AttributionDomain:    o.cfg.AttributionDomain,
 			AttributionStreamID:  o.cfg.AttributionStreamID,
-			InitializePolicyGate: initializePolicyGate,
+			InitializePolicyGate: o.steadyPolicyInitializer(),
 			DataDir:              o.cfg.DataDir,
 			SegmentsDir:          segmentsDir,
 			FS:                   o.cfg.FS,
@@ -125,49 +112,70 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 
 		o.logger.InfoContext(ctx, "steady-state consumer running")
 
-		g, gctx := errgroup.WithContext(ctx)
+		return o.runSteadyWorkers(ctx, c)
+	})
+}
 
-		// Run the main loop
-		g.Go(func() error { return c.Run(gctx) })
+func (o *Orchestrator) steadyPolicyInitializer() func(*ingest.Writer) (*policygate.Gate, error) {
+	initializePolicyGate := o.cfg.InitializePolicyGate
+	if initializePolicyGate != nil {
+		initializePolicyGate = func(writer *ingest.Writer) (*policygate.Gate, error) {
+			gate, err := o.cfg.InitializePolicyGate(writer)
+			if err != nil {
+				return nil, err
+			}
+			if gate != nil {
+				o.policyGate.Store(gate)
+			}
+			return gate, nil
+		}
+	}
+	return initializePolicyGate
+}
 
-		// Run the compactor loop
+func (o *Orchestrator) runSteadyWorkers(ctx context.Context, c *live.Consumer) error {
+	g, gctx := errgroup.WithContext(ctx)
+
+	// Run the main loop
+	g.Go(func() error { return c.Run(gctx) })
+
+	// Run the compactor loop
+	g.Go(func() error {
+		err := o.runSteadyCompactor(gctx, c.Writer())
+		if errors.Is(err, context.Canceled) {
+			return nil
+		}
+		return err
+	})
+
+	if o.cfg.FailedRepoRetryInterval > 0 {
 		g.Go(func() error {
-			err := o.runSteadyCompactor(gctx, c.Writer())
+			err := backfill.RunFailedRepoRetry(gctx, backfill.RetryConfig{
+				Store:         o.cfg.Store,
+				Writer:        c.Writer(),
+				HTTPClient:    o.cfg.HTTPClient,
+				RelayURL:      o.cfg.RelayURL,
+				Logger:        o.cfg.Logger,
+				Metrics:       o.cfg.BackfillMetrics,
+				DropMetrics:   o.cfg.DropMetrics,
+				NewHostClient: o.cfg.BackfillNewHostClient,
+				// hypercerts: Steady retry shares the runtime live-verifier directory.
+				Directory:           o.cfg.Directory,
+				Attribution:         o.cfg.Attribution,
+				AttributionStreamID: o.cfg.AttributionStreamID,
+				PolicyGate:          c.PolicyGate(),
+				Interval:            o.cfg.FailedRepoRetryInterval,
+				Workers:             o.cfg.FailedRepoRetryWorkers,
+				HostWorkers:         o.cfg.FailedRepoRetryHostWorkers,
+				MaxDelay:            o.cfg.FailedRepoRetryMaxDelay,
+			})
 			if errors.Is(err, context.Canceled) {
 				return nil
 			}
 			return err
 		})
 
-		if o.cfg.FailedRepoRetryInterval > 0 {
-			g.Go(func() error {
-				err := backfill.RunFailedRepoRetry(gctx, backfill.RetryConfig{
-					Store:         o.cfg.Store,
-					Writer:        c.Writer(),
-					HTTPClient:    o.cfg.HTTPClient,
-					RelayURL:      o.cfg.RelayURL,
-					Logger:        o.cfg.Logger,
-					Metrics:       o.cfg.BackfillMetrics,
-					DropMetrics:   o.cfg.DropMetrics,
-					NewHostClient: o.cfg.BackfillNewHostClient,
-					// hypercerts: Steady retry shares the runtime live-verifier directory.
-					Directory:           o.cfg.Directory,
-					Attribution:         o.cfg.Attribution,
-					AttributionStreamID: o.cfg.AttributionStreamID,
-					PolicyGate:          c.PolicyGate(),
-					Interval:            o.cfg.FailedRepoRetryInterval,
-					Workers:             o.cfg.FailedRepoRetryWorkers,
-					HostWorkers:         o.cfg.FailedRepoRetryHostWorkers,
-					MaxDelay:            o.cfg.FailedRepoRetryMaxDelay,
-				})
-				if errors.Is(err, context.Canceled) {
-					return nil
-				}
-				return err
-			})
+	}
 
-		}
-
-		return g.Wait()
-	})
+	return g.Wait()
 }

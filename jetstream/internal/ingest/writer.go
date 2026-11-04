@@ -283,8 +283,8 @@ func (w *Writer) AppendImported(ctx context.Context, ev *segment.Event, source a
 		if len(sourcePolicy) != 1 || sourcePolicy[0].Revision != *source.PolicyRev {
 			return fmt.Errorf("ingest: source policy required: %w", attribution.ErrInvalid)
 		}
-		copy := sourcePolicy[0]
-		policy = &copy
+		sourcePolicyCopy := sourcePolicy[0]
+		policy = &sourcePolicyCopy
 	} else if len(sourcePolicy) != 0 {
 		return fmt.Errorf("ingest: unexpected source policy: %w", attribution.ErrInvalid)
 	}
@@ -423,89 +423,13 @@ func (w *Writer) appendBatchCoreLocked(ctx context.Context, events []segment.Eve
 	if metadata != nil && (metadata.StreamID == "" || metadata.Policy.Revision == 0) {
 		return nil, fmt.Errorf("ingest: invalid attribution metadata: %w", attribution.ErrInvalid)
 	}
-	type acceptedCandidate struct {
-		event         segment.Event
-		originalIndex int
-		prepared      attribution.Prepared
+	candidates, err := w.prepareBatchCandidates(ctx, events, metadata)
+	if err != nil {
+		return nil, err
 	}
-	candidates := make([]acceptedCandidate, 0, len(events))
-	for i := range events {
-		if err := segment.ValidateEvent(events[i]); err != nil {
-			return nil, err
-		}
-		candidate := events[i]
-		if !w.cfg.CollectionPolicy.Allows(&candidate) {
-			events[i].Seq = 0
-			continue
-		}
-		if superseded, err := w.snapshotSupersedes(&candidate, metadata); err != nil {
-			return nil, err
-		} else if superseded {
-			events[i].Seq = 0
-			continue
-		}
-		if metadata != nil && metadata.Source != nil && (metadata.Source.Seq != events[i].Seq || metadata.Source.SegmentFingerprint != attribution.FingerprintSegment(events[i])) {
-			return nil, fmt.Errorf("ingest: imported source sequence mismatch: %w", attribution.ErrInvalid)
-		}
-		candidate.Seq = w.nextSeq + uint64(len(candidates))
-		if w.cfg.TimestampStamper != nil {
-			if err := w.cfg.TimestampStamper.Stamp(ctx, &candidate); err != nil {
-				return nil, fmt.Errorf("ingest: timestamp stamp: %w", err)
-			}
-		}
-		if metadata != nil {
-			if err := attribution.ValidateSegment(candidate, metadata.StreamID, metadata.Policy, metadata.Provenance, metadata.Boundary); err != nil {
-				return nil, fmt.Errorf("ingest: validate attribution: %w", err)
-			}
-		}
-		candidates = append(candidates, acceptedCandidate{event: candidate, originalIndex: i})
-	}
-	// Run all persistence-bearing preparations before the first segment write.
-	for i := range candidates {
-		if metadata == nil {
-			break
-		}
-		prepared, err := w.cfg.Attribution.PrepareSegment(candidates[i].event, metadata.StreamID, metadata.Policy, metadata.Provenance, metadata.Boundary, metadata.Source)
-		if err != nil {
-			return nil, w.wrapSegmentPersistenceError("preparing batch attribution", fmt.Errorf("ingest: prepare attribution: %w", err))
-		}
-		candidates[i].prepared = prepared
-	}
-	var jobs []*asyncFlushJob
-	for i := range candidates {
-		accepted := &candidates[i]
-		full, err := w.active.Append(accepted.event)
-		if err != nil {
-			return jobs, w.wrapSegmentPersistenceError("appending batch event", fmt.Errorf("ingest: append: %w", err))
-		}
-		event := &events[accepted.originalIndex]
-		event.Seq, event.IndexedAt = accepted.event.Seq, accepted.event.IndexedAt
-		if metadata != nil {
-			w.pendingAttributions = append(w.pendingAttributions, accepted.prepared)
-		}
-		w.nextSeq++
-		w.cfg.Metrics.incEventsAppended()
-		w.cfg.Metrics.setNextSeq(w.nextSeq)
-		w.readLog.append(&accepted.event)
-		if w.cfg.OnAppend != nil {
-			if err := w.cfg.OnAppend(event); err != nil {
-				return jobs, fmt.Errorf("ingest: on_append: %w", err)
-			}
-		}
-		if full {
-			if w.async != nil {
-				job, err := w.prepareAsyncFlushLocked()
-				if err != nil {
-					return jobs, err
-				}
-				jobs = append(jobs, job)
-			} else if err := w.flushAndRotateLocked(ctx); err != nil {
-				return jobs, err
-			}
-		}
-	}
-	return jobs, nil
+	return w.writeBatchCandidatesLocked(ctx, events, candidates, metadata)
 }
+
 func (w *Writer) appendLocked(ctx context.Context, ev *segment.Event) (*asyncFlushJob, error) {
 	if w.cfg.Attribution != nil {
 		return nil, fmt.Errorf("ingest: attributed writer requires AppendAttributed metadata")
@@ -514,14 +438,8 @@ func (w *Writer) appendLocked(ctx context.Context, ev *segment.Event) (*asyncFlu
 }
 
 func (w *Writer) appendAttributedLocked(ctx context.Context, ev *segment.Event, metadata *AttributionMetadata) (*asyncFlushJob, error) {
-	if metadata != nil && w.cfg.Attribution == nil {
-		return nil, fmt.Errorf("ingest: attribution manager is required")
-	}
-	if w.cfg.Attribution != nil && metadata == nil {
-		return nil, fmt.Errorf("ingest: attributed writer requires AppendAttributed metadata")
-	}
-	if metadata != nil && (metadata.StreamID == "" || metadata.Policy.Revision == 0) {
-		return nil, fmt.Errorf("ingest: invalid attribution metadata: %w", attribution.ErrInvalid)
+	if err := w.validateAppendMetadata(metadata); err != nil {
+		return nil, err
 	}
 	if w.closed {
 		w.cfg.Metrics.incAppendErrors()
@@ -541,24 +459,9 @@ func (w *Writer) appendAttributedLocked(ctx context.Context, ev *segment.Event, 
 		return nil, nil
 	}
 
-	if metadata != nil && metadata.Source != nil && metadata.Source.Seq != ev.Seq {
-		return nil, fmt.Errorf("ingest: imported source sequence mismatch: %w", attribution.ErrInvalid)
-	}
-	candidate := *ev
-	candidate.Seq = w.nextSeq
-	if w.cfg.TimestampStamper != nil {
-		if err := w.cfg.TimestampStamper.Stamp(ctx, &candidate); err != nil {
-			w.cfg.Metrics.incAppendErrors()
-			return nil, fmt.Errorf("ingest: timestamp stamp: %w", err)
-		}
-	}
-	var prepared attribution.Prepared
-	if metadata != nil {
-		var prepareErr error
-		prepared, prepareErr = w.cfg.Attribution.PrepareSegment(candidate, metadata.StreamID, metadata.Policy, metadata.Provenance, metadata.Boundary, metadata.Source)
-		if prepareErr != nil {
-			return nil, fmt.Errorf("ingest: prepare attribution: %w", prepareErr)
-		}
+	candidate, prepared, err := w.prepareAttributedCandidate(ctx, ev, metadata)
+	if err != nil {
+		return nil, err
 	}
 	full, err := w.active.Append(candidate)
 	if err != nil {
@@ -582,16 +485,7 @@ func (w *Writer) appendAttributedLocked(ctx context.Context, ev *segment.Event, 
 	}
 
 	if full {
-		if w.async != nil {
-			job, err := w.prepareAsyncFlushLocked()
-			if err != nil {
-				return nil, err
-			}
-			return job, nil
-		}
-		if err := w.flushAndRotateLocked(ctx); err != nil {
-			return nil, err
-		}
+		return w.flushFullAppendBlockLocked(ctx)
 	}
 	return nil, nil
 }
@@ -1152,4 +1046,159 @@ func (w *Writer) commitDurableBatchWithAttributionsLocked(ctx context.Context, n
 		afterCommit()
 	}
 	return nil
+}
+
+type acceptedCandidate struct {
+	event         segment.Event
+	originalIndex int
+	prepared      attribution.Prepared
+}
+
+func (w *Writer) prepareBatchCandidates(ctx context.Context, events []segment.Event, metadata *AttributionMetadata) ([]acceptedCandidate, error) {
+	candidates := make([]acceptedCandidate, 0, len(events))
+	for i := range events {
+		if err := segment.ValidateEvent(events[i]); err != nil {
+			return nil, err
+		}
+		candidate, accepted, err := w.batchCandidate(ctx, &events[i], w.nextSeq+uint64(len(candidates)), metadata)
+		if err != nil {
+			return nil, err
+		}
+		if !accepted {
+			continue
+		}
+		candidates = append(candidates, acceptedCandidate{event: candidate, originalIndex: i})
+	}
+	if err := w.prepareCandidateAttributions(candidates, metadata); err != nil {
+		return nil, err
+	}
+	return candidates, nil
+}
+
+func (w *Writer) prepareCandidateAttributions(candidates []acceptedCandidate, metadata *AttributionMetadata) error {
+	// Run all persistence-bearing preparations before the first segment write.
+	for i := range candidates {
+		if metadata == nil {
+			break
+		}
+		prepared, err := w.cfg.Attribution.PrepareSegment(candidates[i].event, metadata.StreamID, metadata.Policy, metadata.Provenance, metadata.Boundary, metadata.Source)
+		if err != nil {
+			return w.wrapSegmentPersistenceError("preparing batch attribution", fmt.Errorf("ingest: prepare attribution: %w", err))
+		}
+		candidates[i].prepared = prepared
+	}
+	return nil
+}
+
+func (w *Writer) batchCandidate(ctx context.Context, event *segment.Event, nextSeq uint64, metadata *AttributionMetadata) (segment.Event, bool, error) {
+	candidate := *event
+	if !w.cfg.CollectionPolicy.Allows(&candidate) {
+		event.Seq = 0
+		return candidate, false, nil
+	}
+	if superseded, err := w.snapshotSupersedes(&candidate, metadata); err != nil {
+		return candidate, false, err
+	} else if superseded {
+		event.Seq = 0
+		return candidate, false, nil
+	}
+	if metadata != nil && metadata.Source != nil && (metadata.Source.Seq != event.Seq || metadata.Source.SegmentFingerprint != attribution.FingerprintSegment(*event)) {
+		return candidate, false, fmt.Errorf("ingest: imported source sequence mismatch: %w", attribution.ErrInvalid)
+	}
+	candidate.Seq = nextSeq
+	if w.cfg.TimestampStamper != nil {
+		if err := w.cfg.TimestampStamper.Stamp(ctx, &candidate); err != nil {
+			return candidate, false, fmt.Errorf("ingest: timestamp stamp: %w", err)
+		}
+	}
+	if metadata != nil {
+		if err := attribution.ValidateSegment(candidate, metadata.StreamID, metadata.Policy, metadata.Provenance, metadata.Boundary); err != nil {
+			return candidate, false, fmt.Errorf("ingest: validate attribution: %w", err)
+		}
+	}
+	return candidate, true, nil
+}
+
+func (w *Writer) publishBatchCandidate(accepted *acceptedCandidate, event *segment.Event, metadata *AttributionMetadata) error {
+	event.Seq, event.IndexedAt = accepted.event.Seq, accepted.event.IndexedAt
+	if metadata != nil {
+		w.pendingAttributions = append(w.pendingAttributions, accepted.prepared)
+	}
+	w.nextSeq++
+	w.cfg.Metrics.incEventsAppended()
+	w.cfg.Metrics.setNextSeq(w.nextSeq)
+	w.readLog.append(&accepted.event)
+	if w.cfg.OnAppend != nil {
+		if err := w.cfg.OnAppend(event); err != nil {
+			return fmt.Errorf("ingest: on_append: %w", err)
+		}
+	}
+	return nil
+}
+
+func (w *Writer) prepareAttributedCandidate(ctx context.Context, ev *segment.Event, metadata *AttributionMetadata) (segment.Event, attribution.Prepared, error) {
+	if metadata != nil && metadata.Source != nil && metadata.Source.Seq != ev.Seq {
+		return segment.Event{}, attribution.Prepared{}, fmt.Errorf("ingest: imported source sequence mismatch: %w", attribution.ErrInvalid)
+	}
+	candidate := *ev
+	candidate.Seq = w.nextSeq
+	if w.cfg.TimestampStamper != nil {
+		if err := w.cfg.TimestampStamper.Stamp(ctx, &candidate); err != nil {
+			w.cfg.Metrics.incAppendErrors()
+			return segment.Event{}, attribution.Prepared{}, fmt.Errorf("ingest: timestamp stamp: %w", err)
+		}
+	}
+	var prepared attribution.Prepared
+	if metadata != nil {
+		var prepareErr error
+		prepared, prepareErr = w.cfg.Attribution.PrepareSegment(candidate, metadata.StreamID, metadata.Policy, metadata.Provenance, metadata.Boundary, metadata.Source)
+		if prepareErr != nil {
+			return segment.Event{}, attribution.Prepared{}, fmt.Errorf("ingest: prepare attribution: %w", prepareErr)
+		}
+	}
+	return candidate, prepared, nil
+}
+
+func (w *Writer) validateAppendMetadata(metadata *AttributionMetadata) error {
+	if metadata != nil && w.cfg.Attribution == nil {
+		return fmt.Errorf("ingest: attribution manager is required")
+	}
+	if w.cfg.Attribution != nil && metadata == nil {
+		return fmt.Errorf("ingest: attributed writer requires AppendAttributed metadata")
+	}
+	if metadata != nil && (metadata.StreamID == "" || metadata.Policy.Revision == 0) {
+		return fmt.Errorf("ingest: invalid attribution metadata: %w", attribution.ErrInvalid)
+	}
+	return nil
+}
+
+func (w *Writer) flushFullAppendBlockLocked(ctx context.Context) (*asyncFlushJob, error) {
+	if w.async != nil {
+		return w.prepareAsyncFlushLocked()
+	}
+	return nil, w.flushAndRotateLocked(ctx)
+}
+
+func (w *Writer) writeBatchCandidatesLocked(ctx context.Context, events []segment.Event, candidates []acceptedCandidate, metadata *AttributionMetadata) ([]*asyncFlushJob, error) {
+	var jobs []*asyncFlushJob
+	for i := range candidates {
+		accepted := &candidates[i]
+		full, err := w.active.Append(accepted.event)
+		if err != nil {
+			return jobs, w.wrapSegmentPersistenceError("appending batch event", fmt.Errorf("ingest: append: %w", err))
+		}
+		if err := w.publishBatchCandidate(accepted, &events[accepted.originalIndex], metadata); err != nil {
+			return jobs, err
+		}
+		if full {
+			job, err := w.flushFullAppendBlockLocked(ctx)
+			if err != nil {
+				return jobs, err
+			}
+			if w.async != nil {
+				jobs = append(jobs, job)
+			}
+		}
+	}
+	return jobs, nil
 }
