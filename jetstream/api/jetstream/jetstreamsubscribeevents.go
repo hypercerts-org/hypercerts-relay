@@ -4054,7 +4054,7 @@ type JetstreamSubscribeEvents_Sync struct {
 	DID           string                                               `json:"did"`
 	Hypercerts    gt.Option[JetstreamSubscribeEvents_SelectedMetadata] `json:"hypercerts,omitzero"`
 	Seq           int64                                                `json:"seq"`
-	Sync          comatproto.SyncSubscribeRepos_Sync                   `json:"sync"` // The upstream event; its seq and time are the upstream relay's, not Jetstream's.
+	Sync          comatproto.SyncSubscribeRepos_Sync                   `json:"sync"` // For stream consumers: ordinary v2 subscriptions preserve the upstream event, including the upstre...
 	Time          string                                               `json:"time"` // The time Jetstream witnessed this event, microsecond precision. Timestamp imports apply only to r...
 
 	// extra preserves unknown fields for same-format round-trips.

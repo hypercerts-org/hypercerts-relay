@@ -226,7 +226,7 @@
         "sync": {
           "type": "ref",
           "ref": "com.atproto.sync.subscribeRepos#sync",
-          "description": "The upstream event; its seq and time are the upstream relay's, not Jetstream's."
+          "description": "For stream consumers: ordinary v2 subscriptions preserve the upstream event, including the upstream relay's seq and time. With contract=hypercerts-selected-v1, this is rebuilt lifecycle metadata: nested time is Jetstream's witnessed time in UTC with exactly six fractional digits, and nested seq is serialized as its default zero, not an upstream cursor. The outer seq and time are authoritative for the selected event's Jetstream cursor and witnessed time."
         }
       }
     },
