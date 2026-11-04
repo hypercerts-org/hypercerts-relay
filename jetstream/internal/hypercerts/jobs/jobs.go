@@ -1579,9 +1579,10 @@ func (m *Manager) flushReceipts(ctx context.Context, receipts *sync.WaitGroup) e
 			if receiptDone != nil {
 				var cancel context.CancelFunc
 				receiptCtx, cancel = context.WithCancel(ctx)
+				defer cancel()
 				go func(done <-chan struct{}) {
 					select {
-					case <-ctx.Done():
+					case <-receiptCtx.Done():
 					case <-done:
 					}
 					cancel()
