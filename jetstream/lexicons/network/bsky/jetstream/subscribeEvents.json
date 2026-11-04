@@ -79,6 +79,7 @@
       "description": "A single record mutation (create, update, or delete).",
       "required": ["seq", "did", "time", "rev", "operation", "collection", "rkey"],
       "properties": {
+        "hypercerts": { "type": "ref", "ref": "#selectedMetadata" },
         "seq": {
           "type": "integer",
           "description": "Jetstream's monotonic per-event sequence number; the stream cursor."
@@ -117,6 +118,7 @@
       "description": "An identity change (handle or DID document update), wrapping the upstream firehose event verbatim.",
       "required": ["seq", "did", "time", "identity"],
       "properties": {
+        "hypercerts": { "type": "ref", "ref": "#selectedMetadata" },
         "seq": { "type": "integer" },
         "did": { "type": "string", "format": "did" },
         "time": {
@@ -136,6 +138,7 @@
       "description": "An account status change (active/deactivated/deleted/...), wrapping the upstream firehose event verbatim.",
       "required": ["seq", "did", "time", "account"],
       "properties": {
+        "hypercerts": { "type": "ref", "ref": "#selectedMetadata" },
         "seq": { "type": "integer" },
         "did": { "type": "string", "format": "did" },
         "time": {
@@ -152,14 +155,59 @@
     },
     "selectedMetadata": {
       "type": "object",
+      "required": ["policyRev"],
+      "nullable": ["policyRev"],
       "description": "Optional Hypercerts metadata present only when contract=hypercerts-selected-v1 is negotiated. Ordinary v2 frames omit it.",
       "properties": {
         "streamId": { "type": "string" },
         "policyRev": { "type": "integer" },
         "provenance": { "type": "string", "knownValues": ["live", "snapshot", "reconciliation", "legacy-unknown"] },
-        "reconciliationBoundary": { "type": "unknown" },
+        "reconciliationBoundary": { "type": "ref", "ref": "#selectedReconciliationBoundary" },
         "reconciliationRequired": { "type": "boolean" },
-        "scope": { "type": "unknown" }
+        "scope": { "type": "ref", "ref": "#selectedSyncScope" }
+      }
+    },
+    "selectedReconciliationBoundary": {
+      "type": "object",
+      "required": ["seq", "snapshotId"],
+      "nullable": ["seq", "snapshotId"],
+      "properties": {
+        "seq": { "type": "integer" },
+        "snapshotId": { "type": "string" }
+      }
+    },
+    "selectedSyncScope": {
+      "type": "object",
+      "properties": {
+        "did": { "type": "string", "format": "did" },
+        "collections": { "type": "unknown", "description": "Collection NSID array or null. Preserved as raw JSON so empty arrays and null survive typed-client round trips." }
+      }
+    },
+    "selectedGap": {
+      "type": "object",
+      "required": ["fromSeq", "throughSeq", "collection"],
+      "nullable": ["fromSeq", "throughSeq", "collection"],
+      "properties": {
+        "fromSeq": { "type": "integer" },
+        "throughSeq": { "type": "integer" },
+        "reason": { "type": "string" },
+        "collection": { "type": "string", "format": "nsid" }
+      }
+    },
+    "selectedInfoMetadata": {
+      "type": "object",
+      "properties": {
+        "contract": { "type": "string", "knownValues": ["hypercerts-selected-v1"] },
+        "streamId": { "type": "string" },
+        "policyRev": { "type": "integer" },
+        "policyRevision": { "type": "integer" },
+        "collections": { "type": "unknown", "description": "Collection NSID array or null. Preserved as raw JSON so empty arrays and null survive typed-client round trips." },
+        "effectiveAfterSeq": { "type": "unknown", "description": "Sequence integer or explicit null; absent when this notice does not advertise this boundary. Raw JSON preserves all three states." },
+        "replayFloor": { "type": "unknown", "description": "Sequence integer or explicit null; absent when this notice does not advertise this boundary. Raw JSON preserves all three states." },
+        "historyMode": { "type": "string" },
+        "originalHistoryFromSeq": { "type": "unknown", "description": "Sequence integer or explicit null; absent when this notice does not advertise this boundary. Raw JSON preserves all three states." },
+        "coverage": { "type": "string" },
+        "gaps": { "type": "unknown", "description": "Array of selectedGap objects, including an empty array; absent on notices other than SelectedFeed. Raw JSON preserves presence without adding capability fields to PolicyAdopted." }
       }
     },
     "sync": {
@@ -167,6 +215,7 @@
       "description": "An archived #sync event (broken commit chain; consumers should resync the repo). Ordinary v2 subscriptions receive the upstream event; selected-contract subscriptions receive lifecycle metadata without CAR blocks or unselected operation payloads. Never emitted on the legacy v1 /subscribe wire.",
       "required": ["seq", "did", "time", "sync"],
       "properties": {
+        "hypercerts": { "type": "ref", "ref": "#selectedMetadata" },
         "seq": { "type": "integer" },
         "did": { "type": "string", "format": "did" },
         "time": {
@@ -186,7 +235,8 @@
       "description": "An advisory, non-fatal notice about the stream (mirrors com.atproto.sync.subscribeRepos#info). Carries no seq and does not advance the cursor. Selected subscriptions may send SelectedFeed first, then PolicyAdopted or Reconciliation notices with selected metadata. OutdatedCursor is sent for ordinary v2 timestamp resumes below the retention floor.",
       "required": ["name"],
       "properties": {
-        "name": { "type": "string", "knownValues": ["OutdatedCursor"] },
+        "hypercerts": { "type": "ref", "ref": "#selectedInfoMetadata" },
+        "name": { "type": "string", "knownValues": ["OutdatedCursor", "SelectedFeed", "PolicyAdopted", "Reconciliation"] },
         "message": { "type": "string" }
       }
     }
