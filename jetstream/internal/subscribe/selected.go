@@ -156,7 +156,9 @@ func PolicyGaps(history []attribution.Policy) []SelectedGap {
 				if gap, ok := open[collection]; ok {
 					name := collection
 					from, through := gap.from, boundary
-					gaps = append(gaps, SelectedGap{FromSeq: &from, ThroughSeq: &through, Reason: "policy-disabled", Collection: &name})
+					if from <= through {
+						gaps = append(gaps, SelectedGap{FromSeq: &from, ThroughSeq: &through, Reason: "policy-disabled", Collection: &name})
+					}
 					delete(open, collection)
 				}
 			}
