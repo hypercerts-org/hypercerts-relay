@@ -15,11 +15,12 @@ import (
 //
 // An account status change (active/deactivated/deleted/...), wrapping the upstream firehose event verbatim.
 type JetstreamSubscribeEvents_Account struct {
-	LexiconTypeID string                                `json:"$type,omitempty"`
-	Account       comatproto.SyncSubscribeRepos_Account `json:"account"` // The upstream event; its seq and time are the upstream relay's, not Jetstream's.
-	DID           string                                `json:"did"`
-	Seq           int64                                 `json:"seq"`
-	Time          string                                `json:"time"` // The time Jetstream witnessed this event, microsecond precision. Timestamp imports apply only to r...
+	LexiconTypeID string                                               `json:"$type,omitempty"`
+	Account       comatproto.SyncSubscribeRepos_Account                `json:"account"` // The upstream event; its seq and time are the upstream relay's, not Jetstream's.
+	DID           string                                               `json:"did"`
+	Hypercerts    gt.Option[JetstreamSubscribeEvents_SelectedMetadata] `json:"hypercerts,omitzero"`
+	Seq           int64                                                `json:"seq"`
+	Time          string                                               `json:"time"` // The time Jetstream witnessed this event, microsecond precision. Timestamp imports apply only to r...
 
 	// extra preserves unknown fields for same-format round-trips.
 	extra []extraField
@@ -32,6 +33,7 @@ var (
 	cborKey_JetstreamSubscribeEvents_Account_time        = cbor.AppendTextKey(nil, "time")
 	cborKey_JetstreamSubscribeEvents_Account_dollar_type = cbor.AppendTextKey(nil, "$type")
 	cborKey_JetstreamSubscribeEvents_Account_account     = cbor.AppendTextKey(nil, "account")
+	cborKey_JetstreamSubscribeEvents_Account_hypercerts  = cbor.AppendTextKey(nil, "hypercerts")
 )
 
 func (s *JetstreamSubscribeEvents_Account) MarshalCBOR() ([]byte, error) {
@@ -41,6 +43,9 @@ func (s *JetstreamSubscribeEvents_Account) MarshalCBOR() ([]byte, error) {
 func (s *JetstreamSubscribeEvents_Account) AppendCBOR(buf []byte) ([]byte, error) {
 	n := 4 + countExtra(s.extra, extraEncodingCBOR)
 	if s.LexiconTypeID != "" {
+		n++
+	}
+	if s.Hypercerts.HasVal() {
 		n++
 	}
 	buf = cbor.AppendMapHeader(buf, uint64(n))
@@ -69,6 +74,20 @@ func (s *JetstreamSubscribeEvents_Account) AppendCBOR(buf []byte) ([]byte, error
 				return nil, err
 			}
 		}
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "hypercerts", buf)
+		if s.Hypercerts.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_Account_hypercerts...)
+			{
+				v := s.Hypercerts.Val()
+				{
+					var err error
+					buf, err = v.AppendCBOR(buf)
+					if err != nil {
+						return nil, err
+					}
+				}
+			}
+		}
 		_, buf = appendCBORExtrasBefore(s.extra, ei, "", buf)
 	} else {
 		buf = append(buf, cborKey_JetstreamSubscribeEvents_Account_did...)
@@ -87,6 +106,19 @@ func (s *JetstreamSubscribeEvents_Account) AppendCBOR(buf []byte) ([]byte, error
 			buf, err = s.Account.AppendCBOR(buf)
 			if err != nil {
 				return nil, err
+			}
+		}
+		if s.Hypercerts.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_Account_hypercerts...)
+			{
+				v := s.Hypercerts.Val()
+				{
+					var err error
+					buf, err = v.AppendCBOR(buf)
+					if err != nil {
+						return nil, err
+					}
+				}
 			}
 		}
 	}
@@ -172,6 +204,26 @@ func (s *JetstreamSubscribeEvents_Account) UnmarshalCBORAt(data []byte, pos int)
 				}
 				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
 			}
+		case 10:
+			if string(data[keyStart:keyEnd]) == "hypercerts" {
+				if cbor.IsNull(data, pos) {
+					pos++
+				} else {
+					var v JetstreamSubscribeEvents_SelectedMetadata
+					pos, err = v.UnmarshalCBORAt(data, pos)
+					if err != nil {
+						return 0, err
+					}
+					s.Hypercerts = gt.Some(v)
+				}
+			} else {
+				valueStart := pos
+				pos, err = cbor.SkipValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
+			}
 		default:
 			valueStart := pos
 			pos, err = cbor.SkipValue(data, pos)
@@ -189,6 +241,7 @@ var (
 	jsonKey_JetstreamSubscribeEvents_Account_dollar_type = []byte("\"$type\":")
 	jsonKey_JetstreamSubscribeEvents_Account_account     = []byte("\"account\":")
 	jsonKey_JetstreamSubscribeEvents_Account_did         = []byte("\"did\":")
+	jsonKey_JetstreamSubscribeEvents_Account_hypercerts  = []byte("\"hypercerts\":")
 	jsonKey_JetstreamSubscribeEvents_Account_seq         = []byte("\"seq\":")
 	jsonKey_JetstreamSubscribeEvents_Account_time        = []byte("\"time\":")
 )
@@ -226,6 +279,23 @@ func (s *JetstreamSubscribeEvents_Account) AppendJSON(buf []byte) ([]byte, error
 	buf = append(buf, jsonKey_JetstreamSubscribeEvents_Account_did...)
 	buf = cbor.AppendJSONString(buf, s.DID)
 	first = false
+	if s.Hypercerts.HasVal() {
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_Account_hypercerts...)
+		{
+			v := s.Hypercerts.Val()
+			{
+				var err error
+				buf, err = v.AppendJSON(buf)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+		first = false
+	}
 	if !first {
 		buf = append(buf, ',')
 	}
@@ -293,6 +363,20 @@ func (s *JetstreamSubscribeEvents_Account) UnmarshalJSONAt(data []byte, pos int)
 			if err != nil {
 				return 0, err
 			}
+		case "hypercerts":
+			if cbor.IsJSONNull(data, pos) {
+				pos, err = cbor.SkipJSONNull(data, pos)
+				if err != nil {
+					return 0, err
+				}
+			} else {
+				var v JetstreamSubscribeEvents_SelectedMetadata
+				pos, err = v.UnmarshalJSONAt(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.Hypercerts = gt.Some(v)
+			}
 		case "seq":
 			s.Seq, pos, err = cbor.ReadJSONInt(data, pos)
 			if err != nil {
@@ -319,16 +403,17 @@ func (s *JetstreamSubscribeEvents_Account) UnmarshalJSONAt(data []byte, pos int)
 //
 // A single record mutation (create, update, or delete).
 type JetstreamSubscribeEvents_Commit struct {
-	LexiconTypeID string            `json:"$type,omitempty"`
-	CID           gt.Option[string] `json:"cid,omitzero"` // CID of the record. Absent for deletes.
-	Collection    string            `json:"collection"`   // Collection NSID of the record.
-	DID           string            `json:"did"`
-	Operation     string            `json:"operation"`
-	Record        json.RawMessage   `json:"record,omitempty"` // The record decoded to JSON. Absent for deletes.
-	Rev           string            `json:"rev"`              // The repo rev of the commit that produced this op.
-	Rkey          string            `json:"rkey"`             // Record key.
-	Seq           int64             `json:"seq"`              // Jetstream's monotonic per-event sequence number; the stream cursor.
-	Time          string            `json:"time"`             // The event's display timestamp, microsecond precision: when Jetstream witnessed the event, unless ...
+	LexiconTypeID string                                               `json:"$type,omitempty"`
+	CID           gt.Option[string]                                    `json:"cid,omitzero"` // CID of the record. Absent for deletes.
+	Collection    string                                               `json:"collection"`   // Collection NSID of the record.
+	DID           string                                               `json:"did"`
+	Hypercerts    gt.Option[JetstreamSubscribeEvents_SelectedMetadata] `json:"hypercerts,omitzero"`
+	Operation     string                                               `json:"operation"`
+	Record        json.RawMessage                                      `json:"record,omitempty"` // The record decoded to JSON. Absent for deletes.
+	Rev           string                                               `json:"rev"`              // The repo rev of the commit that produced this op.
+	Rkey          string                                               `json:"rkey"`             // Record key.
+	Seq           int64                                                `json:"seq"`              // Jetstream's monotonic per-event sequence number; the stream cursor.
+	Time          string                                               `json:"time"`             // The event's display timestamp, microsecond precision: when Jetstream witnessed the event, unless ...
 
 	// extra preserves unknown fields for same-format round-trips.
 	extra []extraField
@@ -346,6 +431,7 @@ var (
 	cborKey_JetstreamSubscribeEvents_Commit_record      = cbor.AppendTextKey(nil, "record")
 	cborKey_JetstreamSubscribeEvents_Commit_operation   = cbor.AppendTextKey(nil, "operation")
 	cborKey_JetstreamSubscribeEvents_Commit_collection  = cbor.AppendTextKey(nil, "collection")
+	cborKey_JetstreamSubscribeEvents_Commit_hypercerts  = cbor.AppendTextKey(nil, "hypercerts")
 )
 
 func (s *JetstreamSubscribeEvents_Commit) MarshalCBOR() ([]byte, error) {
@@ -361,6 +447,9 @@ func (s *JetstreamSubscribeEvents_Commit) AppendCBOR(buf []byte) ([]byte, error)
 		n++
 	}
 	if s.Record != nil {
+		n++
+	}
+	if s.Hypercerts.HasVal() {
 		n++
 	}
 	buf = cbor.AppendMapHeader(buf, uint64(n))
@@ -402,6 +491,20 @@ func (s *JetstreamSubscribeEvents_Commit) AppendCBOR(buf []byte) ([]byte, error)
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "collection", buf)
 		buf = append(buf, cborKey_JetstreamSubscribeEvents_Commit_collection...)
 		buf = cbor.AppendText(buf, s.Collection)
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "hypercerts", buf)
+		if s.Hypercerts.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_Commit_hypercerts...)
+			{
+				v := s.Hypercerts.Val()
+				{
+					var err error
+					buf, err = v.AppendCBOR(buf)
+					if err != nil {
+						return nil, err
+					}
+				}
+			}
+		}
 		_, buf = appendCBORExtrasBefore(s.extra, ei, "", buf)
 	} else {
 		if s.CID.HasVal() {
@@ -430,6 +533,19 @@ func (s *JetstreamSubscribeEvents_Commit) AppendCBOR(buf []byte) ([]byte, error)
 		buf = cbor.AppendText(buf, s.Operation)
 		buf = append(buf, cborKey_JetstreamSubscribeEvents_Commit_collection...)
 		buf = cbor.AppendText(buf, s.Collection)
+		if s.Hypercerts.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_Commit_hypercerts...)
+			{
+				v := s.Hypercerts.Val()
+				{
+					var err error
+					buf, err = v.AppendCBOR(buf)
+					if err != nil {
+						return nil, err
+					}
+				}
+			}
+		}
 	}
 	return buf, nil
 }
@@ -554,6 +670,17 @@ func (s *JetstreamSubscribeEvents_Commit) UnmarshalCBORAt(data []byte, pos int) 
 				if err != nil {
 					return 0, err
 				}
+			} else if string(data[keyStart:keyEnd]) == "hypercerts" {
+				if cbor.IsNull(data, pos) {
+					pos++
+				} else {
+					var v JetstreamSubscribeEvents_SelectedMetadata
+					pos, err = v.UnmarshalCBORAt(data, pos)
+					if err != nil {
+						return 0, err
+					}
+					s.Hypercerts = gt.Some(v)
+				}
 			} else {
 				valueStart := pos
 				pos, err = cbor.SkipValue(data, pos)
@@ -580,6 +707,7 @@ var (
 	jsonKey_JetstreamSubscribeEvents_Commit_cid         = []byte("\"cid\":")
 	jsonKey_JetstreamSubscribeEvents_Commit_collection  = []byte("\"collection\":")
 	jsonKey_JetstreamSubscribeEvents_Commit_did         = []byte("\"did\":")
+	jsonKey_JetstreamSubscribeEvents_Commit_hypercerts  = []byte("\"hypercerts\":")
 	jsonKey_JetstreamSubscribeEvents_Commit_operation   = []byte("\"operation\":")
 	jsonKey_JetstreamSubscribeEvents_Commit_record      = []byte("\"record\":")
 	jsonKey_JetstreamSubscribeEvents_Commit_rev         = []byte("\"rev\":")
@@ -623,6 +751,23 @@ func (s *JetstreamSubscribeEvents_Commit) AppendJSON(buf []byte) ([]byte, error)
 	buf = append(buf, jsonKey_JetstreamSubscribeEvents_Commit_did...)
 	buf = cbor.AppendJSONString(buf, s.DID)
 	first = false
+	if s.Hypercerts.HasVal() {
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_Commit_hypercerts...)
+		{
+			v := s.Hypercerts.Val()
+			{
+				var err error
+				buf, err = v.AppendJSON(buf)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+		first = false
+	}
 	if !first {
 		buf = append(buf, ',')
 	}
@@ -730,6 +875,20 @@ func (s *JetstreamSubscribeEvents_Commit) UnmarshalJSONAt(data []byte, pos int) 
 			if err != nil {
 				return 0, err
 			}
+		case "hypercerts":
+			if cbor.IsJSONNull(data, pos) {
+				pos, err = cbor.SkipJSONNull(data, pos)
+				if err != nil {
+					return 0, err
+				}
+			} else {
+				var v JetstreamSubscribeEvents_SelectedMetadata
+				pos, err = v.UnmarshalJSONAt(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.Hypercerts = gt.Some(v)
+			}
 		case "operation":
 			s.Operation, pos, err = cbor.ReadJSONString(data, pos)
 			if err != nil {
@@ -780,11 +939,12 @@ func (s *JetstreamSubscribeEvents_Commit) UnmarshalJSONAt(data []byte, pos int) 
 //
 // An identity change (handle or DID document update), wrapping the upstream firehose event verbatim.
 type JetstreamSubscribeEvents_Identity struct {
-	LexiconTypeID string                                 `json:"$type,omitempty"`
-	DID           string                                 `json:"did"`
-	Identity      comatproto.SyncSubscribeRepos_Identity `json:"identity"` // The upstream event; its seq and time are the upstream relay's, not Jetstream's.
-	Seq           int64                                  `json:"seq"`
-	Time          string                                 `json:"time"` // The time Jetstream witnessed this event, microsecond precision. Timestamp imports apply only to r...
+	LexiconTypeID string                                               `json:"$type,omitempty"`
+	DID           string                                               `json:"did"`
+	Hypercerts    gt.Option[JetstreamSubscribeEvents_SelectedMetadata] `json:"hypercerts,omitzero"`
+	Identity      comatproto.SyncSubscribeRepos_Identity               `json:"identity"` // The upstream event; its seq and time are the upstream relay's, not Jetstream's.
+	Seq           int64                                                `json:"seq"`
+	Time          string                                               `json:"time"` // The time Jetstream witnessed this event, microsecond precision. Timestamp imports apply only to r...
 
 	// extra preserves unknown fields for same-format round-trips.
 	extra []extraField
@@ -797,6 +957,7 @@ var (
 	cborKey_JetstreamSubscribeEvents_Identity_time        = cbor.AppendTextKey(nil, "time")
 	cborKey_JetstreamSubscribeEvents_Identity_dollar_type = cbor.AppendTextKey(nil, "$type")
 	cborKey_JetstreamSubscribeEvents_Identity_identity    = cbor.AppendTextKey(nil, "identity")
+	cborKey_JetstreamSubscribeEvents_Identity_hypercerts  = cbor.AppendTextKey(nil, "hypercerts")
 )
 
 func (s *JetstreamSubscribeEvents_Identity) MarshalCBOR() ([]byte, error) {
@@ -806,6 +967,9 @@ func (s *JetstreamSubscribeEvents_Identity) MarshalCBOR() ([]byte, error) {
 func (s *JetstreamSubscribeEvents_Identity) AppendCBOR(buf []byte) ([]byte, error) {
 	n := 4 + countExtra(s.extra, extraEncodingCBOR)
 	if s.LexiconTypeID != "" {
+		n++
+	}
+	if s.Hypercerts.HasVal() {
 		n++
 	}
 	buf = cbor.AppendMapHeader(buf, uint64(n))
@@ -834,6 +998,20 @@ func (s *JetstreamSubscribeEvents_Identity) AppendCBOR(buf []byte) ([]byte, erro
 				return nil, err
 			}
 		}
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "hypercerts", buf)
+		if s.Hypercerts.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_Identity_hypercerts...)
+			{
+				v := s.Hypercerts.Val()
+				{
+					var err error
+					buf, err = v.AppendCBOR(buf)
+					if err != nil {
+						return nil, err
+					}
+				}
+			}
+		}
 		_, buf = appendCBORExtrasBefore(s.extra, ei, "", buf)
 	} else {
 		buf = append(buf, cborKey_JetstreamSubscribeEvents_Identity_did...)
@@ -852,6 +1030,19 @@ func (s *JetstreamSubscribeEvents_Identity) AppendCBOR(buf []byte) ([]byte, erro
 			buf, err = s.Identity.AppendCBOR(buf)
 			if err != nil {
 				return nil, err
+			}
+		}
+		if s.Hypercerts.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_Identity_hypercerts...)
+			{
+				v := s.Hypercerts.Val()
+				{
+					var err error
+					buf, err = v.AppendCBOR(buf)
+					if err != nil {
+						return nil, err
+					}
+				}
 			}
 		}
 	}
@@ -937,6 +1128,26 @@ func (s *JetstreamSubscribeEvents_Identity) UnmarshalCBORAt(data []byte, pos int
 				}
 				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
 			}
+		case 10:
+			if string(data[keyStart:keyEnd]) == "hypercerts" {
+				if cbor.IsNull(data, pos) {
+					pos++
+				} else {
+					var v JetstreamSubscribeEvents_SelectedMetadata
+					pos, err = v.UnmarshalCBORAt(data, pos)
+					if err != nil {
+						return 0, err
+					}
+					s.Hypercerts = gt.Some(v)
+				}
+			} else {
+				valueStart := pos
+				pos, err = cbor.SkipValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
+			}
 		default:
 			valueStart := pos
 			pos, err = cbor.SkipValue(data, pos)
@@ -953,6 +1164,7 @@ func (s *JetstreamSubscribeEvents_Identity) UnmarshalCBORAt(data []byte, pos int
 var (
 	jsonKey_JetstreamSubscribeEvents_Identity_dollar_type = []byte("\"$type\":")
 	jsonKey_JetstreamSubscribeEvents_Identity_did         = []byte("\"did\":")
+	jsonKey_JetstreamSubscribeEvents_Identity_hypercerts  = []byte("\"hypercerts\":")
 	jsonKey_JetstreamSubscribeEvents_Identity_identity    = []byte("\"identity\":")
 	jsonKey_JetstreamSubscribeEvents_Identity_seq         = []byte("\"seq\":")
 	jsonKey_JetstreamSubscribeEvents_Identity_time        = []byte("\"time\":")
@@ -979,6 +1191,23 @@ func (s *JetstreamSubscribeEvents_Identity) AppendJSON(buf []byte) ([]byte, erro
 	buf = append(buf, jsonKey_JetstreamSubscribeEvents_Identity_did...)
 	buf = cbor.AppendJSONString(buf, s.DID)
 	first = false
+	if s.Hypercerts.HasVal() {
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_Identity_hypercerts...)
+		{
+			v := s.Hypercerts.Val()
+			{
+				var err error
+				buf, err = v.AppendJSON(buf)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+		first = false
+	}
 	if !first {
 		buf = append(buf, ',')
 	}
@@ -1053,6 +1282,20 @@ func (s *JetstreamSubscribeEvents_Identity) UnmarshalJSONAt(data []byte, pos int
 			if err != nil {
 				return 0, err
 			}
+		case "hypercerts":
+			if cbor.IsJSONNull(data, pos) {
+				pos, err = cbor.SkipJSONNull(data, pos)
+				if err != nil {
+					return 0, err
+				}
+			} else {
+				var v JetstreamSubscribeEvents_SelectedMetadata
+				pos, err = v.UnmarshalJSONAt(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.Hypercerts = gt.Some(v)
+			}
 		case "identity":
 			pos, err = s.Identity.UnmarshalJSONAt(data, pos)
 			if err != nil {
@@ -1084,9 +1327,10 @@ func (s *JetstreamSubscribeEvents_Identity) UnmarshalJSONAt(data []byte, pos int
 //
 // An advisory, non-fatal notice about the stream (mirrors com.atproto.sync.subscribeRepos#info). Carries no seq and does not advance the cursor. Selected subscriptions may send SelectedFeed first, then PolicyAdopted or Reconciliation notices with selected metadata. OutdatedCursor is sent for ordinary v2 timestamp resumes below the retention floor.
 type JetstreamSubscribeEvents_Info struct {
-	LexiconTypeID string            `json:"$type,omitempty"`
-	Message       gt.Option[string] `json:"message,omitzero"`
-	Name          string            `json:"name"`
+	LexiconTypeID string                                                   `json:"$type,omitempty"`
+	Hypercerts    gt.Option[JetstreamSubscribeEvents_SelectedInfoMetadata] `json:"hypercerts,omitzero"`
+	Message       gt.Option[string]                                        `json:"message,omitzero"`
+	Name          string                                                   `json:"name"`
 
 	// extra preserves unknown fields for same-format round-trips.
 	extra []extraField
@@ -1097,6 +1341,7 @@ var (
 	cborKey_JetstreamSubscribeEvents_Info_name        = cbor.AppendTextKey(nil, "name")
 	cborKey_JetstreamSubscribeEvents_Info_dollar_type = cbor.AppendTextKey(nil, "$type")
 	cborKey_JetstreamSubscribeEvents_Info_message     = cbor.AppendTextKey(nil, "message")
+	cborKey_JetstreamSubscribeEvents_Info_hypercerts  = cbor.AppendTextKey(nil, "hypercerts")
 )
 
 func (s *JetstreamSubscribeEvents_Info) MarshalCBOR() ([]byte, error) {
@@ -1109,6 +1354,9 @@ func (s *JetstreamSubscribeEvents_Info) AppendCBOR(buf []byte) ([]byte, error) {
 		n++
 	}
 	if s.Message.HasVal() {
+		n++
+	}
+	if s.Hypercerts.HasVal() {
 		n++
 	}
 	buf = cbor.AppendMapHeader(buf, uint64(n))
@@ -1127,6 +1375,20 @@ func (s *JetstreamSubscribeEvents_Info) AppendCBOR(buf []byte) ([]byte, error) {
 			buf = append(buf, cborKey_JetstreamSubscribeEvents_Info_message...)
 			buf = cbor.AppendText(buf, s.Message.Val())
 		}
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "hypercerts", buf)
+		if s.Hypercerts.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_Info_hypercerts...)
+			{
+				v := s.Hypercerts.Val()
+				{
+					var err error
+					buf, err = v.AppendCBOR(buf)
+					if err != nil {
+						return nil, err
+					}
+				}
+			}
+		}
 		_, buf = appendCBORExtrasBefore(s.extra, ei, "", buf)
 	} else {
 		buf = append(buf, cborKey_JetstreamSubscribeEvents_Info_name...)
@@ -1138,6 +1400,19 @@ func (s *JetstreamSubscribeEvents_Info) AppendCBOR(buf []byte) ([]byte, error) {
 		if s.Message.HasVal() {
 			buf = append(buf, cborKey_JetstreamSubscribeEvents_Info_message...)
 			buf = cbor.AppendText(buf, s.Message.Val())
+		}
+		if s.Hypercerts.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_Info_hypercerts...)
+			{
+				v := s.Hypercerts.Val()
+				{
+					var err error
+					buf, err = v.AppendCBOR(buf)
+					if err != nil {
+						return nil, err
+					}
+				}
+			}
 		}
 	}
 	return buf, nil
@@ -1209,6 +1484,26 @@ func (s *JetstreamSubscribeEvents_Info) UnmarshalCBORAt(data []byte, pos int) (i
 				}
 				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
 			}
+		case 10:
+			if string(data[keyStart:keyEnd]) == "hypercerts" {
+				if cbor.IsNull(data, pos) {
+					pos++
+				} else {
+					var v JetstreamSubscribeEvents_SelectedInfoMetadata
+					pos, err = v.UnmarshalCBORAt(data, pos)
+					if err != nil {
+						return 0, err
+					}
+					s.Hypercerts = gt.Some(v)
+				}
+			} else {
+				valueStart := pos
+				pos, err = cbor.SkipValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
+			}
 		default:
 			valueStart := pos
 			pos, err = cbor.SkipValue(data, pos)
@@ -1224,6 +1519,7 @@ func (s *JetstreamSubscribeEvents_Info) UnmarshalCBORAt(data []byte, pos int) (i
 // Precomputed JSON key tokens for JetstreamSubscribeEvents_Info.
 var (
 	jsonKey_JetstreamSubscribeEvents_Info_dollar_type = []byte("\"$type\":")
+	jsonKey_JetstreamSubscribeEvents_Info_hypercerts  = []byte("\"hypercerts\":")
 	jsonKey_JetstreamSubscribeEvents_Info_message     = []byte("\"message\":")
 	jsonKey_JetstreamSubscribeEvents_Info_name        = []byte("\"name\":")
 )
@@ -1241,6 +1537,23 @@ func (s *JetstreamSubscribeEvents_Info) AppendJSON(buf []byte) ([]byte, error) {
 		}
 		buf = append(buf, jsonKey_JetstreamSubscribeEvents_Info_dollar_type...)
 		buf = cbor.AppendJSONString(buf, s.LexiconTypeID)
+		first = false
+	}
+	if s.Hypercerts.HasVal() {
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_Info_hypercerts...)
+		{
+			v := s.Hypercerts.Val()
+			{
+				var err error
+				buf, err = v.AppendJSON(buf)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
 		first = false
 	}
 	if s.Message.HasVal() {
@@ -1301,6 +1614,20 @@ func (s *JetstreamSubscribeEvents_Info) UnmarshalJSONAt(data []byte, pos int) (i
 			s.LexiconTypeID, pos, err = cbor.ReadJSONString(data, pos)
 			if err != nil {
 				return 0, err
+			}
+		case "hypercerts":
+			if cbor.IsJSONNull(data, pos) {
+				pos, err = cbor.SkipJSONNull(data, pos)
+				if err != nil {
+					return 0, err
+				}
+			} else {
+				var v JetstreamSubscribeEvents_SelectedInfoMetadata
+				pos, err = v.UnmarshalJSONAt(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.Hypercerts = gt.Some(v)
 			}
 		case "message":
 			if cbor.IsJSONNull(data, pos) {
@@ -1544,17 +1871,1103 @@ func (u *JetstreamSubscribeEvents_Message) UnmarshalCBORAt(data []byte, pos int)
 	}
 }
 
+// JetstreamSubscribeEvents_SelectedGap is a "selectedGap" in the network.bsky.jetstream.subscribeEvents schema.
+type JetstreamSubscribeEvents_SelectedGap struct {
+	LexiconTypeID string            `json:"$type,omitempty"`
+	Collection    gt.Option[string] `json:"collection"`
+	FromSeq       gt.Option[int64]  `json:"fromSeq"`
+	Reason        gt.Option[string] `json:"reason,omitzero"`
+	ThroughSeq    gt.Option[int64]  `json:"throughSeq"`
+
+	// extra preserves unknown fields for same-format round-trips.
+	extra []extraField
+}
+
+// Precomputed CBOR key tokens for JetstreamSubscribeEvents_SelectedGap.
+var (
+	cborKey_JetstreamSubscribeEvents_SelectedGap_dollar_type = cbor.AppendTextKey(nil, "$type")
+	cborKey_JetstreamSubscribeEvents_SelectedGap_reason      = cbor.AppendTextKey(nil, "reason")
+	cborKey_JetstreamSubscribeEvents_SelectedGap_fromSeq     = cbor.AppendTextKey(nil, "fromSeq")
+	cborKey_JetstreamSubscribeEvents_SelectedGap_collection  = cbor.AppendTextKey(nil, "collection")
+	cborKey_JetstreamSubscribeEvents_SelectedGap_throughSeq  = cbor.AppendTextKey(nil, "throughSeq")
+)
+
+func (s *JetstreamSubscribeEvents_SelectedGap) MarshalCBOR() ([]byte, error) {
+	return s.AppendCBOR(make([]byte, 0, 256))
+}
+
+func (s *JetstreamSubscribeEvents_SelectedGap) AppendCBOR(buf []byte) ([]byte, error) {
+	n := 3 + countExtra(s.extra, extraEncodingCBOR)
+	if s.LexiconTypeID != "" {
+		n++
+	}
+	if s.Reason.HasVal() {
+		n++
+	}
+	buf = cbor.AppendMapHeader(buf, uint64(n))
+	if len(s.extra) > 0 {
+		ei := 0
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "$type", buf)
+		if s.LexiconTypeID != "" {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedGap_dollar_type...)
+			buf = cbor.AppendText(buf, s.LexiconTypeID)
+		}
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "reason", buf)
+		if s.Reason.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedGap_reason...)
+			buf = cbor.AppendText(buf, s.Reason.Val())
+		}
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "fromSeq", buf)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedGap_fromSeq...)
+		if !s.FromSeq.HasVal() {
+			buf = cbor.AppendNull(buf)
+		} else {
+			buf = cbor.AppendInt(buf, s.FromSeq.Val())
+		}
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "collection", buf)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedGap_collection...)
+		if !s.Collection.HasVal() {
+			buf = cbor.AppendNull(buf)
+		} else {
+			buf = cbor.AppendText(buf, s.Collection.Val())
+		}
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "throughSeq", buf)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedGap_throughSeq...)
+		if !s.ThroughSeq.HasVal() {
+			buf = cbor.AppendNull(buf)
+		} else {
+			buf = cbor.AppendInt(buf, s.ThroughSeq.Val())
+		}
+		_, buf = appendCBORExtrasBefore(s.extra, ei, "", buf)
+	} else {
+		if s.LexiconTypeID != "" {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedGap_dollar_type...)
+			buf = cbor.AppendText(buf, s.LexiconTypeID)
+		}
+		if s.Reason.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedGap_reason...)
+			buf = cbor.AppendText(buf, s.Reason.Val())
+		}
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedGap_fromSeq...)
+		if !s.FromSeq.HasVal() {
+			buf = cbor.AppendNull(buf)
+		} else {
+			buf = cbor.AppendInt(buf, s.FromSeq.Val())
+		}
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedGap_collection...)
+		if !s.Collection.HasVal() {
+			buf = cbor.AppendNull(buf)
+		} else {
+			buf = cbor.AppendText(buf, s.Collection.Val())
+		}
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedGap_throughSeq...)
+		if !s.ThroughSeq.HasVal() {
+			buf = cbor.AppendNull(buf)
+		} else {
+			buf = cbor.AppendInt(buf, s.ThroughSeq.Val())
+		}
+	}
+	return buf, nil
+}
+
+func (s *JetstreamSubscribeEvents_SelectedGap) UnmarshalCBOR(data []byte) error {
+	_, err := s.UnmarshalCBORAt(data, 0)
+	return err
+}
+
+func (s *JetstreamSubscribeEvents_SelectedGap) UnmarshalCBORAt(data []byte, pos int) (int, error) {
+	s.extra = clearExtra(s.extra, extraEncodingCBOR)
+	count, pos, err := cbor.ReadMapHeader(data, pos)
+	if err != nil {
+		return 0, err
+	}
+	for i := uint64(0); i < count; i++ {
+		keyStart, keyEnd, newPos, err := cbor.ReadTextKey(data, pos)
+		if err != nil {
+			return 0, err
+		}
+		pos = newPos
+		switch keyEnd - keyStart {
+		case 5:
+			if string(data[keyStart:keyEnd]) == "$type" {
+				s.LexiconTypeID, pos, err = cbor.ReadText(data, pos)
+				if err != nil {
+					return 0, err
+				}
+			} else {
+				valueStart := pos
+				pos, err = cbor.SkipValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
+			}
+		case 6:
+			if string(data[keyStart:keyEnd]) == "reason" {
+				if cbor.IsNull(data, pos) {
+					pos++
+				} else {
+					var v string
+					v, pos, err = cbor.ReadText(data, pos)
+					if err != nil {
+						return 0, err
+					}
+					s.Reason = gt.Some(v)
+				}
+			} else {
+				valueStart := pos
+				pos, err = cbor.SkipValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
+			}
+		case 7:
+			if string(data[keyStart:keyEnd]) == "fromSeq" {
+				if cbor.IsNull(data, pos) {
+					pos++
+				} else {
+					var v int64
+					v, pos, err = cbor.ReadInt(data, pos)
+					if err != nil {
+						return 0, err
+					}
+					s.FromSeq = gt.Some(v)
+				}
+			} else {
+				valueStart := pos
+				pos, err = cbor.SkipValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
+			}
+		case 10:
+			if string(data[keyStart:keyEnd]) == "collection" {
+				if cbor.IsNull(data, pos) {
+					pos++
+				} else {
+					var v string
+					v, pos, err = cbor.ReadText(data, pos)
+					if err != nil {
+						return 0, err
+					}
+					s.Collection = gt.Some(v)
+				}
+			} else if string(data[keyStart:keyEnd]) == "throughSeq" {
+				if cbor.IsNull(data, pos) {
+					pos++
+				} else {
+					var v int64
+					v, pos, err = cbor.ReadInt(data, pos)
+					if err != nil {
+						return 0, err
+					}
+					s.ThroughSeq = gt.Some(v)
+				}
+			} else {
+				valueStart := pos
+				pos, err = cbor.SkipValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
+			}
+		default:
+			valueStart := pos
+			pos, err = cbor.SkipValue(data, pos)
+			if err != nil {
+				return 0, err
+			}
+			s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
+		}
+	}
+	return pos, nil
+}
+
+// Precomputed JSON key tokens for JetstreamSubscribeEvents_SelectedGap.
+var (
+	jsonKey_JetstreamSubscribeEvents_SelectedGap_dollar_type = []byte("\"$type\":")
+	jsonKey_JetstreamSubscribeEvents_SelectedGap_collection  = []byte("\"collection\":")
+	jsonKey_JetstreamSubscribeEvents_SelectedGap_fromSeq     = []byte("\"fromSeq\":")
+	jsonKey_JetstreamSubscribeEvents_SelectedGap_reason      = []byte("\"reason\":")
+	jsonKey_JetstreamSubscribeEvents_SelectedGap_throughSeq  = []byte("\"throughSeq\":")
+)
+
+func (s *JetstreamSubscribeEvents_SelectedGap) MarshalJSON() ([]byte, error) {
+	return s.AppendJSON(make([]byte, 0, 256))
+}
+
+func (s *JetstreamSubscribeEvents_SelectedGap) AppendJSON(buf []byte) ([]byte, error) {
+	buf = append(buf, '{')
+	first := true
+	if s.LexiconTypeID != "" {
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_SelectedGap_dollar_type...)
+		buf = cbor.AppendJSONString(buf, s.LexiconTypeID)
+		first = false
+	}
+	if !first {
+		buf = append(buf, ',')
+	}
+	buf = append(buf, jsonKey_JetstreamSubscribeEvents_SelectedGap_collection...)
+	if !s.Collection.HasVal() {
+		buf = cbor.AppendJSONNull(buf)
+	} else {
+		buf = cbor.AppendJSONString(buf, s.Collection.Val())
+	}
+	first = false
+	if !first {
+		buf = append(buf, ',')
+	}
+	buf = append(buf, jsonKey_JetstreamSubscribeEvents_SelectedGap_fromSeq...)
+	if !s.FromSeq.HasVal() {
+		buf = cbor.AppendJSONNull(buf)
+	} else {
+		buf = cbor.AppendJSONInt(buf, s.FromSeq.Val())
+	}
+	first = false
+	if s.Reason.HasVal() {
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_SelectedGap_reason...)
+		buf = cbor.AppendJSONString(buf, s.Reason.Val())
+		first = false
+	}
+	if !first {
+		buf = append(buf, ',')
+	}
+	buf = append(buf, jsonKey_JetstreamSubscribeEvents_SelectedGap_throughSeq...)
+	if !s.ThroughSeq.HasVal() {
+		buf = cbor.AppendJSONNull(buf)
+	} else {
+		buf = cbor.AppendJSONInt(buf, s.ThroughSeq.Val())
+	}
+	first = false
+	for _, ef := range s.extra {
+		if ef.Encoding != extraEncodingJSON {
+			continue
+		}
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = cbor.AppendJSONString(buf, ef.Key)
+		buf = append(buf, ':')
+		buf = append(buf, ef.Value...)
+		first = false
+	}
+	buf = append(buf, '}')
+	return buf, nil
+}
+
+func (s *JetstreamSubscribeEvents_SelectedGap) UnmarshalJSON(data []byte) error {
+	_, err := s.UnmarshalJSONAt(data, 0)
+	return err
+}
+
+func (s *JetstreamSubscribeEvents_SelectedGap) UnmarshalJSONAt(data []byte, pos int) (int, error) {
+	s.extra = clearExtra(s.extra, extraEncodingJSON)
+	var err error
+	pos, err = cbor.ReadJSONObjectStart(data, pos)
+	if err != nil {
+		return 0, err
+	}
+	for {
+		var done bool
+		pos, done = cbor.ReadJSONObjectEnd(data, pos)
+		if done {
+			return pos, nil
+		}
+		var key string
+		key, pos, err = cbor.ReadJSONKey(data, pos)
+		if err != nil {
+			return 0, err
+		}
+		switch key {
+		case "$type":
+			s.LexiconTypeID, pos, err = cbor.ReadJSONString(data, pos)
+			if err != nil {
+				return 0, err
+			}
+		case "collection":
+			if cbor.IsJSONNull(data, pos) {
+				pos, err = cbor.SkipJSONNull(data, pos)
+				if err != nil {
+					return 0, err
+				}
+			} else {
+				var v string
+				v, pos, err = cbor.ReadJSONString(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.Collection = gt.Some(v)
+			}
+		case "fromSeq":
+			if cbor.IsJSONNull(data, pos) {
+				pos, err = cbor.SkipJSONNull(data, pos)
+				if err != nil {
+					return 0, err
+				}
+			} else {
+				var v int64
+				v, pos, err = cbor.ReadJSONInt(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.FromSeq = gt.Some(v)
+			}
+		case "reason":
+			if cbor.IsJSONNull(data, pos) {
+				pos, err = cbor.SkipJSONNull(data, pos)
+				if err != nil {
+					return 0, err
+				}
+			} else {
+				var v string
+				v, pos, err = cbor.ReadJSONString(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.Reason = gt.Some(v)
+			}
+		case "throughSeq":
+			if cbor.IsJSONNull(data, pos) {
+				pos, err = cbor.SkipJSONNull(data, pos)
+				if err != nil {
+					return 0, err
+				}
+			} else {
+				var v int64
+				v, pos, err = cbor.ReadJSONInt(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.ThroughSeq = gt.Some(v)
+			}
+		default:
+			valueStart := pos
+			pos, err = cbor.SkipJSONValue(data, pos)
+			if err != nil {
+				return 0, err
+			}
+			s.extra = append(s.extra, extraField{Key: key, Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingJSON})
+		}
+		pos = cbor.SkipJSONComma(data, pos)
+	}
+}
+
+// JetstreamSubscribeEvents_SelectedInfoMetadata is a "selectedInfoMetadata" in the network.bsky.jetstream.subscribeEvents schema.
+type JetstreamSubscribeEvents_SelectedInfoMetadata struct {
+	LexiconTypeID          string            `json:"$type,omitempty"`
+	Collections            json.RawMessage   `json:"collections,omitempty"` // Collection NSID array or null. Preserved as raw JSON so empty arrays and null survive typed-clien...
+	Contract               gt.Option[string] `json:"contract,omitzero"`
+	Coverage               gt.Option[string] `json:"coverage,omitzero"`
+	EffectiveAfterSeq      json.RawMessage   `json:"effectiveAfterSeq,omitempty"` // Sequence integer or explicit null; absent when this notice does not advertise this boundary. Raw ...
+	Gaps                   json.RawMessage   `json:"gaps,omitempty"`              // Array of selectedGap objects, including an empty array; absent on notices other than SelectedFeed...
+	HistoryMode            gt.Option[string] `json:"historyMode,omitzero"`
+	OriginalHistoryFromSeq json.RawMessage   `json:"originalHistoryFromSeq,omitempty"` // Sequence integer or explicit null; absent when this notice does not advertise this boundary. Raw ...
+	PolicyRev              gt.Option[int64]  `json:"policyRev,omitzero"`
+	PolicyRevision         gt.Option[int64]  `json:"policyRevision,omitzero"`
+	ReplayFloor            json.RawMessage   `json:"replayFloor,omitempty"` // Sequence integer or explicit null; absent when this notice does not advertise this boundary. Raw ...
+	StreamId               gt.Option[string] `json:"streamId,omitzero"`
+
+	// extra preserves unknown fields for same-format round-trips.
+	extra []extraField
+}
+
+// Precomputed CBOR key tokens for JetstreamSubscribeEvents_SelectedInfoMetadata.
+var (
+	cborKey_JetstreamSubscribeEvents_SelectedInfoMetadata_gaps                   = cbor.AppendTextKey(nil, "gaps")
+	cborKey_JetstreamSubscribeEvents_SelectedInfoMetadata_dollar_type            = cbor.AppendTextKey(nil, "$type")
+	cborKey_JetstreamSubscribeEvents_SelectedInfoMetadata_contract               = cbor.AppendTextKey(nil, "contract")
+	cborKey_JetstreamSubscribeEvents_SelectedInfoMetadata_coverage               = cbor.AppendTextKey(nil, "coverage")
+	cborKey_JetstreamSubscribeEvents_SelectedInfoMetadata_streamId               = cbor.AppendTextKey(nil, "streamId")
+	cborKey_JetstreamSubscribeEvents_SelectedInfoMetadata_policyRev              = cbor.AppendTextKey(nil, "policyRev")
+	cborKey_JetstreamSubscribeEvents_SelectedInfoMetadata_collections            = cbor.AppendTextKey(nil, "collections")
+	cborKey_JetstreamSubscribeEvents_SelectedInfoMetadata_historyMode            = cbor.AppendTextKey(nil, "historyMode")
+	cborKey_JetstreamSubscribeEvents_SelectedInfoMetadata_replayFloor            = cbor.AppendTextKey(nil, "replayFloor")
+	cborKey_JetstreamSubscribeEvents_SelectedInfoMetadata_policyRevision         = cbor.AppendTextKey(nil, "policyRevision")
+	cborKey_JetstreamSubscribeEvents_SelectedInfoMetadata_effectiveAfterSeq      = cbor.AppendTextKey(nil, "effectiveAfterSeq")
+	cborKey_JetstreamSubscribeEvents_SelectedInfoMetadata_originalHistoryFromSeq = cbor.AppendTextKey(nil, "originalHistoryFromSeq")
+)
+
+func (s *JetstreamSubscribeEvents_SelectedInfoMetadata) MarshalCBOR() ([]byte, error) {
+	return s.AppendCBOR(make([]byte, 0, 256))
+}
+
+func (s *JetstreamSubscribeEvents_SelectedInfoMetadata) AppendCBOR(buf []byte) ([]byte, error) {
+	n := 0 + countExtra(s.extra, extraEncodingCBOR)
+	if s.Gaps != nil {
+		n++
+	}
+	if s.LexiconTypeID != "" {
+		n++
+	}
+	if s.Contract.HasVal() {
+		n++
+	}
+	if s.Coverage.HasVal() {
+		n++
+	}
+	if s.StreamId.HasVal() {
+		n++
+	}
+	if s.PolicyRev.HasVal() {
+		n++
+	}
+	if s.Collections != nil {
+		n++
+	}
+	if s.HistoryMode.HasVal() {
+		n++
+	}
+	if s.ReplayFloor != nil {
+		n++
+	}
+	if s.PolicyRevision.HasVal() {
+		n++
+	}
+	if s.EffectiveAfterSeq != nil {
+		n++
+	}
+	if s.OriginalHistoryFromSeq != nil {
+		n++
+	}
+	buf = cbor.AppendMapHeader(buf, uint64(n))
+	if len(s.extra) > 0 {
+		ei := 0
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "gaps", buf)
+		if s.Gaps != nil {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedInfoMetadata_gaps...)
+			buf = cbor.AppendNull(buf)
+		}
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "$type", buf)
+		if s.LexiconTypeID != "" {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedInfoMetadata_dollar_type...)
+			buf = cbor.AppendText(buf, s.LexiconTypeID)
+		}
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "contract", buf)
+		if s.Contract.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedInfoMetadata_contract...)
+			buf = cbor.AppendText(buf, s.Contract.Val())
+		}
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "coverage", buf)
+		if s.Coverage.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedInfoMetadata_coverage...)
+			buf = cbor.AppendText(buf, s.Coverage.Val())
+		}
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "streamId", buf)
+		if s.StreamId.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedInfoMetadata_streamId...)
+			buf = cbor.AppendText(buf, s.StreamId.Val())
+		}
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "policyRev", buf)
+		if s.PolicyRev.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedInfoMetadata_policyRev...)
+			buf = cbor.AppendInt(buf, s.PolicyRev.Val())
+		}
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "collections", buf)
+		if s.Collections != nil {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedInfoMetadata_collections...)
+			buf = cbor.AppendNull(buf)
+		}
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "historyMode", buf)
+		if s.HistoryMode.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedInfoMetadata_historyMode...)
+			buf = cbor.AppendText(buf, s.HistoryMode.Val())
+		}
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "replayFloor", buf)
+		if s.ReplayFloor != nil {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedInfoMetadata_replayFloor...)
+			buf = cbor.AppendNull(buf)
+		}
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "policyRevision", buf)
+		if s.PolicyRevision.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedInfoMetadata_policyRevision...)
+			buf = cbor.AppendInt(buf, s.PolicyRevision.Val())
+		}
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "effectiveAfterSeq", buf)
+		if s.EffectiveAfterSeq != nil {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedInfoMetadata_effectiveAfterSeq...)
+			buf = cbor.AppendNull(buf)
+		}
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "originalHistoryFromSeq", buf)
+		if s.OriginalHistoryFromSeq != nil {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedInfoMetadata_originalHistoryFromSeq...)
+			buf = cbor.AppendNull(buf)
+		}
+		_, buf = appendCBORExtrasBefore(s.extra, ei, "", buf)
+	} else {
+		if s.Gaps != nil {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedInfoMetadata_gaps...)
+			buf = cbor.AppendNull(buf)
+		}
+		if s.LexiconTypeID != "" {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedInfoMetadata_dollar_type...)
+			buf = cbor.AppendText(buf, s.LexiconTypeID)
+		}
+		if s.Contract.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedInfoMetadata_contract...)
+			buf = cbor.AppendText(buf, s.Contract.Val())
+		}
+		if s.Coverage.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedInfoMetadata_coverage...)
+			buf = cbor.AppendText(buf, s.Coverage.Val())
+		}
+		if s.StreamId.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedInfoMetadata_streamId...)
+			buf = cbor.AppendText(buf, s.StreamId.Val())
+		}
+		if s.PolicyRev.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedInfoMetadata_policyRev...)
+			buf = cbor.AppendInt(buf, s.PolicyRev.Val())
+		}
+		if s.Collections != nil {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedInfoMetadata_collections...)
+			buf = cbor.AppendNull(buf)
+		}
+		if s.HistoryMode.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedInfoMetadata_historyMode...)
+			buf = cbor.AppendText(buf, s.HistoryMode.Val())
+		}
+		if s.ReplayFloor != nil {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedInfoMetadata_replayFloor...)
+			buf = cbor.AppendNull(buf)
+		}
+		if s.PolicyRevision.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedInfoMetadata_policyRevision...)
+			buf = cbor.AppendInt(buf, s.PolicyRevision.Val())
+		}
+		if s.EffectiveAfterSeq != nil {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedInfoMetadata_effectiveAfterSeq...)
+			buf = cbor.AppendNull(buf)
+		}
+		if s.OriginalHistoryFromSeq != nil {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedInfoMetadata_originalHistoryFromSeq...)
+			buf = cbor.AppendNull(buf)
+		}
+	}
+	return buf, nil
+}
+
+func (s *JetstreamSubscribeEvents_SelectedInfoMetadata) UnmarshalCBOR(data []byte) error {
+	_, err := s.UnmarshalCBORAt(data, 0)
+	return err
+}
+
+func (s *JetstreamSubscribeEvents_SelectedInfoMetadata) UnmarshalCBORAt(data []byte, pos int) (int, error) {
+	s.extra = clearExtra(s.extra, extraEncodingCBOR)
+	count, pos, err := cbor.ReadMapHeader(data, pos)
+	if err != nil {
+		return 0, err
+	}
+	for i := uint64(0); i < count; i++ {
+		keyStart, keyEnd, newPos, err := cbor.ReadTextKey(data, pos)
+		if err != nil {
+			return 0, err
+		}
+		pos = newPos
+		switch keyEnd - keyStart {
+		case 4:
+			if string(data[keyStart:keyEnd]) == "gaps" {
+				pos, err = cbor.SkipValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+			} else {
+				valueStart := pos
+				pos, err = cbor.SkipValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
+			}
+		case 5:
+			if string(data[keyStart:keyEnd]) == "$type" {
+				s.LexiconTypeID, pos, err = cbor.ReadText(data, pos)
+				if err != nil {
+					return 0, err
+				}
+			} else {
+				valueStart := pos
+				pos, err = cbor.SkipValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
+			}
+		case 8:
+			if string(data[keyStart:keyEnd]) == "contract" {
+				if cbor.IsNull(data, pos) {
+					pos++
+				} else {
+					var v string
+					v, pos, err = cbor.ReadText(data, pos)
+					if err != nil {
+						return 0, err
+					}
+					s.Contract = gt.Some(v)
+				}
+			} else if string(data[keyStart:keyEnd]) == "coverage" {
+				if cbor.IsNull(data, pos) {
+					pos++
+				} else {
+					var v string
+					v, pos, err = cbor.ReadText(data, pos)
+					if err != nil {
+						return 0, err
+					}
+					s.Coverage = gt.Some(v)
+				}
+			} else if string(data[keyStart:keyEnd]) == "streamId" {
+				if cbor.IsNull(data, pos) {
+					pos++
+				} else {
+					var v string
+					v, pos, err = cbor.ReadText(data, pos)
+					if err != nil {
+						return 0, err
+					}
+					s.StreamId = gt.Some(v)
+				}
+			} else {
+				valueStart := pos
+				pos, err = cbor.SkipValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
+			}
+		case 9:
+			if string(data[keyStart:keyEnd]) == "policyRev" {
+				if cbor.IsNull(data, pos) {
+					pos++
+				} else {
+					var v int64
+					v, pos, err = cbor.ReadInt(data, pos)
+					if err != nil {
+						return 0, err
+					}
+					s.PolicyRev = gt.Some(v)
+				}
+			} else {
+				valueStart := pos
+				pos, err = cbor.SkipValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
+			}
+		case 11:
+			if string(data[keyStart:keyEnd]) == "collections" {
+				pos, err = cbor.SkipValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+			} else if string(data[keyStart:keyEnd]) == "historyMode" {
+				if cbor.IsNull(data, pos) {
+					pos++
+				} else {
+					var v string
+					v, pos, err = cbor.ReadText(data, pos)
+					if err != nil {
+						return 0, err
+					}
+					s.HistoryMode = gt.Some(v)
+				}
+			} else if string(data[keyStart:keyEnd]) == "replayFloor" {
+				pos, err = cbor.SkipValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+			} else {
+				valueStart := pos
+				pos, err = cbor.SkipValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
+			}
+		case 14:
+			if string(data[keyStart:keyEnd]) == "policyRevision" {
+				if cbor.IsNull(data, pos) {
+					pos++
+				} else {
+					var v int64
+					v, pos, err = cbor.ReadInt(data, pos)
+					if err != nil {
+						return 0, err
+					}
+					s.PolicyRevision = gt.Some(v)
+				}
+			} else {
+				valueStart := pos
+				pos, err = cbor.SkipValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
+			}
+		case 17:
+			if string(data[keyStart:keyEnd]) == "effectiveAfterSeq" {
+				pos, err = cbor.SkipValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+			} else {
+				valueStart := pos
+				pos, err = cbor.SkipValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
+			}
+		case 22:
+			if string(data[keyStart:keyEnd]) == "originalHistoryFromSeq" {
+				pos, err = cbor.SkipValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+			} else {
+				valueStart := pos
+				pos, err = cbor.SkipValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
+			}
+		default:
+			valueStart := pos
+			pos, err = cbor.SkipValue(data, pos)
+			if err != nil {
+				return 0, err
+			}
+			s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
+		}
+	}
+	return pos, nil
+}
+
+// Precomputed JSON key tokens for JetstreamSubscribeEvents_SelectedInfoMetadata.
+var (
+	jsonKey_JetstreamSubscribeEvents_SelectedInfoMetadata_dollar_type            = []byte("\"$type\":")
+	jsonKey_JetstreamSubscribeEvents_SelectedInfoMetadata_collections            = []byte("\"collections\":")
+	jsonKey_JetstreamSubscribeEvents_SelectedInfoMetadata_contract               = []byte("\"contract\":")
+	jsonKey_JetstreamSubscribeEvents_SelectedInfoMetadata_coverage               = []byte("\"coverage\":")
+	jsonKey_JetstreamSubscribeEvents_SelectedInfoMetadata_effectiveAfterSeq      = []byte("\"effectiveAfterSeq\":")
+	jsonKey_JetstreamSubscribeEvents_SelectedInfoMetadata_gaps                   = []byte("\"gaps\":")
+	jsonKey_JetstreamSubscribeEvents_SelectedInfoMetadata_historyMode            = []byte("\"historyMode\":")
+	jsonKey_JetstreamSubscribeEvents_SelectedInfoMetadata_originalHistoryFromSeq = []byte("\"originalHistoryFromSeq\":")
+	jsonKey_JetstreamSubscribeEvents_SelectedInfoMetadata_policyRev              = []byte("\"policyRev\":")
+	jsonKey_JetstreamSubscribeEvents_SelectedInfoMetadata_policyRevision         = []byte("\"policyRevision\":")
+	jsonKey_JetstreamSubscribeEvents_SelectedInfoMetadata_replayFloor            = []byte("\"replayFloor\":")
+	jsonKey_JetstreamSubscribeEvents_SelectedInfoMetadata_streamId               = []byte("\"streamId\":")
+)
+
+func (s *JetstreamSubscribeEvents_SelectedInfoMetadata) MarshalJSON() ([]byte, error) {
+	return s.AppendJSON(make([]byte, 0, 256))
+}
+
+func (s *JetstreamSubscribeEvents_SelectedInfoMetadata) AppendJSON(buf []byte) ([]byte, error) {
+	buf = append(buf, '{')
+	first := true
+	if s.LexiconTypeID != "" {
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_SelectedInfoMetadata_dollar_type...)
+		buf = cbor.AppendJSONString(buf, s.LexiconTypeID)
+		first = false
+	}
+	if s.Collections != nil {
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_SelectedInfoMetadata_collections...)
+		buf = append(buf, s.Collections...)
+		first = false
+	}
+	if s.Contract.HasVal() {
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_SelectedInfoMetadata_contract...)
+		buf = cbor.AppendJSONString(buf, s.Contract.Val())
+		first = false
+	}
+	if s.Coverage.HasVal() {
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_SelectedInfoMetadata_coverage...)
+		buf = cbor.AppendJSONString(buf, s.Coverage.Val())
+		first = false
+	}
+	if s.EffectiveAfterSeq != nil {
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_SelectedInfoMetadata_effectiveAfterSeq...)
+		buf = append(buf, s.EffectiveAfterSeq...)
+		first = false
+	}
+	if s.Gaps != nil {
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_SelectedInfoMetadata_gaps...)
+		buf = append(buf, s.Gaps...)
+		first = false
+	}
+	if s.HistoryMode.HasVal() {
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_SelectedInfoMetadata_historyMode...)
+		buf = cbor.AppendJSONString(buf, s.HistoryMode.Val())
+		first = false
+	}
+	if s.OriginalHistoryFromSeq != nil {
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_SelectedInfoMetadata_originalHistoryFromSeq...)
+		buf = append(buf, s.OriginalHistoryFromSeq...)
+		first = false
+	}
+	if s.PolicyRev.HasVal() {
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_SelectedInfoMetadata_policyRev...)
+		buf = cbor.AppendJSONInt(buf, s.PolicyRev.Val())
+		first = false
+	}
+	if s.PolicyRevision.HasVal() {
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_SelectedInfoMetadata_policyRevision...)
+		buf = cbor.AppendJSONInt(buf, s.PolicyRevision.Val())
+		first = false
+	}
+	if s.ReplayFloor != nil {
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_SelectedInfoMetadata_replayFloor...)
+		buf = append(buf, s.ReplayFloor...)
+		first = false
+	}
+	if s.StreamId.HasVal() {
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_SelectedInfoMetadata_streamId...)
+		buf = cbor.AppendJSONString(buf, s.StreamId.Val())
+		first = false
+	}
+	for _, ef := range s.extra {
+		if ef.Encoding != extraEncodingJSON {
+			continue
+		}
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = cbor.AppendJSONString(buf, ef.Key)
+		buf = append(buf, ':')
+		buf = append(buf, ef.Value...)
+		first = false
+	}
+	buf = append(buf, '}')
+	return buf, nil
+}
+
+func (s *JetstreamSubscribeEvents_SelectedInfoMetadata) UnmarshalJSON(data []byte) error {
+	_, err := s.UnmarshalJSONAt(data, 0)
+	return err
+}
+
+func (s *JetstreamSubscribeEvents_SelectedInfoMetadata) UnmarshalJSONAt(data []byte, pos int) (int, error) {
+	s.extra = clearExtra(s.extra, extraEncodingJSON)
+	var err error
+	pos, err = cbor.ReadJSONObjectStart(data, pos)
+	if err != nil {
+		return 0, err
+	}
+	for {
+		var done bool
+		pos, done = cbor.ReadJSONObjectEnd(data, pos)
+		if done {
+			return pos, nil
+		}
+		var key string
+		key, pos, err = cbor.ReadJSONKey(data, pos)
+		if err != nil {
+			return 0, err
+		}
+		switch key {
+		case "$type":
+			s.LexiconTypeID, pos, err = cbor.ReadJSONString(data, pos)
+			if err != nil {
+				return 0, err
+			}
+		case "collections":
+			{
+				start := pos
+				pos, err = cbor.SkipJSONValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.Collections = json.RawMessage(data[start:pos])
+			}
+		case "contract":
+			if cbor.IsJSONNull(data, pos) {
+				pos, err = cbor.SkipJSONNull(data, pos)
+				if err != nil {
+					return 0, err
+				}
+			} else {
+				var v string
+				v, pos, err = cbor.ReadJSONString(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.Contract = gt.Some(v)
+			}
+		case "coverage":
+			if cbor.IsJSONNull(data, pos) {
+				pos, err = cbor.SkipJSONNull(data, pos)
+				if err != nil {
+					return 0, err
+				}
+			} else {
+				var v string
+				v, pos, err = cbor.ReadJSONString(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.Coverage = gt.Some(v)
+			}
+		case "effectiveAfterSeq":
+			{
+				start := pos
+				pos, err = cbor.SkipJSONValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.EffectiveAfterSeq = json.RawMessage(data[start:pos])
+			}
+		case "gaps":
+			{
+				start := pos
+				pos, err = cbor.SkipJSONValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.Gaps = json.RawMessage(data[start:pos])
+			}
+		case "historyMode":
+			if cbor.IsJSONNull(data, pos) {
+				pos, err = cbor.SkipJSONNull(data, pos)
+				if err != nil {
+					return 0, err
+				}
+			} else {
+				var v string
+				v, pos, err = cbor.ReadJSONString(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.HistoryMode = gt.Some(v)
+			}
+		case "originalHistoryFromSeq":
+			{
+				start := pos
+				pos, err = cbor.SkipJSONValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.OriginalHistoryFromSeq = json.RawMessage(data[start:pos])
+			}
+		case "policyRev":
+			if cbor.IsJSONNull(data, pos) {
+				pos, err = cbor.SkipJSONNull(data, pos)
+				if err != nil {
+					return 0, err
+				}
+			} else {
+				var v int64
+				v, pos, err = cbor.ReadJSONInt(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.PolicyRev = gt.Some(v)
+			}
+		case "policyRevision":
+			if cbor.IsJSONNull(data, pos) {
+				pos, err = cbor.SkipJSONNull(data, pos)
+				if err != nil {
+					return 0, err
+				}
+			} else {
+				var v int64
+				v, pos, err = cbor.ReadJSONInt(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.PolicyRevision = gt.Some(v)
+			}
+		case "replayFloor":
+			{
+				start := pos
+				pos, err = cbor.SkipJSONValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.ReplayFloor = json.RawMessage(data[start:pos])
+			}
+		case "streamId":
+			if cbor.IsJSONNull(data, pos) {
+				pos, err = cbor.SkipJSONNull(data, pos)
+				if err != nil {
+					return 0, err
+				}
+			} else {
+				var v string
+				v, pos, err = cbor.ReadJSONString(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.StreamId = gt.Some(v)
+			}
+		default:
+			valueStart := pos
+			pos, err = cbor.SkipJSONValue(data, pos)
+			if err != nil {
+				return 0, err
+			}
+			s.extra = append(s.extra, extraField{Key: key, Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingJSON})
+		}
+		pos = cbor.SkipJSONComma(data, pos)
+	}
+}
+
 // JetstreamSubscribeEvents_SelectedMetadata is a "selectedMetadata" in the network.bsky.jetstream.subscribeEvents schema.
 //
 // Optional Hypercerts metadata present only when contract=hypercerts-selected-v1 is negotiated. Ordinary v2 frames omit it.
 type JetstreamSubscribeEvents_SelectedMetadata struct {
-	LexiconTypeID          string            `json:"$type,omitempty"`
-	PolicyRev              gt.Option[int64]  `json:"policyRev,omitzero"`
-	Provenance             gt.Option[string] `json:"provenance,omitzero"`
-	ReconciliationBoundary json.RawMessage   `json:"reconciliationBoundary,omitempty"`
-	ReconciliationRequired gt.Option[bool]   `json:"reconciliationRequired,omitzero"`
-	Scope                  json.RawMessage   `json:"scope,omitempty"`
-	StreamId               gt.Option[string] `json:"streamId,omitzero"`
+	LexiconTypeID          string                                                             `json:"$type,omitempty"`
+	PolicyRev              gt.Option[int64]                                                   `json:"policyRev"`
+	Provenance             gt.Option[string]                                                  `json:"provenance,omitzero"`
+	ReconciliationBoundary gt.Option[JetstreamSubscribeEvents_SelectedReconciliationBoundary] `json:"reconciliationBoundary,omitzero"`
+	ReconciliationRequired gt.Option[bool]                                                    `json:"reconciliationRequired,omitzero"`
+	Scope                  gt.Option[JetstreamSubscribeEvents_SelectedSyncScope]              `json:"scope,omitzero"`
+	StreamId               gt.Option[string]                                                  `json:"streamId,omitzero"`
 
 	// extra preserves unknown fields for same-format round-trips.
 	extra []extraField
@@ -1576,23 +2989,20 @@ func (s *JetstreamSubscribeEvents_SelectedMetadata) MarshalCBOR() ([]byte, error
 }
 
 func (s *JetstreamSubscribeEvents_SelectedMetadata) AppendCBOR(buf []byte) ([]byte, error) {
-	n := 0 + countExtra(s.extra, extraEncodingCBOR)
+	n := 1 + countExtra(s.extra, extraEncodingCBOR)
 	if s.LexiconTypeID != "" {
 		n++
 	}
-	if s.Scope != nil {
+	if s.Scope.HasVal() {
 		n++
 	}
 	if s.StreamId.HasVal() {
 		n++
 	}
-	if s.PolicyRev.HasVal() {
-		n++
-	}
 	if s.Provenance.HasVal() {
 		n++
 	}
-	if s.ReconciliationBoundary != nil {
+	if s.ReconciliationBoundary.HasVal() {
 		n++
 	}
 	if s.ReconciliationRequired.HasVal() {
@@ -1607,9 +3017,18 @@ func (s *JetstreamSubscribeEvents_SelectedMetadata) AppendCBOR(buf []byte) ([]by
 			buf = cbor.AppendText(buf, s.LexiconTypeID)
 		}
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "scope", buf)
-		if s.Scope != nil {
+		if s.Scope.HasVal() {
 			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedMetadata_scope...)
-			buf = cbor.AppendNull(buf)
+			{
+				v := s.Scope.Val()
+				{
+					var err error
+					buf, err = v.AppendCBOR(buf)
+					if err != nil {
+						return nil, err
+					}
+				}
+			}
 		}
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "streamId", buf)
 		if s.StreamId.HasVal() {
@@ -1617,8 +3036,10 @@ func (s *JetstreamSubscribeEvents_SelectedMetadata) AppendCBOR(buf []byte) ([]by
 			buf = cbor.AppendText(buf, s.StreamId.Val())
 		}
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "policyRev", buf)
-		if s.PolicyRev.HasVal() {
-			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedMetadata_policyRev...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedMetadata_policyRev...)
+		if !s.PolicyRev.HasVal() {
+			buf = cbor.AppendNull(buf)
+		} else {
 			buf = cbor.AppendInt(buf, s.PolicyRev.Val())
 		}
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "provenance", buf)
@@ -1627,9 +3048,18 @@ func (s *JetstreamSubscribeEvents_SelectedMetadata) AppendCBOR(buf []byte) ([]by
 			buf = cbor.AppendText(buf, s.Provenance.Val())
 		}
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "reconciliationBoundary", buf)
-		if s.ReconciliationBoundary != nil {
+		if s.ReconciliationBoundary.HasVal() {
 			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedMetadata_reconciliationBoundary...)
-			buf = cbor.AppendNull(buf)
+			{
+				v := s.ReconciliationBoundary.Val()
+				{
+					var err error
+					buf, err = v.AppendCBOR(buf)
+					if err != nil {
+						return nil, err
+					}
+				}
+			}
 		}
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "reconciliationRequired", buf)
 		if s.ReconciliationRequired.HasVal() {
@@ -1642,25 +3072,45 @@ func (s *JetstreamSubscribeEvents_SelectedMetadata) AppendCBOR(buf []byte) ([]by
 			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedMetadata_dollar_type...)
 			buf = cbor.AppendText(buf, s.LexiconTypeID)
 		}
-		if s.Scope != nil {
+		if s.Scope.HasVal() {
 			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedMetadata_scope...)
-			buf = cbor.AppendNull(buf)
+			{
+				v := s.Scope.Val()
+				{
+					var err error
+					buf, err = v.AppendCBOR(buf)
+					if err != nil {
+						return nil, err
+					}
+				}
+			}
 		}
 		if s.StreamId.HasVal() {
 			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedMetadata_streamId...)
 			buf = cbor.AppendText(buf, s.StreamId.Val())
 		}
-		if s.PolicyRev.HasVal() {
-			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedMetadata_policyRev...)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedMetadata_policyRev...)
+		if !s.PolicyRev.HasVal() {
+			buf = cbor.AppendNull(buf)
+		} else {
 			buf = cbor.AppendInt(buf, s.PolicyRev.Val())
 		}
 		if s.Provenance.HasVal() {
 			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedMetadata_provenance...)
 			buf = cbor.AppendText(buf, s.Provenance.Val())
 		}
-		if s.ReconciliationBoundary != nil {
+		if s.ReconciliationBoundary.HasVal() {
 			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedMetadata_reconciliationBoundary...)
-			buf = cbor.AppendNull(buf)
+			{
+				v := s.ReconciliationBoundary.Val()
+				{
+					var err error
+					buf, err = v.AppendCBOR(buf)
+					if err != nil {
+						return nil, err
+					}
+				}
+			}
 		}
 		if s.ReconciliationRequired.HasVal() {
 			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedMetadata_reconciliationRequired...)
@@ -1695,9 +3145,15 @@ func (s *JetstreamSubscribeEvents_SelectedMetadata) UnmarshalCBORAt(data []byte,
 					return 0, err
 				}
 			} else if string(data[keyStart:keyEnd]) == "scope" {
-				pos, err = cbor.SkipValue(data, pos)
-				if err != nil {
-					return 0, err
+				if cbor.IsNull(data, pos) {
+					pos++
+				} else {
+					var v JetstreamSubscribeEvents_SelectedSyncScope
+					pos, err = v.UnmarshalCBORAt(data, pos)
+					if err != nil {
+						return 0, err
+					}
+					s.Scope = gt.Some(v)
 				}
 			} else {
 				valueStart := pos
@@ -1769,9 +3225,15 @@ func (s *JetstreamSubscribeEvents_SelectedMetadata) UnmarshalCBORAt(data []byte,
 			}
 		case 22:
 			if string(data[keyStart:keyEnd]) == "reconciliationBoundary" {
-				pos, err = cbor.SkipValue(data, pos)
-				if err != nil {
-					return 0, err
+				if cbor.IsNull(data, pos) {
+					pos++
+				} else {
+					var v JetstreamSubscribeEvents_SelectedReconciliationBoundary
+					pos, err = v.UnmarshalCBORAt(data, pos)
+					if err != nil {
+						return 0, err
+					}
+					s.ReconciliationBoundary = gt.Some(v)
 				}
 			} else if string(data[keyStart:keyEnd]) == "reconciliationRequired" {
 				if cbor.IsNull(data, pos) {
@@ -1830,14 +3292,16 @@ func (s *JetstreamSubscribeEvents_SelectedMetadata) AppendJSON(buf []byte) ([]by
 		buf = cbor.AppendJSONString(buf, s.LexiconTypeID)
 		first = false
 	}
-	if s.PolicyRev.HasVal() {
-		if !first {
-			buf = append(buf, ',')
-		}
-		buf = append(buf, jsonKey_JetstreamSubscribeEvents_SelectedMetadata_policyRev...)
-		buf = cbor.AppendJSONInt(buf, s.PolicyRev.Val())
-		first = false
+	if !first {
+		buf = append(buf, ',')
 	}
+	buf = append(buf, jsonKey_JetstreamSubscribeEvents_SelectedMetadata_policyRev...)
+	if !s.PolicyRev.HasVal() {
+		buf = cbor.AppendJSONNull(buf)
+	} else {
+		buf = cbor.AppendJSONInt(buf, s.PolicyRev.Val())
+	}
+	first = false
 	if s.Provenance.HasVal() {
 		if !first {
 			buf = append(buf, ',')
@@ -1846,12 +3310,21 @@ func (s *JetstreamSubscribeEvents_SelectedMetadata) AppendJSON(buf []byte) ([]by
 		buf = cbor.AppendJSONString(buf, s.Provenance.Val())
 		first = false
 	}
-	if s.ReconciliationBoundary != nil {
+	if s.ReconciliationBoundary.HasVal() {
 		if !first {
 			buf = append(buf, ',')
 		}
 		buf = append(buf, jsonKey_JetstreamSubscribeEvents_SelectedMetadata_reconciliationBoundary...)
-		buf = append(buf, s.ReconciliationBoundary...)
+		{
+			v := s.ReconciliationBoundary.Val()
+			{
+				var err error
+				buf, err = v.AppendJSON(buf)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
 		first = false
 	}
 	if s.ReconciliationRequired.HasVal() {
@@ -1862,12 +3335,21 @@ func (s *JetstreamSubscribeEvents_SelectedMetadata) AppendJSON(buf []byte) ([]by
 		buf = cbor.AppendJSONBool(buf, s.ReconciliationRequired.Val())
 		first = false
 	}
-	if s.Scope != nil {
+	if s.Scope.HasVal() {
 		if !first {
 			buf = append(buf, ',')
 		}
 		buf = append(buf, jsonKey_JetstreamSubscribeEvents_SelectedMetadata_scope...)
-		buf = append(buf, s.Scope...)
+		{
+			v := s.Scope.Val()
+			{
+				var err error
+				buf, err = v.AppendJSON(buf)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
 		first = false
 	}
 	if s.StreamId.HasVal() {
@@ -1952,13 +3434,18 @@ func (s *JetstreamSubscribeEvents_SelectedMetadata) UnmarshalJSONAt(data []byte,
 				s.Provenance = gt.Some(v)
 			}
 		case "reconciliationBoundary":
-			{
-				start := pos
-				pos, err = cbor.SkipJSONValue(data, pos)
+			if cbor.IsJSONNull(data, pos) {
+				pos, err = cbor.SkipJSONNull(data, pos)
 				if err != nil {
 					return 0, err
 				}
-				s.ReconciliationBoundary = json.RawMessage(data[start:pos])
+			} else {
+				var v JetstreamSubscribeEvents_SelectedReconciliationBoundary
+				pos, err = v.UnmarshalJSONAt(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.ReconciliationBoundary = gt.Some(v)
 			}
 		case "reconciliationRequired":
 			if cbor.IsJSONNull(data, pos) {
@@ -1975,13 +3462,18 @@ func (s *JetstreamSubscribeEvents_SelectedMetadata) UnmarshalJSONAt(data []byte,
 				s.ReconciliationRequired = gt.Some(v)
 			}
 		case "scope":
-			{
-				start := pos
-				pos, err = cbor.SkipJSONValue(data, pos)
+			if cbor.IsJSONNull(data, pos) {
+				pos, err = cbor.SkipJSONNull(data, pos)
 				if err != nil {
 					return 0, err
 				}
-				s.Scope = json.RawMessage(data[start:pos])
+			} else {
+				var v JetstreamSubscribeEvents_SelectedSyncScope
+				pos, err = v.UnmarshalJSONAt(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.Scope = gt.Some(v)
 			}
 		case "streamId":
 			if cbor.IsJSONNull(data, pos) {
@@ -2009,15 +3501,561 @@ func (s *JetstreamSubscribeEvents_SelectedMetadata) UnmarshalJSONAt(data []byte,
 	}
 }
 
+// JetstreamSubscribeEvents_SelectedReconciliationBoundary is a "selectedReconciliationBoundary" in the network.bsky.jetstream.subscribeEvents schema.
+type JetstreamSubscribeEvents_SelectedReconciliationBoundary struct {
+	LexiconTypeID string            `json:"$type,omitempty"`
+	Seq           gt.Option[int64]  `json:"seq"`
+	SnapshotId    gt.Option[string] `json:"snapshotId"`
+
+	// extra preserves unknown fields for same-format round-trips.
+	extra []extraField
+}
+
+// Precomputed CBOR key tokens for JetstreamSubscribeEvents_SelectedReconciliationBoundary.
+var (
+	cborKey_JetstreamSubscribeEvents_SelectedReconciliationBoundary_seq         = cbor.AppendTextKey(nil, "seq")
+	cborKey_JetstreamSubscribeEvents_SelectedReconciliationBoundary_dollar_type = cbor.AppendTextKey(nil, "$type")
+	cborKey_JetstreamSubscribeEvents_SelectedReconciliationBoundary_snapshotId  = cbor.AppendTextKey(nil, "snapshotId")
+)
+
+func (s *JetstreamSubscribeEvents_SelectedReconciliationBoundary) MarshalCBOR() ([]byte, error) {
+	return s.AppendCBOR(make([]byte, 0, 256))
+}
+
+func (s *JetstreamSubscribeEvents_SelectedReconciliationBoundary) AppendCBOR(buf []byte) ([]byte, error) {
+	n := 2 + countExtra(s.extra, extraEncodingCBOR)
+	if s.LexiconTypeID != "" {
+		n++
+	}
+	buf = cbor.AppendMapHeader(buf, uint64(n))
+	if len(s.extra) > 0 {
+		ei := 0
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "seq", buf)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedReconciliationBoundary_seq...)
+		if !s.Seq.HasVal() {
+			buf = cbor.AppendNull(buf)
+		} else {
+			buf = cbor.AppendInt(buf, s.Seq.Val())
+		}
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "$type", buf)
+		if s.LexiconTypeID != "" {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedReconciliationBoundary_dollar_type...)
+			buf = cbor.AppendText(buf, s.LexiconTypeID)
+		}
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "snapshotId", buf)
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedReconciliationBoundary_snapshotId...)
+		if !s.SnapshotId.HasVal() {
+			buf = cbor.AppendNull(buf)
+		} else {
+			buf = cbor.AppendText(buf, s.SnapshotId.Val())
+		}
+		_, buf = appendCBORExtrasBefore(s.extra, ei, "", buf)
+	} else {
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedReconciliationBoundary_seq...)
+		if !s.Seq.HasVal() {
+			buf = cbor.AppendNull(buf)
+		} else {
+			buf = cbor.AppendInt(buf, s.Seq.Val())
+		}
+		if s.LexiconTypeID != "" {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedReconciliationBoundary_dollar_type...)
+			buf = cbor.AppendText(buf, s.LexiconTypeID)
+		}
+		buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedReconciliationBoundary_snapshotId...)
+		if !s.SnapshotId.HasVal() {
+			buf = cbor.AppendNull(buf)
+		} else {
+			buf = cbor.AppendText(buf, s.SnapshotId.Val())
+		}
+	}
+	return buf, nil
+}
+
+func (s *JetstreamSubscribeEvents_SelectedReconciliationBoundary) UnmarshalCBOR(data []byte) error {
+	_, err := s.UnmarshalCBORAt(data, 0)
+	return err
+}
+
+func (s *JetstreamSubscribeEvents_SelectedReconciliationBoundary) UnmarshalCBORAt(data []byte, pos int) (int, error) {
+	s.extra = clearExtra(s.extra, extraEncodingCBOR)
+	count, pos, err := cbor.ReadMapHeader(data, pos)
+	if err != nil {
+		return 0, err
+	}
+	for i := uint64(0); i < count; i++ {
+		keyStart, keyEnd, newPos, err := cbor.ReadTextKey(data, pos)
+		if err != nil {
+			return 0, err
+		}
+		pos = newPos
+		switch keyEnd - keyStart {
+		case 3:
+			if string(data[keyStart:keyEnd]) == "seq" {
+				if cbor.IsNull(data, pos) {
+					pos++
+				} else {
+					var v int64
+					v, pos, err = cbor.ReadInt(data, pos)
+					if err != nil {
+						return 0, err
+					}
+					s.Seq = gt.Some(v)
+				}
+			} else {
+				valueStart := pos
+				pos, err = cbor.SkipValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
+			}
+		case 5:
+			if string(data[keyStart:keyEnd]) == "$type" {
+				s.LexiconTypeID, pos, err = cbor.ReadText(data, pos)
+				if err != nil {
+					return 0, err
+				}
+			} else {
+				valueStart := pos
+				pos, err = cbor.SkipValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
+			}
+		case 10:
+			if string(data[keyStart:keyEnd]) == "snapshotId" {
+				if cbor.IsNull(data, pos) {
+					pos++
+				} else {
+					var v string
+					v, pos, err = cbor.ReadText(data, pos)
+					if err != nil {
+						return 0, err
+					}
+					s.SnapshotId = gt.Some(v)
+				}
+			} else {
+				valueStart := pos
+				pos, err = cbor.SkipValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
+			}
+		default:
+			valueStart := pos
+			pos, err = cbor.SkipValue(data, pos)
+			if err != nil {
+				return 0, err
+			}
+			s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
+		}
+	}
+	return pos, nil
+}
+
+// Precomputed JSON key tokens for JetstreamSubscribeEvents_SelectedReconciliationBoundary.
+var (
+	jsonKey_JetstreamSubscribeEvents_SelectedReconciliationBoundary_dollar_type = []byte("\"$type\":")
+	jsonKey_JetstreamSubscribeEvents_SelectedReconciliationBoundary_seq         = []byte("\"seq\":")
+	jsonKey_JetstreamSubscribeEvents_SelectedReconciliationBoundary_snapshotId  = []byte("\"snapshotId\":")
+)
+
+func (s *JetstreamSubscribeEvents_SelectedReconciliationBoundary) MarshalJSON() ([]byte, error) {
+	return s.AppendJSON(make([]byte, 0, 256))
+}
+
+func (s *JetstreamSubscribeEvents_SelectedReconciliationBoundary) AppendJSON(buf []byte) ([]byte, error) {
+	buf = append(buf, '{')
+	first := true
+	if s.LexiconTypeID != "" {
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_SelectedReconciliationBoundary_dollar_type...)
+		buf = cbor.AppendJSONString(buf, s.LexiconTypeID)
+		first = false
+	}
+	if !first {
+		buf = append(buf, ',')
+	}
+	buf = append(buf, jsonKey_JetstreamSubscribeEvents_SelectedReconciliationBoundary_seq...)
+	if !s.Seq.HasVal() {
+		buf = cbor.AppendJSONNull(buf)
+	} else {
+		buf = cbor.AppendJSONInt(buf, s.Seq.Val())
+	}
+	first = false
+	if !first {
+		buf = append(buf, ',')
+	}
+	buf = append(buf, jsonKey_JetstreamSubscribeEvents_SelectedReconciliationBoundary_snapshotId...)
+	if !s.SnapshotId.HasVal() {
+		buf = cbor.AppendJSONNull(buf)
+	} else {
+		buf = cbor.AppendJSONString(buf, s.SnapshotId.Val())
+	}
+	first = false
+	for _, ef := range s.extra {
+		if ef.Encoding != extraEncodingJSON {
+			continue
+		}
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = cbor.AppendJSONString(buf, ef.Key)
+		buf = append(buf, ':')
+		buf = append(buf, ef.Value...)
+		first = false
+	}
+	buf = append(buf, '}')
+	return buf, nil
+}
+
+func (s *JetstreamSubscribeEvents_SelectedReconciliationBoundary) UnmarshalJSON(data []byte) error {
+	_, err := s.UnmarshalJSONAt(data, 0)
+	return err
+}
+
+func (s *JetstreamSubscribeEvents_SelectedReconciliationBoundary) UnmarshalJSONAt(data []byte, pos int) (int, error) {
+	s.extra = clearExtra(s.extra, extraEncodingJSON)
+	var err error
+	pos, err = cbor.ReadJSONObjectStart(data, pos)
+	if err != nil {
+		return 0, err
+	}
+	for {
+		var done bool
+		pos, done = cbor.ReadJSONObjectEnd(data, pos)
+		if done {
+			return pos, nil
+		}
+		var key string
+		key, pos, err = cbor.ReadJSONKey(data, pos)
+		if err != nil {
+			return 0, err
+		}
+		switch key {
+		case "$type":
+			s.LexiconTypeID, pos, err = cbor.ReadJSONString(data, pos)
+			if err != nil {
+				return 0, err
+			}
+		case "seq":
+			if cbor.IsJSONNull(data, pos) {
+				pos, err = cbor.SkipJSONNull(data, pos)
+				if err != nil {
+					return 0, err
+				}
+			} else {
+				var v int64
+				v, pos, err = cbor.ReadJSONInt(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.Seq = gt.Some(v)
+			}
+		case "snapshotId":
+			if cbor.IsJSONNull(data, pos) {
+				pos, err = cbor.SkipJSONNull(data, pos)
+				if err != nil {
+					return 0, err
+				}
+			} else {
+				var v string
+				v, pos, err = cbor.ReadJSONString(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.SnapshotId = gt.Some(v)
+			}
+		default:
+			valueStart := pos
+			pos, err = cbor.SkipJSONValue(data, pos)
+			if err != nil {
+				return 0, err
+			}
+			s.extra = append(s.extra, extraField{Key: key, Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingJSON})
+		}
+		pos = cbor.SkipJSONComma(data, pos)
+	}
+}
+
+// JetstreamSubscribeEvents_SelectedSyncScope is a "selectedSyncScope" in the network.bsky.jetstream.subscribeEvents schema.
+type JetstreamSubscribeEvents_SelectedSyncScope struct {
+	LexiconTypeID string            `json:"$type,omitempty"`
+	Collections   json.RawMessage   `json:"collections,omitempty"` // Collection NSID array or null. Preserved as raw JSON so empty arrays and null survive typed-clien...
+	DID           gt.Option[string] `json:"did,omitzero"`
+
+	// extra preserves unknown fields for same-format round-trips.
+	extra []extraField
+}
+
+// Precomputed CBOR key tokens for JetstreamSubscribeEvents_SelectedSyncScope.
+var (
+	cborKey_JetstreamSubscribeEvents_SelectedSyncScope_did         = cbor.AppendTextKey(nil, "did")
+	cborKey_JetstreamSubscribeEvents_SelectedSyncScope_dollar_type = cbor.AppendTextKey(nil, "$type")
+	cborKey_JetstreamSubscribeEvents_SelectedSyncScope_collections = cbor.AppendTextKey(nil, "collections")
+)
+
+func (s *JetstreamSubscribeEvents_SelectedSyncScope) MarshalCBOR() ([]byte, error) {
+	return s.AppendCBOR(make([]byte, 0, 256))
+}
+
+func (s *JetstreamSubscribeEvents_SelectedSyncScope) AppendCBOR(buf []byte) ([]byte, error) {
+	n := 0 + countExtra(s.extra, extraEncodingCBOR)
+	if s.DID.HasVal() {
+		n++
+	}
+	if s.LexiconTypeID != "" {
+		n++
+	}
+	if s.Collections != nil {
+		n++
+	}
+	buf = cbor.AppendMapHeader(buf, uint64(n))
+	if len(s.extra) > 0 {
+		ei := 0
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "did", buf)
+		if s.DID.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedSyncScope_did...)
+			buf = cbor.AppendText(buf, s.DID.Val())
+		}
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "$type", buf)
+		if s.LexiconTypeID != "" {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedSyncScope_dollar_type...)
+			buf = cbor.AppendText(buf, s.LexiconTypeID)
+		}
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "collections", buf)
+		if s.Collections != nil {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedSyncScope_collections...)
+			buf = cbor.AppendNull(buf)
+		}
+		_, buf = appendCBORExtrasBefore(s.extra, ei, "", buf)
+	} else {
+		if s.DID.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedSyncScope_did...)
+			buf = cbor.AppendText(buf, s.DID.Val())
+		}
+		if s.LexiconTypeID != "" {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedSyncScope_dollar_type...)
+			buf = cbor.AppendText(buf, s.LexiconTypeID)
+		}
+		if s.Collections != nil {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedSyncScope_collections...)
+			buf = cbor.AppendNull(buf)
+		}
+	}
+	return buf, nil
+}
+
+func (s *JetstreamSubscribeEvents_SelectedSyncScope) UnmarshalCBOR(data []byte) error {
+	_, err := s.UnmarshalCBORAt(data, 0)
+	return err
+}
+
+func (s *JetstreamSubscribeEvents_SelectedSyncScope) UnmarshalCBORAt(data []byte, pos int) (int, error) {
+	s.extra = clearExtra(s.extra, extraEncodingCBOR)
+	count, pos, err := cbor.ReadMapHeader(data, pos)
+	if err != nil {
+		return 0, err
+	}
+	for i := uint64(0); i < count; i++ {
+		keyStart, keyEnd, newPos, err := cbor.ReadTextKey(data, pos)
+		if err != nil {
+			return 0, err
+		}
+		pos = newPos
+		switch keyEnd - keyStart {
+		case 3:
+			if string(data[keyStart:keyEnd]) == "did" {
+				if cbor.IsNull(data, pos) {
+					pos++
+				} else {
+					var v string
+					v, pos, err = cbor.ReadText(data, pos)
+					if err != nil {
+						return 0, err
+					}
+					s.DID = gt.Some(v)
+				}
+			} else {
+				valueStart := pos
+				pos, err = cbor.SkipValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
+			}
+		case 5:
+			if string(data[keyStart:keyEnd]) == "$type" {
+				s.LexiconTypeID, pos, err = cbor.ReadText(data, pos)
+				if err != nil {
+					return 0, err
+				}
+			} else {
+				valueStart := pos
+				pos, err = cbor.SkipValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
+			}
+		case 11:
+			if string(data[keyStart:keyEnd]) == "collections" {
+				pos, err = cbor.SkipValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+			} else {
+				valueStart := pos
+				pos, err = cbor.SkipValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
+			}
+		default:
+			valueStart := pos
+			pos, err = cbor.SkipValue(data, pos)
+			if err != nil {
+				return 0, err
+			}
+			s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
+		}
+	}
+	return pos, nil
+}
+
+// Precomputed JSON key tokens for JetstreamSubscribeEvents_SelectedSyncScope.
+var (
+	jsonKey_JetstreamSubscribeEvents_SelectedSyncScope_dollar_type = []byte("\"$type\":")
+	jsonKey_JetstreamSubscribeEvents_SelectedSyncScope_collections = []byte("\"collections\":")
+	jsonKey_JetstreamSubscribeEvents_SelectedSyncScope_did         = []byte("\"did\":")
+)
+
+func (s *JetstreamSubscribeEvents_SelectedSyncScope) MarshalJSON() ([]byte, error) {
+	return s.AppendJSON(make([]byte, 0, 256))
+}
+
+func (s *JetstreamSubscribeEvents_SelectedSyncScope) AppendJSON(buf []byte) ([]byte, error) {
+	buf = append(buf, '{')
+	first := true
+	if s.LexiconTypeID != "" {
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_SelectedSyncScope_dollar_type...)
+		buf = cbor.AppendJSONString(buf, s.LexiconTypeID)
+		first = false
+	}
+	if s.Collections != nil {
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_SelectedSyncScope_collections...)
+		buf = append(buf, s.Collections...)
+		first = false
+	}
+	if s.DID.HasVal() {
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_SelectedSyncScope_did...)
+		buf = cbor.AppendJSONString(buf, s.DID.Val())
+		first = false
+	}
+	for _, ef := range s.extra {
+		if ef.Encoding != extraEncodingJSON {
+			continue
+		}
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = cbor.AppendJSONString(buf, ef.Key)
+		buf = append(buf, ':')
+		buf = append(buf, ef.Value...)
+		first = false
+	}
+	buf = append(buf, '}')
+	return buf, nil
+}
+
+func (s *JetstreamSubscribeEvents_SelectedSyncScope) UnmarshalJSON(data []byte) error {
+	_, err := s.UnmarshalJSONAt(data, 0)
+	return err
+}
+
+func (s *JetstreamSubscribeEvents_SelectedSyncScope) UnmarshalJSONAt(data []byte, pos int) (int, error) {
+	s.extra = clearExtra(s.extra, extraEncodingJSON)
+	var err error
+	pos, err = cbor.ReadJSONObjectStart(data, pos)
+	if err != nil {
+		return 0, err
+	}
+	for {
+		var done bool
+		pos, done = cbor.ReadJSONObjectEnd(data, pos)
+		if done {
+			return pos, nil
+		}
+		var key string
+		key, pos, err = cbor.ReadJSONKey(data, pos)
+		if err != nil {
+			return 0, err
+		}
+		switch key {
+		case "$type":
+			s.LexiconTypeID, pos, err = cbor.ReadJSONString(data, pos)
+			if err != nil {
+				return 0, err
+			}
+		case "collections":
+			{
+				start := pos
+				pos, err = cbor.SkipJSONValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.Collections = json.RawMessage(data[start:pos])
+			}
+		case "did":
+			if cbor.IsJSONNull(data, pos) {
+				pos, err = cbor.SkipJSONNull(data, pos)
+				if err != nil {
+					return 0, err
+				}
+			} else {
+				var v string
+				v, pos, err = cbor.ReadJSONString(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.DID = gt.Some(v)
+			}
+		default:
+			valueStart := pos
+			pos, err = cbor.SkipJSONValue(data, pos)
+			if err != nil {
+				return 0, err
+			}
+			s.extra = append(s.extra, extraField{Key: key, Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingJSON})
+		}
+		pos = cbor.SkipJSONComma(data, pos)
+	}
+}
+
 // JetstreamSubscribeEvents_Sync is a "sync" in the network.bsky.jetstream.subscribeEvents schema.
 //
 // An archived #sync event (broken commit chain; consumers should resync the repo). Ordinary v2 subscriptions receive the upstream event; selected-contract subscriptions receive lifecycle metadata without CAR blocks or unselected operation payloads. Never emitted on the legacy v1 /subscribe wire.
 type JetstreamSubscribeEvents_Sync struct {
-	LexiconTypeID string                             `json:"$type,omitempty"`
-	DID           string                             `json:"did"`
-	Seq           int64                              `json:"seq"`
-	Sync          comatproto.SyncSubscribeRepos_Sync `json:"sync"` // The upstream event; its seq and time are the upstream relay's, not Jetstream's.
-	Time          string                             `json:"time"` // The time Jetstream witnessed this event, microsecond precision. Timestamp imports apply only to r...
+	LexiconTypeID string                                               `json:"$type,omitempty"`
+	DID           string                                               `json:"did"`
+	Hypercerts    gt.Option[JetstreamSubscribeEvents_SelectedMetadata] `json:"hypercerts,omitzero"`
+	Seq           int64                                                `json:"seq"`
+	Sync          comatproto.SyncSubscribeRepos_Sync                   `json:"sync"` // The upstream event; its seq and time are the upstream relay's, not Jetstream's.
+	Time          string                                               `json:"time"` // The time Jetstream witnessed this event, microsecond precision. Timestamp imports apply only to r...
 
 	// extra preserves unknown fields for same-format round-trips.
 	extra []extraField
@@ -2030,6 +4068,7 @@ var (
 	cborKey_JetstreamSubscribeEvents_Sync_sync        = cbor.AppendTextKey(nil, "sync")
 	cborKey_JetstreamSubscribeEvents_Sync_time        = cbor.AppendTextKey(nil, "time")
 	cborKey_JetstreamSubscribeEvents_Sync_dollar_type = cbor.AppendTextKey(nil, "$type")
+	cborKey_JetstreamSubscribeEvents_Sync_hypercerts  = cbor.AppendTextKey(nil, "hypercerts")
 )
 
 func (s *JetstreamSubscribeEvents_Sync) MarshalCBOR() ([]byte, error) {
@@ -2039,6 +4078,9 @@ func (s *JetstreamSubscribeEvents_Sync) MarshalCBOR() ([]byte, error) {
 func (s *JetstreamSubscribeEvents_Sync) AppendCBOR(buf []byte) ([]byte, error) {
 	n := 4 + countExtra(s.extra, extraEncodingCBOR)
 	if s.LexiconTypeID != "" {
+		n++
+	}
+	if s.Hypercerts.HasVal() {
 		n++
 	}
 	buf = cbor.AppendMapHeader(buf, uint64(n))
@@ -2067,6 +4109,20 @@ func (s *JetstreamSubscribeEvents_Sync) AppendCBOR(buf []byte) ([]byte, error) {
 			buf = append(buf, cborKey_JetstreamSubscribeEvents_Sync_dollar_type...)
 			buf = cbor.AppendText(buf, s.LexiconTypeID)
 		}
+		ei, buf = appendCBORExtrasBefore(s.extra, ei, "hypercerts", buf)
+		if s.Hypercerts.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_Sync_hypercerts...)
+			{
+				v := s.Hypercerts.Val()
+				{
+					var err error
+					buf, err = v.AppendCBOR(buf)
+					if err != nil {
+						return nil, err
+					}
+				}
+			}
+		}
 		_, buf = appendCBORExtrasBefore(s.extra, ei, "", buf)
 	} else {
 		buf = append(buf, cborKey_JetstreamSubscribeEvents_Sync_did...)
@@ -2086,6 +4142,19 @@ func (s *JetstreamSubscribeEvents_Sync) AppendCBOR(buf []byte) ([]byte, error) {
 		if s.LexiconTypeID != "" {
 			buf = append(buf, cborKey_JetstreamSubscribeEvents_Sync_dollar_type...)
 			buf = cbor.AppendText(buf, s.LexiconTypeID)
+		}
+		if s.Hypercerts.HasVal() {
+			buf = append(buf, cborKey_JetstreamSubscribeEvents_Sync_hypercerts...)
+			{
+				v := s.Hypercerts.Val()
+				{
+					var err error
+					buf, err = v.AppendCBOR(buf)
+					if err != nil {
+						return nil, err
+					}
+				}
+			}
 		}
 	}
 	return buf, nil
@@ -2161,6 +4230,26 @@ func (s *JetstreamSubscribeEvents_Sync) UnmarshalCBORAt(data []byte, pos int) (i
 				}
 				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
 			}
+		case 10:
+			if string(data[keyStart:keyEnd]) == "hypercerts" {
+				if cbor.IsNull(data, pos) {
+					pos++
+				} else {
+					var v JetstreamSubscribeEvents_SelectedMetadata
+					pos, err = v.UnmarshalCBORAt(data, pos)
+					if err != nil {
+						return 0, err
+					}
+					s.Hypercerts = gt.Some(v)
+				}
+			} else {
+				valueStart := pos
+				pos, err = cbor.SkipValue(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.extra = append(s.extra, extraField{Key: string(data[keyStart:keyEnd]), Value: append([]byte(nil), data[valueStart:pos]...), Encoding: extraEncodingCBOR})
+			}
 		default:
 			valueStart := pos
 			pos, err = cbor.SkipValue(data, pos)
@@ -2177,6 +4266,7 @@ func (s *JetstreamSubscribeEvents_Sync) UnmarshalCBORAt(data []byte, pos int) (i
 var (
 	jsonKey_JetstreamSubscribeEvents_Sync_dollar_type = []byte("\"$type\":")
 	jsonKey_JetstreamSubscribeEvents_Sync_did         = []byte("\"did\":")
+	jsonKey_JetstreamSubscribeEvents_Sync_hypercerts  = []byte("\"hypercerts\":")
 	jsonKey_JetstreamSubscribeEvents_Sync_seq         = []byte("\"seq\":")
 	jsonKey_JetstreamSubscribeEvents_Sync_sync        = []byte("\"sync\":")
 	jsonKey_JetstreamSubscribeEvents_Sync_time        = []byte("\"time\":")
@@ -2203,6 +4293,23 @@ func (s *JetstreamSubscribeEvents_Sync) AppendJSON(buf []byte) ([]byte, error) {
 	buf = append(buf, jsonKey_JetstreamSubscribeEvents_Sync_did...)
 	buf = cbor.AppendJSONString(buf, s.DID)
 	first = false
+	if s.Hypercerts.HasVal() {
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, jsonKey_JetstreamSubscribeEvents_Sync_hypercerts...)
+		{
+			v := s.Hypercerts.Val()
+			{
+				var err error
+				buf, err = v.AppendJSON(buf)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+		first = false
+	}
 	if !first {
 		buf = append(buf, ',')
 	}
@@ -2276,6 +4383,20 @@ func (s *JetstreamSubscribeEvents_Sync) UnmarshalJSONAt(data []byte, pos int) (i
 			s.DID, pos, err = cbor.ReadJSONString(data, pos)
 			if err != nil {
 				return 0, err
+			}
+		case "hypercerts":
+			if cbor.IsJSONNull(data, pos) {
+				pos, err = cbor.SkipJSONNull(data, pos)
+				if err != nil {
+					return 0, err
+				}
+			} else {
+				var v JetstreamSubscribeEvents_SelectedMetadata
+				pos, err = v.UnmarshalJSONAt(data, pos)
+				if err != nil {
+					return 0, err
+				}
+				s.Hypercerts = gt.Some(v)
 			}
 		case "seq":
 			s.Seq, pos, err = cbor.ReadJSONInt(data, pos)
