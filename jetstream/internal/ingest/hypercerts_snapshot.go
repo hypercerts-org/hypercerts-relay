@@ -11,6 +11,7 @@ import (
 
 	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
 	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/tombstone"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos/api/comatproto"
 )
@@ -18,10 +19,11 @@ import (
 // Snapshot is a verified full-PDS repository projected to the job's collections.
 // It never emits a DID-wide tombstone: missing paths become scoped deletes.
 type Snapshot struct {
-	DID         string
-	Rev         string
-	Collections []string
-	Records     []segment.Event
+	DID          string
+	Rev          string
+	Collections  []string
+	Records      []segment.Event
+	PresentPaths []string
 	// AppendMetadata attributes generated replacement and delete rows when set.
 	AppendMetadata *AttributionMetadata
 }
@@ -32,13 +34,20 @@ type snapshotBoundary struct {
 
 func snapshotKey(did string) []byte { return []byte("hypercerts/snapshot/" + did) }
 
+func (w *Writer) snapshotKey(did string) []byte {
+	if w.cfg.SeqKey == seqNextKey {
+		return snapshotKey(did)
+	}
+	return []byte("hypercerts/snapshot-domain/" + w.cfg.SeqKey + "/" + did)
+}
+
 // snapshotSupersedes keeps delayed live/retry input below a durable snapshot
 // from overwriting newer materialized state. Verification still processes it.
 func (w *Writer) snapshotSupersedes(ev *segment.Event, metadata *AttributionMetadata) (bool, error) {
 	if w.cfg.CollectionPolicy == nil || ev.Rev == "" {
 		return false, nil
 	}
-	b, closer, err := w.cfg.Store.Get(snapshotKey(ev.DID))
+	b, closer, err := w.cfg.Store.Get(w.snapshotKey(ev.DID))
 	if errors.Is(err, store.ErrNotFound) {
 		return false, nil
 	}
@@ -54,6 +63,13 @@ func (w *Writer) snapshotSupersedes(ev *segment.Event, metadata *AttributionMeta
 		return ev.Rev <= boundary.Revisions[ev.Collection], nil
 	}
 	if ev.Kind == segment.KindSync {
+		scope, err := tombstone.DecodeScopedSync(ev)
+		if err != nil {
+			return false, err
+		}
+		if scope != nil {
+			return false, nil
+		}
 		// A live marker is appended only after scoped reconciliation succeeds.
 		// Keep that observed lifecycle event, while synthetic/unattributed or
 		// non-live sync rows still fail closed after a snapshot boundary.
@@ -71,13 +87,15 @@ func (w *Writer) snapshotSupersedes(ev *segment.Event, metadata *AttributionMeta
 func (w *Writer) ReconcileSnapshot(ctx context.Context, snapshot Snapshot) error {
 	w.drainMu.Lock()
 	defer w.drainMu.Unlock()
+	if w.async != nil {
+		if err := w.drainAsync(ctx); err != nil {
+			return err
+		}
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
 		return ErrClosed
-	}
-	if w.async != nil {
-		return errors.New("snapshot requires the synchronous steady-state writer")
 	}
 	if err := w.flushAndRotateLocked(ctx); err != nil {
 		return err
@@ -158,7 +176,13 @@ func (s *snapshotArchiveState) observe(snapshot Snapshot, row segment.Event) err
 		s.accountUnavailable = !account.Active
 	}
 	if row.Kind == segment.KindSync && row.Rev > s.syncRev {
-		s.syncRev = row.Rev
+		scope, err := tombstone.DecodeScopedSync(&row)
+		if err != nil {
+			return err
+		}
+		if scope == nil {
+			s.syncRev = row.Rev
+		}
 	}
 	if row.Kind.IsCommit() && slices.Contains(snapshot.Collections, row.Collection) {
 		s.observeRecord(row)
@@ -228,6 +252,9 @@ func (w *Writer) walkSnapshotSegment(path string, visit func([]segment.Event) er
 
 func (s *snapshotArchiveState) planReplacement(snapshot Snapshot) ([]segment.Event, error) {
 	keys := map[string]bool{}
+	for _, path := range snapshot.PresentPaths {
+		keys[path] = true
+	}
 	var rows []segment.Event
 	for _, row := range snapshot.Records {
 		if row.DID != snapshot.DID || row.Rev != snapshot.Rev || !slices.Contains(snapshot.Collections, row.Collection) || !row.Kind.IsMaterialization() {
@@ -273,7 +300,7 @@ func (s *snapshotArchiveState) missingRecordDeletes(snapshot Snapshot, keys map[
 // Called only after the replacement rows have crossed the archive durability boundary.
 func (w *Writer) persistSnapshotBoundary(snapshot Snapshot) error {
 	previous := snapshotBoundary{Revisions: map[string]string{}}
-	if b, closer, err := w.cfg.Store.Get(snapshotKey(snapshot.DID)); err == nil {
+	if b, closer, err := w.cfg.Store.Get(w.snapshotKey(snapshot.DID)); err == nil {
 		err = json.Unmarshal(b, &previous)
 		closer.Close()
 		if err != nil {
@@ -294,7 +321,7 @@ func (w *Writer) persistSnapshotBoundary(snapshot Snapshot) error {
 	if err != nil {
 		return err
 	}
-	return w.cfg.Store.Set(snapshotKey(snapshot.DID), boundary, store.SyncWrites)
+	return w.cfg.Store.Set(w.snapshotKey(snapshot.DID), boundary, store.SyncWrites)
 }
 
 // ErrAccountUnavailable prevents snapshots from resurrecting a concurrently
@@ -311,7 +338,7 @@ func (w *Writer) NeedsScopedSync(did string) (bool, error) {
 	if w.cfg.ReconcileSnapshot != nil {
 		return true, nil
 	}
-	_, closer, err := w.cfg.Store.Get(snapshotKey(did))
+	_, closer, err := w.cfg.Store.Get(w.snapshotKey(did))
 	if errors.Is(err, store.ErrNotFound) {
 		return false, nil
 	}

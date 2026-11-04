@@ -91,6 +91,8 @@ Where history is discontinuous or unavailable, expose a `gaps` array. Each gap i
 
 Implementations MUST NOT omit a known gap, represent a known gap with an empty array, or convert unknown boundaries into fabricated exact values.
 
+For consumers upgrading a legacy materialized archive, selected replay starts no earlier than the first durably attributed event. Policy-history initialization does not establish that activation boundary. Earlier sequences are reported as a `legacy-scope-unknown` gap and inclusive resumes there fail with `ReplayUnavailable` before WebSocket upgrade, even when request filters would hide every legacy row. Without durable activation, `replayFloor` is null and selected replay is unavailable; an existing archive reports the legacy gap through its durable tip, while an empty archive has no legacy gap. Live-only negotiation remains available. Consumers must explicitly reconcile selected state before starting at the advertised floor or choosing live-only delivery; neither choice proves reconciliation complete. Ordinary upstream-compatible subscriptions retain legacy access.
+
 ## 6. First-frame capability and history disclosure
 
 The first selected stream frame is `info` and MUST precede data. Its mandatory fields are:

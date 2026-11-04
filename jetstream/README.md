@@ -136,6 +136,21 @@ validated without timestamp heuristics. See the
 [Selected Stream Contract v1](../docs/contracts/selected-stream-v1.md) for the
 wire fields and stable negotiation/replay errors.
 
+For selected-stream consumers upgrading an existing archive, the advertised
+`replayFloor` excludes the region before the first durably attributed event,
+not the first policy-history entry (which can predate attribution). The capability
+frame reports that region as a `legacy-scope-unknown` gap. Until attribution
+activates, selected replay is unavailable and `replayFloor` is null; an existing
+legacy archive is disclosed as a gap through its durable tip. An empty archive
+has no legacy gap. Live-only subscription remains available in both cases. A
+selected cursor in that region is rejected before WebSocket upgrade with
+`ReplayUnavailable`, even when a DID or collection filter would hide its rows.
+Legacy syncs have no recoverable exact policy scope, so the server cannot safely
+represent them under this contract. Consumers must explicitly reconcile their
+selected state before starting at the advertised floor or choosing live-only
+subscription; the boundary is not evidence that reconciliation is complete.
+Ordinary subscriptions and archive downloads keep their existing legacy access.
+
 This boundary concerns Jetstream record materialization. Raw Relay/Rainbow data
 and transient full-repository CAR downloads can contain excluded records; this
 does not promise their absence from upstream storage or transient input buffers.
@@ -168,7 +183,13 @@ Jobs enumerate repositories directly from the named PDS, verify signed snapshots
 against the DID identity, and reconcile only selected collections. Missing selected
 records produce per-record deletes; another collection is not replaced by a
 DID-wide tombstone. Managed steady-state whole-repository live/retry syncs use scoped record
-replacements and deletes instead of a DID-wide sync tombstone. This preserves newer collection snapshots across delayed sync delivery.
+replacements and deletes instead of a DID-wide sync tombstone. Bootstrap syncs
+persist their admitted collections and verified present-record paths; merging
+reconciles missing records against the destination archive, not only the temporary
+live archive. Compaction retains this scoped lifecycle marker without deleting its
+replacement rows or unrelated collections. Ordinary unmanaged whole-repository
+syncs retain their DID-wide tombstone behavior. This preserves newer collection
+snapshots across delayed sync delivery.
 Inactive account events block stale snapshot publication. Archive writes and
 per-collection revision boundaries are synced before repository progress is
 acknowledged. Delayed older live/retry rows cannot overwrite a completed

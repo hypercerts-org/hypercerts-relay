@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
@@ -19,6 +20,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/obs"
 	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/tombstone"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/cockroachdb/pebble/vfs"
 )
@@ -165,6 +167,29 @@ func (r *mergeRunner) processSourceSegment(ctx context.Context, sf ingest.Segmen
 						return nil, fmt.Errorf("orchestrator: merge: lookup source policy: %w", err)
 					}
 					appendImported := func(destination ingest.AttributionMetadata) error {
+						scope, err := tombstone.DecodeScopedSync(ev)
+						if err != nil {
+							return err
+						}
+						if scope != nil {
+							if source.PolicyRev == nil || len(sourcePolicy) != 1 || !slices.Equal(scope.Collections, sourcePolicy[0].Collections) {
+								return attribution.ErrInvalid
+							}
+							collections := make([]string, 0, len(scope.Collections))
+							for _, collection := range scope.Collections {
+								if slices.Contains(destination.Policy.Collections, collection) {
+									collections = append(collections, collection)
+								}
+							}
+							snapshot := ingest.Snapshot{DID: ev.DID, Rev: ev.Rev, Collections: collections, PresentPaths: scope.Paths, AppendMetadata: &destination}
+							if err := r.dst.ReconcileSnapshot(ctx, snapshot); err != nil {
+								if errors.Is(err, ingest.ErrAccountUnavailable) {
+									ev.Seq = 0
+									return nil
+								}
+								return err
+							}
+						}
 						witnessedAt, indexedAt := ev.WitnessedAt, ev.IndexedAt
 						if destination.Boundary.Seq == nil || destination.Boundary.SnapshotID == nil {
 							boundary, id := r.dst.NextSeq(), "merge/reconciliation"
