@@ -40,6 +40,15 @@ func runSelectedSubscriberLoop(ctx context.Context, conn *websocket.Conn, deps S
 			if !atTip && cursor < readlog.FloorSeq() {
 				batch, next, err := deps.Tail.ReadFrom(ctx, cursor, deps.Tail.ReadBatch())
 				if err != nil {
+					if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+						return
+					}
+					message := "stream read failed; reconnect"
+					if errors.Is(err, errColdUnavailable) {
+						message = "archive replay unavailable; reconnect"
+					}
+					logger.Warn("selected cold replay failed", "cursor", cursor, "streamId", config.StreamID)
+					writeFrame(ctx, conn, compress, EncodeV2Error("InternalError", message))
 					return
 				}
 				if len(batch) == 0 {
