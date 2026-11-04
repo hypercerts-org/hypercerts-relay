@@ -562,7 +562,8 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 		if encErr != nil || !writeFrame(ctx, conn, wantZstd, frame) {
 			return
 		}
-		runSelectedSubscriberLoop(ctx, conn, deps, initialV2Filter, selectedConfig, startSeq, wantZstd, logger)
+		selectedConn := selectedConnection{conn: conn, deps: deps, filter: initialV2Filter, config: selectedConfig, cursor: startSeq, compress: wantZstd, logger: logger}
+		selectedConn.runSelectedSubscriberLoop(ctx)
 		return
 	}
 

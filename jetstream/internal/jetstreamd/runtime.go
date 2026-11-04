@@ -53,6 +53,8 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+const selectedAttributionDomain = "selected-stream"
+
 // Runtime is one fully constructed jetstream daemon instance.
 type Runtime struct {
 	// hypercerts: Durable scoped backfill jobs share the process lifecycle.
@@ -262,7 +264,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		if err := rt.BackfillJobs.SeedSources(opts.InitialPDSSources); err != nil {
 			return fail(err)
 		}
-		eventAttribution, err = attribution.Open(metaStore, selectedStreamID, "selected-stream")
+		eventAttribution, err = attribution.Open(metaStore, selectedStreamID, selectedAttributionDomain)
 		if err != nil {
 			return fail(fmt.Errorf("serve: open selected stream attribution: %w", err))
 		}
@@ -447,20 +449,20 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		CollectionPolicy:           rt.CollectionPolicy,
 		BackfillJobs:               rt.BackfillJobs,
 		Attribution:                eventAttribution,
-		AttributionDomain:          "selected-stream",
+		AttributionDomain:          selectedAttributionDomain,
 		AttributionStreamID:        selectedStreamID,
 		BootstrapAttribution:       bootstrapAttribution,
 		BootstrapAttributionDomain: "bootstrap-live",
 		PolicyGate:                 nil,
 		InitializePolicyGate: func(w *ingest.Writer) (*policygate.Gate, error) {
 			if rt.CollectionPolicy == nil {
-				return policygate.New(nil, w, "selected-stream"), nil
+				return policygate.New(nil, w, selectedAttributionDomain), nil
 			}
 			if eventAttribution == nil {
 				return nil, fmt.Errorf("selected-stream attribution unavailable")
 			}
-			gate := policygate.New(rt.CollectionPolicy, w, "selected-stream")
-			if err := gate.Adopt(ctx, "selected-stream", func(boundary *uint64) error {
+			gate := policygate.New(rt.CollectionPolicy, w, selectedAttributionDomain)
+			if err := gate.Adopt(ctx, selectedAttributionDomain, func(boundary *uint64) error {
 				current := rt.CollectionPolicy.Current()
 				return eventAttribution.EnsureInitialPolicyHistory(attribution.Policy{
 					Revision: current.Revision, Collections: current.Collections,
@@ -469,7 +471,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 				return nil, fmt.Errorf("initialize selected-stream policy history: %w", err)
 			}
 			if rt.BackfillJobs != nil {
-				rt.BackfillJobs.BindPolicyAdoption(gate, eventAttribution, "selected-stream")
+				rt.BackfillJobs.BindPolicyAdoption(gate, eventAttribution, selectedAttributionDomain)
 			}
 			return gate, nil
 		},
