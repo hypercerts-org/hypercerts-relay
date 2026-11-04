@@ -106,15 +106,7 @@ func TestAdoptBoundaryAndDrainFailure(t *testing.T) {
 			called := false
 			err := New(testPolicy(t), d, "domain").Adopt(context.Background(), "domain", func(boundary *uint64) error {
 				called = true
-				if tc.next <= 1 {
-					if boundary != nil {
-						t.Fatalf("boundary = %d, want nil", *boundary)
-					}
-					return nil
-				}
-				if boundary == nil || *boundary != tc.want {
-					t.Fatalf("boundary = %d, want %d", boundary, tc.want)
-				}
+				assertAdoptionBoundary(t, boundary, tc.next, tc.want)
 				return nil
 			})
 			if err != nil || !called {
@@ -122,11 +114,26 @@ func TestAdoptBoundaryAndDrainFailure(t *testing.T) {
 			}
 		})
 	}
-	drainErr := errors.New("drain failed")
-	called := false
-	err := New(testPolicy(t), &testDrainer{drainErr: drainErr}, "domain").Adopt(context.Background(), "domain", func(*uint64) error { called = true; return nil })
-	if !errors.Is(err, drainErr) || called {
-		t.Fatalf("Adopt() = %v, callback called %v", err, called)
+	t.Run("drain failure", func(t *testing.T) {
+		drainErr := errors.New("drain failed")
+		called := false
+		err := New(testPolicy(t), &testDrainer{drainErr: drainErr}, "domain").Adopt(context.Background(), "domain", func(*uint64) error { called = true; return nil })
+		if !errors.Is(err, drainErr) || called {
+			t.Fatalf("Adopt() = %v, callback called %v", err, called)
+		}
+	})
+}
+
+func assertAdoptionBoundary(t *testing.T, boundary *uint64, next, want uint64) {
+	t.Helper()
+	if next <= 1 {
+		if boundary != nil {
+			t.Fatalf("boundary = %d, want nil", *boundary)
+		}
+		return
+	}
+	if boundary == nil || *boundary != want {
+		t.Fatalf("boundary = %d, want %d", boundary, want)
 	}
 }
 

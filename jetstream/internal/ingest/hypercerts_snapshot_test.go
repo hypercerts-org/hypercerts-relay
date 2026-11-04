@@ -135,35 +135,42 @@ func TestHypercertsManagedSnapshotWritesRowsAndAttribution(t *testing.T) {
 			require.NoError(t, w.ReconcileSnapshot(context.Background(), snapshot))
 			require.Equal(t, before+2, w.NextSeq(), "snapshot replacement and generated delete are appended")
 			require.NoError(t, w.Flush(context.Background()))
-			files, err := SegmentFiles(w.cfg.SegmentsDir)
-			require.NoError(t, err)
-			var replacement, generatedDelete *segment.Event
-			for _, file := range files {
-				require.NoError(t, segment.WalkActive(file.Path, func(events []segment.Event) error {
-					for i := range events {
-						row := events[i]
-						if row.Seq < before {
-							continue
-						}
-						if row.Rkey == "present" && row.Kind == segment.KindUpdate {
-							replacement = &row
-						}
-						if row.Rkey == "removed" && row.Kind == segment.KindDelete {
-							generatedDelete = &row
-						}
-					}
-					return nil
-				}))
-			}
-			require.NotNil(t, replacement)
-			require.NotNil(t, generatedDelete)
-			for _, row := range []*segment.Event{replacement, generatedDelete} {
-				got, err := manager.Lookup(row.Seq)
-				require.NoError(t, err)
-				require.Equal(t, attribution.ProvenanceSnapshot, got.Provenance)
-				require.EqualValues(t, 1, *got.PolicyRev)
-			}
+			assertManagedSnapshotRowsAndAttribution(t, w.cfg.SegmentsDir, before, manager)
 		})
+	}
+}
+
+func assertManagedSnapshotRowsAndAttribution(t *testing.T, segmentsDir string, before uint64, manager *attribution.Manager) {
+	t.Helper()
+	files, err := SegmentFiles(segmentsDir)
+	require.NoError(t, err)
+	var rows []segment.Event
+	for _, file := range files {
+		require.NoError(t, segment.WalkActive(file.Path, func(events []segment.Event) error {
+			rows = append(rows, events...)
+			return nil
+		}))
+	}
+	var replacement, generatedDelete *segment.Event
+	for i := range rows {
+		row := &rows[i]
+		if row.Seq < before {
+			continue
+		}
+		if row.Rkey == "present" && row.Kind == segment.KindUpdate {
+			replacement = row
+		}
+		if row.Rkey == "removed" && row.Kind == segment.KindDelete {
+			generatedDelete = row
+		}
+	}
+	require.NotNil(t, replacement)
+	require.NotNil(t, generatedDelete)
+	for _, row := range []*segment.Event{replacement, generatedDelete} {
+		got, err := manager.Lookup(row.Seq)
+		require.NoError(t, err)
+		require.Equal(t, attribution.ProvenanceSnapshot, got.Provenance)
+		require.EqualValues(t, 1, *got.PolicyRev)
 	}
 }
 

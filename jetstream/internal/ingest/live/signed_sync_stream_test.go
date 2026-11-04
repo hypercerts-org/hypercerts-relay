@@ -40,51 +40,13 @@ import (
 func TestConsumerStreamsVerifiedSyncWithReplacementOps(t *testing.T) {
 	t.Parallel()
 	did := atmos.DID("did:plc:selectedverifiedsync")
-	key, err := crypto.GenerateP256()
-	require.NoError(t, err)
-	repo := &atmosrepo.Repo{DID: did, Clock: atmos.NewTIDClock(0), Store: mst.NewMemBlockStore()}
-	repo.Tree = mst.NewTree(repo.Store)
-	require.NoError(t, repo.Create("app.bsky.feed.post", "fresh", map[string]any{"text": "fresh"}))
-	postCID, _, err := repo.Get("app.bsky.feed.post", "fresh")
-	require.NoError(t, err)
-	dataCID, err := repo.Tree.WriteBlocks(repo.Store)
-	require.NoError(t, err)
-	commit := &atmosrepo.Commit{DID: string(did), Version: atmossync.CommitVersion, Data: dataCID, Rev: "3mmoojp7vgo2f"}
-	require.NoError(t, commit.Sign(key))
-	commitBytes, err := commit.EncodeCBOR()
-	require.NoError(t, err)
-	commitCID := cbor.ComputeCID(cbor.CodecDagCBOR, commitBytes)
-	require.NoError(t, repo.Store.PutBlock(commitCID, commitBytes))
-	var carBuf bytes.Buffer
-	cw, err := car.NewWriter(&carBuf, []cbor.CID{commitCID})
-	require.NoError(t, err)
-	for cid, data := range repo.Store.(*mst.MemBlockStore).All() {
-		require.NoError(t, cw.WriteBlock(cid, data))
-	}
-	wireSync := &comatproto.SyncSubscribeRepos_Sync{DID: string(did), Rev: commit.Rev, Seq: 42, Time: "2026-05-21T00:00:00Z", Blocks: carBuf.Bytes()}
+	revision := "3mmoojp7vgo2f"
+	carBytes, postCID, directory := signedSyncCAR(t, did, revision)
+	wireSync := &comatproto.SyncSubscribeRepos_Sync{DID: string(did), Rev: revision, Seq: 42, Time: "2026-05-21T00:00:00Z", Blocks: carBytes}
 	body, err := wireSync.MarshalCBOR()
 	require.NoError(t, err)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/xrpc/com.atproto.sync.getRepo" {
-			w.Header().Set("Content-Type", "application/vnd.ipld.car")
-			_, _ = w.Write(carBuf.Bytes())
-			return
-		}
-		if r.URL.Path != "/xrpc/com.atproto.sync.subscribeRepos" {
-			http.NotFound(w, r)
-			return
-		}
-		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
-		if err != nil {
-			return
-		}
-		defer conn.CloseNow()
-		_ = conn.Write(r.Context(), websocket.MessageBinary, encodeFrame(t, "#sync", body))
-		<-r.Context().Done()
-	}))
+	server := newSignedSyncServer(t, carBytes, body)
 	defer server.Close()
-	resolver := &stubResolver{docs: map[atmos.DID]*identity.DIDDocument{did: buildDIDDoc(did, key.PublicKey())}}
-	directory := &identity.Directory{Resolver: resolver}
 	syncClient := atmossync.NewClient(atmossync.Options{Client: &xrpc.Client{Host: server.URL}})
 	verifier, err := atmossync.NewVerifier(atmossync.VerifierOptions{Directory: directory, StateStore: atmossync.NewMemStateStore(), Policy: gt.Some(atmossync.PolicyResync), SyncClient: gt.Some(syncClient), ResyncLimit: gt.Some(rate.Inf), ResyncBurst: gt.Some(1)})
 	require.NoError(t, err)
@@ -95,21 +57,7 @@ func TestConsumerStreamsVerifiedSyncWithReplacementOps(t *testing.T) {
 	client, err := streaming.NewClient(streaming.Options{URL: wsURL, Verifier: gt.Some(verifier), SyncClient: gt.Some(syncClient)})
 	require.NoError(t, err)
 	defer client.Close()
-	var event streaming.Event
-	got := false
-	for batch, iterErr := range client.Events(ctx) {
-		require.NoError(t, iterErr)
-		for _, candidate := range batch {
-			if candidate.Sync != nil {
-				event, got = candidate, true
-				break
-			}
-		}
-		if got {
-			break
-		}
-	}
-	require.True(t, got)
+	event := awaitVerifiedSync(t, ctx, client)
 	require.Nil(t, event.Commit)
 	require.NotNil(t, event.Sync)
 	require.EqualValues(t, 42, event.Seq)
@@ -196,4 +144,73 @@ func TestConsumerStreamsVerifiedSyncWithReplacementOps(t *testing.T) {
 	}
 	require.Equal(t, 2, markers)
 	require.GreaterOrEqual(t, verifier.Stats().Resyncs, uint64(1))
+}
+
+func signedSyncCAR(t *testing.T, did atmos.DID, revision string) ([]byte, cbor.CID, *identity.Directory) {
+	t.Helper()
+	signingKey, err := crypto.GenerateP256()
+	require.NoError(t, err)
+	repo := &atmosrepo.Repo{DID: did, Clock: atmos.NewTIDClock(0), Store: mst.NewMemBlockStore()}
+	repo.Tree = mst.NewTree(repo.Store)
+	require.NoError(t, repo.Create("app.bsky.feed.post", "fresh", map[string]any{"text": "fresh"}))
+	postCID, _, err := repo.Get("app.bsky.feed.post", "fresh")
+	require.NoError(t, err)
+	dataCID, err := repo.Tree.WriteBlocks(repo.Store)
+	require.NoError(t, err)
+	commit := &atmosrepo.Commit{DID: string(did), Version: atmossync.CommitVersion, Data: dataCID, Rev: revision}
+	require.NoError(t, commit.Sign(signingKey))
+	commitBytes, err := commit.EncodeCBOR()
+	require.NoError(t, err)
+	commitCID := cbor.ComputeCID(cbor.CodecDagCBOR, commitBytes)
+	require.NoError(t, repo.Store.PutBlock(commitCID, commitBytes))
+	var carBuf bytes.Buffer
+	cw, err := car.NewWriter(&carBuf, []cbor.CID{commitCID})
+	require.NoError(t, err)
+	for cid, data := range repo.Store.(*mst.MemBlockStore).All() {
+		require.NoError(t, cw.WriteBlock(cid, data))
+	}
+	resolver := &stubResolver{docs: map[atmos.DID]*identity.DIDDocument{did: buildDIDDoc(did, signingKey.PublicKey())}}
+	return carBuf.Bytes(), postCID, &identity.Directory{Resolver: resolver}
+}
+
+func newSignedSyncServer(t *testing.T, carBytes, body []byte) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/xrpc/com.atproto.sync.getRepo" {
+			w.Header().Set("Content-Type", "application/vnd.ipld.car")
+			_, _ = w.Write(carBytes)
+			return
+		}
+		if r.URL.Path != "/xrpc/com.atproto.sync.subscribeRepos" {
+			http.NotFound(w, r)
+			return
+		}
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		_ = conn.Write(r.Context(), websocket.MessageBinary, encodeFrame(t, "#sync", body))
+		<-r.Context().Done()
+	}))
+}
+
+func awaitVerifiedSync(t *testing.T, ctx context.Context, client *streaming.Client) streaming.Event {
+	t.Helper()
+	var event streaming.Event
+	got := false
+	for batch, iterErr := range client.Events(ctx) {
+		require.NoError(t, iterErr)
+		for _, candidate := range batch {
+			if candidate.Sync != nil {
+				event, got = candidate, true
+				break
+			}
+		}
+		if got {
+			break
+		}
+	}
+	require.True(t, got)
+	return event
 }
