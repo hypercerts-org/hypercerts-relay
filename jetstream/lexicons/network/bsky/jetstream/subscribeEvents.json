@@ -19,7 +19,7 @@
           },
           "cursor": {
             "type": "integer",
-            "description": "Resume position, inclusive: the server replays events with seq >= cursor and the client dedups the overlap. Values >= 1e15 are interpreted as a unix-microseconds timestamp instead of a seq and translated to the first seq witnessed at or after that instant; a timestamp below the retention floor clamps up to the floor and an #info OutdatedCursor frame is sent. Omitted: start at the live tip."
+            "description": "For clients resuming this stream, the position is inclusive: the server replays events with seq >= cursor and the client dedups the overlap. Ordinary v2 (contract omitted): values >= 1e15 are interpreted as a unix-microseconds timestamp instead of a seq and translated to the first seq witnessed at or after that instant; a timestamp below the retention floor clamps up to the floor and an #info OutdatedCursor frame is sent. A seq below the retention floor is rejected before WebSocket upgrade with HTTP 400 (CursorTooOld). With contract=hypercerts-selected-v1, cursor is strictly an unsigned decimal uint64 seq with no timestamp heuristics or clamping, and streamId and cursor must be supplied together and non-empty or both omitted. Selected resumes are rejected before WebSocket upgrade with HTTP 400: InvalidCursor for malformed or unpaired coordinates, StreamMismatch for a different streamId, CursorOutOfRange for a seq beyond the current tip, or ReplayUnavailable when replay is disabled or the seq is below replayFloor. Omitted (with streamId also omitted for selected subscriptions): start at the live tip."
           },
           "kinds": {
             "type": "array",
