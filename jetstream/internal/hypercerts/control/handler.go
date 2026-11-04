@@ -110,6 +110,9 @@ func failure(w http.ResponseWriter, err error) {
 	status := http.StatusInternalServerError
 	code := "persistence_error"
 	switch {
+	case errors.Is(err, jobs.ErrPolicyAdoptionNotReady):
+		status = http.StatusServiceUnavailable
+		code = "policy_adoption_not_ready"
 	case errors.Is(err, jobs.ErrNotFound):
 		status = 404
 		code = "not_found"
