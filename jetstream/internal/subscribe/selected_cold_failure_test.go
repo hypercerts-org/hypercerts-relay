@@ -66,7 +66,8 @@ func TestSelectedColdReadFailureTerminates(t *testing.T) {
 						return
 					}
 					defer conn.CloseNow()
-					runSelectedSubscriberLoop(ctx, conn, Subscription{Writer: writer, Tail: tail, SelectedAttribution: manager}, &FilterV2{}, SelectedConfig{StreamID: "stream"}, 1, compressed, logger)
+					selectedConn := selectedConnection{conn: conn, deps: Subscription{Writer: writer, Tail: tail, SelectedAttribution: manager}, filter: &FilterV2{}, config: SelectedConfig{StreamID: "stream"}, cursor: 1, compress: compressed, logger: logger}
+					selectedConn.runSelectedSubscriberLoop(ctx)
 				}))
 				defer server.Close()
 				conn, response, err := websocket.Dial(t.Context(), "ws"+strings.TrimPrefix(server.URL, "http"), nil)

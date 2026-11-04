@@ -127,48 +127,57 @@ type SelectedSyncScope struct {
 // A removal takes effect after its boundary; a later re-addition closes the
 // interval inclusively at that policy's boundary. A nil ThroughSeq is open.
 func PolicyGaps(history []attribution.Policy) []SelectedGap {
-	type openGap struct{ from uint64 }
-	open := make(map[string]openGap)
+	open := make(map[string]uint64)
 	var gaps []SelectedGap
 	for i, policy := range history {
 		if i == 0 {
 			continue
 		}
-		prior := make(map[string]bool, len(history[i-1].Collections))
-		for _, collection := range history[i-1].Collections {
-			prior[collection] = true
-		}
-		current := make(map[string]bool, len(policy.Collections))
-		for _, collection := range policy.Collections {
-			current[collection] = true
-		}
-		boundary := uint64(0)
-		if policy.EffectiveAfterSeq != nil {
-			boundary = *policy.EffectiveAfterSeq
-		}
-		for collection := range prior {
-			if !current[collection] {
-				open[collection] = openGap{from: boundary + 1}
-			}
-		}
-		for collection := range current {
-			if !prior[collection] {
-				if gap, ok := open[collection]; ok {
-					name := collection
-					from, through := gap.from, boundary
-					if from <= through {
-						gaps = append(gaps, SelectedGap{FromSeq: &from, ThroughSeq: &through, Reason: "policy-disabled", Collection: &name})
-					}
-					delete(open, collection)
-				}
-			}
-		}
+		gaps = append(gaps, transitionPolicyGaps(open, history[i-1], policy)...)
 	}
-	for collection, gap := range open {
-		name, from := collection, gap.from
-		gaps = append(gaps, SelectedGap{FromSeq: &from, Reason: "policy-disabled", Collection: &name})
+	for collection, from := range open {
+		name, start := collection, from
+		gaps = append(gaps, SelectedGap{FromSeq: &start, Reason: "policy-disabled", Collection: &name})
 	}
 	sort.Slice(gaps, func(i, j int) bool { return *gaps[i].FromSeq < *gaps[j].FromSeq })
+	return gaps
+}
+
+func policyCollectionSet(collections []string) map[string]bool {
+	result := make(map[string]bool, len(collections))
+	for _, collection := range collections {
+		result[collection] = true
+	}
+	return result
+}
+
+func transitionPolicyGaps(open map[string]uint64, previous, policy attribution.Policy) []SelectedGap {
+	prior := policyCollectionSet(previous.Collections)
+	current := policyCollectionSet(policy.Collections)
+	boundary := uint64(0)
+	if policy.EffectiveAfterSeq != nil {
+		boundary = *policy.EffectiveAfterSeq
+	}
+	for collection := range prior {
+		if !current[collection] {
+			open[collection] = boundary + 1
+		}
+	}
+	var gaps []SelectedGap
+	for collection := range current {
+		if prior[collection] {
+			continue
+		}
+		from, ok := open[collection]
+		if !ok {
+			continue
+		}
+		name, through := collection, boundary
+		if from <= through {
+			gaps = append(gaps, SelectedGap{FromSeq: &from, ThroughSeq: &through, Reason: "policy-disabled", Collection: &name})
+		}
+		delete(open, collection)
+	}
 	return gaps
 }
 
