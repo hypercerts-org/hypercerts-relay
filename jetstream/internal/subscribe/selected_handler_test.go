@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -52,8 +53,8 @@ func TestSelectedHandlerWebsocketCapabilityAndMetadata(t *testing.T) {
 		floor := uint64(0)
 		return subscribe.SelectedConfig{StreamID: stream, PolicyRevision: 1, Collections: []string{}, ReplayFloor: &floor, CurrentSeq: 2, ReplayEnabled: true, Coverage: "unknown", Gaps: []subscribe.SelectedGap{}}, nil
 	})
-	server := httptest.NewServer(subscribe.NewHandler(subscribe.Subscription{Tail: tail, Store: st, Writer: w, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Metrics: subscribe.NewMetrics(prometheus.NewRegistry()), Lookback: time.Hour, V2: true, SelectedConfig: provider, SelectedAttribution: manager, SelectedStreamID: stream}))
-	defer server.Close()
+	server, stop := selectedTestServer(subscribe.NewHandler(subscribe.Subscription{Tail: tail, Store: st, Writer: w, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Metrics: subscribe.NewMetrics(prometheus.NewRegistry()), Lookback: time.Hour, V2: true, SelectedConfig: provider, SelectedAttribution: manager, SelectedStreamID: stream}))
+	defer stop()
 	conn, resp, err := websocket.Dial(context.Background(), "ws"+strings.TrimPrefix(server.URL, "http")+"/?contract="+subscribe.SelectedContract, &websocket.DialOptions{HTTPHeader: http.Header{"Sec-WebSocket-Protocol": []string{subscribe.SelectedContract}}})
 	require.NoError(t, err)
 	if resp != nil && resp.Body != nil {
@@ -124,6 +125,55 @@ func TestSelectedSyncWebsocketDoesNotLeakCARAndKeepsLifecycle(t *testing.T) {
 	require.Contains(t, string(frame), `"did":"did:plc:test"`)
 	require.Contains(t, string(frame), `"reconciliationRequired":true`)
 	require.Contains(t, string(frame), `"collections":["app.example.one"]`)
+}
+
+func TestSelectedLegacySyncReplayBoundaryAndLive(t *testing.T) {
+	f := newSelectedWebsocketFixture(t, true)
+	f.addEvent(t, 2, 1)
+	response, err := http.Get(f.server.URL + "/?contract=" + subscribe.SelectedContract + "&streamId=" + f.stream + "&cursor=1&dids=did:plc:other")
+	require.NoError(t, err)
+	defer response.Body.Close()
+	require.NotEqual(t, http.StatusSwitchingProtocols, response.StatusCode)
+	body, err := io.ReadAll(response.Body)
+	require.NoError(t, err)
+	require.Contains(t, string(body), "ReplayUnavailable")
+	conn := f.dial(t, "streamId="+f.stream+"&cursor=2")
+	defer conn.CloseNow()
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	capability := readSelectedFrame(t, conn, ctx, "SelectedFeed")
+	require.Contains(t, string(capability), `"replayFloor":2`)
+	require.Contains(t, string(capability), "legacy-scope-unknown")
+	readSelectedFrame(t, conn, ctx, "PolicyAdopted")
+	readSelectedFrame(t, conn, ctx, `"seq":2`)
+	f.addEvent(t, 3, 1)
+	frame := readSelectedFrame(t, conn, ctx, `"seq":3`)
+	require.NotContains(t, string(frame), "excluded-legacy-car")
+}
+
+func TestSelectedNoActivationRejectsResumeBeforeUpgrade(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		t.Run(map[bool]string{false: "empty", true: "legacy"}[legacy], func(t *testing.T) {
+			f := newSelectedWebsocketFixture(t, legacy)
+			response, err := http.Get(f.server.URL + "/?contract=" + subscribe.SelectedContract + "&streamId=" + f.stream + "&cursor=0&dids=did:plc:other")
+			require.NoError(t, err)
+			defer response.Body.Close()
+			require.NotEqual(t, http.StatusSwitchingProtocols, response.StatusCode)
+			body, err := io.ReadAll(response.Body)
+			require.NoError(t, err)
+			require.Contains(t, string(body), "ReplayUnavailable")
+			conn := f.dial(t, "")
+			defer conn.CloseNow()
+			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+			defer cancel()
+			capability := readSelectedFrame(t, conn, ctx, "SelectedFeed")
+			require.Contains(t, string(capability), `"replayFloor":null`)
+			require.Equal(t, legacy, strings.Contains(string(capability), "legacy-scope-unknown"))
+			f.addEvent(t, f.writer.NextSeq(), 1)
+			readSelectedFrame(t, conn, ctx, "PolicyAdopted")
+			readSelectedFrame(t, conn, ctx, "#commit")
+		})
+	}
 }
 
 func TestSelectedNegotiationFailsBeforeUpgrade(t *testing.T) {
@@ -229,7 +279,18 @@ type selectedWebsocketFixture struct {
 	stream  string
 }
 
-func newSelectedWebsocketFixture(t *testing.T) *selectedWebsocketFixture {
+func selectedTestServer(handler http.Handler) (*httptest.Server, func()) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var handlers sync.WaitGroup
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handlers.Add(1)
+		defer handlers.Done()
+		handler.ServeHTTP(w, r.WithContext(ctx))
+	}))
+	return server, func() { server.Close(); cancel(); handlers.Wait() }
+}
+
+func newSelectedWebsocketFixture(t *testing.T, legacy ...bool) *selectedWebsocketFixture {
 	t.Helper()
 	dir := t.TempDir()
 	st, err := store.Open(dir, nil)
@@ -238,7 +299,18 @@ func newSelectedWebsocketFixture(t *testing.T) *selectedWebsocketFixture {
 	manager, err := attribution.Open(st, stream, "selected-websocket")
 	require.NoError(t, err)
 	first := attribution.Policy{Revision: 1, Collections: []string{"app.example.one"}}
-	require.NoError(t, manager.EnsureInitialPolicyHistory(first, nil))
+	var legacyBoundary *uint64
+	if len(legacy) > 0 && legacy[0] {
+		legacyWriter, err := ingest.Open(ingest.Config{SegmentsDir: filepath.Join(dir, "segments"), Store: st, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+		require.NoError(t, err)
+		payload, err := (&comatproto.SyncSubscribeRepos_Sync{DID: "did:plc:test", Rev: "3mmoojp7vgo2f", Blocks: []byte("excluded-legacy-car")}).MarshalCBOR()
+		require.NoError(t, err)
+		require.NoError(t, legacyWriter.Append(t.Context(), &segment.Event{Kind: segment.KindSync, DID: "did:plc:test", Rev: "3mmoojp7vgo2f", Payload: payload}))
+		require.NoError(t, legacyWriter.Close())
+		boundary := uint64(1)
+		legacyBoundary = &boundary
+	}
+	require.NoError(t, manager.EnsureInitialPolicyHistory(first, legacyBoundary))
 	policyManager, err := selection.Open(st, []string{"app.example.one"})
 	require.NoError(t, err)
 	w, err := ingest.Open(ingest.Config{SegmentsDir: filepath.Join(dir, "segments"), Store: st, Attribution: manager, AttributionDomain: "selected-websocket", CollectionPolicy: policyManager, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), ReadLogRetentionBytes: 1 << 20})
@@ -248,18 +320,25 @@ func newSelectedWebsocketFixture(t *testing.T) *selectedWebsocketFixture {
 	tail.SetReadLogSource(func() *ingest.ReadableLog { return w.ReadLog() })
 	require.NoError(t, lifecycle.WritePhase(st, lifecycle.PhaseSteadyState, time.Now().UTC()))
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	require.Equal(t, uint64(1), w.NextSeq())
+	if legacyBoundary == nil {
+		require.Equal(t, uint64(1), w.NextSeq())
+	}
 	f := &selectedWebsocketFixture{t: t, st: st, writer: w, manager: manager, tail: tail, stream: stream}
 	m := mustOpenManifest(t, filepath.Join(dir, "segments"))
-	f.server = httptest.NewServer(subscribe.NewHandler(subscribe.Subscription{Tail: tail, Store: st, Writer: w, Logger: logger, Metrics: subscribe.NewMetrics(prometheus.NewRegistry()), Lookback: time.Hour, V2: true, Manifest: m, SelectedConfig: subscribe.SelectedConfigProviderFunc(func() (subscribe.SelectedConfig, error) {
+	var stop func()
+	f.server, stop = selectedTestServer(subscribe.NewHandler(subscribe.Subscription{Tail: tail, Store: st, Writer: w, Logger: logger, Metrics: subscribe.NewMetrics(prometheus.NewRegistry()), Lookback: time.Hour, V2: true, Manifest: m, SelectedConfig: subscribe.SelectedConfigProviderFunc(func() (subscribe.SelectedConfig, error) {
 		history, e := manager.ReadPolicyHistory()
 		if e != nil {
 			return subscribe.SelectedConfig{}, e
 		}
 		p := history[len(history)-1]
-		return subscribe.SelectedConfig{StreamID: stream, PolicyRevision: p.Revision, PolicyEffectiveAfterSeq: p.EffectiveAfterSeq, Collections: p.Collections, ReplayFloor: func() *uint64 { v := uint64(0); return &v }(), CurrentSeq: w.NextSeq() - 1, ReplayEnabled: true, Coverage: "unknown", Gaps: []subscribe.SelectedGap{}}, nil
+		activation, e := manager.ActivationSeq()
+		if e != nil {
+			return subscribe.SelectedConfig{}, e
+		}
+		return subscribe.ApplySelectedReplayBoundary(subscribe.SelectedConfig{StreamID: stream, PolicyRevision: p.Revision, PolicyEffectiveAfterSeq: p.EffectiveAfterSeq, Collections: p.Collections, ReplayFloor: func() *uint64 { v := uint64(0); return &v }(), CurrentSeq: w.NextSeq() - 1, ReplayEnabled: true, Coverage: "unknown", Gaps: []subscribe.SelectedGap{}}, activation), nil
 	}), SelectedAttribution: manager, SelectedStreamID: stream}))
-	t.Cleanup(func() { f.server.Close(); _ = w.Close(); _ = st.Close() })
+	t.Cleanup(func() { stop(); _ = w.Close(); _ = st.Close() })
 	return f
 }
 

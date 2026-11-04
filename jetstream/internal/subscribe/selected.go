@@ -51,6 +51,27 @@ type SelectedConfigProviderFunc func() (SelectedConfig, error)
 
 func (f SelectedConfigProviderFunc) SelectedConfig() (SelectedConfig, error) { return f() }
 
+func ApplySelectedReplayBoundary(config SelectedConfig, activation uint64) SelectedConfig {
+	if activation == 0 || activation > config.CurrentSeq {
+		config.ReplayEnabled = false
+		config.ReplayFloor = nil
+		if config.CurrentSeq > 0 {
+			from, through := uint64(1), config.CurrentSeq
+			config.Gaps = append(config.Gaps, SelectedGap{FromSeq: &from, ThroughSeq: &through, Reason: "legacy-scope-unknown"})
+		}
+		return config
+	}
+	if config.ReplayEnabled && (config.ReplayFloor == nil || *config.ReplayFloor < activation) {
+		floor := activation
+		config.ReplayFloor = &floor
+	}
+	if activation > 1 {
+		from, through := uint64(1), activation-1
+		config.Gaps = append(config.Gaps, SelectedGap{FromSeq: &from, ThroughSeq: &through, Reason: "legacy-scope-unknown"})
+	}
+	return config
+}
+
 type SelectedRequest struct {
 	Contract string
 	StreamID string

@@ -133,9 +133,7 @@ func TestConsumerStreamsVerifiedSyncWithReplacementOps(t *testing.T) {
 	require.NoError(t, history.EnsureInitialPolicyHistory(initial, nil))
 	gate := policygate.New(policy, nil, domain)
 	var consumer *Consumer
-	consumer, err = Open(Config{SegmentsDir: filepath.Join(t.TempDir(), "segments"), Store: st, SeqKey: SteadySeqKey, CursorKey: CursorKey, RelayURL: server.URL, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Verifier: verifier, Attribution: history, AttributionDomain: domain, AttributionStreamID: streamID, CollectionPolicy: policy, PolicyGate: gate, ReadLogRetentionBytes: 1 << 20, ReconcileSnapshot: func(ctx context.Context, snapshot ingest.Snapshot) error {
-		return consumer.writer.ReconcileSnapshot(ctx, snapshot)
-	}})
+	consumer, err = Open(Config{SegmentsDir: filepath.Join(t.TempDir(), "segments"), Store: st, SeqKey: BootstrapSeqKey, CursorKey: CursorKey, RelayURL: server.URL, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Verifier: verifier, Attribution: history, AttributionDomain: domain, AttributionStreamID: streamID, CollectionPolicy: policy, PolicyGate: gate, ReadLogRetentionBytes: 1 << 20})
 	require.NoError(t, err)
 	defer consumer.Close()
 	_, convertedErr := ConvertEvent(event, time.Now().UnixMicro())

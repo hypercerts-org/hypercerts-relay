@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/obs"
 	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/tombstone"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/cockroachdb/pebble"
 	"github.com/jcalabro/atmos"
@@ -160,6 +162,9 @@ func Open(cfg Config) (*Consumer, error) {
 		return nil, fmt.Errorf("livestream: open writer: %w", err)
 	}
 	c.writer = w
+	if c.cfg.ReconcileSnapshot == nil {
+		c.cfg.ReconcileSnapshot = w.ReconcileSnapshot
+	}
 	if cfg.InitializePolicyGate != nil {
 		gate, err := cfg.InitializePolicyGate(w)
 		if err != nil {
@@ -753,20 +758,27 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 						if c.cfg.ReconcileSnapshot == nil {
 							return fmt.Errorf("livestream: managed snapshot reconciler unavailable: %w", attribution.ErrInvalid)
 						}
+						fullPolicy, err := c.cfg.Attribution.LookupPolicy(policy.Revision)
+						if err != nil {
+							return fmt.Errorf("livestream: lookup policy history: %w", err)
+						}
 						metadata := ingest.AttributionMetadata{
-							StreamID: c.cfg.AttributionStreamID, Policy: attribution.Policy{Revision: policy.Revision, Collections: append([]string(nil), policy.Collections...)},
+							StreamID: c.cfg.AttributionStreamID, Policy: fullPolicy,
 							Provenance: attribution.ProvenanceReconciliation,
 						}
 						handled, reconcileErr = c.writer.ReconcileSyncWithMetadata(admittedCtx, segEvts[0].DID, segEvts[0].Rev, segEvts[1:], policy.Collections, metadata)
 						if reconcileErr != nil {
 							return reconcileErr
 						}
-						if policy.Revision == 0 {
-							return fmt.Errorf("livestream: missing policy history: %w", attribution.ErrInvalid)
+						scope := tombstone.SyncScope{Collections: policy.Collections, Paths: []string{}}
+						for _, row := range segEvts[1:] {
+							if row.Kind.IsMaterialization() && slices.Contains(policy.Collections, row.Collection) {
+								scope.Paths = append(scope.Paths, row.Collection+"/"+row.Rkey)
+							}
 						}
-						fullPolicy, err := c.cfg.Attribution.LookupPolicy(policy.Revision)
+						segEvts[0].Payload, err = tombstone.EncodeScopedSync(segEvts[0].Payload, scope)
 						if err != nil {
-							return fmt.Errorf("livestream: lookup policy history: %w", err)
+							return err
 						}
 						return c.writer.AppendAttributed(admittedCtx, &segEvts[0], ingest.AttributionMetadata{
 							StreamID: c.cfg.AttributionStreamID, Policy: fullPolicy,
@@ -775,6 +787,11 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 					})
 				} else {
 					handled, reconcileErr = c.writer.ReconcileSync(ctx, segEvts[0].DID, segEvts[0].Rev, segEvts[1:])
+				}
+				if errors.Is(reconcileErr, ingest.ErrAccountUnavailable) {
+					c.promoteSyncState(segEvts)
+					c.noteUpstreamSeq(evt.Seq)
+					continue
 				}
 				if reconcileErr != nil {
 					return reconcileErr

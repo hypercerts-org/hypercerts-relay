@@ -712,7 +712,11 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 					}
 				}
 			}
-			return subscribe.SelectedConfig{StreamID: selectedStreamID, PolicyRevision: policy.Revision, PolicyEffectiveAfterSeq: effectiveAfter, Collections: policy.Collections, EffectiveAfterSeq: effectiveAfter, ReplayFloor: replayFloor, CurrentSeq: tip, ReplayEnabled: opts.CursorLookback > 0, HistoryMode: "materialized", Coverage: "unknown", Gaps: subscribe.PolicyGaps(history)}, nil
+			activation, err := eventAttribution.ActivationSeq()
+			if err != nil {
+				return subscribe.SelectedConfig{}, err
+			}
+			return subscribe.ApplySelectedReplayBoundary(subscribe.SelectedConfig{StreamID: selectedStreamID, PolicyRevision: policy.Revision, PolicyEffectiveAfterSeq: effectiveAfter, Collections: policy.Collections, EffectiveAfterSeq: effectiveAfter, ReplayFloor: replayFloor, CurrentSeq: tip, ReplayEnabled: opts.CursorLookback > 0, HistoryMode: "materialized", Coverage: "unknown", Gaps: subscribe.PolicyGaps(history)}, activation), nil
 		})
 	}
 	// HandlerDeps.WriterRef is read at request time via writerPtr.Load();

@@ -27,6 +27,21 @@ func TestPolicyGapsRemovalReaddAndOpenIntervals(t *testing.T) {
 	require.Equal(t, "app.example.b", *gaps[1].Collection)
 }
 
+func TestLegacyReplayBoundaryRejectsUnknownScope(t *testing.T) {
+	floor := uint64(1)
+	config := ApplySelectedReplayBoundary(SelectedConfig{StreamID: "stream", CurrentSeq: 8, ReplayEnabled: true, ReplayFloor: &floor}, 5)
+	require.EqualValues(t, 5, *config.ReplayFloor)
+	require.Len(t, config.Gaps, 1)
+	require.Equal(t, "legacy-scope-unknown", config.Gaps[0].Reason)
+	require.Nil(t, config.Gaps[0].Collection)
+	_, err := ParseSelectedRequest(SelectedContract, "stream", "4", config)
+	require.ErrorIs(t, err, ErrReplayUnavailable)
+	_, err = ParseSelectedRequest(SelectedContract, "stream", "5", config)
+	require.NoError(t, err)
+	_, err = ParseSelectedRequest("", "stream", "4", config)
+	require.NoError(t, err)
+}
+
 func TestParseSelectedRequest(t *testing.T) {
 	floor := uint64(3)
 	config := SelectedConfig{StreamID: "stream-a", CurrentSeq: 9, ReplayFloor: &floor, ReplayEnabled: true}

@@ -372,12 +372,8 @@ func (w *Writer) appendBatch(ctx context.Context, events []segment.Event, metada
 		w.mu.Lock()
 		jobs, err := w.appendBatchCoreLocked(ctx, events, metadata)
 		w.mu.Unlock()
-		if err != nil {
-			w.drainMu.Unlock()
-			return err
-		}
 		w.submitAsyncFlushes(jobs)
-		err = w.waitSubmittedAsyncFlushes(jobs)
+		err = errors.Join(err, w.waitSubmittedAsyncFlushes(jobs))
 		w.drainMu.Unlock()
 		if err != nil {
 			return err
@@ -403,12 +399,15 @@ func (w *Writer) appendBatchAttributedLocked(ctx context.Context, events []segme
 
 func (w *Writer) appendBatchLockedWithMetadata(ctx context.Context, events []segment.Event, metadata *AttributionMetadata) error {
 	jobs, err := w.appendBatchCoreLocked(ctx, events, metadata)
-	if err != nil {
+	if w.async != nil {
+		w.mu.Unlock()
+		w.submitAsyncFlushes(jobs)
+		err = errors.Join(err, w.waitSubmittedAsyncFlushes(jobs))
+		w.mu.Lock()
 		return err
 	}
-	if w.async != nil {
-		w.submitAsyncFlushes(jobs)
-		return w.waitSubmittedAsyncFlushes(jobs)
+	if err != nil {
+		return err
 	}
 	return w.rotateIfFull(ctx)
 }

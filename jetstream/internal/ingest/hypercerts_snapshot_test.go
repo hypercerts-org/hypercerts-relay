@@ -17,6 +17,26 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestSnapshotBoundaryDoesNotCrossBootstrapSequenceDomain(t *testing.T) {
+	st := newTestStore(t)
+	policy, err := selection.Open(st, []string{"org.example.record"})
+	require.NoError(t, err)
+	cfg := Config{Store: st, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), CollectionPolicy: policy, SegmentsDir: filepath.Join(t.TempDir(), "bootstrap"), SeqKey: "live_segments/seq/next", AsyncFlushWorkers: 2, MaxEventsPerBlock: 1}
+	bootstrap, err := Open(cfg)
+	require.NoError(t, err)
+	snapshot := Snapshot{DID: "did:plc:test", Rev: "rev2", Collections: []string{"org.example.record"}, Records: []segment.Event{{Kind: segment.KindCreateResync, DID: "did:plc:test", Rev: "rev2", Collection: "org.example.record", Rkey: "present"}}}
+	require.NoError(t, bootstrap.ReconcileSnapshot(t.Context(), snapshot))
+	require.NoError(t, bootstrap.Close())
+	cfg.SeqKey = seqNextKey
+	cfg.SegmentsDir = filepath.Join(t.TempDir(), "steady")
+	steady, err := Open(cfg)
+	require.NoError(t, err)
+	defer steady.Close()
+	imported := snapshot.Records[0]
+	require.NoError(t, steady.Append(t.Context(), &imported))
+	require.NotZero(t, imported.Seq, "bootstrap boundary must not filter rows before their merge into steady archive")
+}
+
 func TestHypercertsScopedSnapshotPreservesConcurrentAndOtherCollections(t *testing.T) {
 	dir := t.TempDir()
 	db, err := store.Open(dir, nil)
@@ -79,64 +99,71 @@ func TestHypercertsScopedSnapshotPreservesConcurrentAndOtherCollections(t *testi
 }
 
 func TestHypercertsManagedSnapshotWritesRowsAndAttribution(t *testing.T) {
-	w := newTestWriter(t, Config{CollectionPolicy: nil})
-	manager, err := attribution.Open(w.cfg.Store, "stream", "snapshot-attribution")
-	require.NoError(t, err)
-	w.cfg.Attribution = manager
-	w.cfg.AttributionDomain = "snapshot-attribution"
-	w.cfg.CollectionPolicy, err = selection.Open(w.cfg.Store, []string{"org.example.record"})
-	require.NoError(t, err)
-	policy := attribution.Policy{Revision: 1, Collections: []string{"org.example.record"}}
-	snapshot := Snapshot{
-		DID: "did:plc:snapshot-attribution", Rev: "rev2", Collections: []string{"org.example.record"},
-		Records:        []segment.Event{{Kind: segment.KindCreateResync, DID: "did:plc:snapshot-attribution", Rev: "rev2", Collection: "org.example.record", Rkey: "present", Payload: []byte(`{"value":true}`)}},
-		AppendMetadata: &AttributionMetadata{StreamID: "stream", Policy: policy, Provenance: attribution.ProvenanceSnapshot},
-	}
-	// Seed prior state so reconciliation must emit an actual generated delete.
-	old := segment.Event{Kind: segment.KindCreate, DID: snapshot.DID, Rev: "rev1", Collection: "org.example.record", Rkey: "removed", Payload: []byte(`{"old":true}`)}
-	old.Seq = w.nextSeq
-	boundarySeq := uint64(1)
-	boundaryID := "prior-snapshot"
-	preparedOld, err := manager.PrepareSegment(old, "stream", policy, attribution.ProvenanceSnapshot, attribution.Boundary{Seq: &boundarySeq, SnapshotID: &boundaryID})
-	require.NoError(t, err)
-	old.Seq = preparedOld.Event.Seq
-	_, err = w.active.Append(old)
-	require.NoError(t, err)
-	w.nextSeq++
-	w.cfg.Metrics.setNextSeq(w.nextSeq)
-	w.readLog.append(&old)
-	require.NoError(t, w.Flush(context.Background()))
-	before := w.NextSeq()
-	require.NoError(t, w.ReconcileSnapshot(context.Background(), snapshot))
-	require.Equal(t, before+2, w.NextSeq(), "snapshot replacement and generated delete are appended")
-	require.NoError(t, w.Flush(context.Background()))
-	files, err := SegmentFiles(w.cfg.SegmentsDir)
-	require.NoError(t, err)
-	var replacement, generatedDelete *segment.Event
-	for _, file := range files {
-		require.NoError(t, segment.WalkActive(file.Path, func(events []segment.Event) error {
-			for i := range events {
-				row := events[i]
-				if row.Seq < before {
-					continue
-				}
-				if row.Rkey == "present" && row.Kind == segment.KindUpdate {
-					replacement = &row
-				}
-				if row.Rkey == "removed" && row.Kind == segment.KindDelete {
-					generatedDelete = &row
-				}
+	for _, mode := range []struct {
+		name    string
+		workers int
+	}{{"sync", 0}, {"async", 2}} {
+		t.Run(mode.name, func(t *testing.T) {
+			w := newTestWriter(t, Config{AsyncFlushWorkers: mode.workers, MaxEventsPerBlock: 1})
+			manager, err := attribution.Open(w.cfg.Store, "stream", "snapshot-attribution")
+			require.NoError(t, err)
+			w.cfg.Attribution = manager
+			w.cfg.AttributionDomain = "snapshot-attribution"
+			w.cfg.CollectionPolicy, err = selection.Open(w.cfg.Store, []string{"org.example.record"})
+			require.NoError(t, err)
+			policy := attribution.Policy{Revision: 1, Collections: []string{"org.example.record"}}
+			snapshot := Snapshot{
+				DID: "did:plc:snapshot-attribution", Rev: "rev2", Collections: []string{"org.example.record"},
+				Records:        []segment.Event{{Kind: segment.KindCreateResync, DID: "did:plc:snapshot-attribution", Rev: "rev2", Collection: "org.example.record", Rkey: "present", Payload: []byte(`{"value":true}`)}},
+				AppendMetadata: &AttributionMetadata{StreamID: "stream", Policy: policy, Provenance: attribution.ProvenanceSnapshot},
 			}
-			return nil
-		}))
-	}
-	require.NotNil(t, replacement)
-	require.NotNil(t, generatedDelete)
-	for _, row := range []*segment.Event{replacement, generatedDelete} {
-		got, err := manager.Lookup(row.Seq)
-		require.NoError(t, err)
-		require.Equal(t, attribution.ProvenanceSnapshot, got.Provenance)
-		require.EqualValues(t, 1, *got.PolicyRev)
+			// Seed prior state so reconciliation must emit an actual generated delete.
+			old := segment.Event{Kind: segment.KindCreate, DID: snapshot.DID, Rev: "rev1", Collection: "org.example.record", Rkey: "removed", Payload: []byte(`{"old":true}`)}
+			old.Seq = w.nextSeq
+			boundarySeq := uint64(1)
+			boundaryID := "prior-snapshot"
+			preparedOld, err := manager.PrepareSegment(old, "stream", policy, attribution.ProvenanceSnapshot, attribution.Boundary{Seq: &boundarySeq, SnapshotID: &boundaryID})
+			require.NoError(t, err)
+			old.Seq = preparedOld.Event.Seq
+			_, err = w.active.Append(old)
+			require.NoError(t, err)
+			w.nextSeq++
+			w.cfg.Metrics.setNextSeq(w.nextSeq)
+			w.readLog.append(&old)
+			require.NoError(t, w.Flush(context.Background()))
+			before := w.NextSeq()
+			require.NoError(t, w.ReconcileSnapshot(context.Background(), snapshot))
+			require.Equal(t, before+2, w.NextSeq(), "snapshot replacement and generated delete are appended")
+			require.NoError(t, w.Flush(context.Background()))
+			files, err := SegmentFiles(w.cfg.SegmentsDir)
+			require.NoError(t, err)
+			var replacement, generatedDelete *segment.Event
+			for _, file := range files {
+				require.NoError(t, segment.WalkActive(file.Path, func(events []segment.Event) error {
+					for i := range events {
+						row := events[i]
+						if row.Seq < before {
+							continue
+						}
+						if row.Rkey == "present" && row.Kind == segment.KindUpdate {
+							replacement = &row
+						}
+						if row.Rkey == "removed" && row.Kind == segment.KindDelete {
+							generatedDelete = &row
+						}
+					}
+					return nil
+				}))
+			}
+			require.NotNil(t, replacement)
+			require.NotNil(t, generatedDelete)
+			for _, row := range []*segment.Event{replacement, generatedDelete} {
+				got, err := manager.Lookup(row.Seq)
+				require.NoError(t, err)
+				require.Equal(t, attribution.ProvenanceSnapshot, got.Provenance)
+				require.EqualValues(t, 1, *got.PolicyRev)
+			}
+		})
 	}
 }
 

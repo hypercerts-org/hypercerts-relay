@@ -12,9 +12,12 @@ import (
 	"github.com/bluesky-social/jetstream/internal/hypercerts/policygate"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/internal/ingest/syncstate"
 	"github.com/bluesky-social/jetstream/segment"
+	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/api/comatproto"
 	"github.com/jcalabro/atmos/streaming"
+	atmossync "github.com/jcalabro/atmos/sync"
 	"github.com/stretchr/testify/require"
 )
 
@@ -144,6 +147,63 @@ func TestProcessBatchImportedLiveSyncCannotBypassSnapshotBoundary(t *testing.T) 
 	for _, blocks := range [][]byte{{0x01, 0x02, 0x03}, nil} {
 		require.NoError(t, c.processBatch(t.Context(), []streaming.Event{{Seq: 43, Sync: &comatproto.SyncSubscribeRepos_Sync{DID: did, Rev: "3mmoojp7vgo2i", Time: "2026-05-21T00:00:00Z", Blocks: blocks}}}))
 	}
+}
+
+func TestProcessBatchManagedSyncLocalReconciler(t *testing.T) {
+	st := newTestStore(t)
+	history, err := attribution.Open(st, "stream", "bootstrap-local")
+	require.NoError(t, err)
+	policy, err := selection.Open(st, []string{"app.bsky.feed.post"})
+	require.NoError(t, err)
+	require.NoError(t, history.EnsureInitialPolicyHistory(attribution.Policy{Revision: 1, Collections: []string{"app.bsky.feed.post"}}, nil))
+	c, err := Open(Config{SegmentsDir: filepath.Join(t.TempDir(), "segments"), Store: st, SeqKey: BootstrapSeqKey, CursorKey: CursorKey, RelayURL: "https://example.invalid", Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Verifier: newTestVerifier(t), Attribution: history, AttributionDomain: "bootstrap-local", AttributionStreamID: "stream", CollectionPolicy: policy, PolicyGate: policygate.New(policy, nil, "bootstrap-local"), ReadLogRetentionBytes: 1 << 20})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, c.Close()) }()
+	require.NoError(t, c.processBatch(t.Context(), []streaming.Event{{Seq: 42, Sync: &comatproto.SyncSubscribeRepos_Sync{DID: "did:plc:test", Rev: "3mmoojp7vgo2g", Time: "2026-05-21T00:00:00Z"}}}))
+	require.EqualValues(t, 2, c.writer.NextSeq())
+	require.NoError(t, c.writer.Flush(t.Context()))
+	meta, err := history.Lookup(1)
+	require.NoError(t, err)
+	require.Equal(t, attribution.ProvenanceLive, meta.Provenance)
+}
+
+func TestProcessBatchManagedInactiveSyncContinues(t *testing.T) {
+	st := newTestStore(t)
+	state := syncstate.New(st)
+	require.NoError(t, state.SaveChain(t.Context(), atmos.DID("did:plc:test"), atmossync.ChainState{Rev: "3mmoojp7vgo2g", Data: fixedCIDForPromote(t)}))
+	history, err := attribution.Open(st, "stream", "inactive-sync")
+	require.NoError(t, err)
+	policy, err := selection.Open(st, []string{"app.bsky.feed.post"})
+	require.NoError(t, err)
+	require.NoError(t, history.EnsureInitialPolicyHistory(attribution.Policy{Revision: 1, Collections: []string{"app.bsky.feed.post"}}, nil))
+	c, err := Open(Config{SegmentsDir: filepath.Join(t.TempDir(), "segments"), Store: st, SeqKey: SteadySeqKey, CursorKey: CursorKey, RelayURL: "https://example.invalid", Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Verifier: newTestVerifier(t), Attribution: history, AttributionDomain: "inactive-sync", AttributionStreamID: "stream", SyncStateStore: state, CollectionPolicy: policy, PolicyGate: policygate.New(policy, nil, "inactive-sync"), ReadLogRetentionBytes: 1 << 20})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, c.Close()) }()
+	require.NoError(t, c.processBatch(t.Context(), []streaming.Event{{Seq: 40, Account: &comatproto.SyncSubscribeRepos_Account{DID: "did:plc:test", Active: false, Time: "2026-05-21T00:00:00Z"}}}))
+	require.NoError(t, c.writer.DrainDurability(t.Context()))
+	beforeChain, err := syncstate.New(st).LoadChain(t.Context(), atmos.DID("did:plc:test"))
+	require.NoError(t, err)
+	require.Nil(t, beforeChain)
+	require.NoError(t, state.SaveChain(t.Context(), atmos.DID("did:plc:test"), atmossync.ChainState{Rev: "3mmoojp7vgo2h", Data: fixedCIDForPromote(t)}))
+	require.NoError(t, c.processBatch(t.Context(), []streaming.Event{
+		{Seq: 40, Account: &comatproto.SyncSubscribeRepos_Account{DID: "did:plc:test", Active: false, Time: "2026-05-21T00:00:00Z"}},
+		{Seq: 41, Sync: &comatproto.SyncSubscribeRepos_Sync{DID: "did:plc:test", Rev: "3mmoojp7vgo2h", Time: "2026-05-21T00:00:00Z"}},
+		{Seq: 42, Identity: &comatproto.SyncSubscribeRepos_Identity{DID: "did:plc:other", Time: "2026-05-21T00:00:00Z"}},
+	}))
+	require.NoError(t, c.writer.DrainDurability(t.Context()))
+	rows, _, ok, _ := c.writer.ReadLog().ReadCommittedFrom(1, 10)
+	require.True(t, ok)
+	require.Len(t, rows, 2)
+	require.Equal(t, segment.KindAccount, rows[0].Event().Kind)
+	require.Equal(t, segment.KindIdentity, rows[1].Event().Kind)
+	require.EqualValues(t, 42, c.LastUpstreamSeq())
+	cursor, err := LoadUpstreamCursor(st, CursorKey)
+	require.NoError(t, err)
+	require.EqualValues(t, 42, cursor)
+	durableChain, err := syncstate.New(st).LoadChain(t.Context(), atmos.DID("did:plc:test"))
+	require.NoError(t, err)
+	require.NotNil(t, durableChain)
+	require.Equal(t, "3mmoojp7vgo2h", durableChain.Rev)
 }
 
 func TestProcessBatchManagedSyncFailureDoesNotAppendMarker(t *testing.T) {

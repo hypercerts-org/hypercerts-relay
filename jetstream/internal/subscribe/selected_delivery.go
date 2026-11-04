@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
+	"github.com/bluesky-social/jetstream/internal/tombstone"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/coder/websocket"
 )
@@ -161,12 +163,25 @@ func deliverSelected(ctx context.Context, conn *websocket.Conn, ev *segment.Even
 	selectedMetadata := SelectedMetadata(meta)
 	if ev.Kind == segment.KindSync {
 		if meta.PolicyRev == nil {
-			return fmt.Errorf("selected sync missing policy attribution")
+			return ErrReplayUnavailable
 		}
 		policy, policyErr := deps.SelectedAttribution.LookupPolicy(*meta.PolicyRev)
 		if policyErr != nil {
 			logger.Error("selected sync policy lookup failed", "seq", ev.Seq, "err", policyErr)
 			return policyErr
+		}
+		scope, scopeErr := tombstone.DecodeScopedSync(ev)
+		if scopeErr != nil {
+			return scopeErr
+		}
+		if scope != nil {
+			collections := make([]string, 0, len(scope.Collections))
+			for _, collection := range scope.Collections {
+				if slices.Contains(policy.Collections, collection) {
+					collections = append(collections, collection)
+				}
+			}
+			policy.Collections = collections
 		}
 		selectedMetadata = selectedSyncMetadata(meta, ev.DID, policy)
 	}
