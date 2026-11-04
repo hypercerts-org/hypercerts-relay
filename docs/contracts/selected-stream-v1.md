@@ -20,7 +20,7 @@ The wire contract remains the existing typed `xrpc.v1.json` payload framed by it
 
 ```json
 {
-  "$type": "com.atproto.sync.subscribeRepos#commit",
+  "$type": "network.bsky.jetstream.subscribeEvents#commit",
   "time": "2026-01-01T00:00:00Z",
   "seq": 123,
   "hypercerts": {
