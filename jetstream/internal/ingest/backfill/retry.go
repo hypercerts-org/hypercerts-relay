@@ -166,27 +166,7 @@ func newRetryRunner(cfg RetryConfig) (*retryRunner, error) {
 	if cfg.Interval < 0 {
 		return nil, fmt.Errorf("backfill: retry: Interval must be >= 0")
 	}
-	if cfg.Workers <= 0 {
-		cfg.Workers = DefaultFailedRepoRetryWorkers
-	}
-	if cfg.HostWorkers <= 0 {
-		cfg.HostWorkers = DefaultFailedRepoRetryHostWorkers
-	}
-	if cfg.MaxDelay <= 0 {
-		cfg.MaxDelay = DefaultFailedRepoRetryMaxDelay
-	}
-	if cfg.DownloadTimeout == 0 {
-		cfg.DownloadTimeout = atmosbackfill.DefaultDownloadTimeout
-	}
-	if cfg.now == nil {
-		cfg.now = time.Now
-	}
-	if cfg.jitter == nil {
-		cfg.jitter = rand.Int64N
-	}
-	if cfg.NewHostClient == nil {
-		cfg.NewHostClient = NewHostClientBuilder(cfg.RelayURL, cfg.HTTPClient)
-	}
+	cfg.applyRetryDefaults()
 
 	xc := &xrpc.Client{
 		Host:       cfg.RelayURL,
@@ -613,4 +593,29 @@ func isLocalRetryError(err error) bool {
 		strings.Contains(msg, "append batch") ||
 		strings.Contains(msg, "drain durable repo rows") ||
 		strings.Contains(msg, "complete repo")
+}
+
+func (cfg *RetryConfig) applyRetryDefaults() {
+	if cfg.Workers <= 0 {
+		cfg.Workers = DefaultFailedRepoRetryWorkers
+	}
+	if cfg.HostWorkers <= 0 {
+		cfg.HostWorkers = DefaultFailedRepoRetryHostWorkers
+	}
+	if cfg.MaxDelay <= 0 {
+		cfg.MaxDelay = DefaultFailedRepoRetryMaxDelay
+	}
+	if cfg.DownloadTimeout == 0 {
+		cfg.DownloadTimeout = atmosbackfill.DefaultDownloadTimeout
+	}
+	if cfg.now == nil {
+		cfg.now = time.Now
+	}
+	if cfg.jitter == nil {
+		cfg.jitter = rand.Int64N
+	}
+	if cfg.NewHostClient == nil {
+		cfg.NewHostClient = NewHostClientBuilder(cfg.RelayURL, cfg.HTTPClient)
+	}
+
 }

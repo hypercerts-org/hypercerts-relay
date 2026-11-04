@@ -106,27 +106,7 @@ func Open(cfg Config) (*Consumer, error) {
 	// where the row and cursor batch are durable but the ratchet is not
 	// — a restart redelivery would then re-archive the row as a
 	// permanent duplicate, the exact bug the guards exist to prevent.
-	var onAppend func(ev *segment.Event) error
-	if cfg.Tombstones != nil || cfg.SyncStateStore != nil {
-		ts := cfg.Tombstones
-		ss := cfg.SyncStateStore
-		onAppend = func(ev *segment.Event) error {
-			if ts != nil {
-				if err := ts.Observe(ev); err != nil {
-					return err
-				}
-			}
-			if ss != nil {
-				switch ev.Kind {
-				case segment.KindAccount:
-					ss.RecordAccountSeq(atmos.DID(ev.DID), ev.UpstreamRelayCursor)
-				case segment.KindIdentity:
-					ss.RecordIdentitySeq(atmos.DID(ev.DID), ev.UpstreamRelayCursor)
-				}
-			}
-			return nil
-		}
-	}
+	onAppend := liveAppendObserver(cfg)
 
 	w, err := ingest.Open(ingest.Config{
 		// hypercerts: The writer also gates sync replacements and retry materializations.
@@ -931,3 +911,27 @@ func (c *Consumer) Writer() *ingest.Writer {
 
 // PolicyGate returns the gate initialized with this consumer's writer.
 func (c *Consumer) PolicyGate() *policygate.Gate { return c.cfg.PolicyGate }
+
+func liveAppendObserver(cfg Config) func(*segment.Event) error {
+	if cfg.Tombstones == nil && cfg.SyncStateStore == nil {
+		return nil
+	}
+	ts := cfg.Tombstones
+	ss := cfg.SyncStateStore
+	return func(ev *segment.Event) error {
+		if ts != nil {
+			if err := ts.Observe(ev); err != nil {
+				return err
+			}
+		}
+		if ss != nil {
+			switch ev.Kind {
+			case segment.KindAccount:
+				ss.RecordAccountSeq(atmos.DID(ev.DID), ev.UpstreamRelayCursor)
+			case segment.KindIdentity:
+				ss.RecordIdentitySeq(atmos.DID(ev.DID), ev.UpstreamRelayCursor)
+			}
+		}
+		return nil
+	}
+}

@@ -120,39 +120,11 @@ func (w *Writer) ReconcileSnapshot(ctx context.Context, snapshot Snapshot) error
 	if err != nil {
 		return err
 	}
-	metadata := snapshot.AppendMetadata
-	if metadata != nil {
-		if metadata.Provenance == attribution.ProvenanceSnapshot || metadata.Provenance == attribution.ProvenanceReconciliation {
-			if metadata.Boundary.Seq == nil {
-				seq := w.nextSeq
-				metadata.Boundary.Seq = &seq
-			}
-			if metadata.Boundary.SnapshotID == nil {
-				id := snapshot.DID + "/" + snapshot.Rev
-				metadata.Boundary.SnapshotID = &id
-			}
-		}
-		policyRevision := metadata.Policy.Revision
-		if err := attribution.Validate(attribution.Event{StreamID: metadata.StreamID, Seq: 1, PolicyRev: &policyRevision, Provenance: metadata.Provenance, Boundary: metadata.Boundary, Payload: json.RawMessage(`{"snapshot":true}`)}); err != nil {
-			return fmt.Errorf("ingest: invalid snapshot attribution: %w", err)
-		}
-	}
-	if err := w.flushAndRotateLocked(ctx); err != nil {
+	metadata, err := w.prepareSnapshotMetadata(snapshot)
+	if err != nil {
 		return err
 	}
-	if metadata != nil {
-		if err := w.appendBatchAttributedLocked(ctx, rows, metadata); err != nil {
-			return err
-		}
-	} else if err := w.appendBatchLocked(ctx, rows); err != nil {
-		return err
-	}
-	if len(rows) > 0 {
-		if err := w.flushAndRotateLocked(ctx); err != nil {
-			return err
-		}
-	}
-	return w.persistSnapshotBoundary(snapshot)
+	return w.publishSnapshotLocked(ctx, snapshot, rows, metadata)
 }
 
 // snapshotArchiveState retains only metadata needed to reconcile one DID.
@@ -408,4 +380,44 @@ func (w *Writer) reconcileSync(ctx context.Context, did, rev string, rows []segm
 		return nil // stale sync cannot revive an inactive account.
 	}
 	return err
+}
+
+func (w *Writer) prepareSnapshotMetadata(snapshot Snapshot) (*AttributionMetadata, error) {
+	metadata := snapshot.AppendMetadata
+	if metadata != nil {
+		if metadata.Provenance == attribution.ProvenanceSnapshot || metadata.Provenance == attribution.ProvenanceReconciliation {
+			if metadata.Boundary.Seq == nil {
+				seq := w.nextSeq
+				metadata.Boundary.Seq = &seq
+			}
+			if metadata.Boundary.SnapshotID == nil {
+				id := snapshot.DID + "/" + snapshot.Rev
+				metadata.Boundary.SnapshotID = &id
+			}
+		}
+		policyRevision := metadata.Policy.Revision
+		if err := attribution.Validate(attribution.Event{StreamID: metadata.StreamID, Seq: 1, PolicyRev: &policyRevision, Provenance: metadata.Provenance, Boundary: metadata.Boundary, Payload: json.RawMessage(`{"snapshot":true}`)}); err != nil {
+			return nil, fmt.Errorf("ingest: invalid snapshot attribution: %w", err)
+		}
+	}
+	return metadata, nil
+}
+
+func (w *Writer) publishSnapshotLocked(ctx context.Context, snapshot Snapshot, rows []segment.Event, metadata *AttributionMetadata) error {
+	if err := w.flushAndRotateLocked(ctx); err != nil {
+		return err
+	}
+	if metadata != nil {
+		if err := w.appendBatchAttributedLocked(ctx, rows, metadata); err != nil {
+			return err
+		}
+	} else if err := w.appendBatchLocked(ctx, rows); err != nil {
+		return err
+	}
+	if len(rows) > 0 {
+		if err := w.flushAndRotateLocked(ctx); err != nil {
+			return err
+		}
+	}
+	return w.persistSnapshotBoundary(snapshot)
 }
