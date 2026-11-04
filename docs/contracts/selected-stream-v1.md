@@ -41,11 +41,11 @@ Every newly sequenced selected event MUST carry this metadata. If the implementa
 
 The selection policy is an exact set of collection NSIDs. A record event is selected only if its collection is enabled under the effective policy at that event's ordered position. A policy revision is immutable once committed. Persist its contents and adoption boundary before reporting adoption successful.
 
-Policy adoption MUST be ordered with event ingestion and durably record `effectiveAfterSeq`, an integer sequence boundary. The new policy applies only to events with `seq > effectiveAfterSeq`, until the next revision's boundary. An adoption that occurs before the first event has `effectiveAfterSeq: null` and MUST be emitted as an unsequenced `info` frame before the first event governed by that revision. The frame uses the existing Jetstream info envelope (`kind: "info"`, `name`, optional `message`) in the existing `xrpc.v1.json` message framing. Keep the established `info.name: "PolicyAdopted"`; there is no new `initialPolicyAdopted` name. Selected-contract fields belong inside the typed info payload under `hypercerts`, for example:
+Policy adoption MUST be ordered with event ingestion and durably record `effectiveAfterSeq`, an integer sequence boundary. The new policy applies only to events with `seq > effectiveAfterSeq`, until the next revision's boundary. An adoption that occurs before the first event has `effectiveAfterSeq: null` and MUST be emitted as an unsequenced `info` frame before the first event governed by that revision. For consumers decoding these notices, the outer `xrpc.v1.json` message frame is `{"$type":"message","payload":{...}}`. Its `payload` is the typed info object with `$type: "network.bsky.jetstream.subscribeEvents#info"`, `name`, and optional `message`; there is no `kind` field. Keep the established payload field `name: "PolicyAdopted"`; there is no new `initialPolicyAdopted` name. Selected-contract fields belong inside that payload under `hypercerts`. The following example shows only the typed info payload, not the outer message frame:
 
 ```json
 {
-  "kind": "info",
+  "$type": "network.bsky.jetstream.subscribeEvents#info",
   "name": "PolicyAdopted",
   "message": "Selected collection policy adopted",
   "hypercerts": {
@@ -95,11 +95,11 @@ For consumers upgrading a legacy materialized archive, selected replay starts no
 
 ## 6. First-frame capability and history disclosure
 
-The first selected stream frame is `info` and MUST precede data. Its mandatory fields are:
+The first selected stream frame carries a typed `#info` payload and MUST precede data. The example below shows that payload only; on the wire it is the `payload` of the outer `{"$type":"message","payload":{...}}` frame:
 
 ```json
 {
-  "kind": "info",
+  "$type": "network.bsky.jetstream.subscribeEvents#info",
   "name": "SelectedFeed",
   "message": "Selected stream capability",
   "hypercerts": {
@@ -119,11 +119,12 @@ The first selected stream frame is `info` and MUST precede data. Its mandatory f
 
 Field types and semantics:
 
-- `kind` and `name`: existing `xrpc.v1.json` info envelope fields (`info` and `SelectedFeed`); `hypercerts` carries the selected contract fields inside the typed info payload.
+- `$type`: the typed payload discriminator, `network.bsky.jetstream.subscribeEvents#info`, distinct from the outer frame's `$type: "message"`; there is no `kind` field.
+- `name`: the info notice name, `SelectedFeed`; `message` is optional human-readable text. `hypercerts` carries the mandatory selected contract fields described below inside the typed info payload, not alongside the outer frame's `payload`.
 - `contract`: the negotiated contract identifier.
 - `streamId`: current persistent stream identity.
 - `policyRev`: current non-negative integer revision.
-- `effectiveAfterSeq`: integer boundary for this revision, or `null` when adopted before any sequence; the separate `unsequencedPolicyAdopted` notice MUST precede its first event.
+- `effectiveAfterSeq`: integer boundary for this revision, or `null` when adopted before any sequence; the separate unsequenced `PolicyAdopted` notice MUST precede its first event.
 - `collections`: exact collection NSID array for the current policy revision.
 - `replayFloor`: earliest selected sequence currently available for replay, or `null` if none is available.
 - `historyMode`: `materialized` or `originalEvents`. Use `originalEvents` only when durable original-event capture can be substantiated from an explicit boundary.
@@ -135,11 +136,11 @@ At initial history materialization, the minimum truthful disclosure is `historyM
 
 ## 7. Reconciliation scope and completion
 
-Reconciliation status is an advisory, unsequenced `info` frame using the existing Jetstream info envelope (`kind: "info"`, `name`, optional `message`). A reconciliation notice uses `name: "Reconciliation"` and carries its typed contract fields under `hypercerts`, for example:
+Reconciliation status is an advisory, unsequenced typed `#info` payload with `$type: "network.bsky.jetstream.subscribeEvents#info"`, `name`, and optional `message`, carried in the outer `xrpc.v1.json` message frame's `payload`. A reconciliation notice uses `name: "Reconciliation"` and carries its typed contract fields under `hypercerts`. This example shows only the typed info payload:
 
 ```json
 {
-  "kind": "info",
+  "$type": "network.bsky.jetstream.subscribeEvents#info",
   "name": "Reconciliation",
   "message": "Reconciliation progress update",
   "hypercerts": {
@@ -175,7 +176,7 @@ Stages are additive and must not retroactively upgrade old data's provenance. A 
 The implementation is accepted only when automated tests demonstrate all of the following:
 
 1. **Compatibility and selection:** absent selector preserves existing upstream output; the supported selector yields only exact selected records with typed metadata; unsupported selectors fail with `UnsupportedContract` before data. The server does not advertise the contract if any mandatory info/event field is unavailable.
-2. **Policy crash boundary:** crashes before, during, and after policy adoption recover one committed revision and its `effectiveAfterSeq`; no event has ambiguous policy attribution. First-event adoption sends `unsequencedPolicyAdopted` first; policy boundaries appear in replay.
+2. **Policy crash boundary:** crashes before, during, and after policy adoption recover one committed revision and its `effectiveAfterSeq`; no event has ambiguous policy attribution. First-event adoption sends unsequenced `PolicyAdopted` first; policy boundaries appear in replay.
 3. **Removal and re-add:** removal halts future admission without purging retained rows or synthesizing deletes; re-add admits only from its new boundary and reports the intervening gap.
 4. **Cursor validation and resume:** `streamId`/integer cursor pairing is enforced; inclusive cursor replay deduplicates correctly; wrong-stream, future, and replay-disabled/unavailable cursors produce their stable errors without tail-jump; old timestamp clamping is not reported as successful selected resume.
 5. **Lifecycle scope:** current/previously selected and source-known lifecycle markers retain the defined selected-DID behavior; identity refresh does not purge, account inactive hides current state but retains history, and sync scope/reconciliation need is disclosed without fabricated completion or unselected payload leakage.
