@@ -219,7 +219,7 @@ func decode(b []byte, v any) error {
 	if err := d.Decode(v); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalid, err)
 	}
-	if err := d.Decode(new(any)); err != io.EOF {
+	if d.Decode(new(any)) != io.EOF {
 		return fmt.Errorf("%w: trailing JSON data", ErrInvalid)
 	}
 	return nil
@@ -305,11 +305,11 @@ func (m *Manager) Prepare(e Event, policies ...Policy) (Prepared, error) {
 	}
 	var policy *Policy
 	if len(policies) == 1 {
-		copy := clonePolicy(policies[0])
-		if !validPolicy(copy) || e.PolicyRev == nil || copy.Revision != *e.PolicyRev {
+		preparedPolicy := clonePolicy(policies[0])
+		if !validPolicy(preparedPolicy) || e.PolicyRev == nil || preparedPolicy.Revision != *e.PolicyRev {
 			return Prepared{}, ErrInvalid
 		}
-		policy = &copy
+		policy = &preparedPolicy
 	} else if e.PolicyRev != nil || e.Provenance != ProvenanceLegacyUnknown {
 		return Prepared{}, ErrInvalid
 	}
@@ -344,24 +344,42 @@ func cloneImportedSource(source *ImportedSource) *ImportedSource {
 	if source == nil {
 		return nil
 	}
-	copy := *source
+	clonedSource := *source
 	if source.PolicyRev != nil {
 		value := *source.PolicyRev
-		copy.PolicyRev = &value
+		clonedSource.PolicyRev = &value
 	}
 	if source.Policy != nil {
 		policy := clonePolicy(*source.Policy)
-		copy.Policy = &policy
+		clonedSource.Policy = &policy
 	}
 	if source.Boundary.Seq != nil {
 		value := *source.Boundary.Seq
-		copy.Boundary.Seq = &value
+		clonedSource.Boundary.Seq = &value
 	}
 	if source.Boundary.SnapshotID != nil {
 		value := *source.Boundary.SnapshotID
-		copy.Boundary.SnapshotID = &value
+		clonedSource.Boundary.SnapshotID = &value
 	}
-	return &copy
+	return &clonedSource
+}
+
+func validEventPolicy(event Event, policy *Policy) bool {
+	if policy == nil {
+		return event.PolicyRev == nil && event.Provenance == ProvenanceLegacyUnknown
+	}
+	return event.PolicyRev != nil && validPolicy(*policy) && policy.Revision == *event.PolicyRev
+}
+
+func validateImportedSource(source *ImportedSource) error {
+	if source.Domain == "" || source.StreamID == "" || source.Seq == 0 {
+		return ErrInvalid
+	}
+	event := Event{StreamID: source.StreamID, Seq: source.Seq, PolicyRev: source.PolicyRev, Provenance: source.Provenance, Boundary: source.Boundary, Payload: json.RawMessage(`{"operation":"import"}`)}
+	if Validate(event) != nil || source.SegmentFingerprint == "" || !validEventPolicy(event, source.Policy) {
+		return ErrInvalid
+	}
+	return nil
 }
 
 func (m *Manager) PrepareSegment(e segment.Event, streamID string, policy Policy, provenance Provenance, boundary Boundary, sources ...*ImportedSource) (Prepared, error) {
@@ -371,12 +389,8 @@ func (m *Manager) PrepareSegment(e segment.Event, streamID string, policy Policy
 	var source *ImportedSource
 	if len(sources) == 1 && sources[0] != nil {
 		source = cloneImportedSource(sources[0])
-		if source.Domain == "" || source.StreamID == "" || source.Seq == 0 {
-			return Prepared{}, ErrInvalid
-		}
-		sourceEvent := Event{StreamID: source.StreamID, Seq: source.Seq, PolicyRev: source.PolicyRev, Provenance: source.Provenance, Boundary: source.Boundary, Payload: json.RawMessage(`{"operation":"import"}`)}
-		if Validate(sourceEvent) != nil || source.SegmentFingerprint == "" || (source.Policy == nil && (source.PolicyRev != nil || source.Provenance != ProvenanceLegacyUnknown)) || (source.Policy != nil && (source.PolicyRev == nil || !validPolicy(*source.Policy) || source.Policy.Revision != *source.PolicyRev)) {
-			return Prepared{}, ErrInvalid
+		if err := validateImportedSource(source); err != nil {
+			return Prepared{}, err
 		}
 	}
 	payload, err := json.Marshal(struct {
@@ -436,65 +450,97 @@ func (m *Manager) commitBatchLocked(prepared []Prepared, commitMetadata func(*pe
 	}
 	batch := m.db.NewBatch()
 	defer batch.Close()
+	minimumSeq, err := minimumPreparedSeq(prepared)
+	if err != nil {
+		return err
+	}
 	seenEvents, seenPolicies := make(map[uint64][]byte), make(map[uint64][]byte)
-	var minimumSeq uint64
+	for _, p := range prepared {
+		if err := m.stagePreparedEntry(batch, p, seenEvents, seenPolicies); err != nil {
+			return err
+		}
+	}
+	if err := m.stageActivation(batch, minimumSeq); err != nil {
+		return err
+	}
+	if commitMetadata != nil {
+		if err := commitMetadata(batch); err != nil {
+			return err
+		}
+	}
+	return m.db.Commit(batch, store.SyncWrites)
+}
+
+func minimumPreparedSeq(prepared []Prepared) (uint64, error) {
+	var minimum uint64
 	for i, p := range prepared {
 		if p.Event.Seq == 0 {
-			return ErrInvalid
+			return 0, ErrInvalid
 		}
-		if i == 0 || p.Event.Seq < minimumSeq {
-			minimumSeq = p.Event.Seq
+		if i == 0 || p.Event.Seq < minimum {
+			minimum = p.Event.Seq
 		}
 	}
-	first := minimumSeq
-	for _, p := range prepared {
-		if p.Event.StreamID != m.streamID || Validate(p.Event) != nil || p.Fingerprint != fingerprint(p.Event) || (p.Policy == nil && (p.Event.PolicyRev != nil || p.Event.Provenance != ProvenanceLegacyUnknown)) || (p.Policy != nil && (p.Event.PolicyRev == nil || !validPolicy(*p.Policy) || p.Policy.Revision != *p.Event.PolicyRev)) {
-			return ErrInvalid
-		}
-		ev, err := encode(p.Event)
+	return minimum, nil
+}
+
+func (m *Manager) encodePreparedEntry(p Prepared) ([]byte, []byte, error) {
+	if p.Event.StreamID != m.streamID || Validate(p.Event) != nil || p.Fingerprint != fingerprint(p.Event) || !validEventPolicy(p.Event, p.Policy) {
+		return nil, nil, ErrInvalid
+	}
+	event, err := encode(p.Event)
+	if err != nil {
+		return nil, nil, err
+	}
+	var policy []byte
+	if p.Policy != nil {
+		policy, err = encode(p.Policy)
 		if err != nil {
-			return err
+			return nil, nil, err
 		}
-		var pol []byte
-		if p.Policy != nil {
-			pol, err = encode(p.Policy)
-			if err != nil {
-				return err
-			}
-		}
-		if prior, ok := seenEvents[p.Event.Seq]; ok && !bytes.Equal(prior, ev) {
+	}
+	return event, policy, nil
+}
+
+func (m *Manager) stagePreparedEntry(batch *pebble.Batch, p Prepared, seenEvents, seenPolicies map[uint64][]byte) error {
+	event, policy, err := m.encodePreparedEntry(p)
+	if err != nil {
+		return err
+	}
+	if prior, ok := seenEvents[p.Event.Seq]; ok && !bytes.Equal(prior, event) {
+		return ErrConflict
+	}
+	seenEvents[p.Event.Seq] = event
+	if p.Policy != nil {
+		if prior, ok := seenPolicies[p.Policy.Revision]; ok && !bytes.Equal(prior, policy) {
 			return ErrConflict
 		}
-		seenEvents[p.Event.Seq] = ev
-		if p.Policy != nil {
-			if prior, ok := seenPolicies[p.Policy.Revision]; ok && !bytes.Equal(prior, pol) {
-				return ErrConflict
-			}
-			seenPolicies[p.Policy.Revision] = pol
-		}
-		if err = m.checkCoordinate(m.eventKey(p.Event.Seq), ev); err != nil {
+		seenPolicies[p.Policy.Revision] = policy
+	}
+	if err := m.checkCoordinate(m.eventKey(p.Event.Seq), event); err != nil {
+		return err
+	}
+	if p.Policy != nil {
+		if err := m.checkCoordinate(m.policyKey(p.Policy.Revision), policy); err != nil {
 			return err
-		}
-		if p.Policy != nil {
-			if err = m.checkCoordinate(m.policyKey(p.Policy.Revision), pol); err != nil {
-				return err
-			}
-		}
-		if err = batch.Set(m.eventKey(p.Event.Seq), ev, nil); err != nil {
-			return err
-		}
-		if p.Policy != nil {
-			if err = batch.Set(m.policyKey(p.Policy.Revision), pol, nil); err != nil {
-				return err
-			}
-		}
-		if err = batch.Delete(m.preparedKey(p.Event.Seq), nil); err != nil {
-			return err
-		}
-		if p.Event.Seq < first {
-			first = p.Event.Seq
 		}
 	}
+	return m.stagePreparedCoordinates(batch, p, event, policy)
+}
+
+func (m *Manager) stagePreparedCoordinates(batch *pebble.Batch, p Prepared, event, policy []byte) error {
+	if err := batch.Set(m.eventKey(p.Event.Seq), event, nil); err != nil {
+		return err
+	}
+	if p.Policy != nil {
+		if err := batch.Set(m.policyKey(p.Policy.Revision), policy, nil); err != nil {
+			return err
+		}
+	}
+	return batch.Delete(m.preparedKey(p.Event.Seq), nil)
+}
+
+func (m *Manager) stageActivation(batch *pebble.Batch, first uint64) error {
 	if existing, closer, err := m.db.Get(m.key("activation")); err == nil {
 		var state struct {
 			StreamID           string `json:"streamId"`
@@ -521,15 +567,7 @@ func (m *Manager) commitBatchLocked(prepared []Prepared, commitMetadata func(*pe
 	if err != nil {
 		return err
 	}
-	if err = batch.Set(m.key("activation"), activation, nil); err != nil {
-		return err
-	}
-	if commitMetadata != nil {
-		if err = commitMetadata(batch); err != nil {
-			return err
-		}
-	}
-	return m.db.Commit(batch, store.SyncWrites)
+	return batch.Set(m.key("activation"), activation, nil)
 }
 func (m *Manager) atomicCommit(p Prepared, policy Policy, commitMetadata func(*pebble.Batch) error) error {
 	if p.Policy == nil || p.Event.PolicyRev == nil || !validPolicy(policy) || policy.Revision != *p.Event.PolicyRev || !bytes.Equal(mustEncode(p.Policy), mustEncode(policy)) {
@@ -578,103 +616,110 @@ func (m *Manager) checkCoordinate(key, value []byte) error {
 	}
 	return err
 }
+
+type recoveryEntry struct {
+	key      []byte
+	prepared Prepared
+}
+
 func (m *Manager) Recover(durableLookup func(uint64) (DurableEvent, error), policyFor func(uint64) (Policy, error)) error {
 	if durableLookup == nil {
 		return ErrInvalid
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	lo := m.key("prepared")
-	iter, err := m.db.NewIter(&pebble.IterOptions{LowerBound: lo, UpperBound: store.PrefixUpperBound(lo)})
-	if err != nil {
-		return err
-	}
-	var entries []struct {
-		key []byte
-		p   Prepared
-	}
-	for iter.First(); iter.Valid(); iter.Next() {
-		var p Prepared
-		if err = decode(iter.Value(), &p); err != nil {
-			_ = iter.Close()
-			return err
-		}
-		entries = append(entries, struct {
-			key []byte
-			p   Prepared
-		}{bytes.Clone(iter.Key()), p})
-	}
-	err = iter.Error()
-	_ = iter.Close()
+	entries, err := m.readRecoveryEntries()
 	if err != nil {
 		return err
 	}
 	for _, entry := range entries {
-		p := entry.p
-		if p.Event.StreamID != m.streamID || p.Event.Seq != seqFromKey(entry.key) || Validate(p.Event) != nil {
-			return ErrInvalid
-		}
-		if p.Fingerprint != fingerprint(p.Event) {
-			return ErrFingerprint
-		}
-		found, err := durableLookup(p.Event.Seq)
-		if err != nil {
-			return err
-		}
-		if !found.Exists {
-			if err = m.db.Delete(entry.key, store.SyncWrites); err != nil {
-				return err
-			}
-			continue
-		}
-		if p.SegmentFingerprint != "" {
-			if found.SegmentFingerprint == "" || found.SegmentFingerprint != p.SegmentFingerprint {
-				return ErrFingerprint
-			}
-		} else if found.Fingerprint != p.Fingerprint {
-			return ErrFingerprint
-		}
-		var pol Policy
-		if p.Policy != nil {
-			pol = clonePolicy(*p.Policy)
-		}
-		if p.Event.PolicyRev == nil && p.Policy == nil && p.Event.Provenance == ProvenanceLegacyUnknown {
-			if err = m.commitLocked(p, Policy{}, nil); err != nil {
-				return err
-			}
-			continue
-		}
-		if p.Event.PolicyRev == nil {
-			return ErrInvalid
-		}
-		if !validPolicy(pol) || pol.Revision != *p.Event.PolicyRev {
-			if len(func() []string {
-				if p.Policy == nil {
-					return nil
-				}
-				return p.Policy.Collections
-			}()) != 0 || func() uint64 {
-				if p.Policy == nil {
-					return 0
-				}
-				return p.Policy.Revision
-			}() != 0 || policyFor == nil {
-				return ErrInvalid
-			}
-			pol, err = policyFor(*p.Event.PolicyRev)
-			if err != nil {
-				return err
-			}
-			if !validPolicy(pol) || pol.Revision != *p.Event.PolicyRev {
-				return ErrInvalid
-			}
-			p.Policy = policyPtr(pol)
-		}
-		if err = m.commitLocked(p, pol, nil); err != nil {
+		if err := m.recoverEntry(entry, durableLookup, policyFor); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (m *Manager) readRecoveryEntries() ([]recoveryEntry, error) {
+	lo := m.key("prepared")
+	iter, err := m.db.NewIter(&pebble.IterOptions{LowerBound: lo, UpperBound: store.PrefixUpperBound(lo)})
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+	var entries []recoveryEntry
+	for iter.First(); iter.Valid(); iter.Next() {
+		var p Prepared
+		if err := decode(iter.Value(), &p); err != nil {
+			return nil, err
+		}
+		entries = append(entries, recoveryEntry{key: bytes.Clone(iter.Key()), prepared: p})
+	}
+	return entries, iter.Error()
+}
+
+func (m *Manager) recoverEntry(entry recoveryEntry, durableLookup func(uint64) (DurableEvent, error), policyFor func(uint64) (Policy, error)) error {
+	p := entry.prepared
+	if p.Event.StreamID != m.streamID || p.Event.Seq != seqFromKey(entry.key) || Validate(p.Event) != nil {
+		return ErrInvalid
+	}
+	if p.Fingerprint != fingerprint(p.Event) {
+		return ErrFingerprint
+	}
+	found, err := durableLookup(p.Event.Seq)
+	if err != nil {
+		return err
+	}
+	if !found.Exists {
+		return m.db.Delete(entry.key, store.SyncWrites)
+	}
+	if err := validateDurableFingerprint(p, found); err != nil {
+		return err
+	}
+	if p.Event.PolicyRev == nil && p.Policy == nil && p.Event.Provenance == ProvenanceLegacyUnknown {
+		return m.commitLocked(p, Policy{}, nil)
+	}
+	policy, err := recoveryPolicy(&p, policyFor)
+	if err != nil {
+		return err
+	}
+	return m.commitLocked(p, policy, nil)
+}
+
+func validateDurableFingerprint(p Prepared, found DurableEvent) error {
+	if p.SegmentFingerprint != "" {
+		if found.SegmentFingerprint == "" || found.SegmentFingerprint != p.SegmentFingerprint {
+			return ErrFingerprint
+		}
+	} else if found.Fingerprint != p.Fingerprint {
+		return ErrFingerprint
+	}
+	return nil
+}
+
+func recoveryPolicy(p *Prepared, policyFor func(uint64) (Policy, error)) (Policy, error) {
+	if p.Event.PolicyRev == nil {
+		return Policy{}, ErrInvalid
+	}
+	var policy Policy
+	if p.Policy != nil {
+		policy = clonePolicy(*p.Policy)
+	}
+	if validPolicy(policy) && policy.Revision == *p.Event.PolicyRev {
+		return policy, nil
+	}
+	if len(policy.Collections) != 0 || policy.Revision != 0 || policyFor == nil {
+		return Policy{}, ErrInvalid
+	}
+	policy, err := policyFor(*p.Event.PolicyRev)
+	if err != nil {
+		return Policy{}, err
+	}
+	if !validPolicy(policy) || policy.Revision != *p.Event.PolicyRev {
+		return Policy{}, ErrInvalid
+	}
+	p.Policy = policyPtr(policy)
+	return policy, nil
 }
 func seqFromKey(key []byte) uint64 {
 	const n = 16
@@ -801,43 +846,7 @@ func (m *Manager) WithPolicyCommit(policy Policy, fn func(func(*pebble.Batch) er
 		}
 		staged = true
 		active = false
-		reader := batch.Reader()
-		target := m.policyKey(policy.Revision)
-		for {
-			kind, key, value, ok, err := reader.Next()
-			if err != nil {
-				return err
-			}
-			if !ok {
-				break
-			}
-			if bytes.Equal(key, target) || (kind == pebble.InternalKeyKindRangeDelete && bytes.Compare(key, target) <= 0 && bytes.Compare(target, value) < 0) {
-				return ErrConflict
-			}
-		}
-		existing, closer, err := m.db.Get(target)
-		if err == nil {
-			defer closer.Close()
-			var prior Policy
-			if err := decode(existing, &prior); err != nil {
-				return err
-			}
-			if !validPolicy(prior) {
-				return ErrInvalid
-			}
-			if !policiesEqual(prior, policy) {
-				return ErrConflict
-			}
-			return nil
-		}
-		if !errors.Is(err, pebble.ErrNotFound) {
-			return err
-		}
-		encoded, err := encode(policy)
-		if err != nil {
-			return err
-		}
-		return batch.Set(target, encoded, nil)
+		return m.stagePolicy(batch, policy)
 	}
 	if err := fn(stage); err != nil {
 		return err
@@ -846,6 +855,52 @@ func (m *Manager) WithPolicyCommit(policy Policy, fn func(func(*pebble.Batch) er
 		return ErrInvalid
 	}
 	return nil
+}
+
+func checkPolicyBatchConflict(batch *pebble.Batch, target []byte) error {
+	reader := batch.Reader()
+	for {
+		kind, key, value, ok, err := reader.Next()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
+		if bytes.Equal(key, target) || (kind == pebble.InternalKeyKindRangeDelete && bytes.Compare(key, target) <= 0 && bytes.Compare(target, value) < 0) {
+			return ErrConflict
+		}
+	}
+}
+
+func (m *Manager) stagePolicy(batch *pebble.Batch, policy Policy) error {
+	target := m.policyKey(policy.Revision)
+	if err := checkPolicyBatchConflict(batch, target); err != nil {
+		return err
+	}
+	existing, closer, err := m.db.Get(target)
+	if err == nil {
+		defer closer.Close()
+		var prior Policy
+		if err := decode(existing, &prior); err != nil {
+			return err
+		}
+		if !validPolicy(prior) {
+			return ErrInvalid
+		}
+		if !policiesEqual(prior, policy) {
+			return ErrConflict
+		}
+		return nil
+	}
+	if !errors.Is(err, pebble.ErrNotFound) {
+		return err
+	}
+	encoded, err := encode(policy)
+	if err != nil {
+		return err
+	}
+	return batch.Set(target, encoded, nil)
 }
 
 func optionalSeqEqual(a, b *uint64) bool {
