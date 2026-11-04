@@ -3,8 +3,6 @@ package jobs
 import (
 	"context"
 	"errors"
-	"runtime"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -17,11 +15,6 @@ func TestReceiptAttemptsReleaseContextsAndWatchers(t *testing.T) {
 	defer db.Close()
 	m.receiptDone = make(chan struct{})
 	defer close(m.receiptDone)
-	watcherCount := func() int {
-		stack := make([]byte, 1<<20)
-		return strings.Count(string(stack[:runtime.Stack(stack, true)]), "(*Manager).flushReceipts.func1.")
-	}
-	before := watcherCount()
 	revision := uint64(0)
 	for _, fail := range []bool{false, true} {
 		for attempt := 0; attempt < 12; attempt++ {
@@ -45,7 +38,7 @@ func TestReceiptAttemptsReleaseContextsAndWatchers(t *testing.T) {
 			require.NoError(t, m.flushReceipts(t.Context(), &receipts))
 			receipts.Wait()
 			require.NotNil(t, received)
-			require.Eventually(t, func() bool { return received.Err() != nil && watcherCount() == before }, time.Second, time.Millisecond)
+			require.ErrorIs(t, received.Err(), context.Canceled)
 		}
 	}
 }
@@ -84,6 +77,32 @@ func TestReceiptShutdownCancelsBlockedSender(t *testing.T) {
 				t.Fatal("receipt did not stop")
 			}
 			require.True(t, m.data.Jobs[job.ID].ReceiptPending)
+		})
+	}
+}
+
+func TestReceiptAttemptWatcherExits(t *testing.T) {
+	for _, trigger := range []string{"completion", "parent", "shutdown"} {
+		t.Run(trigger, func(t *testing.T) {
+			parent, cancelParent := context.WithCancel(t.Context())
+			defer cancelParent()
+			done := make(chan struct{})
+			receiptCtx, cancel, exited := receiptAttemptContext(parent, done)
+			defer cancel()
+			switch trigger {
+			case "completion":
+				cancel()
+			case "parent":
+				cancelParent()
+			case "shutdown":
+				close(done)
+			}
+			select {
+			case <-exited:
+			case <-time.After(time.Second):
+				t.Fatal("receipt watcher did not exit")
+			}
+			require.ErrorIs(t, receiptCtx.Err(), context.Canceled)
 		})
 	}
 }
