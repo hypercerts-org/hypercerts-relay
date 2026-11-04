@@ -435,11 +435,13 @@ func (w *Writer) appendBatchCoreLocked(ctx context.Context, events []segment.Eve
 		}
 		candidate := events[i]
 		if !w.cfg.CollectionPolicy.Allows(&candidate) {
+			events[i].Seq = 0
 			continue
 		}
 		if superseded, err := w.snapshotSupersedes(&candidate, metadata); err != nil {
 			return nil, err
 		} else if superseded {
+			events[i].Seq = 0
 			continue
 		}
 		if metadata != nil && metadata.Source != nil && (metadata.Source.Seq != events[i].Seq || metadata.Source.SegmentFingerprint != attribution.FingerprintSegment(events[i])) {
