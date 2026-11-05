@@ -120,3 +120,27 @@ func TestSelectedMetadataLegacyUnknownAndPolicyInfo(t *testing.T) {
 	require.Contains(t, string(frame.Payload), `"name":"PolicyAdopted"`)
 	require.Contains(t, string(frame.Payload), `"contract":"hypercerts-selected-v1"`)
 }
+
+func TestPolicyGapsEqualBoundariesHaveStableCollectionOrder(t *testing.T) {
+	boundary, closeBoundary := uint64(3), uint64(8)
+	for _, closeGaps := range []bool{false, true} {
+		history := []attribution.Policy{{Revision: 1, Collections: []string{"app.example.z", "app.example.a"}}, {Revision: 2, Collections: []string{}, EffectiveAfterSeq: &boundary}}
+		if closeGaps {
+			history = append(history, attribution.Policy{Revision: 3, Collections: []string{"app.example.z", "app.example.a"}, EffectiveAfterSeq: &closeBoundary})
+		}
+		for range 100 {
+			gaps := PolicyGaps(history)
+			require.Len(t, gaps, 2)
+			require.Equal(t, "app.example.a", *gaps[0].Collection)
+			require.Equal(t, "app.example.z", *gaps[1].Collection)
+			for _, gap := range gaps {
+				require.Equal(t, uint64(4), *gap.FromSeq)
+				if closeGaps {
+					require.Equal(t, closeBoundary, *gap.ThroughSeq)
+				} else {
+					require.Nil(t, gap.ThroughSeq)
+				}
+			}
+		}
+	}
+}

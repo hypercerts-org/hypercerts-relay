@@ -2961,13 +2961,13 @@ func (s *JetstreamSubscribeEvents_SelectedInfoMetadata) UnmarshalJSONAt(data []b
 //
 // Optional Hypercerts metadata present only when contract=hypercerts-selected-v1 is negotiated. Ordinary v2 frames omit it.
 type JetstreamSubscribeEvents_SelectedMetadata struct {
-	LexiconTypeID          string                                                             `json:"$type,omitempty"`
-	PolicyRev              gt.Option[int64]                                                   `json:"policyRev"`
-	Provenance             gt.Option[string]                                                  `json:"provenance,omitzero"`
-	ReconciliationBoundary gt.Option[JetstreamSubscribeEvents_SelectedReconciliationBoundary] `json:"reconciliationBoundary,omitzero"`
-	ReconciliationRequired gt.Option[bool]                                                    `json:"reconciliationRequired,omitzero"`
-	Scope                  gt.Option[JetstreamSubscribeEvents_SelectedSyncScope]              `json:"scope,omitzero"`
-	StreamId               gt.Option[string]                                                  `json:"streamId,omitzero"`
+	LexiconTypeID          string                                                `json:"$type,omitempty"`
+	PolicyRev              gt.Option[int64]                                      `json:"policyRev"`
+	Provenance             gt.Option[string]                                     `json:"provenance,omitzero"`
+	ReconciliationBoundary json.RawMessage                                       `json:"reconciliationBoundary,omitempty"` // Non-negative sequence integer or boundary object with seq and/or snapshotId. Raw JSON preserves b...
+	ReconciliationRequired gt.Option[bool]                                       `json:"reconciliationRequired,omitzero"`
+	Scope                  gt.Option[JetstreamSubscribeEvents_SelectedSyncScope] `json:"scope,omitzero"`
+	StreamId               gt.Option[string]                                     `json:"streamId,omitzero"`
 
 	// extra preserves unknown fields for same-format round-trips.
 	extra []extraField
@@ -3002,7 +3002,7 @@ func (s *JetstreamSubscribeEvents_SelectedMetadata) AppendCBOR(buf []byte) ([]by
 	if s.Provenance.HasVal() {
 		n++
 	}
-	if s.ReconciliationBoundary.HasVal() {
+	if s.ReconciliationBoundary != nil {
 		n++
 	}
 	if s.ReconciliationRequired.HasVal() {
@@ -3048,18 +3048,9 @@ func (s *JetstreamSubscribeEvents_SelectedMetadata) AppendCBOR(buf []byte) ([]by
 			buf = cbor.AppendText(buf, s.Provenance.Val())
 		}
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "reconciliationBoundary", buf)
-		if s.ReconciliationBoundary.HasVal() {
+		if s.ReconciliationBoundary != nil {
 			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedMetadata_reconciliationBoundary...)
-			{
-				v := s.ReconciliationBoundary.Val()
-				{
-					var err error
-					buf, err = v.AppendCBOR(buf)
-					if err != nil {
-						return nil, err
-					}
-				}
-			}
+			buf = cbor.AppendNull(buf)
 		}
 		ei, buf = appendCBORExtrasBefore(s.extra, ei, "reconciliationRequired", buf)
 		if s.ReconciliationRequired.HasVal() {
@@ -3099,18 +3090,9 @@ func (s *JetstreamSubscribeEvents_SelectedMetadata) AppendCBOR(buf []byte) ([]by
 			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedMetadata_provenance...)
 			buf = cbor.AppendText(buf, s.Provenance.Val())
 		}
-		if s.ReconciliationBoundary.HasVal() {
+		if s.ReconciliationBoundary != nil {
 			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedMetadata_reconciliationBoundary...)
-			{
-				v := s.ReconciliationBoundary.Val()
-				{
-					var err error
-					buf, err = v.AppendCBOR(buf)
-					if err != nil {
-						return nil, err
-					}
-				}
-			}
+			buf = cbor.AppendNull(buf)
 		}
 		if s.ReconciliationRequired.HasVal() {
 			buf = append(buf, cborKey_JetstreamSubscribeEvents_SelectedMetadata_reconciliationRequired...)
@@ -3225,15 +3207,9 @@ func (s *JetstreamSubscribeEvents_SelectedMetadata) UnmarshalCBORAt(data []byte,
 			}
 		case 22:
 			if string(data[keyStart:keyEnd]) == "reconciliationBoundary" {
-				if cbor.IsNull(data, pos) {
-					pos++
-				} else {
-					var v JetstreamSubscribeEvents_SelectedReconciliationBoundary
-					pos, err = v.UnmarshalCBORAt(data, pos)
-					if err != nil {
-						return 0, err
-					}
-					s.ReconciliationBoundary = gt.Some(v)
+				pos, err = cbor.SkipValue(data, pos)
+				if err != nil {
+					return 0, err
 				}
 			} else if string(data[keyStart:keyEnd]) == "reconciliationRequired" {
 				if cbor.IsNull(data, pos) {
@@ -3310,21 +3286,12 @@ func (s *JetstreamSubscribeEvents_SelectedMetadata) AppendJSON(buf []byte) ([]by
 		buf = cbor.AppendJSONString(buf, s.Provenance.Val())
 		first = false
 	}
-	if s.ReconciliationBoundary.HasVal() {
+	if s.ReconciliationBoundary != nil {
 		if !first {
 			buf = append(buf, ',')
 		}
 		buf = append(buf, jsonKey_JetstreamSubscribeEvents_SelectedMetadata_reconciliationBoundary...)
-		{
-			v := s.ReconciliationBoundary.Val()
-			{
-				var err error
-				buf, err = v.AppendJSON(buf)
-				if err != nil {
-					return nil, err
-				}
-			}
-		}
+		buf = append(buf, s.ReconciliationBoundary...)
 		first = false
 	}
 	if s.ReconciliationRequired.HasVal() {
@@ -3434,18 +3401,13 @@ func (s *JetstreamSubscribeEvents_SelectedMetadata) UnmarshalJSONAt(data []byte,
 				s.Provenance = gt.Some(v)
 			}
 		case "reconciliationBoundary":
-			if cbor.IsJSONNull(data, pos) {
-				pos, err = cbor.SkipJSONNull(data, pos)
+			{
+				start := pos
+				pos, err = cbor.SkipJSONValue(data, pos)
 				if err != nil {
 					return 0, err
 				}
-			} else {
-				var v JetstreamSubscribeEvents_SelectedReconciliationBoundary
-				pos, err = v.UnmarshalJSONAt(data, pos)
-				if err != nil {
-					return 0, err
-				}
-				s.ReconciliationBoundary = gt.Some(v)
+				s.ReconciliationBoundary = json.RawMessage(data[start:pos])
 			}
 		case "reconciliationRequired":
 			if cbor.IsJSONNull(data, pos) {

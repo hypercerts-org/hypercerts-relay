@@ -2,11 +2,16 @@ package ingest
 
 import (
 	"context"
+	"fmt"
+	"io/fs"
+
+	"github.com/cockroachdb/pebble/vfs"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
+	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/stretchr/testify/require"
 )
@@ -62,9 +67,8 @@ func TestRecoverAttributionIgnoresTornTailAndRemovesMissingPreparedRow(t *testin
 	require.NoError(t, err)
 	policy := attribution.Policy{Revision: 1, Collections: []string{"org.example.record"}}
 	durable := *event
-	prepared, err := manager.PrepareSegment(durable, "stream", policy, attribution.ProvenanceLive, attribution.Boundary{})
+	_, err = manager.PrepareSegment(durable, "stream", policy, attribution.ProvenanceLive, attribution.Boundary{})
 	require.NoError(t, err)
-	require.NoError(t, manager.Commit(prepared, policy, nil))
 	missing := segment.Event{Seq: event.Seq + 1, Kind: segment.Kind(1), Collection: "org.example.record", DID: "did:plc:test", Rkey: "missing", Payload: []byte(`{"ok":false}`)}
 	_, err = manager.PrepareSegment(missing, "stream", policy, attribution.ProvenanceLive, attribution.Boundary{})
 	require.NoError(t, err)
@@ -79,4 +83,41 @@ func TestRecoverAttributionIgnoresTornTailAndRemovesMissingPreparedRow(t *testin
 	seqs, err := manager.PreparedSeqs()
 	require.NoError(t, err)
 	require.Empty(t, seqs)
+}
+
+type recoveryListErrorFS struct {
+	vfs.FS
+	listErr error
+}
+
+func (f recoveryListErrorFS) List(string) ([]string, error) { return nil, f.listErr }
+
+func TestAttributionRecoveryWrappedFilesystemErrors(t *testing.T) {
+	for _, cause := range []error{fs.ErrNotExist, fs.ErrPermission} {
+		t.Run(cause.Error(), func(t *testing.T) {
+			cfg := Config{FS: recoveryListErrorFS{FS: vfs.NewMem(), listErr: fmt.Errorf("wrapped: %w", cause)}, SegmentsDir: "segments"}
+			for _, err := range []error{auditAttributions(cfg, 1), scanPreparedAttributions(cfg, func([]segment.Event) error { return nil })} {
+				if cause == fs.ErrNotExist {
+					require.NoError(t, err)
+				} else {
+					require.ErrorIs(t, err, cause)
+				}
+			}
+		})
+	}
+}
+
+func TestSelectedStreamIdentitySurvivesStoreReopen(t *testing.T) {
+	directory := t.TempDir()
+	db, err := store.Open(directory, nil)
+	require.NoError(t, err)
+	first, err := attribution.OpenSelectedStreamIdentity(db)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+	db, err = store.Open(directory, nil)
+	require.NoError(t, err)
+	defer db.Close()
+	second, err := attribution.OpenSelectedStreamIdentity(db)
+	require.NoError(t, err)
+	require.Equal(t, first, second)
 }

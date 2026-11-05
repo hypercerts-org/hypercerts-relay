@@ -3,7 +3,7 @@ package ingest
 import (
 	"errors"
 	"fmt"
-	"os"
+	"io/fs"
 
 	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
 	"github.com/bluesky-social/jetstream/segment"
@@ -59,7 +59,7 @@ func auditAttributions(cfg Config, activation uint64) error {
 		return nil
 	}
 	files, err := SegmentFilesFS(cfg.FS, cfg.SegmentsDir)
-	if os.IsNotExist(err) {
+	if errors.Is(err, fs.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
@@ -69,7 +69,7 @@ func auditAttributions(cfg Config, activation uint64) error {
 	visit := missingAttributionVisitor(cfg, activation, &missing)
 	for _, file := range files {
 		err := segment.ScanActiveFS(cfg.FS, file.Path, visit)
-		if err == nil || os.IsNotExist(err) {
+		if err == nil || errors.Is(err, fs.ErrNotExist) {
 			continue
 		}
 		if !errors.Is(err, segment.ErrSegmentSealed) {
@@ -134,15 +134,15 @@ func preparedAttributionVisitor(seqs []uint64) (map[uint64]attribution.DurableEv
 
 func scanPreparedAttributions(cfg Config, visit func([]segment.Event) error) error {
 	files, err := SegmentFilesFS(cfg.FS, cfg.SegmentsDir)
-	if err != nil && !os.IsNotExist(err) {
-		return err
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
 	}
 	if err != nil {
-		return nil
+		return err
 	}
 	for _, file := range files {
 		scanErr := segment.ScanActiveFS(cfg.FS, file.Path, visit)
-		if scanErr == nil || os.IsNotExist(scanErr) {
+		if scanErr == nil || errors.Is(scanErr, fs.ErrNotExist) {
 			continue
 		}
 		if !errors.Is(scanErr, segment.ErrSegmentSealed) {

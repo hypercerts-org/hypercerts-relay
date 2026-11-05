@@ -21,8 +21,10 @@ func TestSelectedOversizeCountsMetricBeforeWrite(t *testing.T) {
 	require.NoError(t, err)
 	metrics := NewMetrics(prometheus.NewRegistry())
 	event := &segment.Event{Seq: 1, Kind: segment.KindCreate, DID: "did:plc:test", Collection: "app.example.one", Rkey: "key", Payload: []byte{0xa0}}
+	meta, err := manager.Lookup(event.Seq)
+	require.ErrorIs(t, err, attribution.ErrLegacyUnknown)
 	for _, compressed := range []bool{false, true} {
-		require.NoError(t, deliverSelected(t.Context(), nil, event, Subscription{SelectedAttribution: manager, Metrics: metrics}, &FilterV2{maxMessageSizeBytes: 1}, compressed, slog.New(slog.NewTextHandler(io.Discard, nil))))
+		require.NoError(t, (&selectedConnection{deps: Subscription{SelectedAttribution: manager, Metrics: metrics}, filter: &FilterV2{maxMessageSizeBytes: 1}, compress: compressed, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}).deliverSelected(t.Context(), event, meta))
 	}
 	require.Equal(t, float64(2), testutil.ToFloat64(metrics.EventsOversize))
 }

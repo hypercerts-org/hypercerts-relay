@@ -162,7 +162,7 @@
         "streamId": { "type": "string" },
         "policyRev": { "type": "integer" },
         "provenance": { "type": "string", "knownValues": ["live", "snapshot", "reconciliation", "legacy-unknown"] },
-        "reconciliationBoundary": { "type": "ref", "ref": "#selectedReconciliationBoundary" },
+        "reconciliationBoundary": { "type": "unknown", "description": "Non-negative sequence integer or boundary object with seq and/or snapshotId. Raw JSON preserves both v1 representations; producers emit the object form." },
         "reconciliationRequired": { "type": "boolean" },
         "scope": { "type": "ref", "ref": "#selectedSyncScope" }
       }

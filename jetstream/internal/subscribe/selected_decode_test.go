@@ -54,9 +54,11 @@ func TestSelectedEventMetadataTypedDecode(t *testing.T) {
 			require.Equal(t, gt.Some("stream-a"), got.StreamId)
 			require.Equal(t, gt.Some(int64(12)), got.PolicyRev)
 			require.Equal(t, gt.Some("reconciliation"), got.Provenance)
-			require.True(t, got.ReconciliationBoundary.HasVal())
-			require.Equal(t, gt.Some(int64(8)), got.ReconciliationBoundary.Val().Seq)
-			require.Equal(t, gt.Some(snapshotID), got.ReconciliationBoundary.Val().SnapshotId)
+			require.NotNil(t, got.ReconciliationBoundary)
+			var decodedBoundary jetstream.JetstreamSubscribeEvents_SelectedReconciliationBoundary
+			require.NoError(t, decodedBoundary.UnmarshalJSON(got.ReconciliationBoundary))
+			require.Equal(t, gt.Some(int64(8)), decodedBoundary.Seq)
+			require.Equal(t, gt.Some(snapshotID), decodedBoundary.SnapshotId)
 			if tc.kind == segment.KindSync {
 				require.Equal(t, gt.Some(true), got.ReconciliationRequired)
 				require.True(t, got.Scope.HasVal())
@@ -79,7 +81,7 @@ func TestSelectedEventMetadataTypedDecode(t *testing.T) {
 			requireSelectedTypedRoundTrip(t, body)
 			legacy := tc.metadata(decodeV2Union(t, body)).Val()
 			require.False(t, legacy.PolicyRev.HasVal())
-			require.False(t, legacy.ReconciliationBoundary.HasVal())
+			require.Nil(t, legacy.ReconciliationBoundary)
 			require.Equal(t, gt.Some("legacy-unknown"), legacy.Provenance)
 		})
 	}
@@ -114,24 +116,7 @@ func TestSelectedInfoMetadataTypedDecode(t *testing.T) {
 				require.JSONEq(t, `1`, string(got.OriginalHistoryFromSeq))
 				require.Equal(t, gt.Some("materialized"), got.HistoryMode)
 				require.Equal(t, gt.Some("unknown"), got.Coverage)
-				var gaps []jetstream.JetstreamSubscribeEvents_SelectedGap
-				require.NoError(t, json.Unmarshal(got.Gaps, &gaps))
-				require.Len(t, gaps, 2)
-				for gapIndex := range gaps {
-					encodedGap, gapErr := gaps[gapIndex].MarshalJSON()
-					require.NoError(t, gapErr)
-					expectedGap, gapErr := json.Marshal(tc.metadata["gaps"].([]SelectedGap)[gapIndex])
-					require.NoError(t, gapErr)
-					require.JSONEq(t, string(expectedGap), string(encodedGap))
-				}
-				require.Equal(t, gt.Some(int64(2)), gaps[0].FromSeq)
-				require.Equal(t, gt.Some(int64(7)), gaps[0].ThroughSeq)
-				require.Equal(t, gt.Some("policy-disabled"), gaps[0].Reason)
-				require.Equal(t, gt.Some(collection), gaps[0].Collection)
-				require.Equal(t, gt.Some(int64(9)), gaps[1].FromSeq)
-				require.Equal(t, gt.Some("legacy-scope-unknown"), gaps[1].Reason)
-				require.False(t, gaps[1].ThroughSeq.HasVal())
-				require.False(t, gaps[1].Collection.HasVal())
+				requireSelectedPolicyGaps(t, got, tc.metadata["gaps"].([]SelectedGap), collection)
 			} else {
 				require.Equal(t, gt.Some(int64(12)), got.PolicyRevision)
 				require.False(t, got.PolicyRev.HasVal())
@@ -219,4 +204,37 @@ func TestSelectedMetadataTypedRoundTrip(t *testing.T) {
 	ordinary, err := EncodeV2Info("OutdatedCursor", "Resume at retention floor")
 	require.NoError(t, err)
 	requireSelectedTypedRoundTrip(t, ordinary)
+}
+
+func TestSelectedBoundaryIntegerAndObjectTypedRoundTrip(t *testing.T) {
+	for _, boundary := range []string{`8`, `{"seq":8,"snapshotId":null}`, `{"seq":null,"snapshotId":"snapshot-a"}`} {
+		payload := []byte(`{"streamId":"stream-a","policyRev":1,"provenance":"snapshot","reconciliationBoundary":` + boundary + `}`)
+		var metadata jetstream.JetstreamSubscribeEvents_SelectedMetadata
+		require.NoError(t, metadata.UnmarshalJSON(payload))
+		encoded, err := metadata.MarshalJSON()
+		require.NoError(t, err)
+		require.JSONEq(t, string(payload), string(encoded))
+	}
+}
+
+func requireSelectedPolicyGaps(t *testing.T, got jetstream.JetstreamSubscribeEvents_SelectedInfoMetadata, expected []SelectedGap, collection string) {
+	t.Helper()
+	var gaps []jetstream.JetstreamSubscribeEvents_SelectedGap
+	require.NoError(t, json.Unmarshal(got.Gaps, &gaps))
+	require.Len(t, gaps, 2)
+	for gapIndex := range gaps {
+		encodedGap, gapErr := gaps[gapIndex].MarshalJSON()
+		require.NoError(t, gapErr)
+		expectedGap, gapErr := json.Marshal(expected[gapIndex])
+		require.NoError(t, gapErr)
+		require.JSONEq(t, string(expectedGap), string(encodedGap))
+	}
+	require.Equal(t, gt.Some(int64(2)), gaps[0].FromSeq)
+	require.Equal(t, gt.Some(int64(7)), gaps[0].ThroughSeq)
+	require.Equal(t, gt.Some("policy-disabled"), gaps[0].Reason)
+	require.Equal(t, gt.Some(collection), gaps[0].Collection)
+	require.Equal(t, gt.Some(int64(9)), gaps[1].FromSeq)
+	require.Equal(t, gt.Some("legacy-scope-unknown"), gaps[1].Reason)
+	require.False(t, gaps[1].ThroughSeq.HasVal())
+	require.False(t, gaps[1].Collection.HasVal())
 }

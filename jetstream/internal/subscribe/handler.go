@@ -201,20 +201,7 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 			httpError(w, deps, http.StatusBadRequest, "InvalidCursor", "streamId and cursor must both be provided and non-empty")
 			return
 		}
-		if len(contracts) > 1 || len(streams) > 1 || len(cursors) > 1 {
-			httpError(w, deps, http.StatusBadRequest, "InvalidRequest", "duplicate selected stream parameter")
-			return
-		}
-		contract, stream, cursor := "", "", ""
-		if len(contracts) == 1 {
-			contract = contracts[0]
-		}
-		if len(streams) == 1 {
-			stream = streams[0]
-		}
-		if len(cursors) == 1 {
-			cursor = cursors[0]
-		}
+		contract, stream, cursor := contracts[0], values.Get("streamId"), values.Get("cursor")
 		var parseErr error
 		selectedRequest, parseErr = ParseSelectedRequest(contract, stream, cursor, selectedConfig)
 		if parseErr != nil {
@@ -451,12 +438,7 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 	}
 	if selected {
 		acceptSubprotocols = []string{v2Subprotocol}
-		for _, token := range r.Header.Values("Sec-WebSocket-Protocol") {
-			for offer := range strings.SplitSeq(token, ",") {
-				if strings.TrimSpace(offer) == SelectedContract { /* selector token opts in; protocol remains xrpc.v1.json */
-				}
-			}
-		}
+
 	}
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		OriginPatterns:  []string{"*"},

@@ -284,26 +284,35 @@ func (h *SegmentHandler) abortOnWriterError(err error) {
 	}
 }
 
-func (h *SegmentHandler) repoMaterialization(ctx context.Context, did atmos.DID, r *repo.Repo, commit *repo.Commit, materializedKind segment.Kind, witnessedAt int64, key string, cid cbor.CID, metadata *ingest.AttributionMetadata) (*segment.Event, error) {
+type repoProjection struct {
+	did         atmos.DID
+	repository  *repo.Repo
+	commit      *repo.Commit
+	kind        segment.Kind
+	witnessedAt int64
+	metadata    *ingest.AttributionMetadata
+}
+
+func (h *SegmentHandler) repoMaterialization(ctx context.Context, projection repoProjection, key string, cid cbor.CID) (*segment.Event, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	collection, rkey, ok := h.validRecordPath(ctx, did, key)
-	if !ok || metadata != nil && !containsCollection(metadata.Policy.Collections, collection) {
+	collection, rkey, ok := h.validRecordPath(ctx, projection.did, key)
+	if !ok || projection.metadata != nil && !containsCollection(projection.metadata.Policy.Collections, collection) {
 		return nil, nil
 	}
-	payload, err := r.Store.GetBlock(cid)
+	payload, err := projection.repository.Store.GetBlock(cid)
 	if err != nil {
-		return nil, fmt.Errorf("backfill: did=%s get block %s/%s: %w", did, collection, rkey, err)
+		return nil, fmt.Errorf("backfill: did=%s get block %s/%s: %w", projection.did, collection, rkey, err)
 	}
-	ev := segment.Event{WitnessedAt: witnessedAt, Kind: materializedKind, DID: string(did), Collection: collection, Rkey: rkey, Rev: commit.Rev, Payload: payload}
+	ev := segment.Event{WitnessedAt: projection.witnessedAt, Kind: projection.kind, DID: string(projection.did), Collection: collection, Rkey: rkey, Rev: projection.commit.Rev, Payload: payload}
 	if err := segment.ValidateEvent(ev); err != nil {
 		if errors.Is(err, segment.ErrFieldTooLong) {
 			h.dropMetrics.IncDropped(ingest.DropSourceBackfill, ingest.DropReasonFieldTooLong)
-			h.logger.WarnContext(ctx, "dropped unarchivable upstream record", "did", string(did), "did_len", len(string(did)), "collection_len", len(collection), "rkey_len", len(rkey), "rev_len", len(commit.Rev), "payload_len", len(payload), "err", err)
+			h.logger.WarnContext(ctx, "dropped unarchivable upstream record", "did", string(projection.did), "did_len", len(string(projection.did)), "collection_len", len(collection), "rkey_len", len(rkey), "rev_len", len(projection.commit.Rev), "payload_len", len(payload), "err", err)
 			return nil, nil
 		}
-		return nil, fmt.Errorf("backfill: did=%s invalid segment event %s/%s: %w", did, collection, rkey, err)
+		return nil, fmt.Errorf("backfill: did=%s invalid segment event %s/%s: %w", projection.did, collection, rkey, err)
 	}
 	return &ev, nil
 }
@@ -333,9 +342,9 @@ func (h *SegmentHandler) appendRepoBatch(ctx context.Context, did atmos.DID, bat
 	return lastSeq, appended, nil
 }
 
-func (h *SegmentHandler) walkRepoBatches(ctx context.Context, did atmos.DID, r *repo.Repo, commit *repo.Commit, materializedKind segment.Kind, witnessedAt int64, metadata *ingest.AttributionMetadata, batch *[]segment.Event, flushBatch func() error) error {
-	return r.Tree.Walk(func(key string, cid cbor.CID) error {
-		ev, err := h.repoMaterialization(ctx, did, r, commit, materializedKind, witnessedAt, key, cid, metadata)
+func (h *SegmentHandler) walkRepoBatches(ctx context.Context, projection repoProjection, batch *[]segment.Event, flushBatch func() error) error {
+	return projection.repository.Tree.Walk(func(key string, cid cbor.CID) error {
+		ev, err := h.repoMaterialization(ctx, projection, key, cid)
 		if err != nil || ev == nil {
 			return err
 		}
@@ -386,7 +395,7 @@ func (h *SegmentHandler) projectRepo(ctx context.Context, did atmos.DID, r *repo
 		batch = batch[:0]
 		return nil
 	}
-	if err := h.walkRepoBatches(ctx, did, r, commit, materializedKind, witnessedAt, metadata, &batch, flushBatch); err != nil {
+	if err := h.walkRepoBatches(ctx, repoProjection{did: did, repository: r, commit: commit, kind: materializedKind, witnessedAt: witnessedAt, metadata: metadata}, &batch, flushBatch); err != nil {
 		return err
 	}
 	if err := flushBatch(); err != nil {

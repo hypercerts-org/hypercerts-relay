@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -31,6 +32,8 @@ func TestHandleRepoResyncPolicyAdmissionCoversProjection(t *testing.T) {
 	manager, err := selection.Open(db, []string{"app.bsky.feed.post", "app.bsky.feed.like"})
 	require.NoError(t, err)
 	started, release := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	releaseProjection := func() { releaseOnce.Do(func() { close(release) }) }
 	history, err := attribution.Open(db, "selected-stream", "selected-stream")
 	require.NoError(t, err)
 	initial := attribution.Policy{Revision: 1, Collections: []string{"app.bsky.feed.like", "app.bsky.feed.post"}}
@@ -47,7 +50,7 @@ func TestHandleRepoResyncPolicyAdmissionCoversProjection(t *testing.T) {
 		return nil
 	}})
 	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, writer.Close()) })
+	t.Cleanup(func() { releaseProjection(); require.NoError(t, writer.Close()) })
 	require.NoError(t, writer.ReconcileSnapshot(t.Context(), ingest.Snapshot{DID: "did:plc:prior", Rev: "3l3qo2vutsw2b", Collections: initial.Collections, AppendMetadata: &ingest.AttributionMetadata{StreamID: "selected-stream", Policy: initial, Provenance: attribution.ProvenanceReconciliation, Boundary: attribution.Boundary{Seq: new(uint64), SnapshotID: new("did:plc:prior/3l3qo2vutsw2b")}}}))
 	gate := policygate.New(manager, writer, "selected-stream")
 	handler := NewSegmentHandler(writer, nil, nil)
@@ -80,7 +83,7 @@ func TestHandleRepoResyncPolicyAdmissionCoversProjection(t *testing.T) {
 		t.Fatalf("policy adoption crossed active retry projection: %v", err)
 	case <-time.After(30 * time.Millisecond):
 	}
-	close(release)
+	releaseProjection()
 	require.NoError(t, <-retryDone)
 	require.NoError(t, <-adoptDone)
 }

@@ -139,7 +139,12 @@ func PolicyGaps(history []attribution.Policy) []SelectedGap {
 		name, start := collection, from
 		gaps = append(gaps, SelectedGap{FromSeq: &start, Reason: "policy-disabled", Collection: &name})
 	}
-	sort.Slice(gaps, func(i, j int) bool { return *gaps[i].FromSeq < *gaps[j].FromSeq })
+	sort.Slice(gaps, func(i, j int) bool {
+		if *gaps[i].FromSeq != *gaps[j].FromSeq {
+			return *gaps[i].FromSeq < *gaps[j].FromSeq
+		}
+		return *gaps[i].Collection < *gaps[j].Collection
+	})
 	return gaps
 }
 

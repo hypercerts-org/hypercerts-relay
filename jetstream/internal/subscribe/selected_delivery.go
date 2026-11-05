@@ -24,6 +24,7 @@ type selectedConnection struct {
 	logger    *slog.Logger
 	cursor    uint64
 	announced uint64
+	history   []attribution.Policy
 }
 
 func (s *selectedConnection) runSelectedSubscriberLoop(ctx context.Context) {
@@ -52,6 +53,7 @@ func (s *selectedConnection) runSelectedSubscriberLoop(ctx context.Context) {
 }
 
 func (s *selectedConnection) deliverCold(ctx context.Context, readlog *ingest.ReadableLog) bool {
+	s.history = nil
 	batch, next, err := s.deps.Tail.ReadFrom(ctx, s.cursor, s.deps.Tail.ReadBatch())
 	if err != nil {
 		s.coldReadFailed(ctx, err)
@@ -62,22 +64,25 @@ func (s *selectedConnection) deliverCold(ctx context.Context, readlog *ingest.Re
 			s.cursor = next
 			return true
 		}
+		s.deliveryFailed(ctx, "empty cold batch", ErrReplayUnavailable)
 		return false
 	}
+	start := s.cursor
 	last := s.cursor
 	for _, entry := range batch {
 		if entry.Event.Seq >= readlog.DurableSeq() {
 			break
 		}
 		if err := s.processSelectedRow(ctx, entry.Event); err != nil {
+			s.deliveryFailed(ctx, "cold row", err)
 			return false
 		}
 		last = entry.Event.Seq + 1
 	}
-	if last == s.cursor && next > s.cursor && next < readlog.DurableSeq() {
-		s.cursor = next
-	} else {
-		s.cursor = last
+	s.cursor = last
+	if s.cursor == start {
+		s.deliveryFailed(ctx, "cold replay made no progress", ErrReplayUnavailable)
+		return false
 	}
 	return true
 }
@@ -95,12 +100,14 @@ func (s *selectedConnection) coldReadFailed(ctx context.Context, err error) {
 }
 
 func (s *selectedConnection) deliverResident(ctx context.Context, readlog *ingest.ReadableLog, entries []*ingest.ReadLogEntry) bool {
+	s.history = nil
 	for _, row := range entries {
 		ev := row.Event()
 		if ev.Seq >= readlog.DurableSeq() {
 			break
 		}
 		if err := s.processSelectedRow(ctx, ev); err != nil {
+			s.deliveryFailed(ctx, "resident row", err)
 			return false
 		}
 		s.cursor = ev.Seq + 1
@@ -108,19 +115,40 @@ func (s *selectedConnection) deliverResident(ctx context.Context, readlog *inges
 	return true
 }
 
+var errSelectedTransport = errors.New("selected transport failed")
+
+func (s *selectedConnection) deliveryFailed(ctx context.Context, stage string, err error) {
+	if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, errSelectedTransport) {
+		return
+	}
+	s.logger.Warn("selected delivery failed", "stage", stage, "cursor", s.cursor, "errorType", fmt.Sprintf("%T", err))
+	writeFrame(ctx, s.conn, s.compress, EncodeV2Error("InternalError", "selected delivery failed; reconnect"))
+}
+
 func (s *selectedConnection) announceIdlePolicies(ctx context.Context) bool {
 	history, err := s.deps.SelectedAttribution.ReadPolicyHistory()
+	if err != nil {
+		s.deliveryFailed(ctx, "idle policy history", err)
+		return false
+	}
 	lastDelivered := uint64(0)
 	if s.cursor > 0 {
 		lastDelivered = s.cursor - 1
 	}
-	if err != nil || !announceApplicablePolicies(history, lastDelivered, s.announced, func(policy attribution.Policy) bool {
-		return s.announcePolicy(ctx, policy)
-	}) {
-		s.logger.Error("selected policy history read failed", "err", err)
+	if err := s.announcePolicies(ctx, history, lastDelivered); err != nil {
+		s.deliveryFailed(ctx, "idle policy announcement", err)
 		return false
 	}
 	return true
+}
+
+func (s *selectedConnection) announcePolicies(ctx context.Context, history []attribution.Policy, lastDelivered uint64) error {
+	var announceErr error
+	announceApplicablePolicies(history, lastDelivered, s.announced, func(policy attribution.Policy) bool {
+		announceErr = s.announcePolicy(ctx, policy)
+		return announceErr == nil
+	})
+	return announceErr
 }
 
 func (s *selectedConnection) wait(ctx context.Context, notify <-chan struct{}, ping <-chan time.Time) bool {
@@ -137,16 +165,19 @@ func (s *selectedConnection) wait(ctx context.Context, notify <-chan struct{}, p
 	}
 }
 
-func (s *selectedConnection) announcePolicy(ctx context.Context, policy attribution.Policy) bool {
+func (s *selectedConnection) announcePolicy(ctx context.Context, policy attribution.Policy) error {
 	if policy.Revision <= s.announced {
-		return true
+		return nil
 	}
 	frame, err := EncodeV2SelectedInfo("PolicyAdopted", "Selected collection policy adopted", map[string]any{"contract": SelectedContract, "streamId": s.config.StreamID, "policyRevision": policy.Revision, "collections": policy.Collections, "effectiveAfterSeq": policy.EffectiveAfterSeq})
-	if err != nil || !writeFrame(ctx, s.conn, s.compress, frame) {
-		return false
+	if err != nil {
+		return err
+	}
+	if err := s.writeSelectedFrame(ctx, frame); err != nil {
+		return err
 	}
 	s.announced = policy.Revision
-	return true
+	return nil
 }
 
 func announceApplicablePolicies(history []attribution.Policy, lastDeliveredSeq, announced uint64, announce func(attribution.Policy) bool) bool {
@@ -172,58 +203,57 @@ func (s *selectedConnection) processSelectedRow(ctx context.Context, ev *segment
 	if s.deps.SelectedAttribution == nil {
 		return fmt.Errorf("selected attribution unavailable")
 	}
-	_, err := s.deps.SelectedAttribution.Lookup(ev.Seq)
+	meta, err := s.deps.SelectedAttribution.Lookup(ev.Seq)
 	if err != nil && !errors.Is(err, attribution.ErrLegacyUnknown) {
 		return err
 	}
-	history, err := s.deps.SelectedAttribution.ReadPolicyHistory()
-	if err != nil {
-		return err
+	if s.history == nil || meta.PolicyRev != nil && (len(s.history) == 0 || *meta.PolicyRev > s.history[len(s.history)-1].Revision) {
+		s.history, err = s.deps.SelectedAttribution.ReadPolicyHistory()
+		if err != nil {
+			return err
+		}
 	}
-	if ev.Seq > 0 && !announceApplicablePolicies(history, ev.Seq-1, s.announced, func(policy attribution.Policy) bool {
-		return s.announcePolicy(ctx, policy)
-	}) {
-		return fmt.Errorf("failed to announce governing policy")
+	if ev.Seq > 0 {
+		if err := s.announcePolicies(ctx, s.history, ev.Seq-1); err != nil {
+			return err
+		}
 	}
-	return deliverSelected(ctx, s.conn, ev, s.deps, s.filter, s.compress, s.logger)
+	return s.deliverSelected(ctx, ev, meta)
 }
 
-func deliverSelected(ctx context.Context, conn *websocket.Conn, ev *segment.Event, deps Subscription, filter *FilterV2, compress bool, logger *slog.Logger) error {
-	if !filter.Wants(ev) {
-		return nil
-	}
-	if deps.SelectedAttribution == nil {
-		return fmt.Errorf("selected attribution unavailable")
-	}
-	meta, err := deps.SelectedAttribution.Lookup(ev.Seq)
-	if err != nil && !errors.Is(err, attribution.ErrLegacyUnknown) {
-		logger.Error("selected attribution lookup failed", "seq", ev.Seq, "err", err)
-		return err
-	}
+func (s *selectedConnection) deliverSelected(ctx context.Context, ev *segment.Event, meta attribution.Event) error {
+	var err error
 	selectedMetadata := SelectedMetadata(meta)
 	if ev.Kind == segment.KindSync {
-		selectedMetadata, err = selectedDeliverySyncMetadata(ev, meta, deps.SelectedAttribution, logger)
+		selectedMetadata, err = selectedDeliverySyncMetadata(ev, meta, s.deps.SelectedAttribution, s.logger)
 		if err != nil {
 			return err
 		}
 	}
 	body, err := EncodeV2Selected(ev, selectedMetadata)
 	if err != nil {
-		logger.Error("selected event encoding failed", "seq", ev.Seq, "err", err)
+		s.logger.Error("selected event encoding failed", "seq", ev.Seq, "errorType", fmt.Sprintf("%T", err))
 		return err
 	}
-	if max := filter.MaxMessageSizeBytes(); max > 0 && uint64(len(body)) > uint64(max) {
-		deps.Metrics.incEventsOversize()
+	if maxBytes := s.filter.MaxMessageSizeBytes(); maxBytes > 0 && uint64(len(body)) > uint64(maxBytes) {
+		s.deps.Metrics.incEventsOversize()
 		return nil
 	}
+	return s.writeSelectedFrame(ctx, body)
+}
+
+func (s *selectedConnection) writeSelectedFrame(ctx context.Context, body []byte) error {
 	msgType := websocket.MessageText
-	if compress {
+	if s.compress {
 		body = compressFrameV2(body)
 		msgType = websocket.MessageBinary
 	}
 	writeCtx, cancel := context.WithTimeout(ctx, frameWriteTimeout)
 	defer cancel()
-	return conn.Write(writeCtx, msgType, body)
+	if err := s.conn.Write(writeCtx, msgType, body); err != nil {
+		return fmt.Errorf("%w: %w", errSelectedTransport, err)
+	}
+	return nil
 }
 
 func selectedDeliverySyncMetadata(ev *segment.Event, meta attribution.Event, manager *attribution.Manager, logger *slog.Logger) (SelectedEventMetadata, error) {
@@ -232,7 +262,7 @@ func selectedDeliverySyncMetadata(ev *segment.Event, meta attribution.Event, man
 	}
 	policy, policyErr := manager.LookupPolicy(*meta.PolicyRev)
 	if policyErr != nil {
-		logger.Error("selected sync policy lookup failed", "seq", ev.Seq, "err", policyErr)
+		logger.Error("selected sync policy lookup failed", "seq", ev.Seq, "errorType", fmt.Sprintf("%T", policyErr))
 		return SelectedEventMetadata{}, policyErr
 	}
 	scope, scopeErr := tombstone.DecodeScopedSync(ev)

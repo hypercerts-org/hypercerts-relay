@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/jetstream/api/jetstream"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 	"github.com/bluesky-social/jetstream/internal/ingest"
@@ -36,10 +37,10 @@ func TestSelectedHandlerWebsocketCapabilityAndMetadata(t *testing.T) {
 	stream := "crypto-identity"
 	manager, err := attribution.Open(st, stream, "selected-stream")
 	require.NoError(t, err)
-	policy := attribution.Policy{Revision: 1, Collections: []string{}}
-	policyManager, err := selection.Open(st, []string{})
+	policy := attribution.Policy{Revision: 1, Collections: []string{"app.example.one"}}
+	policyManager, err := selection.Open(st, []string{"app.example.one"})
 	require.NoError(t, err)
-	w, err = ingest.Open(ingest.Config{SegmentsDir: filepath.Join(dir, "segments"), Store: st, Attribution: manager, AttributionDomain: "selected-stream", CollectionPolicy: policyManager, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	w, err = ingest.Open(ingest.Config{SegmentsDir: filepath.Join(dir, "segments"), Store: st, Attribution: manager, AttributionDomain: "selected-stream", CollectionPolicy: policyManager, ReadLogRetentionBytes: 1 << 20, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	require.NoError(t, err)
 	require.NoError(t, lifecycle.WritePhase(st, lifecycle.PhaseSteadyState, time.Now().UTC()))
 	require.NoError(t, manager.EnsureInitialPolicyHistory(policy, nil))
@@ -48,10 +49,9 @@ func TestSelectedHandlerWebsocketCapabilityAndMetadata(t *testing.T) {
 	tail, err := subscribe.New(subscribe.Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, func() uint64 { return w.NextSeq() })
 	require.NoError(t, err)
 	tail.SetReadLogSource(func() *ingest.ReadableLog { return w.ReadLog() })
-	// Cursorless selection starts at the live edge; append a second event after upgrade below.
 	provider := subscribe.SelectedConfigProviderFunc(func() (subscribe.SelectedConfig, error) {
 		floor := uint64(0)
-		return subscribe.SelectedConfig{StreamID: stream, PolicyRevision: 1, Collections: []string{}, ReplayFloor: &floor, CurrentSeq: 2, ReplayEnabled: true, Coverage: "unknown", Gaps: []subscribe.SelectedGap{}}, nil
+		return subscribe.SelectedConfig{StreamID: stream, PolicyRevision: 1, Collections: []string{"app.example.one"}, ReplayFloor: &floor, CurrentSeq: 1, ReplayEnabled: true, Coverage: "unknown", Gaps: []subscribe.SelectedGap{}}, nil
 	})
 	server, stop := selectedTestServer(subscribe.NewHandler(subscribe.Subscription{Tail: tail, Store: st, Writer: w, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Metrics: subscribe.NewMetrics(prometheus.NewRegistry()), Lookback: time.Hour, V2: true, SelectedConfig: provider, SelectedAttribution: manager, SelectedStreamID: stream}))
 	defer stop()
@@ -71,6 +71,20 @@ func TestSelectedHandlerWebsocketCapabilityAndMetadata(t *testing.T) {
 	_, second, err := conn.Read(ctx)
 	require.NoError(t, err)
 	require.Contains(t, string(second), "PolicyAdopted")
+	require.NoError(t, w.AppendAttributed(ctx, &segment.Event{Kind: segment.KindCreate, DID: "did:plc:test", Collection: "app.example.one", Rkey: "record", Payload: []byte{0xa0}}, ingest.AttributionMetadata{StreamID: stream, Policy: attribution.Policy{Revision: 1, Collections: []string{"app.example.one"}}, Provenance: attribution.ProvenanceLive}))
+	require.NoError(t, w.Flush(ctx))
+	commitFrame := readSelectedFrame(t, conn, ctx, "#commit")
+	var envelope struct {
+		Payload json.RawMessage `json:"payload"`
+	}
+	require.NoError(t, json.Unmarshal(commitFrame, &envelope))
+	var message jetstream.JetstreamSubscribeEvents_Message
+	require.NoError(t, message.UnmarshalJSON(envelope.Payload))
+	metadata := message.JetstreamSubscribeEvents_Commit.Val().Hypercerts.Val()
+	require.Equal(t, stream, metadata.StreamId.Val())
+	require.EqualValues(t, 1, metadata.PolicyRev.Val())
+	require.Equal(t, "live", metadata.Provenance.Val())
+
 }
 
 func TestAbsentSelectedContractDoesNotOptIn(t *testing.T) {
@@ -86,11 +100,11 @@ func TestAbsentSelectedContractDoesNotOptIn(t *testing.T) {
 	})
 	srv := httptest.NewServer(subscribe.NewHandler(subscribe.Subscription{Tail: tail, Store: st, Writer: w, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Metrics: subscribe.NewMetrics(prometheus.NewRegistry()), V2: true, SelectedConfig: provider}))
 	defer srv.Close()
-	resp, err := http.Get(srv.URL + "/?streamId=some-stream&cursor=1")
+	resp, err := selectedHTTPGet(t, srv.URL+"/?streamId=some-stream&cursor=1")
 	require.NoError(t, err)
 	require.Equal(t, http.StatusUpgradeRequired, resp.StatusCode)
 	_ = resp.Body.Close()
-	request, err := http.NewRequest(http.MethodGet, srv.URL+"/", nil)
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+"/", nil)
 	require.NoError(t, err)
 	request.Header.Set("Sec-WebSocket-Protocol", subscribe.SelectedContract)
 	request.Header.Set("Connection", "Upgrade")
@@ -125,12 +139,23 @@ func TestSelectedSyncWebsocketDoesNotLeakCARAndKeepsLifecycle(t *testing.T) {
 	require.Contains(t, string(frame), `"did":"did:plc:test"`)
 	require.Contains(t, string(frame), `"reconciliationRequired":true`)
 	require.Contains(t, string(frame), `"collections":["app.example.one"]`)
+	var envelope struct {
+		Payload json.RawMessage `json:"payload"`
+	}
+	require.NoError(t, json.Unmarshal(frame, &envelope))
+	var message jetstream.JetstreamSubscribeEvents_Message
+	require.NoError(t, message.UnmarshalJSON(envelope.Payload))
+	require.Empty(t, message.JetstreamSubscribeEvents_Sync.Val().Sync.Blocks)
+	var payload map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(envelope.Payload, &payload))
+	require.NotContains(t, payload, "ops")
+
 }
 
 func TestSelectedLegacySyncReplayBoundaryAndLive(t *testing.T) {
 	f := newSelectedWebsocketFixture(t, true)
 	f.addEvent(t, 2, 1)
-	response, err := http.Get(f.server.URL + "/?contract=" + subscribe.SelectedContract + "&streamId=" + f.stream + "&cursor=1&dids=did:plc:other")
+	response, err := selectedHTTPGet(t, f.server.URL+"/?contract="+subscribe.SelectedContract+"&streamId="+f.stream+"&cursor=1&dids=did:plc:other")
 	require.NoError(t, err)
 	defer response.Body.Close()
 	require.NotEqual(t, http.StatusSwitchingProtocols, response.StatusCode)
@@ -155,7 +180,7 @@ func TestSelectedNoActivationRejectsResumeBeforeUpgrade(t *testing.T) {
 	for _, legacy := range []bool{false, true} {
 		t.Run(map[bool]string{false: "empty", true: "legacy"}[legacy], func(t *testing.T) {
 			f := newSelectedWebsocketFixture(t, legacy)
-			response, err := http.Get(f.server.URL + "/?contract=" + subscribe.SelectedContract + "&streamId=" + f.stream + "&cursor=0&dids=did:plc:other")
+			response, err := selectedHTTPGet(t, f.server.URL+"/?contract="+subscribe.SelectedContract+"&streamId="+f.stream+"&cursor=0&dids=did:plc:other")
 			require.NoError(t, err)
 			defer response.Body.Close()
 			require.NotEqual(t, http.StatusSwitchingProtocols, response.StatusCode)
@@ -185,7 +210,7 @@ func TestSelectedNegotiationFailsBeforeUpgrade(t *testing.T) {
 	require.NoError(t, err)
 	srv := httptest.NewServer(subscribe.NewHandler(subscribe.Subscription{Tail: tail, Store: st, Writer: w, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Metrics: subscribe.NewMetrics(prometheus.NewRegistry()), V2: true}))
 	defer srv.Close()
-	resp, err := http.Get(srv.URL + "/?contract=unsupported")
+	resp, err := selectedHTTPGet(t, srv.URL+"/?contract=unsupported")
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
@@ -406,4 +431,15 @@ func readSelectedFrame(t *testing.T, conn *websocket.Conn, ctx context.Context, 
 	require.NoError(t, err)
 	require.Contains(t, string(body), want)
 	return body
+}
+
+func selectedHTTPGet(t *testing.T, address string) (*http.Response, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	t.Cleanup(cancel)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, address, nil)
+	if err != nil {
+		return nil, err
+	}
+	return http.DefaultClient.Do(request)
 }
