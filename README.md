@@ -47,6 +47,7 @@ DID migration never admits or connects the resolved target automatically. Each o
 | --- | --- |
 | `cmd/relay` | Indigo Relay base for accepting PDS subscriptions and emitting the raw repository event stream. |
 | `cmd/rainbow` | Indigo raw-stream fan-out proxy for reducing direct Relay connections. |
+| `cmd/collectiondir` | Candidate DID/collection directory; see the [operator guide](cmd/collectiondir/README.md) for limitations and exposure. |
 | `jetstream/` | Copied Jetstream v2 runtime module for archive, replay, live subscriptions, and Hypercerts-owned collection/backfill work. See [`jetstream/README.md`](jetstream/README.md) for provenance and operations. |
 | `atproto`, `api`, `events`, `models`, `splitter`, `util`, `xrpc`, and `lex/util` | The dependency closure required to build and test Relay and Rainbow. |
 
@@ -80,13 +81,14 @@ cd hypercerts-relay
 ./scripts/verify.sh
 ```
 
-The verification script runs focused tests for Relay and Rainbow, static checks, and builds both binaries. One Relay test is inconsistent across environments at the tracked Indigo baseline: `TestClaimDueAccountLimitAlertsRepeatsAfterInterval` fails in the local verification environment but passed the published GitHub Actions run. The script skips only that local failure. CI runs the test separately as a non-blocking signal while the difference is investigated.
+The verification script runs focused tests, static checks, and builds for Relay, Rainbow, and collection directory. One Relay test is inconsistent across environments at the tracked Indigo baseline: `TestClaimDueAccountLimitAlertsRepeatsAfterInterval` fails in the local verification environment but passed the published GitHub Actions run. The script skips only that local failure. CI runs the test separately as a non-blocking signal while the difference is investigated.
 
 Build a service locally with:
 
 ```bash
 go build ./cmd/relay
 go build ./cmd/rainbow
+go build ./cmd/collectiondir
 (cd jetstream && go build ./cmd/jetstream)
 ```
 
