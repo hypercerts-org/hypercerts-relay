@@ -2,7 +2,7 @@
 
 # Maintaining the Indigo fork
 
-Hypercerts Relay is a deliberately small fork of [Bluesky Indigo](https://github.com/bluesky-social/indigo). It contains the Relay, Rainbow, and their Go dependency closure. This document owns the fork provenance, upstream setup, and synchronization process.
+Hypercerts Relay is a deliberately small fork of [Bluesky Indigo](https://github.com/bluesky-social/indigo). It contains the Relay, Rainbow, collection directory, and their Go dependency closure. This document owns the fork provenance, upstream setup, and synchronization process.
 
 ## Module path
 
@@ -46,7 +46,7 @@ Every changed upstream line can become a future merge conflict.
 
 ## Synchronize from Indigo
 
-This repository does not merge `upstream/main`. `.hypercerts/upstream-paths` is the authoritative allowlist of upstream paths: it contains Relay, Rainbow, their required Go packages, `go.mod`, `go.sum`, and the upstream licenses. It explicitly excludes the inherited Relay Basic-auth web UI.
+This repository does not merge `upstream/main`. `.hypercerts/upstream-paths` is the authoritative allowlist of upstream paths: it contains Relay, Rainbow, collection directory, their required Go packages, `go.mod`, `go.sum`, and the upstream licenses. It explicitly excludes the inherited Relay Basic-auth web UI.
 
 `.hypercerts/upstream-base` records the last Indigo commit applied to those paths. `scripts/apply-upstream-update.sh` produces a binary diff from that baseline to `upstream/main`, restricted to the allowlist, then applies it with Git's three-way merge support. An excluded upstream file can never enter a sync pull request.
 
