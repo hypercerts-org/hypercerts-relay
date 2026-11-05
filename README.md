@@ -2,15 +2,17 @@
 
 # Hypercerts Relay
 
-Hypercerts Relay is the controlled AT Protocol event source for Hypercerts services. It contains the Relay and Rainbow Indigo closure plus a separately maintained, copied Jetstream v2 runtime module.
+Hypercerts Relay is the controlled AT Protocol event source for Hypercerts services. It contains the Relay, Rainbow, and collection directory Indigo closure plus a separately maintained, copied Jetstream v2 runtime module.
 
 The Relay connects to approved PDS instances and publishes a raw `com.atproto.sync.subscribeRepos` stream. The relay does not select Hypercerts records or provide a consumer archive. The `jetstream/` module receives this stream, retains only the enabled record collections, and performs durable collection backfills. Rainbow is a deferred raw-stream fan-out option, not part of the initial launch topology.
+
+The optional collection directory consumes the raw Relay stream and crawls configured PDSs to serve `com.atproto.sync.listReposByCollection`. It helps consumers discover candidate repositories for a collection; it does not replace Jetstream's archive or backfills. Results may be stale or incomplete, so consumers must verify records. See the [collection directory operator guide](cmd/collectiondir/README.md) for bootstrap, security, and recovery limitations.
 
 The administration control plane manages PDS sources, record collections, rate limits, backfills, and relay telemetry. Its Svelte web interface is not the inherited Relay admin UI: the existing Basic-auth interface under `cmd/relay/relay-admin-ui` remains upstream code and is not the control plane.
 
 ## Status
 
-This repository contains the maintained Relay and Rainbow base, durable Relay processing and rejections, a managed PDS registry, a copied Jetstream v2 runtime, collection-selection policy, scoped backfill jobs, and the administration control plane. Their remaining acceptance, recovery, upgrade and deployment gates are tracked in the implementation plans; their presence is not deployment qualification.
+This repository contains the maintained Relay and Rainbow base, an optional collection directory, durable Relay processing and rejections, a managed PDS registry, a copied Jetstream v2 runtime, collection-selection policy, scoped backfill jobs, and the administration control plane. Their remaining acceptance, recovery, upgrade and deployment gates are tracked in the implementation plans; their presence is not deployment qualification.
 
 ## Event durability
 
@@ -47,9 +49,9 @@ DID migration never admits or connects the resolved target automatically. Each o
 | --- | --- |
 | `cmd/relay` | Indigo Relay base for accepting PDS subscriptions and emitting the raw repository event stream. |
 | `cmd/rainbow` | Indigo raw-stream fan-out proxy for reducing direct Relay connections. |
-| `cmd/collectiondir` | Candidate DID/collection directory; see the [operator guide](cmd/collectiondir/README.md) for limitations and exposure. |
+| `cmd/collectiondir` | Optional directory for discovering candidate repository DIDs by collection; see the [operator guide](cmd/collectiondir/README.md) for limitations and exposure. |
 | `jetstream/` | Copied Jetstream v2 runtime module for archive, replay, live subscriptions, and Hypercerts-owned collection/backfill work. See [`jetstream/README.md`](jetstream/README.md) for provenance and operations. |
-| `atproto`, `api`, `events`, `models`, `splitter`, `util`, `xrpc`, and `lex/util` | The dependency closure required to build and test Relay and Rainbow. |
+| `atproto`, `api`, `events`, `models`, `splitter`, `util`, `xrpc`, and `lex/util` | The dependency closure required to build and test the Indigo services. |
 
 ## Development
 
