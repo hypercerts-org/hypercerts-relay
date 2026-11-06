@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "hypercerts-relay": {
+      "source": "hypercerts-org/hypercerts-relay",
+      "sourceType": "github",
+      "skillPath": ".agents/skills/hypercerts-relay/SKILL.md",
+      "computedHash": "bbaa27ecb1a8e172b7f2931766611538ea3d3509d1e19e570d76c2b55c59046f"
+    }
+  }
+}
