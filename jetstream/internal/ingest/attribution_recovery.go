@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"time"
 
 	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
 	"github.com/bluesky-social/jetstream/segment"
@@ -21,7 +22,17 @@ func RecoverAttributions(cfg Config, manager *attribution.Manager, domain string
 	return recoverAttributions(cfg)
 }
 
-func recoverAttributions(cfg Config) error {
+func recoverAttributions(cfg Config) (resultErr error) {
+	if cfg.Logger != nil {
+		start := time.Now()
+		defer func() {
+			if resultErr != nil {
+				cfg.Logger.Error("attribution recovery and audit failed", "duration", time.Since(start))
+			} else {
+				cfg.Logger.Info("attribution recovery and audit complete", "duration", time.Since(start))
+			}
+		}()
+	}
 	manager := cfg.Attribution
 	seqs, err := manager.PreparedSeqs()
 	if err != nil {

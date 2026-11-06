@@ -346,23 +346,20 @@ func Patch(path string, mutate func(*Event) bool, opts PatchOptions) (PatchResul
 		return PatchResult{}, fmt.Errorf("segment: patch close tmp: %w", err)
 	}
 	f = nil
-	if _, err := BeginAuditMutation(opts.FS, path); err != nil {
-		return PatchResult{}, err
-	}
 	if err := beforeSegmentIO(opts.IOFaultInjector, path, IOOpRename); err != nil {
-		return PatchResult{}, &ReplacementPersistenceError{Path: path, MayHaveChanged: true, Err: err}
+		return PatchResult{}, fmt.Errorf("segment: patch rename: %w", err)
 	}
 	if err := renameSegmentFile(opts.FS, tmp, path); err != nil {
-		return PatchResult{}, &ReplacementPersistenceError{Path: path, MayHaveChanged: true, Err: err}
+		return PatchResult{}, fmt.Errorf("segment: patch rename: %w", err)
 	}
 	if err := simulatePatchCrash(opts, CrashPointPatchRenamed); err != nil {
-		return PatchResult{}, &ReplacementPersistenceError{Path: path, MayHaveChanged: true, Err: err}
+		return PatchResult{}, err
 	}
 	if err := syncParentDirFS(opts.FS, path, opts.IOFaultInjector); err != nil {
-		return PatchResult{}, &ReplacementPersistenceError{Path: path, MayHaveChanged: true, Err: err}
+		return PatchResult{}, err
 	}
 	if err := simulatePatchCrash(opts, CrashPointPatchDirSynced); err != nil {
-		return PatchResult{}, &ReplacementPersistenceError{Path: path, MayHaveChanged: true, Err: err}
+		return PatchResult{}, err
 	}
 	success = true
 

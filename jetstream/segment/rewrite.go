@@ -215,23 +215,20 @@ func Rewrite(path string, decide func(*Event) RowDecision, opts RewriteOptions) 
 		return RewriteResult{}, fmt.Errorf("segment: rewrite close tmp: %w", err)
 	}
 	f = nil
-	if _, err := BeginAuditMutation(opts.FS, path); err != nil {
-		return RewriteResult{}, err
-	}
 	if err := beforeSegmentIO(opts.IOFaultInjector, path, IOOpRename); err != nil {
-		return RewriteResult{}, &ReplacementPersistenceError{Path: path, MayHaveChanged: true, Err: err}
+		return RewriteResult{}, fmt.Errorf("segment: rewrite rename: %w", err)
 	}
 	if err := renameSegmentFile(opts.FS, tmp, path); err != nil {
-		return RewriteResult{}, &ReplacementPersistenceError{Path: path, MayHaveChanged: true, Err: err}
+		return RewriteResult{}, fmt.Errorf("segment: rewrite rename: %w", err)
 	}
 	if err := simulateRewriteCrash(opts, CrashPointRewriteRenamed); err != nil {
-		return RewriteResult{}, &ReplacementPersistenceError{Path: path, MayHaveChanged: true, Err: err}
+		return RewriteResult{}, err
 	}
 	if err := syncParentDirFS(opts.FS, path, opts.IOFaultInjector); err != nil {
-		return RewriteResult{}, &ReplacementPersistenceError{Path: path, MayHaveChanged: true, Err: err}
+		return RewriteResult{}, err
 	}
 	if err := simulateRewriteCrash(opts, CrashPointRewriteDirSynced); err != nil {
-		return RewriteResult{}, &ReplacementPersistenceError{Path: path, MayHaveChanged: true, Err: err}
+		return RewriteResult{}, err
 	}
 	success = true
 

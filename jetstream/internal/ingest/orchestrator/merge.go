@@ -107,7 +107,7 @@ func (o *Orchestrator) prepareMergeSource(ctx context.Context, liveSegmentsDir s
 		return cleaned, err
 	}
 	if o.cfg.BootstrapAttribution != nil {
-		if err := ingest.RecoverAttributions(ingest.Config{SegmentsDir: liveSegmentsDir, DataDir: o.cfg.DataDir, FS: o.cfg.FS, Store: o.cfg.Store}, o.cfg.BootstrapAttribution, o.cfg.BootstrapAttributionDomain); err != nil {
+		if err := ingest.RecoverAttributions(ingest.Config{SegmentsDir: liveSegmentsDir, DataDir: o.cfg.DataDir, FS: o.cfg.FS, Store: o.cfg.Store, Logger: o.cfg.Logger}, o.cfg.BootstrapAttribution, o.cfg.BootstrapAttributionDomain); err != nil {
 			return false, fmt.Errorf("orchestrator: merge: recover source attribution: %w", err)
 		}
 	}
