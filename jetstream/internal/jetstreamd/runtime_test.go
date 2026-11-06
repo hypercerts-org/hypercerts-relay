@@ -430,9 +430,8 @@ func testOptions(t *testing.T) Options {
 	}
 }
 
-// hypercerts: An upstream continuity loss is durable evidence. Build must
-// refuse to reopen the archive, even when collection selection is disabled.
-func TestBuildRefusesRecordedUpstreamLoss(t *testing.T) {
+// hypercerts: A recorded upstream continuity loss is reported, not a startup barrier.
+func TestBuildToleratesRecordedUpstreamLoss(t *testing.T) {
 	t.Parallel()
 
 	opts := testOptions(t)
@@ -441,20 +440,7 @@ func TestBuildRefusesRecordedUpstreamLoss(t *testing.T) {
 	require.NoError(t, live.RecordUpstreamLoss(st, live.UpstreamLoss{Version: 1, Reason: "sequence_gap", CursorKey: live.CursorKey, SafeCursor: 12, Expected: 13, Got: 20}))
 	require.NoError(t, st.Close())
 
-	_, err = Build(t.Context(), opts)
-	require.ErrorIs(t, err, live.ErrUpstreamLoss)
-	require.ErrorContains(t, err, "upgrade-restore.md")
-}
-
-func TestBuildRefusesMalformedUpstreamLossMarker(t *testing.T) {
-	t.Parallel()
-
-	opts := testOptions(t)
-	st, err := store.Open(opts.DataDir, nil, store.WithFS(opts.StorageFS))
-	require.NoError(t, err)
-	require.NoError(t, st.Set([]byte("hypercerts/selected/upstream-loss/v1"), []byte(`{"reason":"bogus"}`), store.SyncWrites))
-	require.NoError(t, st.Close())
-
-	_, err = Build(t.Context(), opts)
-	require.ErrorContains(t, err, "read upstream loss marker")
+	rt, err := Build(t.Context(), opts)
+	require.NoError(t, err, "a recorded loss must not block startup")
+	t.Cleanup(func() { _ = rt.Close(context.Background()) })
 }

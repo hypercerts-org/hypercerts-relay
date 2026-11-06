@@ -2,4 +2,4 @@
 'hypercerts-relay': patch
 ---
 
-Selected Jetstream subscriptions now stop instead of skipping a known upstream continuity loss. An upstream `OutdatedCursor` notice or relay sequence gap is recorded durably, fails `/readyz`, closes established selected subscriptions, and blocks restart until an operator restores a coherent pre-loss snapshot or provisions a new stream identity. Follow `docs/upgrade-restore.md`; do not delete the recorded loss and resume the same archive.
+Selected Jetstream subscriptions now log and skip a known upstream continuity loss instead of stopping. An upstream `OutdatedCursor` notice or relay sequence gap is logged at error level and recorded durably, then ingestion continues; readiness, established subscriptions and restart are unaffected. The recorded loss is reported again on the next start. Treat the skipped interval as a real history gap and follow `docs/upgrade-restore.md`.

@@ -135,10 +135,10 @@ Field types and semantics:
 At initial history materialization, the minimum truthful disclosure is `historyMode: "materialized"`, `originalHistoryFromSeq: null`, `coverage: "unknown"`, and `gaps: []` only when there are no known gaps (otherwise report them). These values MUST NOT be replaced with `false`/empty claims about historical completeness. A richer historical claim is not required for TECH670; claims that are made must be supported. `collections` describes current selection, not historical capture. If any mandatory field is unavailable, do not advertise/accept the selected contract.
 
 If ingestion detects a known upstream continuity loss (an `OutdatedCursor`
-notice or a relay sequence gap), the server stops advertising and serving the
-selected contract instead of continuing with silently incomplete data. The loss
-is recorded durably and disclosed to the operator; `coverage: "unknown"` covers
-only unknown history, not a known, recorded discontinuity.
+notice or a relay sequence gap), the server records it durably, logs it at error
+level, and continues ingesting past it. The skip is never silent: the loss stays
+external evidence for the operator, and `coverage: "unknown"` covers only
+unknown history, not a known, recorded discontinuity.
 
 ## 7. Reconciliation scope and completion
 
