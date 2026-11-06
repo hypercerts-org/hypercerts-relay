@@ -3,6 +3,7 @@ package subscribe_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -94,6 +95,26 @@ func TestSelectedHandlerWebsocketCapabilityAndMetadata(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return testutil.ToFloat64(metrics.CleanDisconnects) == 1 && testutil.ToFloat64(metrics.Subscribers.WithLabelValues("none")) == 0
 	}, time.Second, time.Millisecond)
+}
+
+func TestSelectedProviderErrorFailsBeforeUpgrade(t *testing.T) {
+	dir := t.TempDir()
+	st, w := openWriterAtTip(t, dir, 0)
+	defer func() { _ = w.Close(); _ = st.Close() }()
+	require.NoError(t, lifecycle.WritePhase(st, lifecycle.PhaseSteadyState, time.Now().UTC()))
+	tail, err := subscribe.New(subscribe.Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil, nil)
+	require.NoError(t, err)
+	provider := subscribe.SelectedConfigProviderFunc(func() (subscribe.SelectedConfig, error) {
+		return subscribe.SelectedConfig{}, errors.New("history unavailable")
+	})
+	srv := httptest.NewServer(subscribe.NewHandler(subscribe.Subscription{Tail: tail, Store: st, Writer: w, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Metrics: subscribe.NewMetrics(prometheus.NewRegistry()), V2: true, SelectedConfig: provider}))
+	defer srv.Close()
+	conn, response, err := websocket.Dial(t.Context(), "ws"+strings.TrimPrefix(srv.URL, "http")+"/?contract="+subscribe.SelectedContract, nil)
+	require.Error(t, err)
+	require.Nil(t, conn)
+	require.NotNil(t, response)
+	defer response.Body.Close()
+	require.Equal(t, http.StatusServiceUnavailable, response.StatusCode)
 }
 
 func TestAbsentSelectedContractDoesNotOptIn(t *testing.T) {

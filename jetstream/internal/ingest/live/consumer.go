@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"iter"
 	"log/slog"
 	"net"
 	"slices"
@@ -61,6 +62,10 @@ type Consumer struct {
 	// inside Run would risk skipping a still-in-flight smaller seq
 	// across a crash, dropping it from the archive permanently.
 	lastUpstream atomic.Int64
+
+	// processedUpstream is the highest upstream seq whose source event was
+	// fully processed under selection. The persisted cursor never exceeds it.
+	processedUpstream atomic.Int64
 
 	// client is set once at the top of Run after NewClient succeeds, and
 	// consulted by the durable-batch cursor sampler to read the
@@ -338,6 +343,12 @@ func (c *Consumer) dropReplayedIdentityEvent(ctx context.Context, segEvts []segm
 // flow). The watermark is always <= the highest seq we've buffered,
 // so persisting it can never skip a still-in-flight smaller seq.
 func (c *Consumer) cursorValue() int64 {
+	// hypercerts: Selection-enabled consumption persists only the boundary
+	// of fully processed source events, so an upstream warning or gap can
+	// never be checkpointed past on a later restart.
+	if c.upstreamLossEnabled() {
+		return c.processedUpstream.Load()
+	}
 	if cl := c.client.Load(); cl != nil {
 		return cl.Cursor()
 	}
@@ -447,6 +458,19 @@ func (c *Consumer) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("livestream: load start cursor: %w", err)
 	}
+	loss, err := ReadUpstreamLoss(c.cfg.Store)
+	if err != nil {
+		return fmt.Errorf("livestream: read upstream loss marker: %w", err)
+	}
+	if loss != nil {
+		if c.cfg.OnUpstreamLoss != nil {
+			c.cfg.OnUpstreamLoss(*loss)
+		}
+		return fmt.Errorf("%w: %s recorded at %s safe cursor %d", ErrUpstreamLoss, loss.Reason, loss.CursorKey, loss.SafeCursor)
+	}
+	if c.upstreamLossEnabled() {
+		c.processedUpstream.Store(startCursor)
+	}
 
 	c.logger.InfoContext(ctx, "subscribing",
 		"url", wsURL,
@@ -469,6 +493,11 @@ func (c *Consumer) Run(ctx context.Context) error {
 				"delay", delay,
 			)
 		}),
+	}
+	// hypercerts: A selection-enabled archive needs parallel delivery to stay
+	// ordered with upstream notices, so a single scheduler worker is used.
+	if c.upstreamLossEnabled() {
+		opts.Parallelism = gt.Some(1)
 	}
 	if c.cfg.ReconnectBackoff != nil {
 		opts.Backoff = gt.Some(*c.cfg.ReconnectBackoff)
@@ -523,10 +552,24 @@ func (c *Consumer) Run(ctx context.Context) error {
 		}
 	}()
 
-	for batch, err := range client.Events(ctx) {
+	return c.consumeEvents(ctx, client.Events(ctx))
+}
+
+// consumeEvents drains one upstream event sequence. It is separate from Run so
+// tests can drive the exact same loop with a deterministic event source.
+func (c *Consumer) consumeEvents(ctx context.Context, events iter.Seq2[[]streaming.Event, error]) error {
+	for batch, err := range events {
 		if err != nil {
 			// Stream-level errors flow through here; atmos has
 			// already flushed the partial batch as nil + err.
+			// hypercerts: A selection-enabled archive must not log
+			// and continue past a known continuity loss.
+			if loss, lost, lossErr := c.upstreamLoss(err); lost {
+				if lossErr != nil {
+					return errors.Join(lossErr, fmt.Errorf("%w: %s safe cursor %d", ErrUpstreamLoss, loss.Reason, loss.SafeCursor))
+				}
+				return fmt.Errorf("%w: %s safe cursor %d", ErrUpstreamLoss, loss.Reason, loss.SafeCursor)
+			}
 			// Classify, log, and continue — the next iteration
 			// will either reconnect or yield the next batch.
 			c.noteStreamError(ctx, err)
@@ -537,7 +580,6 @@ func (c *Consumer) Run(ctx context.Context) error {
 			return perr
 		}
 	}
-
 	return context.Cause(ctx)
 }
 
@@ -611,6 +653,16 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 
 		for _, evt := range batch {
 			c.cfg.Metrics.incEventsReceived()
+			if c.upstreamLossEnabled() && evt.Info != nil && evt.Info.Name == "OutdatedCursor" {
+				loss := UpstreamLoss{Version: 1, Reason: "outdated_cursor", CursorKey: c.cfg.CursorKey, SafeCursor: c.processedUpstream.Load()}
+				if c.cfg.OnUpstreamLoss != nil {
+					c.cfg.OnUpstreamLoss(loss)
+				}
+				if err := RecordUpstreamLossOnce(c.cfg.Store, loss); err != nil {
+					return err
+				}
+				return fmt.Errorf("%w: %s safe cursor %d", ErrUpstreamLoss, loss.Reason, loss.SafeCursor)
+			}
 
 			segEvts, err := ConvertEvent(evt, witnessedAt)
 			dme, isDropped := errors.AsType[*DroppedOpsError](err)
@@ -867,6 +919,9 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 			// cursor we persist comes from cursorValue() which
 			// prefers atmos's watermark.
 			c.noteUpstreamSeq(evt.Seq)
+			if c.upstreamLossEnabled() && evt.Seq > c.processedUpstream.Load() {
+				c.processedUpstream.Store(evt.Seq)
+			}
 		}
 
 		return nil
@@ -887,6 +942,37 @@ func (c *Consumer) maybeTriggerCompaction() {
 			c.cfg.OnCompactionTriggerCoalesced()
 		}
 	}
+}
+
+// upstreamLossEnabled reports whether this consumer writes the selected
+// archive. Both bootstrap-live and steady-state consumption carry a
+// collection policy; an embedded consumer without one keeps the upstream
+// best-effort stream behavior.
+func (c *Consumer) upstreamLossEnabled() bool {
+	return c.cfg.CollectionPolicy != nil
+}
+
+// upstreamLoss converts an upstream continuity event into a durable loss
+// marker for selection-enabled consumption. It reports false for notices and
+// errors that must keep the existing best-effort handling.
+// hypercerts: A known upstream discontinuity must stop selected ingestion
+// instead of being logged and skipped; see docs/contracts/selected-stream-v1.md.
+func (c *Consumer) upstreamLoss(err error) (UpstreamLoss, bool, error) {
+	if !c.upstreamLossEnabled() {
+		return UpstreamLoss{}, false, nil
+	}
+	loss := UpstreamLoss{Version: 1, CursorKey: c.cfg.CursorKey, SafeCursor: c.cursorValue()}
+	if gap, ok := errors.AsType[*streaming.GapError](err); ok {
+		loss.Reason = "sequence_gap"
+		loss.Expected = gap.Expected
+		loss.Got = gap.Got
+	} else {
+		return UpstreamLoss{}, false, nil
+	}
+	if c.cfg.OnUpstreamLoss != nil {
+		c.cfg.OnUpstreamLoss(loss)
+	}
+	return loss, true, RecordUpstreamLossOnce(c.cfg.Store, loss)
 }
 
 func (c *Consumer) noteUpstreamSeq(seq int64) {

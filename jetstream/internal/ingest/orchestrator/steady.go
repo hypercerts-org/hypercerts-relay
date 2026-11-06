@@ -86,6 +86,7 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 			OnEvent:               o.cfg.OnEvent,
 			OnUpstreamEventSeen:   o.cfg.LiveMetrics.NoteLastSeenUpstreamEvent,
 			OnAfterSeal:           o.cfg.IngestOnAfterSeal,
+			OnUpstreamLoss:        o.cfg.OnUpstreamLoss,
 			TimestampStamper:      o.cfg.TimestampStamper,
 			ReconnectBackoff:      o.cfg.LiveReconnectBackoff,
 			Dial:                  o.cfg.LiveDial,

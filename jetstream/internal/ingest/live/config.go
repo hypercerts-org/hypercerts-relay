@@ -183,6 +183,12 @@ type Config struct {
 	// the full contract. Optional.
 	OnAfterSeal func(idx uint64, path string) error
 
+	// OnUpstreamLoss is called synchronously, before the durable loss
+	// marker is written, when a selection-enabled consumer loses upstream
+	// continuity. It must fail readiness immediately and must not block
+	// on writer or compactor shutdown.
+	OnUpstreamLoss func(UpstreamLoss)
+
 	// now is overridable for tests; production uses time.Now.
 	now func() time.Time
 

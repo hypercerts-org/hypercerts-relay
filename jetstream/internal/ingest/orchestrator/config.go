@@ -57,6 +57,10 @@ type Config struct {
 	PolicyGate                 *policygate.Gate
 	InitializePolicyGate       func(*ingest.Writer) (*policygate.Gate, error)
 	OnManagedLiveError         func(error)
+	// OnUpstreamLoss reports a durable upstream continuity loss from the
+	// bootstrap or steady live consumer. It must be synchronous and must not
+	// block on writer or compactor shutdown.
+	OnUpstreamLoss func(live.UpstreamLoss)
 	// DataDir is the root data directory. The orchestrator writes to
 	// <DataDir>/segments and <DataDir>/backfill/live_segments.
 	DataDir string

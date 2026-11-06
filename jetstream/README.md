@@ -157,6 +157,14 @@ does not promise their absence from upstream storage or transient input buffers.
 The internal embedding API retains upstream behavior unless `CollectionSelection`
 is enabled; the production `serve` command always enables it.
 
+With selection enabled, a known upstream continuity loss stops ingestion rather
+than being skipped: an upstream `OutdatedCursor` notice or a relay sequence gap
+is recorded durably, `/readyz` fails, established selected subscriptions close,
+and a restart refuses the archive until an operator performs the documented
+recovery in `docs/upgrade-restore.md`. Selected replay cannot recover raw events
+that were never acquired, so consumer reconciliation cannot assume that missing
+upstream history is recoverable.
+
 ## Scoped PDS backfill jobs
 
 Relay sends durable source lifecycle handoffs using `JETSTREAM_CONTROL_URL` and

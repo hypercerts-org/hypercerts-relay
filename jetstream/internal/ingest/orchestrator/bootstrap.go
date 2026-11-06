@@ -151,6 +151,7 @@ func (o *Orchestrator) openBootstrapLive(liveSegmentsDir string) (*live.Consumer
 		MaxEventsPerBlock:    o.cfg.BootstrapLiveMaxEventsPerBlock,
 		SegmentMetrics:       o.cfg.SegmentMetrics,
 		OnEvent:              o.cfg.OnBootstrapLiveEvent,
+		OnUpstreamLoss:       o.cfg.OnUpstreamLoss,
 		ReconnectBackoff:     o.cfg.LiveReconnectBackoff,
 		Dial:                 o.cfg.LiveDial,
 

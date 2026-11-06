@@ -85,11 +85,30 @@ type Runtime struct {
 	runMu     sync.Mutex
 	runCancel context.CancelFunc
 	runDone   chan struct{}
+	// cancelRun lets a lost upstream path stop the runtime before writer or
+	// compactor shutdown completes. It is set when Run starts.
+	cancelRun atomic.Pointer[context.CancelFunc]
 
 	closeMu sync.Mutex
 
 	jobsRunCancel context.CancelFunc
 	jobsRunDone   chan struct{}
+}
+
+// RefuseUpstreamLoss aborts Build when an earlier process recorded a durable
+// upstream continuity loss. Recovery is an operator decision: restore a
+// coherent backup or provision a new stream identity; nothing re-enables the
+// archive automatically.
+// hypercerts: documented operator recovery lives in docs/upgrade-restore.md.
+func refuseUpstreamLoss(st *store.Store) error {
+	loss, err := live.ReadUpstreamLoss(st)
+	if err != nil {
+		return fmt.Errorf("read upstream loss marker: %w", err)
+	}
+	if loss == nil {
+		return nil
+	}
+	return fmt.Errorf("%w: %s recorded at %s safe cursor %d; see docs/upgrade-restore.md", live.ErrUpstreamLoss, loss.Reason, loss.CursorKey, loss.SafeCursor)
 }
 
 // Build constructs the production service graph without starting listeners or
@@ -243,6 +262,11 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		return fail(err)
 	}
 	rt.metaStore = metaStore
+	// hypercerts: A recorded upstream continuity loss blocks every restart,
+	// even when collection selection is currently disabled.
+	if err := refuseUpstreamLoss(metaStore); err != nil {
+		return fail(err)
+	}
 	// hypercerts: Restore policy before any archive producer starts.
 	var selectedStreamID string
 	var eventAttribution *attribution.Manager
@@ -302,6 +326,23 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	// atomically. Before steady-state the lifecycle.IsSteadyState gate
 	// returns 503, so the nil-pointer window is harmless.
 	var writerPtr atomic.Pointer[ingest.Writer]
+	// hypercerts: A durable upstream continuity loss fails readiness, closes
+	// hijacked selected sockets, and cancels the runtime immediately.
+	var upstreamFailure atomic.Pointer[string]
+	var tailForLoss atomic.Pointer[subscribe.Tail]
+	onUpstreamLoss := func(loss live.UpstreamLoss) {
+		reason := fmt.Sprintf("upstream continuity loss: %s", loss.Reason)
+		upstreamFailure.CompareAndSwap(nil, &reason)
+		processLogger.Error("upstream continuity loss", "reason", loss.Reason, "cursor_key", loss.CursorKey, "safe_cursor", loss.SafeCursor)
+		if liveTail := tailForLoss.Load(); liveTail != nil {
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer shutdownCancel()
+			_ = liveTail.Shutdown(shutdownCtx)
+		}
+		if cancel := rt.cancelRun.Load(); cancel != nil {
+			(*cancel)()
+		}
+	}
 
 	// Verifier setup (shared across phases). The verifier itself is
 	// owned by the orchestrator's per-phase live consumers, but we
@@ -382,6 +423,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	if err != nil {
 		return fail(fmt.Errorf("serve: build subscribe tail: %w", err))
 	}
+	tailForLoss.Store(tail)
 	rt.tail = tail
 
 	verifierLogger := processLogger.With(slog.String("component", "verifier"))
@@ -535,6 +577,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		AfterRepoComplete:              opts.AfterRepoComplete,
 		CrashInjector:                  opts.CrashInjector,
 		SegmentIOFaultInjector:         opts.SegmentIOFaultInjector,
+		OnUpstreamLoss:                 onUpstreamLoss,
 		OnSteadyStateWriter: func(w *ingest.Writer) {
 			// hypercerts: Expose the ready writer to deterministic integration fixtures.
 			if opts.OnSteadyStateWriter != nil {
@@ -644,13 +687,19 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	}
 	srv := server.New(server.Config{
 		PrivateControlHandler: controlHandler,
-		EnablePprof:           opts.EnablePprof,
-		PublicAddr:            opts.PublicAddr,
-		DebugAddr:             opts.DebugAddr,
-		ShutdownTimeout:       opts.ShutdownTimeout,
-		StatusHandler:         statusHandler,
-		PublicListener:        opts.PublicListener,
-		DebugListener:         opts.DebugListener,
+		Unhealthy: func() string {
+			if reason := upstreamFailure.Load(); reason != nil {
+				return *reason
+			}
+			return ""
+		},
+		EnablePprof:     opts.EnablePprof,
+		PublicAddr:      opts.PublicAddr,
+		DebugAddr:       opts.DebugAddr,
+		ShutdownTimeout: opts.ShutdownTimeout,
+		StatusHandler:   statusHandler,
+		PublicListener:  opts.PublicListener,
+		DebugListener:   opts.DebugListener,
 	}, processLogger, metrics)
 	// hypercerts: The disposable acceptance binary needs an explicit archive
 	// boundary; production builds do not register this route.
@@ -672,15 +721,17 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	selectedProvider := subscribe.SelectedConfigProvider(nil)
 	if opts.CollectionSelection {
 		selectedProvider = subscribe.SelectedConfigProviderFunc(func() (subscribe.SelectedConfig, error) {
+			if reason := upstreamFailure.Load(); reason != nil {
+				return subscribe.SelectedConfig{}, fmt.Errorf("selected stream unavailable: %s", *reason)
+			}
 			writer := writerPtr.Load()
 			if writer == nil || rt.CollectionPolicy == nil || eventAttribution == nil {
 				return subscribe.SelectedConfig{}, errors.New("selected stream not ready")
 			}
-			history, err := eventAttribution.ReadPolicyHistory()
+			policy, history, err := selectedPolicySnapshot(rt.CollectionPolicy.Current, eventAttribution.ReadPolicyHistory)
 			if err != nil {
 				return subscribe.SelectedConfig{}, err
 			}
-			policy := rt.CollectionPolicy.Current()
 			readLog := writer.ReadLog()
 			durable := readLog.DurableSeq()
 			tip := uint64(0)
@@ -704,16 +755,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 				}
 				replayFloor = &floor
 			}
-			var effectiveAfter *uint64
-			if history, err := eventAttribution.ReadPolicyHistory(); err == nil {
-				for _, historical := range history {
-					if historical.Revision == policy.Revision && historical.EffectiveAfterSeq != nil {
-						boundary := *historical.EffectiveAfterSeq
-						effectiveAfter = &boundary
-						break
-					}
-				}
-			}
+			effectiveAfter := history[len(history)-1].EffectiveAfterSeq
 			activation, err := eventAttribution.ActivationSeq()
 			if err != nil {
 				return subscribe.SelectedConfig{}, err
@@ -852,6 +894,8 @@ func (r *Runtime) WaitSteadyState(ctx context.Context) error {
 // fatal subsystem error.
 func (r *Runtime) Run(ctx context.Context) (runErr error) {
 	runCtx, cancelRun := context.WithCancel(ctx)
+	r.cancelRun.Store(&cancelRun)
+	defer r.cancelRun.Store(nil)
 	runDone := make(chan struct{})
 	r.runMu.Lock()
 	if r.runDone != nil {
