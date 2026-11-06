@@ -21,6 +21,7 @@ type selectedConnection struct {
 	filter    *FilterV2
 	config    SelectedConfig
 	compress  bool
+	scheme    string
 	logger    *slog.Logger
 	cursor    uint64
 	announced uint64
@@ -28,6 +29,11 @@ type selectedConnection struct {
 }
 
 func (s *selectedConnection) runSelectedSubscriberLoop(ctx context.Context) {
+	defer func() {
+		if ctx.Err() != nil {
+			s.deps.Metrics.incCleanDisconnects()
+		}
+	}()
 	writer := s.deps.writer()
 	if writer == nil || s.deps.SelectedAttribution == nil || s.filter == nil {
 		return
@@ -173,7 +179,7 @@ func (s *selectedConnection) announcePolicy(ctx context.Context, policy attribut
 	if err != nil {
 		return err
 	}
-	if err := s.writeSelectedFrame(ctx, frame); err != nil {
+	if err := s.writeSelectedFrame(ctx, frame, false); err != nil {
 		return err
 	}
 	s.announced = policy.Revision
@@ -239,10 +245,11 @@ func (s *selectedConnection) deliverSelected(ctx context.Context, ev *segment.Ev
 		s.deps.Metrics.incEventsOversize()
 		return nil
 	}
-	return s.writeSelectedFrame(ctx, body)
+	return s.writeSelectedFrame(ctx, body, true)
 }
 
-func (s *selectedConnection) writeSelectedFrame(ctx context.Context, body []byte) error {
+func (s *selectedConnection) writeSelectedFrame(ctx context.Context, body []byte, event bool) error {
+	encodedBytes := len(body)
 	msgType := websocket.MessageText
 	if s.compress {
 		body = compressFrameV2(body)
@@ -252,6 +259,9 @@ func (s *selectedConnection) writeSelectedFrame(ctx context.Context, body []byte
 	defer cancel()
 	if err := s.conn.Write(writeCtx, msgType, body); err != nil {
 		return fmt.Errorf("%w: %w", errSelectedTransport, err)
+	}
+	if event {
+		s.deps.Metrics.incEventsSent(s.scheme, len(body), encodedBytes)
 	}
 	return nil
 }

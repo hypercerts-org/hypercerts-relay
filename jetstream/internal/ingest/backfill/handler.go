@@ -95,7 +95,7 @@ func (h *SegmentHandler) HandleRepoResync(ctx context.Context, did atmos.DID, r 
 	if h.attribution != nil {
 		return h.handleManagedResync(ctx, did, r, commit)
 	}
-	if h.policyGate == nil {
+	if !h.policyGate.HasPolicy() {
 		return h.handleRepoResyncCore(ctx, did, r, commit, nil, false, nil)
 	}
 	return h.policyGate.Admit(ctx, func(policy selection.Policy) error {
@@ -148,14 +148,22 @@ func (h *SegmentHandler) collectSelectedRows(ctx context.Context, did atmos.DID,
 			return err
 		}
 		collection, rkey, reason := splitRecordPath(key)
-		if reason != "" || !containsCollection(collections, collection) {
+		if reason != "" || collections != nil && !containsCollection(collections, collection) {
 			return nil
 		}
 		payload, err := r.Store.GetBlock(cid)
 		if err != nil {
 			return err
 		}
-		rows = append(rows, segment.Event{DID: string(did), Rev: commit.Rev, Kind: kind, Collection: collection, Rkey: rkey, Payload: payload, WitnessedAt: h.now().UnixMicro()})
+		event := segment.Event{DID: string(did), Rev: commit.Rev, Kind: kind, Collection: collection, Rkey: rkey, Payload: payload, WitnessedAt: h.now().UnixMicro()}
+		if err := segment.ValidateEvent(event); err != nil {
+			if errors.Is(err, segment.ErrFieldTooLong) && len(rkey) > 255 {
+				h.dropMetrics.IncDropped(ingest.DropSourceBackfill, ingest.DropReasonFieldTooLong)
+				return nil
+			}
+			return err
+		}
+		rows = append(rows, event)
 		return nil
 	})
 	return rows, err
@@ -188,12 +196,10 @@ func (h *SegmentHandler) handleRepoResyncCore(ctx context.Context, did atmos.DID
 		if err != nil {
 			return err
 		}
-		if managed {
-			metadataCopy := metadata
-			if metadataCopy == nil {
-				return ErrManagedPolicyConfig
-			}
-			_, err = h.writer.ReconcileSyncWithMetadata(ctx, string(did), commit.Rev, rows, collections, *metadataCopy)
+		if managed && metadata != nil {
+			_, err = h.writer.ReconcileSyncWithMetadata(ctx, string(did), commit.Rev, rows, collections, *metadata)
+		} else if managed {
+			_, err = h.writer.ReconcileSyncWithCollections(ctx, string(did), commit.Rev, rows, collections)
 		} else {
 			_, err = h.writer.ReconcileSync(ctx, string(did), commit.Rev, rows)
 		}

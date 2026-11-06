@@ -26,6 +26,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/jcalabro/atmos/api/comatproto"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -53,7 +54,8 @@ func TestSelectedHandlerWebsocketCapabilityAndMetadata(t *testing.T) {
 		floor := uint64(0)
 		return subscribe.SelectedConfig{StreamID: stream, PolicyRevision: 1, Collections: []string{"app.example.one"}, ReplayFloor: &floor, CurrentSeq: 1, ReplayEnabled: true, Coverage: "unknown", Gaps: []subscribe.SelectedGap{}}, nil
 	})
-	server, stop := selectedTestServer(subscribe.NewHandler(subscribe.Subscription{Tail: tail, Store: st, Writer: w, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Metrics: subscribe.NewMetrics(prometheus.NewRegistry()), Lookback: time.Hour, V2: true, SelectedConfig: provider, SelectedAttribution: manager, SelectedStreamID: stream}))
+	metrics := subscribe.NewMetrics(prometheus.NewRegistry())
+	server, stop := selectedTestServer(subscribe.NewHandler(subscribe.Subscription{Tail: tail, Store: st, Writer: w, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Metrics: metrics, Lookback: time.Hour, V2: true, SelectedConfig: provider, SelectedAttribution: manager, SelectedStreamID: stream}))
 	defer stop()
 	conn, resp, err := websocket.Dial(context.Background(), "ws"+strings.TrimPrefix(server.URL, "http")+"/?contract="+subscribe.SelectedContract, &websocket.DialOptions{HTTPHeader: http.Header{"Sec-WebSocket-Protocol": []string{subscribe.SelectedContract}}})
 	require.NoError(t, err)
@@ -84,7 +86,14 @@ func TestSelectedHandlerWebsocketCapabilityAndMetadata(t *testing.T) {
 	require.Equal(t, stream, metadata.StreamId.Val())
 	require.EqualValues(t, 1, metadata.PolicyRev.Val())
 	require.Equal(t, "live", metadata.Provenance.Val())
-
+	require.Eventually(t, func() bool { return testutil.ToFloat64(metrics.EventsSent.WithLabelValues("none")) == 1 }, time.Second, time.Millisecond)
+	require.Positive(t, testutil.ToFloat64(metrics.BytesSent.WithLabelValues("none")))
+	require.Positive(t, testutil.ToFloat64(metrics.BytesEncoded.WithLabelValues("none")))
+	require.Equal(t, float64(1), testutil.ToFloat64(metrics.Subscribers.WithLabelValues("none")))
+	require.NoError(t, conn.Close(websocket.StatusNormalClosure, "done"))
+	require.Eventually(t, func() bool {
+		return testutil.ToFloat64(metrics.CleanDisconnects) == 1 && testutil.ToFloat64(metrics.Subscribers.WithLabelValues("none")) == 0
+	}, time.Second, time.Millisecond)
 }
 
 func TestAbsentSelectedContractDoesNotOptIn(t *testing.T) {
@@ -283,14 +292,15 @@ func TestSelectedHandlerHistoricalPolicyAdoptionsPrecedeGovernedRows(t *testing.
 				frames <- b
 			}
 		}()
-		select {
-		case <-frames:
-			t.Fatal("unexpected idle frame")
-		case <-time.After(1200 * time.Millisecond):
-		}
 		f.addEvent(t, 3, 2)
-		require.Contains(t, string(<-frames), "PolicyAdopted")
-		require.Contains(t, string(<-frames), `"seq":3`)
+		for _, expected := range []string{"PolicyAdopted", `"seq":3`} {
+			select {
+			case frame := <-frames:
+				require.Contains(t, string(frame), expected)
+			case <-ctx.Done():
+				t.Fatalf("waiting for %s: %v", expected, ctx.Err())
+			}
+		}
 	})
 }
 

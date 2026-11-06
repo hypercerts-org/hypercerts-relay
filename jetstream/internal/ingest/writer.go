@@ -466,7 +466,11 @@ func (w *Writer) appendAttributedLocked(ctx context.Context, ev *segment.Event, 
 	full, err := w.active.Append(candidate)
 	if err != nil {
 		w.cfg.Metrics.incAppendErrors()
-		return nil, fmt.Errorf("ingest: append: %w", err)
+		appendErr := fmt.Errorf("ingest: append: %w", err)
+		if metadata != nil {
+			appendErr = errors.Join(appendErr, w.cfg.Attribution.DiscardPrepared(prepared))
+		}
+		return nil, appendErr
 	}
 	ev.Seq = candidate.Seq
 	ev.IndexedAt = candidate.IndexedAt
@@ -1083,11 +1087,23 @@ func (w *Writer) prepareCandidateAttributions(candidates []acceptedCandidate, me
 		}
 		prepared, err := w.cfg.Attribution.PrepareSegment(candidates[i].event, metadata.StreamID, metadata.Policy, metadata.Provenance, metadata.Boundary, metadata.Source)
 		if err != nil {
-			return w.wrapSegmentPersistenceError("preparing batch attribution", fmt.Errorf("ingest: prepare attribution: %w", err))
+			prepareErr := w.wrapSegmentPersistenceError("preparing batch attribution", fmt.Errorf("ingest: prepare attribution: %w", err))
+			return errors.Join(prepareErr, w.discardCandidateAttributions(candidates[:i], metadata))
 		}
 		candidates[i].prepared = prepared
 	}
 	return nil
+}
+
+func (w *Writer) discardCandidateAttributions(candidates []acceptedCandidate, metadata *AttributionMetadata) error {
+	if metadata == nil {
+		return nil
+	}
+	var err error
+	for _, candidate := range candidates {
+		err = errors.Join(err, w.cfg.Attribution.DiscardPrepared(candidate.prepared))
+	}
+	return err
 }
 
 func (w *Writer) batchCandidate(ctx context.Context, event *segment.Event, nextSeq uint64, metadata *AttributionMetadata) (segment.Event, bool, error) {
@@ -1185,15 +1201,16 @@ func (w *Writer) writeBatchCandidatesLocked(ctx context.Context, events []segmen
 		accepted := &candidates[i]
 		full, err := w.active.Append(accepted.event)
 		if err != nil {
-			return jobs, w.wrapSegmentPersistenceError("appending batch event", fmt.Errorf("ingest: append: %w", err))
+			appendErr := w.wrapSegmentPersistenceError("appending batch event", fmt.Errorf("ingest: append: %w", err))
+			return jobs, errors.Join(appendErr, w.discardCandidateAttributions(candidates[i:], metadata))
 		}
 		if err := w.publishBatchCandidate(accepted, &events[accepted.originalIndex], metadata); err != nil {
-			return jobs, err
+			return jobs, errors.Join(err, w.discardCandidateAttributions(candidates[i+1:], metadata))
 		}
 		if full {
 			job, err := w.flushFullAppendBlockLocked(ctx)
 			if err != nil {
-				return jobs, err
+				return jobs, errors.Join(err, w.discardCandidateAttributions(candidates[i+1:], metadata))
 			}
 			if w.async != nil {
 				jobs = append(jobs, job)

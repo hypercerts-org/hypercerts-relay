@@ -28,6 +28,9 @@ func New(policyManager *selection.Manager, drainer Drainer, domain string) *Gate
 	return &Gate{token: make(chan struct{}, 1), policy: policyManager, drainer: drainer, domain: domain}
 }
 
+// HasPolicy reports whether admission can capture a collection policy.
+func (g *Gate) HasPolicy() bool { return g != nil && g.policy != nil }
+
 type admissionKey struct{}
 
 // WithAdmission attaches the already-admitted policy to a callback context.

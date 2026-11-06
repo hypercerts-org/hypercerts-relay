@@ -383,8 +383,10 @@ func (w *Writer) reconcileSync(ctx context.Context, did, rev string, rows []segm
 }
 
 func (w *Writer) prepareSnapshotMetadata(snapshot Snapshot) (*AttributionMetadata, error) {
-	metadata := snapshot.AppendMetadata
-	if metadata != nil {
+	var metadata *AttributionMetadata
+	if snapshot.AppendMetadata != nil {
+		metadataCopy := *snapshot.AppendMetadata
+		metadata = &metadataCopy
 		if metadata.Provenance == attribution.ProvenanceSnapshot || metadata.Provenance == attribution.ProvenanceReconciliation {
 			if metadata.Boundary.Seq == nil {
 				seq := w.nextSeq

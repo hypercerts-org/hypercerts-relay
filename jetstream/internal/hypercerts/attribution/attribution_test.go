@@ -40,6 +40,10 @@ func TestSegmentFingerprintAndAdapter(t *testing.T) {
 	changed := event
 	changed.Payload = []byte{3, 2, 1}
 	require.NotEqual(t, first, FingerprintSegment(changed))
+	changed.Payload = nil
+	empty := changed
+	empty.Payload = []byte{}
+	require.Equal(t, FingerprintSegment(changed), FingerprintSegment(empty))
 	changed = event
 	changed.Seq++
 	require.NotEqual(t, first, FingerprintSegment(changed))

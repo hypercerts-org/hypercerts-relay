@@ -148,6 +148,30 @@ func New(cfg Config) (*Writer, error) {
 		cfg.MaxEventsPerBlock = DefaultMaxEventsPerBlock
 	}
 
+	// Probe without opening a sealed segment for writing or changing its epoch.
+	probe, err := openSegmentReadOnly(cfg.FS, cfg.Path)
+	if err == nil {
+		info, statErr := probe.Stat()
+		if statErr == nil && info.Size() >= ReservedHeaderBytes {
+			var checksum [8]byte
+			_, statErr = probe.ReadAt(checksum[:], 4)
+			if statErr == nil && binary.LittleEndian.Uint64(checksum[:]) != 0 {
+				_ = probe.Close()
+				return nil, fmt.Errorf("%w: %s", ErrSegmentSealed, cfg.Path)
+			}
+		}
+		_ = probe.Close()
+		if statErr != nil {
+			return nil, statErr
+		}
+	} else if !isSegmentNotExist(err) {
+		return nil, err
+	}
+	// The epoch must be durable before open-or-create can mutate the path.
+	if _, err := BeginAuditMutation(cfg.FS, cfg.Path); err != nil {
+		return nil, err
+	}
+
 	// Open-or-create. We want O_RDWR because we both read the magic
 	// from offset 0 (when the file pre-existed) and append new
 	// blocks at end-of-file.

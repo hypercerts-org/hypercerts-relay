@@ -304,6 +304,10 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 	var cursorPlan CursorPlan
 	switch {
 	case selected:
+		if deps.writer() == nil {
+			httpError(w, deps, http.StatusServiceUnavailable, "ServiceUnavailable", "service not ready: selected stream warming up")
+			return
+		}
 		cursorPlan = CursorPlan{Mode: ModeLive}
 	case deps.Lookback <= 0:
 		// Cursor lookback is disabled by configuration. The service runs
@@ -544,7 +548,9 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 		if encErr != nil || !writeFrame(ctx, conn, wantZstd, frame) {
 			return
 		}
-		selectedConn := selectedConnection{conn: conn, deps: deps, filter: initialV2Filter, config: selectedConfig, cursor: startSeq, compress: wantZstd, logger: logger}
+		selectedConn := selectedConnection{conn: conn, deps: deps, filter: initialV2Filter, config: selectedConfig, cursor: startSeq, compress: wantZstd, scheme: scheme, logger: logger}
+		deps.Metrics.incSubscribers(scheme)
+		defer deps.Metrics.decSubscribers(scheme)
 		selectedConn.runSelectedSubscriberLoop(ctx)
 		return
 	}

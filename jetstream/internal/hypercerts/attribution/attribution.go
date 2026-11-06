@@ -226,6 +226,9 @@ func decode(b []byte, v any) error {
 }
 
 func FingerprintSegment(e segment.Event) string {
+	if len(e.Payload) == 0 {
+		e.Payload = nil
+	}
 	b, _ := json.Marshal(struct {
 		Seq         uint64       `json:"seq"`
 		WitnessedAt int64        `json:"witnessedAt"`
@@ -615,6 +618,34 @@ func (m *Manager) checkCoordinate(key, value []byte) error {
 		return nil
 	}
 	return err
+}
+
+// DiscardPrepared removes an unappended coordinate only if it still matches
+// the preparation owned by the caller.
+func (m *Manager) DiscardPrepared(p Prepared) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := m.preparedKey(p.Event.Seq)
+	value, closer, err := m.db.Get(key)
+	if errors.Is(err, pebble.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var existing Prepared
+	err = decode(value, &existing)
+	closeErr := closer.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	if existing.Fingerprint != p.Fingerprint || existing.SegmentFingerprint != p.SegmentFingerprint {
+		return ErrConflict
+	}
+	return m.db.Delete(key, store.SyncWrites)
 }
 
 type recoveryEntry struct {
