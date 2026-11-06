@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	historyjournal "github.com/bluesky-social/jetstream/internal/history"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/policygate"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
@@ -59,16 +60,30 @@ func TestRevisionedSourceRemovalFencesDelayedAdds(t *testing.T) {
 	require.NoError(t, err, "equal revision remains idempotent after explicit re-admission")
 }
 
-func TestBoundPolicyAdoptionRecordsHistoryWithoutBoundary(t *testing.T) {
+func TestBoundPolicyAdoptionRecordsDurableBoundary(t *testing.T) {
 	dir := t.TempDir()
 	m, db := newManager(t, dir)
 	drainer := &testPolicyDrainer{next: 1}
 	history, err := attribution.Open(db, "crypto", "selected")
 	require.NoError(t, err)
+	journal, err := historyjournal.Open(db)
+	require.NoError(t, err)
+	m.BindJournal(journal)
 	m.BindPolicyAdoption(policygate.New(m.policy, drainer, "selected"), history, "selected")
 	adopted, err := m.SetPolicy(t.Context(), 1, []string{"app.bsky.feed.like"})
 	require.NoError(t, err)
 	require.Equal(t, uint64(2), adopted.Revision)
+	journalPolicy, ok, err := journal.ReadPolicyState()
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, uint64(2), journalPolicy.Policy.Revision)
+	require.Zero(t, journalPolicy.AdoptedAtJournalSequence)
+	adoptions, err := journal.ReadPolicyAdoptions()
+	require.NoError(t, err)
+	require.Len(t, adoptions, 1)
+	require.Equal(t, uint64(2), adoptions[0].Policy.Revision)
+	require.NotNil(t, adoptions[0].EffectiveAfterJournalSeq)
+	require.Zero(t, *adoptions[0].EffectiveAfterJournalSeq)
 	policies, err := history.ReadPolicyHistory()
 	require.NoError(t, err)
 	require.Len(t, policies, 1)
@@ -85,6 +100,29 @@ func TestBoundPolicyAdoptionRecordsHistoryWithoutBoundary(t *testing.T) {
 	require.Len(t, policies, 1)
 	require.Nil(t, policies[0].EffectiveAfterSeq)
 	require.Equal(t, uint64(2), m.policy.Current().Revision)
+}
+func TestBoundPolicyAdoptionCommitsJournalWithSelectionAndJobs(t *testing.T) {
+	dir := t.TempDir()
+	m, db := newManager(t, dir)
+	defer db.Close()
+	attr, err := attribution.Open(db, "crypto", "selected")
+	require.NoError(t, err)
+	journal, err := historyjournal.Open(db)
+	require.NoError(t, err)
+	m.BindJournal(journal)
+	m.BindPolicyAdoption(policygate.New(m.policy, &testPolicyDrainer{next: 9}, "selected"), attr, "selected")
+	_, err = m.SetPolicy(t.Context(), 1, []string{"app.example.record"})
+	require.NoError(t, err)
+	state, ok, err := journal.ReadPolicyState()
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, uint64(0), state.AdoptedAtJournalSequence)
+	require.Equal(t, uint64(2), state.Policy.Revision)
+	adoptions, err := journal.ReadPolicyAdoptions()
+	require.NoError(t, err)
+	require.Len(t, adoptions, 1)
+	require.Equal(t, uint64(2), adoptions[0].Policy.Revision)
+	require.Equal(t, uint64(0), *adoptions[0].EffectiveAfterJournalSeq)
 }
 
 func TestApplyAdmitsBeforeTakingJobsLock(t *testing.T) {

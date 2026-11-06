@@ -41,8 +41,9 @@ const (
 )
 
 type Boundary struct {
-	Seq        *uint64 `json:"seq"`
-	SnapshotID *string `json:"snapshotId"`
+	Seq             *uint64 `json:"seq"`
+	SnapshotID      *string `json:"snapshotId"`
+	JournalSequence *uint64 `json:"journalSequence,omitempty"`
 }
 type Event struct {
 	StreamID   string          `json:"streamId"`
@@ -841,6 +842,10 @@ func (m *Manager) EnsureInitialPolicyHistory(current Policy, boundary *uint64) e
 // WithPolicyCommit holds the attribution manager lock across the selection
 // update and its durable commit, and binds policy staging to that commit batch.
 func (m *Manager) WithPolicyCommit(policy Policy, fn func(func(*pebble.Batch) error) error) error {
+	return m.WithPolicyCommitAndStage(policy, nil, fn)
+}
+
+func (m *Manager) WithPolicyCommitAndStage(policy Policy, stageAdditional func(*pebble.Batch) error, fn func(func(*pebble.Batch) error) error) error {
 	if fn == nil || !validPolicy(policy) {
 		return ErrInvalid
 	}
@@ -889,6 +894,11 @@ func (m *Manager) WithPolicyCommit(policy Policy, fn func(func(*pebble.Batch) er
 		}
 		if !errors.Is(err, pebble.ErrNotFound) {
 			return err
+		}
+		if stageAdditional != nil {
+			if err := stageAdditional(batch); err != nil {
+				return err
+			}
 		}
 		encoded, err := encode(policy)
 		if err != nil {

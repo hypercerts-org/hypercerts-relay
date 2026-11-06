@@ -85,6 +85,10 @@ var ErrRevision = errors.New("collection policy revision conflict")
 // Update atomically commits a policy and its dependent jobs. The caller owns
 // the job-manager lock; no callback may call back into this selection manager.
 func (m *Manager) Update(expected uint64, collections []string, stage func(Policy, *pebble.Batch) error) (Policy, error) {
+	return m.UpdateAfterCommit(expected, collections, stage, nil)
+}
+
+func (m *Manager) UpdateAfterCommit(expected uint64, collections []string, stage func(Policy, *pebble.Batch) error, afterCommit func(*pebble.Batch)) (Policy, error) {
 	collections, err := Normalize(collections)
 	if err != nil {
 		return Policy{}, err
@@ -117,6 +121,9 @@ func (m *Manager) Update(expected uint64, collections []string, stage func(Polic
 	}
 	if err := m.db.Commit(b, store.SyncWrites); err != nil {
 		return Policy{}, err
+	}
+	if afterCommit != nil {
+		afterCommit(b)
 	}
 	m.policy = next
 	return Policy{Revision: next.Revision, Collections: slices.Clone(next.Collections)}, nil

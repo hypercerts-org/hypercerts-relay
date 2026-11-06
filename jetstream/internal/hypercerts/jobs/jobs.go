@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	historyjournal "github.com/bluesky-social/jetstream/internal/history"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/policygate"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
@@ -161,6 +162,7 @@ type Manager struct {
 	attribution               *attribution.Manager
 	attributionDomain         string
 	requirePolicyAdoption     bool
+	journal                   *historyjournal.Store
 	receiptRunning            map[string]bool
 	receiptCancel             context.CancelFunc
 	receiptDone               chan struct{}
@@ -500,6 +502,12 @@ func (m *Manager) BindPolicyAdoption(gate *policygate.Gate, history *attribution
 	m.gate, m.attribution, m.attributionDomain = gate, history, domain
 }
 
+func (m *Manager) BindJournal(journal *historyjournal.Store) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.journal = journal
+}
+
 func (m *Manager) SetPolicy(ctx context.Context, expected uint64, collections []string) (selection.Policy, error) {
 	collections, err := selection.Normalize(collections)
 	if err != nil {
@@ -507,24 +515,32 @@ func (m *Manager) SetPolicy(ctx context.Context, expected uint64, collections []
 	}
 	m.mu.Lock()
 	gate, history, domain := m.gate, m.attribution, m.attributionDomain
+	journal := m.journal
 	requireAdoption := m.requirePolicyAdoption
 	m.mu.Unlock()
 	if gate == nil || history == nil || domain == "" {
 		if requireAdoption {
 			return selection.Policy{}, ErrPolicyAdoptionNotReady
 		}
-		return m.setPolicyLocked(ctx, expected, collections, nil, false)
+		return m.setPolicyLocked(ctx, expected, collections, nil, false, nil)
 	}
 	var result selection.Policy
 	err = gate.Adopt(ctx, domain, func(boundary *uint64) error {
+		var stageHistory func(*pebble.Batch) error
+		if journal != nil {
+			stageHistory = func(batch *pebble.Batch) error {
+				_, err := journal.StagePolicy(batch, historyjournal.Policy{Revision: expected + 1, Collections: collections}, time.Now().UTC().UnixNano())
+				return err
+			}
+		}
 		var updateErr error
-		result, updateErr = m.setPolicyLocked(ctx, expected, collections, boundary, true)
+		result, updateErr = m.setPolicyLocked(ctx, expected, collections, boundary, true, stageHistory)
 		return updateErr
 	})
 	return result, err
 }
 
-func (m *Manager) setPolicyLocked(ctx context.Context, expected uint64, collections []string, boundary *uint64, boundAdoption bool) (selection.Policy, error) {
+func (m *Manager) setPolicyLocked(ctx context.Context, expected uint64, collections []string, boundary *uint64, boundAdoption bool, stageHistory func(*pebble.Batch) error) (selection.Policy, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	collections, err := selection.Normalize(collections)
@@ -558,8 +574,16 @@ func (m *Manager) setPolicyLocked(ctx context.Context, expected uint64, collecti
 	var policy selection.Policy
 	update := func(stagePolicy func(*pebble.Batch) error) error {
 		var updateErr error
-		policy, updateErr = m.policy.Update(expected, collections, func(candidate selection.Policy, b *pebble.Batch) error {
+		policy, updateErr = m.policy.UpdateAfterCommit(expected, collections, func(candidate selection.Policy, b *pebble.Batch) error {
 			policy = candidate
+			if stageHistory != nil {
+				if candidate.Revision != expected+1 {
+					return selection.ErrRevision
+				}
+				if err := stageHistory(b); err != nil {
+					return err
+				}
+			}
 			if stagePolicy != nil {
 				if candidate.Revision != expected+1 {
 					return selection.ErrRevision
@@ -590,11 +614,15 @@ func (m *Manager) setPolicyLocked(ctx context.Context, expected uint64, collecti
 				return err
 			}
 			return b.Set([]byte(stateKey), encoded, nil)
+		}, func(batch *pebble.Batch) {
+			if stageHistory != nil && m.journal != nil {
+				m.journal.NotifyAfterCommit()
+			}
 		})
 		return updateErr
 	}
 	if boundAdoption && m.attribution != nil {
-		err = m.attribution.WithPolicyCommit(attribution.Policy{Revision: expected + 1, Collections: collections, EffectiveAfterSeq: boundary}, update)
+		err = m.attribution.WithPolicyCommitAndStage(attribution.Policy{Revision: expected + 1, Collections: collections, EffectiveAfterSeq: boundary}, stageHistory, update)
 	} else {
 		err = update(nil)
 	}
