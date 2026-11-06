@@ -16,6 +16,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/policygate"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/cockroachdb/pebble"
@@ -48,6 +50,7 @@ var ErrInvalidInput = errors.New("invalid job input")
 var ErrPolicyMirrorRequired = errors.New("Relay policy mirror is required for a Relay-bound source")
 var ErrReceiptStale = errors.New("recovery receipt rejected as stale")
 var ErrReceiptSourceMissing = errors.New("recovery receipt source no longer exists")
+var ErrPolicyAdoptionNotReady = errors.New("collection policy adoption is not ready")
 
 // AcquisitionEvidence is checkpoint-owned evidence for one frozen inventory.
 // A nil pointer on older jobs means attribution is unknown, never zero.
@@ -137,6 +140,7 @@ type data struct {
 	Initialized        bool                         `json:"initialized"`
 	Sources            map[string]bool              `json:"sources"`
 	SourceRevisions    map[string]uint64            `json:"sourceRevisions,omitempty"`
+	SourceTombstones   map[string]uint64            `json:"sourceTombstones,omitempty"`
 	Jobs               map[string]Job               `json:"jobs"`
 	SnapshotRejections map[string]SnapshotRejection `json:"snapshotRejections"`
 }
@@ -153,6 +157,13 @@ type Manager struct {
 	runningID                 string
 	receiptSender             ReceiptSender
 	policyAdvancer            PolicyAdvanceSender
+	gate                      *policygate.Gate
+	attribution               *attribution.Manager
+	attributionDomain         string
+	requirePolicyAdoption     bool
+	receiptRunning            map[string]bool
+	receiptCancel             context.CancelFunc
+	receiptDone               chan struct{}
 }
 
 // ReceiptSender submits a completed job's bounded recovery coordinate to the
@@ -167,7 +178,7 @@ func Open(db *store.Store, policy *selection.Manager) (*Manager, error) {
 	if policy == nil {
 		return nil, errors.New("jobs require collection policy")
 	}
-	m := &Manager{db: db, policy: policy, wake: make(chan struct{}, 1)}
+	m := &Manager{db: db, policy: policy, wake: make(chan struct{}, 1), receiptRunning: map[string]bool{}}
 	persisted, found, err := readPersistedData(db)
 	if err != nil {
 		return nil, err
@@ -190,6 +201,7 @@ func emptyData() data {
 	return data{
 		Sources:            map[string]bool{},
 		SourceRevisions:    map[string]uint64{},
+		SourceTombstones:   map[string]uint64{},
 		Jobs:               map[string]Job{},
 		SnapshotRejections: map[string]SnapshotRejection{},
 	}
@@ -216,6 +228,9 @@ func restorePersistedData(persisted *data) error {
 		return errors.New("invalid persisted job state")
 	}
 	ensureSourceRevisions(persisted)
+	if persisted.SourceTombstones == nil {
+		persisted.SourceTombstones = map[string]uint64{}
+	}
 	// hypercerts: Older job documents predate the direct-PDS rejection ledger.
 	if persisted.SnapshotRejections == nil {
 		persisted.SnapshotRejections = map[string]SnapshotRejection{}
@@ -348,7 +363,10 @@ func (m *Manager) SeedSources(sources []string) error {
 		next.Jobs[j.ID] = j
 	}
 	next.Initialized = true
-	return m.commit(next)
+	if err := m.commit(next); err != nil {
+		return err
+	}
+	return nil
 }
 
 // AddSource admits an explicit direct-PDS acquisition target and schedules its
@@ -358,7 +376,8 @@ func (m *Manager) AddSource(raw string) (Job, error) {
 }
 
 // AddSourceWithRevision remembers the Relay lifecycle coordinate that made an
-// explicitly admitted source eligible for a recovery acknowledgement.
+// explicitly admitted source eligible for a recovery acknowledgement. An
+// unversioned compatibility request does not bypass a durable source tombstone.
 func (m *Manager) AddSourceWithRevision(raw string, sourceRevision uint64) (Job, error) {
 	pds, err := normalizeSource(raw)
 	if err != nil {
@@ -368,8 +387,13 @@ func (m *Manager) AddSourceWithRevision(raw string, sourceRevision uint64) (Job,
 	defer m.mu.Unlock()
 	next := clone(m.data)
 	ensureSourceRevisions(&next)
-	if sourceRevision > 0 && sourceRevision < next.SourceRevisions[pds] {
+	if sourceRevision == 0 && next.SourceTombstones[pds] > 0 || sourceRevision > 0 && (sourceRevision < next.SourceRevisions[pds] || sourceRevision <= next.SourceTombstones[pds]) {
 		return Job{}, ErrConflict
+	}
+	if sourceRevision == 0 && next.SourceRevisions[pds] == 0 && next.SourceTombstones[pds] == 0 {
+		// Compatibility: old management clients did not version lifecycle
+		// commands, and older state may record enabled configuration as false.
+		next.Sources[pds] = true
 	}
 	advanced := sourceRevision > 0 && sourceRevision > next.SourceRevisions[pds]
 	if sourceRevision > 0 {
@@ -378,11 +402,30 @@ func (m *Manager) AddSourceWithRevision(raw string, sourceRevision uint64) (Job,
 	if advanced {
 		m.cancelStaleSourceJobs(&next, pds, sourceRevision)
 	}
+	// Legacy seeded sources may carry an explicit false Sources entry from
+	// older state without a tombstone; an unversioned add preserves that
+	// compatibility. Versioned removes still require a strictly newer revision.
+	if sourceRevision == 0 && next.SourceRevisions[pds] == 0 && next.SourceTombstones[pds] == 0 {
+		next.Sources[pds] = true
+	}
+	// An already-enabled matching lifecycle coordinate is idempotent even when
+	// policy has advanced since the original durable acceptance. Do not create
+	// a second source_added job for a lost HTTP acknowledgment.
+	if next.Sources[pds] && sourceRevision > 0 && sourceRevision == next.SourceRevisions[pds] {
+		for _, existing := range next.Jobs {
+			if existing.PDS == pds && existing.SourceRevision == sourceRevision && existing.Reason == "source_added" {
+				return clone(existing), nil
+			}
+		}
+	}
 	job := newJob(pds, m.policy.Current(), "source_added", next.SourceRevisions[pds])
 	if existing, ok := next.Jobs[job.ID]; ok && next.Sources[pds] {
 		return clone(existing), nil
 	}
 	next.Sources[pds] = true
+	if sourceRevision > next.SourceTombstones[pds] {
+		delete(next.SourceTombstones, pds)
+	}
 	if err := beginAcquisition(next, &job); err != nil {
 		return Job{}, err
 	}
@@ -396,16 +439,38 @@ func (m *Manager) AddSourceWithRevision(raw string, sourceRevision uint64) (Job,
 	return clone(job), nil
 }
 func (m *Manager) RemoveSource(raw string) error {
+	return m.RemoveSourceWithRevision(raw, 0)
+}
+
+// RemoveSourceWithRevision persists a fence even when the source was never
+// registered. A delayed add at this revision or earlier cannot revive it.
+func (m *Manager) RemoveSourceWithRevision(raw string, sourceRevision uint64) error {
 	pds, err := normalizeSource(raw)
 	if err != nil {
 		return err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.data.Sources[pds]; !ok {
-		return ErrNotFound
-	}
 	next := clone(m.data)
+	if sourceRevision == 0 {
+		sourceRevision = next.SourceRevisions[pds] + 1
+	}
+	if sourceRevision < next.SourceRevisions[pds] || sourceRevision < next.SourceTombstones[pds] {
+		return ErrConflict
+	}
+	if next.SourceTombstones == nil {
+		next.SourceTombstones = map[string]uint64{}
+	}
+	if next.SourceRevisions == nil {
+		next.SourceRevisions = map[string]uint64{}
+	}
+	next.SourceTombstones[pds] = sourceRevision
+	if sourceRevision > next.SourceRevisions[pds] {
+		next.SourceRevisions[pds] = sourceRevision
+	}
+	if next.Sources == nil {
+		next.Sources = map[string]bool{}
+	}
 	next.Sources[pds] = false
 	for id, j := range next.Jobs {
 		if j.PDS == pds && (j.State == Pending || j.State == Running) {
@@ -418,12 +483,48 @@ func (m *Manager) RemoveSource(raw string) error {
 	if err := m.commit(next); err != nil {
 		return err
 	}
-	if m.cancel != nil && m.data.Jobs[m.runningID].PDS == pds {
+	if m.cancel != nil && m.runningID != "" && m.data.Jobs[m.runningID].PDS == pds {
 		m.cancel()
 	}
 	return nil
 }
+func (m *Manager) AddRequirePolicyAdoption(required bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.requirePolicyAdoption = required
+}
+
+func (m *Manager) BindPolicyAdoption(gate *policygate.Gate, history *attribution.Manager, domain string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.gate, m.attribution, m.attributionDomain = gate, history, domain
+}
+
 func (m *Manager) SetPolicy(ctx context.Context, expected uint64, collections []string) (selection.Policy, error) {
+	collections, err := selection.Normalize(collections)
+	if err != nil {
+		return selection.Policy{}, err
+	}
+	m.mu.Lock()
+	gate, history, domain := m.gate, m.attribution, m.attributionDomain
+	requireAdoption := m.requirePolicyAdoption
+	m.mu.Unlock()
+	if gate == nil || history == nil || domain == "" {
+		if requireAdoption {
+			return selection.Policy{}, ErrPolicyAdoptionNotReady
+		}
+		return m.setPolicyLocked(ctx, expected, collections, nil, false)
+	}
+	var result selection.Policy
+	err = gate.Adopt(ctx, domain, func(boundary *uint64) error {
+		var updateErr error
+		result, updateErr = m.setPolicyLocked(ctx, expected, collections, boundary, true)
+		return updateErr
+	})
+	return result, err
+}
+
+func (m *Manager) setPolicyLocked(ctx context.Context, expected uint64, collections []string, boundary *uint64, boundAdoption bool) (selection.Policy, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	collections, err := selection.Normalize(collections)
@@ -440,44 +541,24 @@ func (m *Manager) SetPolicy(ctx context.Context, expected uint64, collections []
 	if expected == ^uint64(0) {
 		return selection.Policy{}, errors.New("collection policy revision exhausted")
 	}
-	for _, pds := range orderedEnabledSources(m.data.Sources) {
-		sourceRevision := m.data.SourceRevisions[pds]
-		if sourceRevision == 0 {
-			continue
-		}
-		if m.policyAdvancer == nil {
-			return selection.Policy{}, ErrPolicyMirrorRequired
-		}
-		if err := m.policyAdvancer(ctx, pds, sourceRevision, expected+1); err != nil {
-			return selection.Policy{}, fmt.Errorf("advance Relay recovery policy for %s: %w", pds, err)
-		}
+	if err := m.advanceRecoveryPolicy(ctx, expected+1); err != nil {
+		return selection.Policy{}, err
 	}
 	next := clone(m.data)
 	ensureSourceRevisions(&next)
-	policy, err := m.policy.Update(expected, collections, func(policy selection.Policy, b *pebble.Batch) error {
-		for id, j := range next.Jobs {
-			if j.State == Pending || j.State == Running {
-				j.State = Canceled
-				j.ErrorCode = "policy_changed"
-				j.FinishedAt = time.Now().UTC()
-				next.Jobs[id] = j
-			}
-		}
-		for pds, enabled := range next.Sources {
-			if enabled {
-				j := newJob(pds, policy, "policy_changed", next.SourceRevisions[pds])
-				if err := beginAcquisition(next, &j); err != nil {
-					return err
-				}
-				next.Jobs[j.ID] = j
-			}
-		}
-		encoded, err := json.Marshal(next)
-		if err != nil {
-			return err
-		}
-		return b.Set([]byte(stateKey), encoded, nil)
-	})
+	var policy selection.Policy
+	update := func(stagePolicy func(*pebble.Batch) error) error {
+		var updateErr error
+		policy, updateErr = m.policy.Update(expected, collections, func(candidate selection.Policy, b *pebble.Batch) error {
+			return stagePolicyJobs(next, candidate, expected+1, stagePolicy, b)
+		})
+		return updateErr
+	}
+	if boundAdoption && m.attribution != nil {
+		err = m.attribution.WithPolicyCommit(attribution.Policy{Revision: expected + 1, Collections: collections, EffectiveAfterSeq: boundary}, update)
+	} else {
+		err = update(nil)
+	}
 	if err != nil {
 		return selection.Policy{}, err
 	}
@@ -488,6 +569,67 @@ func (m *Manager) SetPolicy(ctx context.Context, expected uint64, collections []
 	}
 	return policy, nil
 }
+func (m *Manager) advanceRecoveryPolicy(ctx context.Context, revision uint64) error {
+	for _, pds := range orderedEnabledSources(m.data.Sources) {
+		sourceRevision := m.data.SourceRevisions[pds]
+		if sourceRevision == 0 {
+			continue
+		}
+		if m.policyAdvancer == nil {
+			return ErrPolicyMirrorRequired
+		}
+		if err := m.policyAdvancer(ctx, pds, sourceRevision, revision); err != nil {
+			return fmt.Errorf("advance Relay recovery policy for %s: %w", pds, err)
+		}
+	}
+	return nil
+}
+
+func cancelPolicyJobs(next data) {
+	for id, job := range next.Jobs {
+		if job.State == Pending || job.State == Running {
+			job.State = Canceled
+			job.ErrorCode = "policy_changed"
+			job.FinishedAt = time.Now().UTC()
+			next.Jobs[id] = job
+		}
+	}
+}
+
+func schedulePolicyJobs(next data, policy selection.Policy) error {
+	for pds, enabled := range next.Sources {
+		if !enabled {
+			continue
+		}
+		job := newJob(pds, policy, "policy_changed", next.SourceRevisions[pds])
+		if err := beginAcquisition(next, &job); err != nil {
+			return err
+		}
+		next.Jobs[job.ID] = job
+	}
+	return nil
+}
+
+func stagePolicyJobs(next data, candidate selection.Policy, revision uint64, stagePolicy func(*pebble.Batch) error, batch *pebble.Batch) error {
+	if stagePolicy != nil {
+		if candidate.Revision != revision {
+			return selection.ErrRevision
+		}
+		if err := stagePolicy(batch); err != nil {
+			return err
+		}
+	}
+	cancelPolicyJobs(next)
+	if err := schedulePolicyJobs(next, candidate); err != nil {
+		return err
+	}
+	encoded, err := json.Marshal(next)
+	if err != nil {
+		return err
+	}
+	return batch.Set([]byte(stateKey), encoded, nil)
+}
+
 func (m *Manager) Request(raw, reason string) (Job, error) { return m.RequestOnce(raw, reason, "") }
 
 // RequestOnce durably deduplicates control-plane retries, including terminal jobs.
@@ -495,8 +637,9 @@ func (m *Manager) RequestOnce(raw, reason, requestID string) (Job, error) {
 	return m.RequestOnceWithSourceRevision(raw, reason, requestID, 0)
 }
 
-// RequestOnceWithSourceRevision binds lifecycle/quota intent to the Relay
-// source version observed by the control plane.
+// RequestOnceWithSourceRevision binds lifecycle intent to a Relay source
+// revision when supplied. Legacy requests use the current enabled source state
+// without advancing the durable revision.
 func (m *Manager) RequestOnceWithSourceRevision(raw, reason, requestID string, sourceRevision uint64) (Job, error) {
 	if err := validateRequest(reason, requestID); err != nil {
 		return Job{}, err
@@ -507,19 +650,52 @@ func (m *Manager) RequestOnceWithSourceRevision(raw, reason, requestID string, s
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if sourceRevision > 0 && sourceRevision < m.data.SourceRevisions[pds] {
+	if sourceRevision > 0 && (sourceRevision < m.data.SourceRevisions[pds] || sourceRevision <= m.data.SourceTombstones[pds]) {
+		return Job{}, ErrConflict
+	}
+	legacyUnversioned := sourceRevision == 0
+	if sourceRevision == 0 {
+		sourceRevision = m.data.SourceRevisions[pds]
+	}
+	if sourceRevision > 0 && sourceRevision <= m.data.SourceTombstones[pds] {
 		return Job{}, ErrConflict
 	}
 	if existing, found, err := m.requestReceipt(pds, reason, requestID, sourceRevision); found {
 		return existing, err
 	}
 	if !m.data.Sources[pds] {
+		if !legacyUnversioned || m.data.SourceTombstones[pds] > 0 {
+			return Job{}, ErrConflict
+		}
+		// A legacy unversioned job request cannot prove source admission.
+		// Accept only an enabled source in the stored configuration, with no
+		// tombstone fence. A false/missing entry remains a conflict.
+		return Job{}, ErrConflict
+	}
+	if !legacyUnversioned && sourceRevision > 0 && sourceRevision != m.data.SourceRevisions[pds] {
 		return Job{}, ErrConflict
 	}
 	next := clone(m.data)
-	advanced := advanceSourceRevision(&next, pds, sourceRevision)
-	if advanced {
-		m.cancelStaleSourceJobs(&next, pds, sourceRevision)
+	// Legacy unversioned requests retain the source's known lifecycle revision;
+	// they must not manufacture or advance a lifecycle coordinate.
+	advanced := false
+	if legacyUnversioned {
+		sourceRevision = next.SourceRevisions[pds]
+		if sourceRevision == 0 {
+			for _, existing := range next.Jobs {
+				if existing.PDS == pds && existing.SourceRevision > sourceRevision {
+					sourceRevision = existing.SourceRevision
+				}
+			}
+		}
+		if sourceRevision > next.SourceRevisions[pds] {
+			next.SourceRevisions[pds] = sourceRevision
+		}
+	} else {
+		advanced = advanceSourceRevision(&next, pds, sourceRevision)
+		if advanced {
+			m.cancelStaleSourceJobs(&next, pds, sourceRevision)
+		}
 	}
 	job, err := requestJob(next, pds, reason, m.policy.Current(), next.SourceRevisions[pds])
 	if err != nil {
@@ -753,6 +929,12 @@ func (m *Manager) Get(id string) (Job, error) {
 	}
 	return clone(job), nil
 }
+func (m *Manager) SourceRevision(pds string) uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.data.SourceRevisions[pds]
+}
+
 func (m *Manager) Sources() map[string]bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -957,12 +1139,33 @@ func (m *Manager) active(id string) bool {
 
 // Apply holds the policy/source cancellation boundary through the archive write.
 func (m *Manager) Apply(id string, write func() error) error {
+	return m.ApplyContext(context.Background(), id, func(context.Context) error { return write() })
+}
+
+func (m *Manager) ApplyContext(ctx context.Context, id string, write func(context.Context) error) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if !m.active(id) {
+		m.mu.Unlock()
 		return ErrConflict
 	}
-	return write()
+	gate := m.gate
+	m.mu.Unlock()
+	if gate == nil {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if !m.active(id) {
+			return ErrConflict
+		}
+		return write(ctx)
+	}
+	return gate.Admit(ctx, func(policy selection.Policy) error {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if !m.active(id) || m.policy.Current().Revision != policy.Revision {
+			return ErrConflict
+		}
+		return write(policygate.WithAdmission(ctx, policy))
+	})
 }
 
 // SetTotalRepos records a known PDS snapshot size. PDSProcessor normally uses
@@ -1188,12 +1391,33 @@ type InputError struct {
 func (e *InputError) Error() string { return e.Code }
 
 func (m *Manager) Run(ctx context.Context, process Processor) error {
+	var receipts sync.WaitGroup
 	if err := m.startRunner(); err != nil {
 		return err
 	}
-	defer m.stopRunner()
+	runCtx, cancel := context.WithCancel(ctx)
+	runDone := make(chan struct{})
+	m.mu.Lock()
+	m.receiptCancel, m.receiptDone = cancel, runDone
+	m.mu.Unlock()
+	defer func() {
+		cancel()
+		receipts.Wait()
+		close(runDone)
+		m.mu.Lock()
+		m.receiptCancel, m.receiptDone = nil, nil
+		m.mu.Unlock()
+		m.stopRunner()
+	}()
 	for {
-		if err := m.runPass(ctx, process); err != nil {
+		if err := m.runPass(runCtx, process, &receipts); err != nil {
+			m.mu.Lock()
+			cancelReceipts := m.receiptCancel
+			m.mu.Unlock()
+			if cancelReceipts != nil {
+				cancelReceipts()
+			}
+			receipts.Wait()
 			return err
 		}
 	}
@@ -1326,63 +1550,128 @@ func (m *Manager) persistJobOutcome(ctx context.Context, id string, processErr e
 	return failure, warningJobID, nil
 }
 
-func (m *Manager) flushReceipts(ctx context.Context) error {
-	m.mu.Lock()
-	sender := m.receiptSender
-	pending := make([]Job, 0)
-	now := time.Now().UTC()
-	if sender != nil {
-		currentPolicyRevision := m.policy.Current().Revision
-		next := clone(m.data)
-		changed := false
-		for _, job := range m.data.Jobs {
-			if job.State == Complete && job.ReceiptPending {
-				if job.Policy.Revision != currentPolicyRevision {
-					// A policy change has already created current-policy work. Do not
-					// let its superseded predecessor acknowledge Relay recovery.
-					job.ReceiptPending = false
-					job.ReceiptRetryAt = time.Time{}
-					job.ReceiptError = "policy_superseded"
-					next.Jobs[job.ID] = job
-					changed = true
-					continue
-				}
-				if !job.ReceiptRetryAt.After(now) {
-					pending = append(pending, clone(job))
-				}
-			}
-		}
-		if changed {
-			if err := m.commit(next); err != nil {
-				m.mu.Unlock()
-				return err
-			}
-		}
+func (m *Manager) flushReceipts(ctx context.Context, receipts *sync.WaitGroup) error {
+	sender, pending, err := m.collectReceipts()
+	if err != nil {
+		return err
 	}
-	m.mu.Unlock()
 	for _, job := range pending {
-		if err := sender(ctx, job); err != nil {
-			if err := m.recordReceiptFailure(job, err); err != nil {
-				return err
-			}
-			continue
-		}
-		m.mu.Lock()
-		next := clone(m.data)
-		current, ok := next.Jobs[job.ID]
-		if ok && current.State == Complete && current.ReceiptPending && current.SourceRevision == job.SourceRevision {
-			current.ReceiptPending = false
-			current.ReceiptRetryAt = time.Time{}
-			current.ReceiptError = ""
-			next.Jobs[job.ID] = current
-			if err := m.commit(next); err != nil {
-				m.mu.Unlock()
-				return err
-			}
-		}
-		m.mu.Unlock()
+		receipts.Add(1)
+		go func(job Job) {
+			defer receipts.Done()
+			m.deliverReceipt(ctx, sender, job)
+		}(job)
 	}
 	return nil
+}
+
+func (m *Manager) collectReceipts() (ReceiptSender, []Job, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sender := m.receiptSender
+	pending := make([]Job, 0)
+	if sender == nil {
+		return sender, pending, nil
+	}
+	now := time.Now().UTC()
+	currentPolicyRevision := m.policy.Current().Revision
+	next := clone(m.data)
+	changed := false
+	for _, job := range m.data.Jobs {
+		if job.State != Complete || !job.ReceiptPending {
+			continue
+		}
+		if job.Policy.Revision != currentPolicyRevision {
+			job.ReceiptPending = false
+			job.ReceiptRetryAt = time.Time{}
+			job.ReceiptError = "policy_superseded"
+			next.Jobs[job.ID] = job
+			changed = true
+			continue
+		}
+		if !job.ReceiptRetryAt.After(now) && !m.receiptRunning[job.ID] {
+			m.receiptRunning[job.ID] = true
+			pending = append(pending, clone(job))
+		}
+	}
+	if changed {
+		if err := m.commit(next); err != nil {
+			return nil, nil, err
+		}
+	}
+	return sender, pending, nil
+}
+
+func receiptAttemptContext(ctx context.Context, done <-chan struct{}) (context.Context, context.CancelFunc, <-chan struct{}) {
+	receiptCtx, cancel := context.WithCancel(ctx)
+	exited := make(chan struct{})
+	go func() {
+		defer close(exited)
+		select {
+		case <-receiptCtx.Done():
+		case <-done:
+		}
+		cancel()
+	}()
+	return receiptCtx, cancel, exited
+}
+
+func (m *Manager) deliverReceipt(ctx context.Context, sender ReceiptSender, job Job) {
+	defer func() {
+		m.mu.Lock()
+		delete(m.receiptRunning, job.ID)
+		m.mu.Unlock()
+	}()
+	m.mu.Lock()
+	receiptDone := m.receiptDone
+	m.mu.Unlock()
+	receiptCtx := ctx
+	if receiptDone != nil {
+		var cancel context.CancelFunc
+		var exited <-chan struct{}
+		receiptCtx, cancel, exited = receiptAttemptContext(ctx, receiptDone)
+		defer func() {
+			cancel()
+			<-exited
+		}()
+	}
+
+	err := sender(receiptCtx, job)
+	if receiptCtx.Err() != nil {
+		return
+	}
+	if err != nil {
+		if persistErr := m.recordReceiptFailure(job, err); persistErr != nil {
+			slog.Error("persist receipt failure", "err", persistErr)
+		}
+		m.signalScheduler()
+		return
+	}
+	if receiptCtx.Err() != nil {
+		return
+	}
+	if err := m.recordReceiptSuccess(receiptCtx, job); err != nil {
+		slog.Error("persist receipt success", "err", err)
+	}
+}
+
+func (m *Manager) recordReceiptSuccess(ctx context.Context, job Job) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	next := clone(m.data)
+	current, ok := next.Jobs[job.ID]
+	if ctx.Err() != nil || !ok || current.State != Complete || !current.ReceiptPending || current.SourceRevision != job.SourceRevision {
+		return nil
+	}
+	current.ReceiptPending = false
+	current.ReceiptRetryAt = time.Time{}
+	if current.Policy.Revision != m.policy.Current().Revision {
+		current.ReceiptError = "policy_superseded"
+	} else {
+		current.ReceiptError = ""
+	}
+	next.Jobs[job.ID] = current
+	return m.commit(next)
 }
 
 func (m *Manager) recordReceiptFailure(job Job, receiptErr error) error {
@@ -1564,11 +1853,11 @@ func (m *Manager) stopRunner() {
 	m.running = false
 }
 
-func (m *Manager) runPass(ctx context.Context, process Processor) error {
+func (m *Manager) runPass(ctx context.Context, process Processor, receipts *sync.WaitGroup) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := m.flushReceipts(ctx); err != nil {
+	if err := m.flushReceipts(ctx, receipts); err != nil {
 		return err
 	}
 	worked, err := m.runNext(ctx, process)

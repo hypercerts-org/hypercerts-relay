@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/hypercerts/policygate"
+
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
@@ -47,6 +49,14 @@ type Orchestrator struct {
 	// Timestamp import is steady-state-only and uses this pointer to force
 	// rotate the active segment after activating new rules.
 	steadyWriter atomic.Pointer[ingest.Writer]
+	policyGate   atomic.Pointer[policygate.Gate]
+}
+
+func (o *Orchestrator) currentPolicyGate() *policygate.Gate {
+	if gate := o.policyGate.Load(); gate != nil {
+		return gate
+	}
+	return o.cfg.PolicyGate
 }
 
 // New validates cfg and returns an Orchestrator ready to Run.

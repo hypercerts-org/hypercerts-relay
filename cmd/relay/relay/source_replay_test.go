@@ -2,6 +2,7 @@ package relay
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -45,10 +46,16 @@ func TestTwoSourcesRetainRawReplayAfterRemoval(t *testing.T) {
 	persistence, err := diskpersist.NewDiskPersistence(filepath.Join(root, "events"), "", db, nil)
 	require.NoError(t, err)
 	events := eventmgr.NewEventManager(persistence)
-	r, err := NewRelay(db, events, dir, nil)
+	config := DefaultRelayConfig()
+	config.TestDialContext = (&net.Dialer{}).DialContext
+	r, err := NewRelay(db, events, dir, config)
 	require.NoError(t, err)
 	persistence.SetUidSource(r)
-	r.HostChecker = &HostClient{Client: &http.Client{Timeout: time.Second}}
+	r.HostChecker = NewMockHostChecker()
+	r.HostChecker.(*MockHostChecker).Hosts["http://"+fixtures[0].host] = true
+	if len(fixtures) > 1 {
+		r.HostChecker.(*MockHostChecker).Hosts["http://"+fixtures[1].host] = true
+	}
 	t.Cleanup(func() {
 		require.NoError(t, r.Slurper.Shutdown())
 		require.NoError(t, events.Shutdown(ctx))

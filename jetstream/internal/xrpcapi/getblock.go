@@ -114,8 +114,13 @@ func (h *getBlockHandler) ServeXRPC(ctx context.Context, w http.ResponseWriter, 
 		return fail(resultError, xrpcserver.InternalError("failed to read block"))
 	}
 
+	// hypercerts: Validate the frame bytes rather than segment metadata.
+	etag, err := representationETag(bytes.NewReader(frame), int64(len(frame)))
+	if err != nil {
+		return fail(resultError, xrpcserver.InternalError("failed to hash block"))
+	}
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("ETag", fmt.Sprintf("%q", checksumHex(hdr.Checksum)+":"+fmt.Sprint(blockIdx)))
+	w.Header().Set("ETag", etag)
 	w.Header().Set("Cache-Control", cacheControlHeader(h.cacheMaxAge))
 
 	if span != nil {
@@ -126,7 +131,7 @@ func (h *getBlockHandler) ServeXRPC(ctx context.Context, w http.ResponseWriter, 
 	// this point the response may be partially written, so per the Handler
 	// contract we return nil.
 	rec := &blockResponseRecorder{ResponseWriter: w}
-	http.ServeContent(rec, r.HTTPReq, name, ref.ModTime, bytes.NewReader(frame))
+	http.ServeContent(rec, r.HTTPReq, name, time.Time{}, bytes.NewReader(frame))
 	result = resultOK
 	if rec.status >= http.StatusBadRequest {
 		result = resultError

@@ -56,6 +56,11 @@ type Config struct {
 	// listeners so the server runs with no socket inside a synctest bubble.
 	PublicListener net.Listener
 	DebugListener  net.Listener
+
+	// Unhealthy, when non-nil, is consulted by /readyz after the listeners are
+	// bound. A non-empty reason makes /readyz answer 503 without waiting for
+	// shutdown, so a failed ingestion path stops advertising readiness.
+	Unhealthy func() string
 }
 
 type publicRoute struct {
@@ -391,6 +396,12 @@ func (s *Server) debugMux() http.Handler {
 		if !s.ready.Load() {
 			http.Error(w, "not ready", http.StatusServiceUnavailable)
 			return
+		}
+		if s.cfg.Unhealthy != nil {
+			if reason := s.cfg.Unhealthy(); reason != "" {
+				http.Error(w, reason, http.StatusServiceUnavailable)
+				return
+			}
 		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
