@@ -492,6 +492,7 @@ func serveOptionsFromCommand(cmd *cli.Command) (jetstreamd.Options, error) {
 		DataDir:                cmd.String("data-dir"),
 		// hypercerts: Production serve always enforces the durable collection policy.
 		CollectionSelection:            true,
+		RequirePolicyAdoption:          true,
 		InitialPDSSources:              cmd.StringSlice("pds-sources"),
 		InitialCollections:             initialCollections,
 		RelayURL:                       cmd.String("relay-url"),

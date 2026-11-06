@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -163,6 +164,7 @@ func TestSourceReconnectUsesSuccessfulCursor(t *testing.T) {
 	config.ConcurrencyPerHost = 1
 	config.PersistCursorCallback = r.PersistHostCursors
 	config.PersistHostStatusCallback = r.UpdateHostStatus
+	config.TestDialContext = (&net.Dialer{}).DialContext
 	s, err := NewSlurper(func(_ context.Context, evt *stream.XRPCStreamEvent, _ string, _ uint64) error {
 		if evt.Sequence() == 12 && !failed {
 			failed = true
@@ -215,6 +217,7 @@ func TestSourceShutdownFlushesCursorWithoutCancelledWrite(t *testing.T) {
 	config := DefaultSlurperConfig()
 	config.ConcurrencyPerHost = 1
 	config.PersistCursorPeriod = time.Hour
+	config.TestDialContext = (&net.Dialer{}).DialContext
 	config.PersistCursorCallback = func(ctx context.Context, cursors *[]HostCursor) error {
 		if ctx.Err() != nil {
 			cancelledWrites.Add(1)
@@ -270,6 +273,7 @@ func TestSourceRestartAfterCursorStorageFailure(t *testing.T) {
 	config.PersistCursorPeriod = time.Hour
 	config.PersistCursorCallback = r.PersistHostCursors
 	config.PersistHostStatusCallback = r.UpdateHostStatus
+	config.TestDialContext = (&net.Dialer{}).DialContext
 	callback := func(context.Context, *stream.XRPCStreamEvent, string, uint64) error {
 		processed <- struct{}{}
 		return nil

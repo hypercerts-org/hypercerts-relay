@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -141,7 +142,22 @@ func TestControlPlaneAcceptanceFixture(t *testing.T) {
 	r.HostChecker = &countingHostChecker{}
 	h, err := svc.controlHandler("fixture-service-credential-32-bytes-minimum")
 	require.NoError(t, err)
-	server := httptest.NewServer(h)
+	mux := http.NewServeMux()
+	mux.Handle("/", h)
+	mux.HandleFunc("POST /_test/configure-handoff", func(w http.ResponseWriter, req *http.Request) {
+		var input struct {
+			TargetURL string `json:"targetURL"`
+			Token     string `json:"token"`
+		}
+		if err := json.NewDecoder(req.Body).Decode(&input); err != nil || input.TargetURL == "" || input.Token == "" {
+			http.Error(w, "invalid handoff fixture configuration", http.StatusBadRequest)
+			return
+		}
+		r.Config.JetstreamControlURL, r.Config.JetstreamControlToken = input.TargetURL, input.Token
+		go r.RunSourceHandoffWorker(context.Background())
+		w.WriteHeader(http.StatusNoContent)
+	})
+	server := httptest.NewServer(mux)
 	defer server.Close()
 	require.NoError(t, os.WriteFile(ready, []byte(server.URL), 0600))
 	deadline := time.NewTimer(2 * time.Minute)

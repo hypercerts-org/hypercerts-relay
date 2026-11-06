@@ -41,12 +41,38 @@ func NewHostClient(userAgent string) *HostClient {
 	}
 	c := http.Client{
 		Timeout:   5 * time.Second,
-		Transport: transport,
+		Transport: sourceHTTPTransport{transport: transport},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return fmt.Errorf("stopped after 10 redirects")
+			}
+			if len(via) > 0 && via[len(via)-1].URL.Scheme == "https" && req.URL.Scheme != "https" {
+				return fmt.Errorf("PDS redirect requires HTTPS")
+			}
+			return nil
+		},
 	}
 	return &HostClient{
 		Client:    &c,
 		UserAgent: userAgent,
 	}
+}
+
+// hypercerts: Enforce PDS TLS on initial requests and every redirect hop.
+type sourceHTTPTransport struct {
+	transport http.RoundTripper
+}
+
+func (t sourceHTTPTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL.Scheme != "https" {
+		if req.URL.Scheme != "http" {
+			return nil, ErrInvalidSourceURL
+		}
+		if err := sourceTransportAllowed(req.URL.Host, true, false); err != nil {
+			return nil, err
+		}
+	}
+	return t.transport.RoundTrip(req)
 }
 
 func (hc *HostClient) apiClient(host string) *atclient.APIClient {

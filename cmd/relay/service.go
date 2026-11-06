@@ -39,7 +39,7 @@ type ServiceConfig struct {
 	// if true, don't process public (unauthenticated) requestCrawl
 	DisableRequestCrawl bool
 
-	// if true, allows non-SSL hosts to be added via public requestCrawl
+	// hypercerts: Retained for configuration compatibility; source policy always requires TLS.
 	AllowInsecureHosts bool
 }
 

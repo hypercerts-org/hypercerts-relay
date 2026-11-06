@@ -33,6 +33,13 @@ npm run server
 | `RAINBOW_PUBLIC_ORIGIN`        | Optional public Rainbow HTTPS origin displayed on the Overview page.                                    |
 | `JETSTREAM_PUBLIC_ORIGIN`      | Optional public Jetstream HTTPS origin displayed on the Overview page; never use the control URL.       |
 
+The Relay independently uses `JETSTREAM_CONTROL_URL` and `JETSTREAM_CONTROL_TOKEN`
+for its durable source-lifecycle handoff to Jetstream. Configure both on the Relay
+process to enable handoffs; if both are absent, Relay keeps durable rows queued and
+does not send them. If exactly one is absent, Relay fails startup. This outbound
+Relay token is distinct from Jetstream's
+`JETSTREAM_CONTROL_TOKEN_FILE`, which configures Jetstream's inbound private API.
+
 Run one administration process per database. Use a process supervisor; this is a
 stateful Node service, not a stateless function. Keep the database directory and
 secret files accessible only to its service account. SQLite uses WAL and FULL

@@ -57,6 +57,35 @@ revision, snapshot identifier, owner paths/volumes, and cutover result.
    the same bounded checks represented by T19 before resuming source admission.
 5. Record the observed recovery time and remaining gap/current-state limits.
 
+## Upstream continuity loss with selected collections
+
+When collection selection is enabled, a known upstream discontinuity stops
+Jetstream instead of logging and skipping it. This covers an upstream
+`OutdatedCursor` notice and a relay sequence gap. Jetstream stops consuming,
+refuses to advertise selected readiness, closes established selected
+subscriptions, and returns `/readyz` as unavailable while shutting down.
+
+The first loss is recorded durably in the Jetstream metadata store at
+`hypercerts/selected/upstream-loss/v1` with the reason, the upstream cursor
+domain, and the last fully processed upstream cursor. A recorded loss also
+blocks startup, even when collection selection has since been disabled.
+Nothing clears the record automatically: the archive cannot reconstruct events
+that were never acquired, and a PDS current-state resync is not a substitute for
+the missing raw history. Never delete the record and resume the same archive.
+
+Recover in one of two ways, and record which was chosen:
+
+1. Restore a coherent pre-loss snapshot of the archive and Jetstream metadata
+   into a separate data directory, but only when the upstream relay can replay
+   the required history from the restored cursor. Stop the failed writers first.
+2. Provision a new data directory and a new selected stream identity, reconcile
+   consumers, and retain the failed directory for investigation.
+
+If writing the durable record fails, Jetstream still stops and keeps the
+upstream cursor at the last fully processed event, but it cannot guarantee that
+the loss evidence survives a crash. Report both errors and treat the directory
+as failed rather than continuing.
+
 ## Explicitly unqualified work
 
 No real Railway resource, PostgreSQL snapshot, image publication, consumer, or

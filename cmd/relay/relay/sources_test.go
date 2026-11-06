@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/indigo/atproto/identity"
 	"github.com/bluesky-social/indigo/cmd/relay/relay/models"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
@@ -33,6 +34,7 @@ func newSourceRelay(t *testing.T) (*Relay, sourceTestDB) {
 		&models.RecoveryReceipt{},
 		&models.Account{},
 		&models.AccountSourceObservation{},
+		&models.SourceHandoff{},
 	))
 	r.Config = *DefaultRelayConfig()
 	r.HostChecker = NewMockHostChecker()
@@ -226,13 +228,41 @@ func TestSetSourceStateUsesRevisionAndPreservesHost(t *testing.T) {
 	require.Equal(t, models.SourceStateRemoved, storedSource.State)
 }
 
+func TestSourceHandoffEnqueuedAtomicallyForValidatedLifecycle(t *testing.T) {
+	ctx := context.Background()
+	r, db := newSourceRelay(t)
+	r.HostChecker.(*MockHostChecker).Hosts["https://handoff.example.com"] = true
+	view, err := r.AddSource(ctx, "https://handoff.example.com")
+	require.NoError(t, err)
+	var count int64
+	require.NoError(t, db.Model(&models.SourceHandoff{}).Count(&count).Error)
+	require.Zero(t, count, "unvalidated source must not be handed off")
+
+	view, err = r.ValidateSource(ctx, view.HostID, view.Revision)
+	require.NoError(t, err)
+	var handoff models.SourceHandoff
+	require.NoError(t, db.First(&handoff, "host_id = ?", view.HostID).Error)
+	require.Equal(t, view.Revision, handoff.SourceRevision)
+	require.Equal(t, string(models.SourceStateEnabled), handoff.State)
+	require.Equal(t, "https://handoff.example.com", handoff.PDS)
+
+	view, err = r.SetSourceState(ctx, view.HostID, view.Revision, models.SourceStateDisabled)
+	require.NoError(t, err)
+	require.NoError(t, db.First(&handoff, "host_id = ?", view.HostID).Error)
+	require.Equal(t, view.Revision, handoff.SourceRevision)
+	require.Equal(t, string(models.SourceStateDisabled), handoff.State)
+	require.Zero(t, handoff.Attempts)
+}
+
 func TestAddSourceIsIdempotentWithoutTLSDowngrade(t *testing.T) {
 	ctx := context.Background()
 	r, db := newSourceRelay(t)
 
 	first, err := r.AddSource(ctx, "https://source.example.com")
 	require.NoError(t, err)
-	second, err := r.AddSource(ctx, "http://source.example.com")
+	_, err = r.AddSource(ctx, "http://source.example.com")
+	require.ErrorIs(t, err, ErrInvalidSourceURL)
+	second, err := r.AddSource(ctx, "https://source.example.com")
 	require.NoError(t, err)
 	require.Equal(t, first.HostID, second.HostID)
 	require.Equal(t, uint64(1), second.Revision)
@@ -243,6 +273,77 @@ func TestAddSourceIsIdempotentWithoutTLSDowngrade(t *testing.T) {
 	require.NoError(t, db.Model(&models.Source{}).Count(&sources).Error)
 	require.Equal(t, int64(1), hosts)
 	require.Equal(t, int64(1), sources)
+}
+
+type canceledSourceHostChecker struct {
+	started chan struct{}
+}
+
+func (c *canceledSourceHostChecker) CheckHost(ctx context.Context, _ string) error {
+	close(c.started)
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (*canceledSourceHostChecker) FetchAccountStatus(context.Context, *identity.Identity) (models.AccountStatus, error) {
+	return "", nil
+}
+
+type delayedCanceledSourceHostChecker struct {
+	started chan struct{}
+	delay   time.Duration
+}
+
+func (c *delayedCanceledSourceHostChecker) CheckHost(ctx context.Context, _ string) error {
+	close(c.started)
+	time.Sleep(c.delay)
+	return ctx.Err()
+}
+
+func (*delayedCanceledSourceHostChecker) FetchAccountStatus(context.Context, *identity.Identity) (models.AccountStatus, error) {
+	return "", nil
+}
+
+func TestValidateSourceDelayedCanceledCheckPersistsFailure(t *testing.T) {
+	r, db := newSourceRelay(t)
+	host := &models.Host{Hostname: "delayed-cancelled-admin.example.com"}
+	require.NoError(t, db.Create(host))
+	require.NoError(t, db.Create(&models.Source{HostID: host.ID, State: models.SourceStateEnabled, Revision: 1, ValidationStatus: models.SourceValidationPending, RecoveryRequired: true}))
+	checker := &delayedCanceledSourceHostChecker{started: make(chan struct{}), delay: 6 * time.Second}
+	r.HostChecker = checker
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { _, err := r.ValidateSource(ctx, host.ID, 1); result <- err }()
+	<-checker.started
+	cancel()
+	require.ErrorIs(t, <-result, ErrSourceValidationFailed)
+
+	var failed models.Source
+	require.NoError(t, db.Where("host_id = ?", host.ID).First(&failed).Error)
+	require.Equal(t, models.SourceValidationFailed, failed.ValidationStatus)
+	require.NotNil(t, failed.ValidationCheckedAt)
+	require.Equal(t, uint64(2), failed.Revision)
+}
+
+func TestValidateSourceCanceledCheckPersistsFailure(t *testing.T) {
+	r, db := newSourceRelay(t)
+	host := &models.Host{Hostname: "cancelled-admin.example.com"}
+	require.NoError(t, db.Create(host))
+	require.NoError(t, db.Create(&models.Source{HostID: host.ID, State: models.SourceStateEnabled, Revision: 1, ValidationStatus: models.SourceValidationPending, RecoveryRequired: true}))
+	checker := &canceledSourceHostChecker{started: make(chan struct{})}
+	r.HostChecker = checker
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { _, err := r.ValidateSource(ctx, host.ID, 1); result <- err }()
+	<-checker.started
+	cancel()
+	require.ErrorIs(t, <-result, ErrSourceValidationFailed)
+
+	var failed models.Source
+	require.NoError(t, db.Where("host_id = ?", host.ID).First(&failed).Error)
+	require.Equal(t, models.SourceValidationFailed, failed.ValidationStatus)
+	require.NotNil(t, failed.ValidationCheckedAt)
+	require.Equal(t, uint64(2), failed.Revision)
 }
 
 func TestValidateSourcePersistsSafeFailure(t *testing.T) {
@@ -346,4 +447,45 @@ func TestListSourceAccountsBoundsThrottledAdmissions(t *testing.T) {
 
 func timeNow() time.Time {
 	return time.Now().UTC()
+}
+
+func TestValidateSourceMissingCheckerPersistsAndReplaysReason(t *testing.T) {
+	r, db := newSourceRelay(t)
+	source, err := r.AddSource(context.Background(), "https://missing-admin-checker.example.com")
+	require.NoError(t, err)
+	r.HostChecker = nil
+	view, err := r.ValidateSource(context.Background(), source.HostID, source.Revision)
+	require.ErrorIs(t, err, ErrSourceValidationFailed)
+	require.Equal(t, models.SourceValidationReasonCheckerMissing, view.Validation.Reason)
+	require.Equal(t, source.Revision+1, view.Revision)
+	require.NotNil(t, view.Validation.CheckedAt)
+	replayed, err := r.ValidateSource(context.Background(), source.HostID, source.Revision)
+	require.ErrorIs(t, err, ErrSourceValidationFailed)
+	require.Equal(t, view, replayed)
+	var stored models.Source
+	require.NoError(t, db.Where("host_id = ?", source.HostID).First(&stored).Error)
+	require.Equal(t, models.SourceValidationReasonCheckerMissing, stored.ValidationReason)
+	require.NotContains(t, r.publicChecks, source.HostID)
+}
+
+func TestSourceCheckReservationSharedBetweenAdmissionAndValidation(t *testing.T) {
+	r, _ := newSourceRelay(t)
+	source, err := r.AddSource(context.Background(), "https://shared-check.example.com")
+	require.NoError(t, err)
+	checker := &blockingHostChecker{started: make(chan struct{}, 1), release: make(chan struct{})}
+	r.HostChecker = checker
+	result := make(chan error, 1)
+	go func() {
+		_, err := r.ValidateSource(context.Background(), source.HostID, source.Revision)
+		result <- err
+	}()
+	<-checker.started
+	require.ErrorIs(t, r.AdmitPublicSource(context.Background(), "https://shared-check.example.com"), ErrSourceRevisionConflict)
+	_, err = r.ValidateSource(context.Background(), source.HostID, source.Revision)
+	require.ErrorIs(t, err, ErrSourceRevisionConflict)
+	close(checker.release)
+	require.NoError(t, <-result)
+	require.NotContains(t, r.publicChecks, source.HostID)
+	require.NoError(t, r.AdmitPublicSource(context.Background(), "https://shared-check.example.com"))
+	require.EqualValues(t, 1, checker.checks.Load())
 }
