@@ -107,9 +107,11 @@ type fakeTimestampStamper struct {
 	indexedAt int64
 	err       error
 	seenSeq   uint64
+	calls     int
 }
 
 func (s *fakeTimestampStamper) Stamp(_ context.Context, ev *segment.Event) error {
+	s.calls++
 	s.seenSeq = ev.Seq
 	if s.indexedAt != 0 {
 		ev.IndexedAt = s.indexedAt

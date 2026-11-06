@@ -3,6 +3,7 @@ package ingest
 import (
 	"context"
 	"fmt"
+	"github.com/bluesky-social/jetstream/internal/history"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 	"log/slog"
@@ -41,8 +42,15 @@ type Config struct {
 	CollectionPolicy *selection.Manager
 	// Attribution optionally records selected-stream event provenance.
 	Attribution *attribution.Manager
+	// History optionally stores the immutable selected-event journal.
+	History *history.Store
 	// AttributionDomain binds recovery to the attribution namespace.
 	AttributionDomain string
+	// HistoryProjectionTarget owns this writer's durable projection reservations.
+	// Zero defaults to main for existing callers.
+	HistoryProjectionTarget  history.ProjectionTarget
+	LifecycleOrdering        func(context.Context, string, segment.Kind) (int64, error)
+	LifecycleJournalBoundary func(context.Context, string, segment.Kind) (uint64, error)
 	// hypercerts: Steady-state replacements share the archive rewrite lock.
 	ReconcileSnapshot func(context.Context, Snapshot) error
 	// DataDir is the root jetstream data directory. Optional outside the

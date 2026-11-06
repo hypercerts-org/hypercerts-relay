@@ -185,6 +185,15 @@ func (l *ReadableLog) evictLocked() {
 // advancement, including metadata-only terminal commits. A cursor below FloorSeq
 // must be read from cold durable storage. The boundary is exclusive: returned
 // entries always satisfy Seq < DurableSeq.
+func (l *ReadableLog) DurableRange() uint64 {
+	if l == nil {
+		return 0
+	}
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.durable
+}
+
 func (l *ReadableLog) ReadCommittedFrom(cursor uint64, max int) (entries []*ReadLogEntry, notify <-chan struct{}, ok bool, atTip bool) {
 	if l == nil {
 		return nil, nil, false, false

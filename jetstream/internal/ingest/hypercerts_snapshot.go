@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/history"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/segment"
@@ -26,8 +27,14 @@ type Snapshot struct {
 	AppendMetadata *AttributionMetadata
 }
 
+type snapshotCollectionBoundary struct {
+	Revision        string `json:"revision"`
+	JournalSequence uint64 `json:"journalSequence,omitempty"`
+}
+
 type snapshotBoundary struct {
-	Revisions map[string]string `json:"revisions"`
+	Revisions   map[string]string                     `json:"revisions"`
+	Collections map[string]snapshotCollectionBoundary `json:"collections,omitempty"`
 }
 
 func snapshotKey(did string) []byte { return []byte("hypercerts/snapshot/" + did) }
@@ -51,7 +58,14 @@ func (w *Writer) snapshotSupersedes(ev *segment.Event, metadata *AttributionMeta
 		return false, err
 	}
 	if ev.Kind.IsCommit() {
-		return ev.Rev <= boundary.Revisions[ev.Collection], nil
+		superseded := ev.Rev <= boundary.Revisions[ev.Collection]
+		if superseded && metadata != nil && metadata.Boundary.JournalSequence == nil {
+			if collectionBoundary, ok := boundary.Collections[ev.Collection]; ok && collectionBoundary.Revision >= ev.Rev && collectionBoundary.JournalSequence != 0 {
+				sequence := collectionBoundary.JournalSequence
+				metadata.Boundary.JournalSequence = &sequence
+			}
+		}
+		return superseded, nil
 	}
 	if ev.Kind == segment.KindSync {
 		// A live marker is appended only after scoped reconciliation succeeds.
@@ -103,8 +117,22 @@ func (w *Writer) ReconcileSnapshot(ctx context.Context, snapshot Snapshot) error
 		return err
 	}
 	metadata := snapshot.AppendMetadata
+	if w.cfg.History != nil {
+		if metadata == nil {
+			return fmt.Errorf("ingest: history-enabled snapshot requires append metadata: %w", attribution.ErrInvalid)
+		}
+		return w.reconcileSnapshotHistoryLocked(ctx, snapshot, rows, metadata)
+	}
 	if metadata != nil {
 		if metadata.Provenance == attribution.ProvenanceSnapshot || metadata.Provenance == attribution.ProvenanceReconciliation {
+			if w.cfg.History != nil {
+				if metadata.Boundary.Seq != nil && *metadata.Boundary.Seq != w.nextSeq {
+					return fmt.Errorf("ingest: snapshot boundary does not match current segment coordinate: %w", attribution.ErrInvalid)
+				}
+				if metadata.Boundary.Seq == nil && metadata.Boundary.SnapshotID != nil {
+					return fmt.Errorf("ingest: snapshot boundary coordinate required: %w", attribution.ErrInvalid)
+				}
+			}
 			if metadata.Boundary.Seq == nil {
 				seq := w.nextSeq
 				metadata.Boundary.Seq = &seq
@@ -272,7 +300,7 @@ func (s *snapshotArchiveState) missingRecordDeletes(snapshot Snapshot, keys map[
 
 // Called only after the replacement rows have crossed the archive durability boundary.
 func (w *Writer) persistSnapshotBoundary(snapshot Snapshot) error {
-	previous := snapshotBoundary{Revisions: map[string]string{}}
+	previous := snapshotBoundary{Revisions: map[string]string{}, Collections: map[string]snapshotCollectionBoundary{}}
 	if b, closer, err := w.cfg.Store.Get(snapshotKey(snapshot.DID)); err == nil {
 		err = json.Unmarshal(b, &previous)
 		closer.Close()
@@ -285,9 +313,44 @@ func (w *Writer) persistSnapshotBoundary(snapshot Snapshot) error {
 	if previous.Revisions == nil {
 		previous.Revisions = map[string]string{}
 	}
+	if previous.Collections == nil {
+		previous.Collections = map[string]snapshotCollectionBoundary{}
+	}
+	var journalSequence uint64
+	if snapshot.AppendMetadata != nil && (snapshot.AppendMetadata.Provenance == attribution.ProvenanceSnapshot || snapshot.AppendMetadata.Provenance == attribution.ProvenanceReconciliation) && snapshot.AppendMetadata.Boundary.JournalSequence != nil {
+		candidate := *snapshot.AppendMetadata.Boundary.JournalSequence
+		if candidate == 0 || w.cfg.History == nil {
+			return fmt.Errorf("ingest: invalid snapshot journal coordinate")
+		}
+		page, err := w.cfg.History.Read(candidate-1, candidate, 1)
+		if err != nil {
+			return err
+		}
+		if len(page.Events) != 1 || page.Events[0].Sequence != candidate || page.Events[0].Provenance != string(attribution.ProvenanceSnapshot) && page.Events[0].Provenance != string(attribution.ProvenanceReconciliation) || page.Events[0].DID != snapshot.DID || page.Events[0].Revision != snapshot.Rev || page.Events[0].Disposition != history.Apply && page.Events[0].Disposition != history.Noop {
+			return fmt.Errorf("ingest: snapshot journal coordinate does not identify a completed snapshot receipt")
+		}
+		if page.Events[0].Collection != "" && !slices.Contains(snapshot.Collections, page.Events[0].Collection) {
+			return fmt.Errorf("ingest: snapshot journal receipt is outside snapshot collection scope")
+		}
+		status, err := w.cfg.History.ProjectionStatusFor(w.cfg.HistoryProjectionTarget, candidate)
+		if err != nil {
+			return err
+		}
+		if status != history.RecoveryComplete {
+			return fmt.Errorf("ingest: snapshot journal projection is incomplete")
+		}
+		journalSequence = candidate
+	}
 	for _, collection := range snapshot.Collections {
 		if snapshot.Rev > previous.Revisions[collection] {
 			previous.Revisions[collection] = snapshot.Rev
+		}
+		old := previous.Collections[collection]
+		if snapshot.Rev > old.Revision {
+			previous.Collections[collection] = snapshotCollectionBoundary{Revision: snapshot.Rev, JournalSequence: journalSequence}
+		} else if snapshot.Rev == old.Revision && old.JournalSequence == 0 && journalSequence != 0 {
+			old.JournalSequence = journalSequence
+			previous.Collections[collection] = old
 		}
 	}
 	boundary, err := json.Marshal(previous)

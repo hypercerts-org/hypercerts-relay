@@ -78,6 +78,71 @@ func TestHypercertsScopedSnapshotPreservesConcurrentAndOtherCollections(t *testi
 	require.Equal(t, 1, removed)
 }
 
+func TestNonHistoryManagedSnapshotBoundaryUsesBatchStartCoordinate(t *testing.T) {
+	w := newTestWriter(t, Config{CollectionPolicy: nil})
+	manager, err := attribution.Open(w.cfg.Store, "stream", "non-history-snapshot-boundary")
+	require.NoError(t, err)
+	w.cfg.Attribution = manager
+	w.cfg.AttributionDomain = "non-history-snapshot-boundary"
+	w.cfg.CollectionPolicy, err = selection.Open(w.cfg.Store, []string{"org.example.record"})
+	require.NoError(t, err)
+	policy := attribution.Policy{Revision: 1, Collections: []string{"org.example.record"}}
+	start := w.NextSeq()
+	boundarySeq, snapshotID := start, "normal-snapshot"
+	snapshot := Snapshot{
+		DID: "did:plc:normal-snapshot", Rev: "3l3qo2vutsw2b", Collections: policy.Collections,
+		Records:        []segment.Event{{Kind: segment.KindCreateResync, DID: "did:plc:normal-snapshot", Rev: "3l3qo2vutsw2b", Collection: "org.example.record", Rkey: "r1", Payload: []byte(`{"value":true}`)}},
+		AppendMetadata: &AttributionMetadata{StreamID: "stream", Policy: policy, Provenance: attribution.ProvenanceSnapshot, Boundary: attribution.Boundary{Seq: &boundarySeq, SnapshotID: &snapshotID}},
+	}
+	require.NoError(t, w.ReconcileSnapshot(t.Context(), snapshot))
+	require.Greater(t, w.NextSeq(), start)
+}
+
+func TestManagedSnapshotCoordinateValidationDoesNotMutateBoundary(t *testing.T) {
+	w, h, _, _ := newCaptureWriter(t)
+	policy := attribution.Policy{Revision: 1, Collections: []string{"org.example.record"}}
+	valid := func() Snapshot {
+		seq, snapshotID, journalSeq := uint64(0), "snapshot-coordinate", uint64(1)
+		return Snapshot{DID: "did:plc:snapshot-coordinate", Rev: "3l3qo2vutsw2b", Collections: []string{"org.example.record"}, Records: []segment.Event{{Kind: segment.KindCreateResync, DID: "did:plc:snapshot-coordinate", Collection: "org.example.record", Rkey: "r1", Rev: "3l3qo2vutsw2b", Payload: []byte(`{"value":true}`)}}, AppendMetadata: &AttributionMetadata{StreamID: h.StreamID(), Policy: policy, Provenance: attribution.ProvenanceSnapshot, Boundary: attribution.Boundary{Seq: &seq, SnapshotID: &snapshotID, JournalSequence: &journalSeq}}}
+	}
+	cases := []struct {
+		name   string
+		mutate func(*Snapshot)
+	}{
+		{"invalid sequence coordinate", func(s *Snapshot) { *s.AppendMetadata.Boundary.Seq = 99 }},
+		{"missing sequence coordinate", func(s *Snapshot) { s.AppendMetadata.Boundary.Seq = nil }},
+		{"missing coordinates", func(s *Snapshot) {
+			s.AppendMetadata.Boundary = attribution.Boundary{Seq: new(uint64), SnapshotID: new("")}
+		}},
+		{"missing snapshot id", func(s *Snapshot) { s.AppendMetadata.Boundary.SnapshotID = nil }},
+		{"cross collection", func(s *Snapshot) { s.AppendMetadata.Policy.Collections = []string{"org.other.record"} }},
+		{"uncompleted boundary", func(s *Snapshot) { *s.AppendMetadata.Boundary.JournalSequence = 99 }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			snapshot := valid()
+			tc.mutate(&snapshot)
+			next := w.NextSeq()
+			err := w.ReconcileSnapshot(t.Context(), snapshot)
+			require.Error(t, err)
+			require.Equal(t, next, w.NextSeq())
+			stored, closer, lookupErr := w.cfg.Store.Get(snapshotKey(snapshot.DID))
+			if lookupErr == nil {
+				require.NoError(t, closer.Close())
+				require.NotEmpty(t, stored)
+			} else {
+				require.ErrorIs(t, lookupErr, store.ErrNotFound)
+			}
+		})
+	}
+	t.Run("legacy metadata without coordinate is accepted", func(t *testing.T) {
+		snapshot := valid()
+		snapshot.AppendMetadata.Boundary = attribution.Boundary{}
+		require.NoError(t, w.ReconcileSnapshot(t.Context(), snapshot))
+		require.Greater(t, w.NextSeq(), uint64(1))
+	})
+}
+
 func TestHypercertsManagedSnapshotWritesRowsAndAttribution(t *testing.T) {
 	w := newTestWriter(t, Config{CollectionPolicy: nil})
 	manager, err := attribution.Open(w.cfg.Store, "stream", "snapshot-attribution")

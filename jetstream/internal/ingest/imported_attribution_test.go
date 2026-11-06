@@ -4,10 +4,46 @@ import (
 	"context"
 	"testing"
 
+	"github.com/bluesky-social/jetstream/internal/history"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/stretchr/testify/require"
 )
+
+func TestAppendImportedReceiptDeduplicatesBeforeLocalStamping(t *testing.T) {
+	w := newTestWriter(t, Config{})
+	journal, err := history.Open(w.cfg.Store)
+	require.NoError(t, err)
+	manager, err := attribution.Open(w.cfg.Store, "destination-stream", "receipt-attribution")
+	require.NoError(t, err)
+	w.cfg.History, w.cfg.Attribution, w.cfg.AttributionDomain = journal, manager, "receipt-attribution"
+	stamper := &fakeTimestampStamper{indexedAt: 100}
+	w.cfg.TimestampStamper = stamper
+	policy := attribution.Policy{Revision: 2, Collections: []string{"org.example.record"}}
+	destination := AttributionMetadata{StreamID: "destination-stream", Policy: policy, Provenance: attribution.ProvenanceLive}
+	sourceRev := uint64(1)
+	sourcePolicy := attribution.Policy{Revision: sourceRev, Collections: []string{"org.example.record"}}
+	source := attribution.Event{StreamID: "source-stream", Seq: 17, PolicyRev: &sourceRev, Provenance: attribution.ProvenanceLive, Payload: []byte(`{"source":true}`)}
+	event := &segment.Event{Seq: 17, Kind: segment.KindCreate, Collection: "org.example.record", DID: "did:plc:imported", Rkey: "record", Payload: []byte(`{"record":true}`), WitnessedAt: 10}
+	require.NoError(t, w.AppendImported(context.Background(), event, source, "bootstrap-live", destination, sourcePolicy))
+	firstSeq, firstIndexed := event.Seq, event.IndexedAt
+	require.NoError(t, w.Flush(context.Background()))
+	stamper.indexedAt = 200
+	retry := *event
+	retry.Seq, retry.IndexedAt = 17, 0
+	require.NoError(t, w.AppendImported(context.Background(), &retry, source, "bootstrap-live", destination, sourcePolicy))
+	require.Equal(t, firstSeq, retry.Seq)
+	require.Equal(t, firstIndexed, retry.IndexedAt)
+	require.EqualValues(t, 1, stamper.calls, "the exact receipt retry must not invoke the stamper twice")
+	require.EqualValues(t, 2, w.NextSeq())
+	require.NoError(t, w.Flush(context.Background()))
+	tip, err := journal.Tip()
+	require.NoError(t, err)
+	require.Zero(t, tip)
+	conflict := *event
+	conflict.Payload = []byte(`{"record":"changed"}`)
+	require.ErrorIs(t, w.AppendImported(context.Background(), &conflict, source, "bootstrap-live", destination, sourcePolicy), history.ErrImportConflict)
+}
 
 func TestAppendImportedRetainsOriginalSourceEvidence(t *testing.T) {
 	for _, async := range []bool{false, true} {

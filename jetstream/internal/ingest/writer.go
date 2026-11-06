@@ -3,6 +3,7 @@ package ingest
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -10,6 +11,7 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/bluesky-social/jetstream/internal/history"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
 	"github.com/bluesky-social/jetstream/internal/obs"
 	"github.com/bluesky-social/jetstream/internal/store"
@@ -44,7 +46,9 @@ type Writer struct {
 	readLog        *ReadableLog
 	closed         bool
 
-	pendingAttributions []attribution.Prepared
+	pendingAttributions        []attribution.Prepared
+	pendingProjectionSequences []uint64
+	pendingImportCompletions   []history.ImportSource
 
 	async            *asyncFlushPipeline
 	asyncJobs        sync.WaitGroup
@@ -56,6 +60,9 @@ type Writer struct {
 // a crash between block fsync and pebble batch commit can never
 // produce duplicate seq numbers.
 func Open(cfg Config) (*Writer, error) {
+	if cfg.History != nil && cfg.Attribution == nil {
+		return nil, fmt.Errorf("ingest: selected history requires attribution")
+	}
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
@@ -63,11 +70,21 @@ func Open(cfg Config) (*Writer, error) {
 		if err := cfg.Attribution.ValidateBinding(cfg.Store, cfg.AttributionDomain); err != nil {
 			return nil, fmt.Errorf("ingest: attribution binding: %w", err)
 		}
-		if err := recoverAttributions(cfg); err != nil {
-			return nil, fmt.Errorf("ingest: recover attribution: %w", err)
+		if cfg.History != nil {
+			// History and attribution must share the same Pebble database; the
+			// journal otherwise cannot atomically checkpoint projection writes.
+			if err := cfg.History.ValidateBinding(cfg.Store); err != nil {
+				return nil, fmt.Errorf("ingest: history binding: %w", err)
+			}
 		}
 	}
 	cfg.applyDefaults()
+	if cfg.HistoryProjectionTarget == "" {
+		cfg.HistoryProjectionTarget = history.TargetMain
+	}
+	if cfg.HistoryProjectionTarget != history.TargetMain && cfg.HistoryProjectionTarget != history.TargetBootstrapLive {
+		return nil, fmt.Errorf("ingest: invalid history projection target %q", cfg.HistoryProjectionTarget)
+	}
 	cfg.Logger = cfg.Logger.With(slog.String("component", "ingest/writer"))
 
 	if err := mkdirAllFS(cfg.FS, cfg.SegmentsDir, 0o755); err != nil {
@@ -157,6 +174,124 @@ func Open(cfg Config) (*Writer, error) {
 	}
 	w.nextSeq, w.durableNextSeq = reconciled, reconciled
 	w.readLog = newReadableLog(reconciled, cfg.ReadLogRetentionBytes, cfg.Metrics)
+	if cfg.Attribution != nil {
+		if err := recoverAttributions(cfg); err != nil {
+			_ = w.active.Close()
+			return nil, fmt.Errorf("ingest: recover attribution: %w", err)
+		}
+	}
+	if cfg.History != nil {
+		pendingImports, importErr := cfg.History.ListPendingImports(string(cfg.HistoryProjectionTarget))
+		if importErr != nil {
+			_ = w.active.Close()
+			return nil, fmt.Errorf("ingest: list pending history imports: %w", importErr)
+		}
+		for _, receipt := range pendingImports {
+			if receipt.SegmentSequence < reconciled {
+				row, exists, lookupErr := lookupProjectionSegment(cfg, receipt.SegmentSequence)
+				if lookupErr != nil {
+					_ = w.active.Close()
+					return nil, fmt.Errorf("ingest: inspect pending history import: %w", lookupErr)
+				}
+				if !exists || row.Fingerprint != attribution.FingerprintSegment(receipt.PlannedEvent) {
+					_ = w.active.Close()
+					return nil, fmt.Errorf("ingest: pending history import segment differs: %w", history.ErrImportConflict)
+				}
+				var saved AttributionMetadata
+				var savedSource attribution.Event
+				var policy attribution.Policy
+				if json.Unmarshal(receipt.DestinationAttribution, &saved) != nil || json.Unmarshal(receipt.SourceAttribution, &savedSource) != nil || json.Unmarshal(receipt.Policy, &policy) != nil || saved.Source == nil || savedSource.Seq != receipt.Source.Sequence || savedSource.StreamID != receipt.Source.StreamID || saved.Policy.Revision != policy.Revision {
+					_ = w.active.Close()
+					return nil, fmt.Errorf("ingest: invalid durable history import metadata: %w", history.ErrImportConflict)
+				}
+				if _, prepErr := cfg.Attribution.PrepareSegment(receipt.PlannedEvent, saved.StreamID, saved.Policy, saved.Provenance, saved.Boundary, saved.Source); prepErr != nil {
+					_ = w.active.Close()
+					return nil, fmt.Errorf("ingest: recover imported attribution: %w", prepErr)
+				}
+				if err := recoverAttributions(cfg); err != nil {
+					_ = w.active.Close()
+					return nil, fmt.Errorf("ingest: commit recovered imported attribution: %w", err)
+				}
+				if err := cfg.History.CompleteImport(receipt.Source, func(*pebble.Batch) error { return nil }); err != nil {
+					_ = w.active.Close()
+					return nil, fmt.Errorf("ingest: complete durable history import: %w", err)
+				}
+				continue
+			}
+			if receipt.SegmentSequence != reconciled || receipt.PlannedEvent.Seq != reconciled {
+				_ = w.active.Close()
+				return nil, fmt.Errorf("ingest: pending history import sequence conflicts with allocator: %w", history.ErrImportConflict)
+			}
+			var saved AttributionMetadata
+			if err := json.Unmarshal(receipt.DestinationAttribution, &saved); err != nil {
+				_ = w.active.Close()
+				return nil, fmt.Errorf("ingest: decode pending import attribution: %w", history.ErrImportConflict)
+			}
+			var savedSource attribution.Event
+			if err := json.Unmarshal(receipt.SourceAttribution, &savedSource); err != nil || savedSource.Seq != receipt.Source.Sequence || savedSource.StreamID != receipt.Source.StreamID {
+				_ = w.active.Close()
+				return nil, fmt.Errorf("ingest: invalid pending import attribution: %w", history.ErrImportConflict)
+			}
+			if saved.StreamID == "" || saved.Policy.Revision == 0 || receipt.Target != string(cfg.HistoryProjectionTarget) {
+				_ = w.active.Close()
+				return nil, fmt.Errorf("ingest: pending import destination no longer matches: %w", history.ErrImportConflict)
+			}
+			var policy attribution.Policy
+			if err := json.Unmarshal(receipt.Policy, &policy); err != nil || policy.Revision != saved.Policy.Revision {
+				_ = w.active.Close()
+				return nil, fmt.Errorf("ingest: invalid pending import policy: %w", history.ErrImportConflict)
+			}
+			var imported *attribution.ImportedSource
+			if saved.Source != nil {
+				imported = saved.Source
+			}
+			prepared, prepErr := cfg.Attribution.PrepareSegment(receipt.PlannedEvent, saved.StreamID, saved.Policy, saved.Provenance, saved.Boundary, imported)
+			if prepErr != nil {
+				_ = w.active.Close()
+				return nil, fmt.Errorf("ingest: prepare pending import attribution: %w", prepErr)
+			}
+			if _, appendErr := w.active.Append(receipt.PlannedEvent); appendErr != nil {
+				_ = w.active.Close()
+				return nil, fmt.Errorf("ingest: replay pending history import: %w", appendErr)
+			}
+			w.pendingAttributions = append(w.pendingAttributions, prepared)
+			w.pendingImportCompletions = append(w.pendingImportCompletions, receipt.Source)
+			w.readLog.append(&receipt.PlannedEvent)
+			w.nextSeq++
+		}
+		if len(w.pendingImportCompletions) > 0 {
+			if err := w.flushAndRotateLocked(context.Background()); err != nil {
+				_ = w.active.Close()
+				return nil, fmt.Errorf("ingest: commit recovered history imports: %w", err)
+			}
+		}
+		recoverConfig := cfg
+		recoverConfig.FS = cfg.FS
+		recoveries, recoverErr := cfg.History.RecoverProjectionFor(cfg.HistoryProjectionTarget, func(seq uint64) (history.ProjectionRow, bool, error) {
+			row, exists, lookupErr := lookupProjectionSegment(recoverConfig, seq)
+			return row, exists, lookupErr
+		})
+		if recoverErr != nil {
+			_ = w.active.Close()
+			return nil, fmt.Errorf("ingest: recover history projection: %w", recoverErr)
+		}
+		for _, recovered := range recoveries {
+			if recovered.Status == history.RecoveryNeedsReplay {
+				break
+			}
+			w.addPendingProjection(recovered.Intent.JournalSequence)
+		}
+		if len(w.pendingProjectionSequences) > 0 {
+			if err := w.commitDurableBatchLocked(context.Background(), reconciled, true, w.sampleDurableBatchPrepareValueLocked()); err != nil {
+				_ = w.active.Close()
+				return nil, fmt.Errorf("ingest: finalize recovered history projection: %w", err)
+			}
+		}
+		if err := w.drainHistoryLocked(context.Background()); err != nil {
+			_ = w.active.Close()
+			return nil, fmt.Errorf("ingest: replay history projection: %w", err)
+		}
+	}
 	w.cfg.Metrics.setActiveSegBytes(w.activeBytes)
 	w.cfg.Metrics.setNextSeq(w.nextSeq)
 	if cfg.AsyncFlushWorkers > 0 {
@@ -275,6 +410,9 @@ func (w *Writer) AppendAttributed(ctx context.Context, ev *segment.Event, metada
 
 // AppendImported appends an event while retaining provenance from its source stream.
 func (w *Writer) AppendImported(ctx context.Context, ev *segment.Event, source attribution.Event, domain string, destination AttributionMetadata, sourcePolicy ...attribution.Policy) error {
+	if w.cfg.History != nil {
+		return w.AppendImportedProjected(ctx, ev, source, domain, destination, sourcePolicy...)
+	}
 	if w.cfg.Attribution == nil || ev == nil || domain == "" || attribution.Validate(source) != nil || len(sourcePolicy) > 1 {
 		return fmt.Errorf("ingest: invalid imported attribution: %w", attribution.ErrInvalid)
 	}
@@ -318,6 +456,9 @@ type ImportedMetadata struct {
 }
 
 func (w *Writer) append(ctx context.Context, ev *segment.Event, metadata *AttributionMetadata) error {
+	if w.cfg.History != nil {
+		return errors.New("ingest: ordinary append cannot consume reserved history projections")
+	}
 	if w.async != nil {
 		w.drainMu.Lock()
 		w.mu.Lock()
@@ -352,11 +493,17 @@ func (w *Writer) append(ctx context.Context, ev *segment.Event, metadata *Attrib
 
 // AppendBatch writes events after validating and preparing the complete batch.
 func (w *Writer) AppendBatch(ctx context.Context, events []segment.Event) error {
+	if w.cfg.History != nil {
+		return errors.New("ingest: ordinary batch append cannot consume reserved history projections")
+	}
 	return w.appendBatch(ctx, events, nil)
 }
 
 // AppendBatchAttributed appends a batch with shared provenance and policy metadata.
 func (w *Writer) AppendBatchAttributed(ctx context.Context, events []segment.Event, metadata AttributionMetadata) error {
+	if w.cfg.History != nil {
+		return errors.New("ingest: attributed append cannot bypass reserved history projections")
+	}
 	if w.cfg.Attribution == nil {
 		return fmt.Errorf("ingest: attribution manager is required")
 	}
@@ -796,7 +943,7 @@ func (w *Writer) flushBlockLocked(ctx context.Context) error {
 			}
 		}
 	}
-	if err := w.commitDurableBatchWithAttributionsLocked(ctx, w.nextSeq, false, prepareValue, attributions); err != nil {
+	if err := w.commitDurableBatchWithAttributionsLocked(ctx, w.nextSeq, len(w.pendingProjectionSequences) > 0, prepareValue, attributions); err != nil {
 		return err
 	}
 	if len(attributions) > 0 {
@@ -889,6 +1036,8 @@ func (w *Writer) onAfterSealLocked(idx uint64, path string) error {
 // NextSeq returns the next seq value the writer will allocate.
 // Exposed for tests and observability; production callers should
 // not rely on this value being stable across goroutines.
+func (w *Writer) HistoryEnabled() bool { return w.cfg.History != nil }
+
 func (w *Writer) NextSeq() uint64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -1128,7 +1277,45 @@ func (w *Writer) commitDurableBatchWithAttributionsLocked(ctx context.Context, n
 			filtered = append(filtered, prepared)
 		}
 	}
-	if w.cfg.Attribution != nil && len(filtered) > 0 {
+	if len(w.pendingImportCompletions) > 0 {
+		sources := append([]history.ImportSource(nil), w.pendingImportCompletions...)
+		commitWithImports := func(stageAttribution func(*pebble.Batch) error) error {
+			return w.cfg.History.CompleteImports(sources, func(batch *pebble.Batch) error {
+				if err := commit(batch); err != nil {
+					return err
+				}
+				if stageAttribution != nil {
+					return stageAttribution(batch)
+				}
+				return nil
+			})
+		}
+		if w.cfg.Attribution != nil && len(filtered) > 0 {
+			commitErr = w.cfg.Attribution.ImplementWithPreparedCommit(filtered, commitWithImports)
+		} else {
+			commitErr = commitWithImports(nil)
+		}
+	} else if len(w.pendingProjectionSequences) > 0 {
+		sequences := append([]uint64(nil), w.pendingProjectionSequences...)
+		commitWithProjection := func(stageAttribution func(*pebble.Batch) error) error {
+			return w.cfg.History.CommitProjectionFor(w.cfg.HistoryProjectionTarget, sequences, func(batch *pebble.Batch) error {
+				if err := commit(batch); err != nil {
+					return err
+				}
+				if stageAttribution != nil {
+					if err := stageAttribution(batch); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+		}
+		if w.cfg.Attribution != nil && len(filtered) > 0 {
+			commitErr = w.cfg.Attribution.ImplementWithPreparedCommit(filtered, commitWithProjection)
+		} else {
+			commitErr = commitWithProjection(nil)
+		}
+	} else if w.cfg.Attribution != nil && len(filtered) > 0 {
 		commitErr = w.cfg.Attribution.CommitBatch(filtered, commit)
 	} else {
 		b := w.cfg.Store.NewBatch()
@@ -1145,8 +1332,13 @@ func (w *Writer) commitDurableBatchWithAttributionsLocked(ctx context.Context, n
 	if len(filtered) > 0 {
 		w.pruneCommittedAttributions(filtered)
 	}
+	if len(w.pendingProjectionSequences) > 0 {
+		w.pendingProjectionSequences = nil
+	}
 	w.durableNextSeq = nextSeq
-	w.readLog.advanceDurable(nextSeq)
+	if w.readLog != nil {
+		w.readLog.advanceDurable(nextSeq)
+	}
 	if afterCommit != nil {
 		afterCommit()
 	}
