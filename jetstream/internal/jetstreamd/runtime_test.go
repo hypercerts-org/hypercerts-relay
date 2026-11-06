@@ -21,6 +21,27 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestBuildHistoryActivationFollowsManagedSelection(t *testing.T) {
+	t.Run("unmanaged compatibility", func(t *testing.T) {
+		opts := testOptions(t)
+		rt, err := Build(t.Context(), opts)
+		require.NoError(t, err)
+		require.Nil(t, rt.History)
+		require.NoError(t, rt.Close(t.Context()))
+	})
+
+	t.Run("managed selected stream", func(t *testing.T) {
+		opts := testOptions(t)
+		opts.CollectionSelection = true
+		opts.InitialCollections = []string{"app.bsky.feed.post"}
+		rt, err := Build(t.Context(), opts)
+		require.NoError(t, err)
+		require.NotNil(t, rt.History)
+		require.NotNil(t, rt.CollectionPolicy)
+		require.NoError(t, rt.Close(t.Context()))
+	})
+}
+
 func TestRuntimePublicAddrBeforeRunIsEmpty(t *testing.T) {
 	t.Parallel()
 

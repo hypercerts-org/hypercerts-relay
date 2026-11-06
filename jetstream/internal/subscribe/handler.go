@@ -16,6 +16,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/bluesky-social/jetstream/api/jetstream"
+	"github.com/bluesky-social/jetstream/internal/history"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 	"github.com/bluesky-social/jetstream/internal/ingest"
@@ -86,6 +87,8 @@ type Subscription struct {
 	V2                  bool
 	SelectedAttribution *attribution.Manager
 	SelectedPolicy      *selection.Manager
+	SelectedHistory     *history.Store
+	SelectedJournalMode bool
 	SelectedStreamID    string
 }
 
@@ -552,7 +555,28 @@ func serve(w http.ResponseWriter, r *http.Request, deps Subscription, logger *sl
 	if cursorPlan.Mode == ModeLive {
 		startSeq = deps.Tail.Tip()
 	}
+	if selected && deps.SelectedJournalMode && deps.SelectedHistory != nil && selectedConfig.HistoryMode == "original-events" {
+		ctx = conn.CloseRead(ctx)
+		if selectedRequest.Cursor != nil {
+			startSeq = *selectedRequest.Cursor
+		} else {
+			startSeq, err = deps.SelectedHistory.Tip()
+			if err != nil {
+				logger.Error("selected journal tip read failed", "err", err)
+				return
+			}
+			startSeq++
+		}
+		info := map[string]any{"contract": SelectedContract, "streamId": selectedConfig.StreamID, "policyRev": selectedConfig.PolicyRevision, "collections": selectedConfig.Collections, "effectiveAfterSeq": selectedConfig.PolicyEffectiveAfterSeq, "replayFloor": selectedConfig.ReplayFloor, "historyMode": selectedConfig.HistoryMode, "originalHistoryFromSeq": selectedConfig.OriginalHistoryFromSeq, "coverage": selectedConfig.Coverage, "gaps": selectedConfig.Gaps, "policyTransitions": selectedConfig.PolicyTransitions, "retention": selectedConfig.Retention, "activation": selectedConfig.Activation}
+		frame, err := EncodeV2SelectedInfo("SelectedFeed", "Selected stream capability", info)
+		if err != nil || !writeFrame(ctx, conn, wantZstd, frame) {
+			return
+		}
+		runSelectedSubscriberLoop(ctx, conn, deps, initialV2Filter, selectedConfig, startSeq, wantZstd, logger)
+		return
+	}
 	if selected {
+		ctx = conn.CloseRead(ctx)
 		gaps := selectedConfig.Gaps
 		if gaps == nil {
 			gaps = []SelectedGap{}

@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	historyjournal "github.com/bluesky-social/jetstream/internal/history"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 	"github.com/bluesky-social/jetstream/internal/ingest"
@@ -257,7 +258,11 @@ func newSelectedWebsocketFixture(t *testing.T) *selectedWebsocketFixture {
 			return subscribe.SelectedConfig{}, e
 		}
 		p := history[len(history)-1]
-		return subscribe.SelectedConfig{StreamID: stream, PolicyRevision: p.Revision, PolicyEffectiveAfterSeq: p.EffectiveAfterSeq, Collections: p.Collections, ReplayFloor: func() *uint64 { v := uint64(0); return &v }(), CurrentSeq: w.NextSeq() - 1, ReplayEnabled: true, Coverage: "unknown", Gaps: []subscribe.SelectedGap{}}, nil
+		policies := make([]historyjournal.Policy, 0, len(history))
+		for _, item := range history {
+			policies = append(policies, historyjournal.Policy{Revision: item.Revision, Collections: item.Collections})
+		}
+		return subscribe.SelectedConfig{StreamID: stream, PolicyRevision: p.Revision, PolicyEffectiveAfterSeq: p.EffectiveAfterSeq, Collections: p.Collections, ReplayFloor: func() *uint64 { v := uint64(0); return &v }(), CurrentSeq: w.NextSeq() - 1, ReplayEnabled: true, Coverage: "unknown", Gaps: []subscribe.SelectedGap{}, PolicyHistory: policies}, nil
 	}), SelectedAttribution: manager, SelectedStreamID: stream}))
 	t.Cleanup(func() { f.server.Close(); _ = w.Close(); _ = st.Close() })
 	return f

@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/history"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/archivekeys"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/control"
@@ -59,6 +60,7 @@ type Runtime struct {
 	BackfillJobs *jobs.Manager
 	jobProcessor jobs.Processor
 	// hypercerts: Runtime-owned durable policy is shared by every acquisition writer.
+	History          *history.Store
 	CollectionPolicy *selection.Manager
 	opts             Options
 
@@ -241,6 +243,13 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		return fail(err)
 	}
 	rt.metaStore = metaStore
+	// hypercerts: History is a managed selected-stream capability, not part of the upstream-compatible runtime.
+	if opts.CollectionSelection {
+		rt.History, err = history.Open(metaStore)
+		if err != nil {
+			return fail(fmt.Errorf("serve: open selected history journal: %w", err))
+		}
+	}
 	// hypercerts: Restore policy before any archive producer starts.
 	var selectedStreamID string
 	var eventAttribution *attribution.Manager
@@ -445,6 +454,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	orch, err := orchestrator.New(orchestrator.Config{
 		// hypercerts: A single policy owner spans bootstrap, live, retries and restart.
 		CollectionPolicy:           rt.CollectionPolicy,
+		History:                    rt.History,
 		BackfillJobs:               rt.BackfillJobs,
 		Attribution:                eventAttribution,
 		AttributionDomain:          "selected-stream",
@@ -462,14 +472,24 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 			gate := policygate.New(rt.CollectionPolicy, w, "selected-stream")
 			if err := gate.Adopt(ctx, "selected-stream", func(boundary *uint64) error {
 				current := rt.CollectionPolicy.Current()
-				return eventAttribution.EnsureInitialPolicyHistory(attribution.Policy{
+				if rt.History == nil {
+					return fmt.Errorf("selected history journal unavailable")
+				}
+				if err := eventAttribution.EnsureInitialPolicyHistory(attribution.Policy{
 					Revision: current.Revision, Collections: current.Collections,
-				}, boundary)
+				}, boundary); err != nil {
+					return err
+				}
+				if _, err := rt.History.EnsurePolicy(history.Policy{Revision: current.Revision, Collections: current.Collections}, time.Now().UTC().UnixNano()); err != nil {
+					return err
+				}
+				return nil
 			}); err != nil {
 				return nil, fmt.Errorf("initialize selected-stream policy history: %w", err)
 			}
 			if rt.BackfillJobs != nil {
 				rt.BackfillJobs.BindPolicyAdoption(gate, eventAttribution, "selected-stream")
+				rt.BackfillJobs.BindJournal(rt.History)
 			}
 			return gate, nil
 		},
@@ -674,45 +694,30 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 			if writer == nil || rt.CollectionPolicy == nil || eventAttribution == nil {
 				return subscribe.SelectedConfig{}, errors.New("selected stream not ready")
 			}
-			history, err := eventAttribution.ReadPolicyHistory()
+			journalTip, err := rt.History.Tip()
 			if err != nil {
 				return subscribe.SelectedConfig{}, err
 			}
-			policy := rt.CollectionPolicy.Current()
-			readLog := writer.ReadLog()
-			durable := readLog.DurableSeq()
-			tip := uint64(0)
-			if durable > 0 {
-				tip = durable - 1
+			activation, err := rt.History.Activation()
+			if err != nil {
+				return subscribe.SelectedConfig{}, err
 			}
-			var replayFloor *uint64
-			if opts.CursorLookback > 0 {
-				floor := uint64(0)
-				floor, _ = mft.LookbackFloor(opts.CursorLookback)
-				// The active segment and hot readable log may contain
-				// committed events newer than the last sealed manifest
-				// entry. Never advertise durable-next as a replay floor:
-				// it would exclude those events while they remain replayable.
-				if _, ok := mft.SegmentForSeq(floor); !ok {
-					if durable == 0 {
-						floor = 0
-					} else if floor >= durable {
-						floor = durable - 1
-					}
-				}
-				replayFloor = &floor
+			journalPolicy, ok, err := rt.History.ReadPolicyState()
+			if err != nil {
+				return subscribe.SelectedConfig{}, err
 			}
-			var effectiveAfter *uint64
-			if history, err := eventAttribution.ReadPolicyHistory(); err == nil {
-				for _, historical := range history {
-					if historical.Revision == policy.Revision && historical.EffectiveAfterSeq != nil {
-						boundary := *historical.EffectiveAfterSeq
-						effectiveAfter = &boundary
-						break
-					}
-				}
+			if !ok {
+				return subscribe.SelectedConfig{}, errors.New("selected journal policy unavailable")
 			}
-			return subscribe.SelectedConfig{StreamID: selectedStreamID, PolicyRevision: policy.Revision, PolicyEffectiveAfterSeq: effectiveAfter, Collections: policy.Collections, EffectiveAfterSeq: effectiveAfter, ReplayFloor: replayFloor, CurrentSeq: tip, ReplayEnabled: opts.CursorLookback > 0, HistoryMode: "materialized", Coverage: "unknown", Gaps: subscribe.PolicyGaps(history)}, nil
+			floor := activation.JournalStart
+			from := activation.JournalStart
+			gaps := make([]subscribe.SelectedGap, 0, len(journalPolicy.Intervals))
+			gaps = selectedPolicyGaps(journalPolicy, journalTip)
+			adoptions, err := rt.History.ReadPolicyAdoptions()
+			if err != nil {
+				return subscribe.SelectedConfig{}, err
+			}
+			return subscribe.SelectedConfig{StreamID: rt.History.StreamID(), PolicyRevision: journalPolicy.Policy.Revision, PolicyEffectiveAfterSeq: &journalPolicy.AdoptedAtJournalSequence, Collections: journalPolicy.Policy.Collections, EffectiveAfterSeq: &journalPolicy.AdoptedAtJournalSequence, ReplayFloor: &floor, OriginalHistoryFromSeq: &from, CurrentSeq: journalTip, ReplayEnabled: true, HistoryMode: "original-events", Coverage: "unknown", Gaps: gaps, PolicyTransitions: journalPolicy.Transitions, PolicyHistory: journalPolicy.History, PolicyAdoptions: adoptions, Retention: activation.Retention, Activation: activation}, nil
 		})
 	}
 	// HandlerDeps.WriterRef is read at request time via writerPtr.Load();
@@ -744,6 +749,8 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		V2:                  true,
 		SelectedConfig:      selectedProvider,
 		SelectedAttribution: eventAttribution,
+		SelectedHistory:     rt.History,
+		SelectedJournalMode: opts.CollectionSelection,
 		SelectedPolicy:      rt.CollectionPolicy,
 		SelectedStreamID:    selectedStreamID,
 	}))

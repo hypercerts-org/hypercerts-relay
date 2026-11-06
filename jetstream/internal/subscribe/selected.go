@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/bluesky-social/jetstream/api/jetstream"
+	"github.com/bluesky-social/jetstream/internal/history"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos/api/comatproto"
@@ -37,6 +38,11 @@ type SelectedConfig struct {
 	OriginalHistoryFromSeq  *uint64
 	Coverage                string
 	Gaps                    []SelectedGap
+	PolicyTransitions       []history.PolicyTransition
+	PolicyHistory           []history.Policy
+	PolicyAdoptions         []history.PolicyAdoption
+	Retention               string
+	Activation              history.Activation
 }
 type SelectedGap struct {
 	FromSeq    *uint64 `json:"fromSeq"`
@@ -95,76 +101,70 @@ type SelectedEventMetadata struct {
 	Boundary               *attribution.Boundary  `json:"reconciliationBoundary,omitempty"`
 	ReconciliationRequired bool                   `json:"reconciliationRequired,omitempty"`
 	Scope                  *SelectedSyncScope     `json:"scope,omitempty"`
+	ProjectionDisposition  history.Disposition    `json:"projectionDisposition,omitempty"`
+	ProjectionBoundary     *uint64                `json:"projectionBoundary,omitempty"`
 }
-
 type SelectedSyncScope struct {
 	DID         string   `json:"did"`
 	Collections []string `json:"collections"`
 }
 
-// PolicyGaps derives exact intervals during which a collection was excluded.
-// A removal takes effect after its boundary; a later re-addition closes the
-// interval inclusively at that policy's boundary. A nil ThroughSeq is open.
-func PolicyGaps(history []attribution.Policy) []SelectedGap {
+func PolicyGaps(policies []attribution.Policy) []SelectedGap {
 	type openGap struct{ from uint64 }
 	open := make(map[string]openGap)
 	var gaps []SelectedGap
-	for i, policy := range history {
+	for i, policy := range policies {
 		if i == 0 {
 			continue
 		}
-		prior := make(map[string]bool, len(history[i-1].Collections))
-		for _, collection := range history[i-1].Collections {
-			prior[collection] = true
-		}
+		prior := make(map[string]bool, len(policies[i-1].Collections))
 		current := make(map[string]bool, len(policy.Collections))
-		for _, collection := range policy.Collections {
-			current[collection] = true
+		for _, c := range policies[i-1].Collections {
+			prior[c] = true
+		}
+		for _, c := range policy.Collections {
+			current[c] = true
 		}
 		boundary := uint64(0)
 		if policy.EffectiveAfterSeq != nil {
 			boundary = *policy.EffectiveAfterSeq
 		}
-		for collection := range prior {
-			if !current[collection] {
-				open[collection] = openGap{from: boundary + 1}
+		for c := range prior {
+			if !current[c] {
+				open[c] = openGap{boundary + 1}
 			}
 		}
-		for collection := range current {
-			if !prior[collection] {
-				if gap, ok := open[collection]; ok {
-					name := collection
-					from, through := gap.from, boundary
+		for c := range current {
+			if !prior[c] {
+				if g, ok := open[c]; ok {
+					name, from, through := c, g.from, boundary
 					gaps = append(gaps, SelectedGap{FromSeq: &from, ThroughSeq: &through, Reason: "policy-disabled", Collection: &name})
-					delete(open, collection)
+					delete(open, c)
 				}
 			}
 		}
 	}
-	for collection, gap := range open {
-		name, from := collection, gap.from
+	for c, g := range open {
+		name, from := c, g.from
 		gaps = append(gaps, SelectedGap{FromSeq: &from, Reason: "policy-disabled", Collection: &name})
 	}
 	sort.Slice(gaps, func(i, j int) bool { return *gaps[i].FromSeq < *gaps[j].FromSeq })
 	return gaps
 }
-
 func SelectedMetadata(event attribution.Event) SelectedEventMetadata {
-	metadata := SelectedEventMetadata{StreamID: event.StreamID, PolicyRev: event.PolicyRev, Provenance: event.Provenance}
+	m := SelectedEventMetadata{StreamID: event.StreamID, PolicyRev: event.PolicyRev, Provenance: event.Provenance}
 	if event.Boundary.Seq != nil || event.Boundary.SnapshotID != nil {
-		boundary := event.Boundary
-		metadata.Boundary = &boundary
+		b := event.Boundary
+		m.Boundary = &b
 	}
-	return metadata
+	return m
 }
-
 func selectedSyncMetadata(event attribution.Event, did string, policy attribution.Policy) SelectedEventMetadata {
-	metadata := SelectedMetadata(event)
-	metadata.ReconciliationRequired = true
-	metadata.Scope = &SelectedSyncScope{DID: did, Collections: append([]string(nil), policy.Collections...)}
-	return metadata
+	m := SelectedMetadata(event)
+	m.ReconciliationRequired = true
+	m.Scope = &SelectedSyncScope{DID: did, Collections: append([]string(nil), policy.Collections...)}
+	return m
 }
-
 func EncodeV2Selected(evt *segment.Event, metadata SelectedEventMetadata) ([]byte, error) {
 	if evt.Kind == segment.KindSync {
 		return encodeV2SelectedSync(evt, metadata)
@@ -188,14 +188,9 @@ func encodeV2SelectedSync(evt *segment.Event, metadata SelectedEventMetadata) ([
 	if metadata.StreamID == "" || !metadata.ReconciliationRequired || metadata.Scope == nil {
 		return nil, fmt.Errorf("selected stream: incomplete sync scope")
 	}
-	if metadata.Provenance != attribution.ProvenanceLive && metadata.Provenance != attribution.ProvenanceSnapshot && metadata.Provenance != attribution.ProvenanceReconciliation && metadata.Provenance != attribution.ProvenanceLegacyUnknown {
-		return nil, fmt.Errorf("selected stream: invalid provenance %q", metadata.Provenance)
-	}
 	if metadata.PolicyRev != nil && *metadata.PolicyRev > math.MaxInt64 {
 		return nil, fmt.Errorf("selected stream: policy revision out of range")
 	}
-	// Rebuild the typed sync payload from approved lifecycle fields. The CAR
-	// in evt.Payload is intentionally never decoded or serialized here.
 	syncEvent := comatproto.SyncSubscribeRepos_Sync{DID: evt.DID, Rev: evt.Rev, Time: wireTime(evt.WitnessedAt), Blocks: []byte{}}
 	msg := jetstream.JetstreamSubscribeEvents_Message{JetstreamSubscribeEvents_Sync: gt.SomeRef(jetstream.JetstreamSubscribeEvents_Sync{Seq: int64(evt.Seq), DID: evt.DID, Time: wireTime(evt.WitnessedAt), Sync: syncEvent})}
 	base := append([]byte(nil), messageFramePrefix...)
@@ -204,10 +199,8 @@ func encodeV2SelectedSync(evt *segment.Event, metadata SelectedEventMetadata) ([
 	if err != nil {
 		return nil, fmt.Errorf("selected stream: encode sync: %w", err)
 	}
-	base = append(base, messageFrameSuffix...)
-	return addHypercerts(base, metadata)
+	return addHypercerts(append(base, messageFrameSuffix...), metadata)
 }
-
 func EncodeV2SelectedInfo(name, message string, metadata any) ([]byte, error) {
 	base, err := EncodeV2Info(name, message)
 	if err != nil {
