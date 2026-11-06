@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 
+	"github.com/bluesky-social/jetstream/internal/history"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/policygate"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
@@ -70,12 +71,16 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 		}
 		c, err := live.Open(live.Config{
 			// hypercerts: Bootstrap and restart share the same persisted collection policy.
-			CollectionPolicy:     o.cfg.CollectionPolicy,
-			ReconcileSnapshot:    o.ReconcileSnapshot,
-			PolicyGate:           o.currentPolicyGate(),
-			Attribution:          o.cfg.Attribution,
-			AttributionDomain:    o.cfg.AttributionDomain,
-			AttributionStreamID:  o.cfg.AttributionStreamID,
+			CollectionPolicy:        o.cfg.CollectionPolicy,
+			ReconcileSnapshot:       o.ReconcileSnapshot,
+			PolicyGate:              o.currentPolicyGate(),
+			Attribution:             o.cfg.Attribution,
+			AttributionDomain:       o.cfg.AttributionDomain,
+			AttributionStreamID:     o.cfg.AttributionStreamID,
+			History:                 o.cfg.History,
+			HistoryProjectionTarget: history.TargetMain,
+			HistoryCapture:          steadyHistoryCapture(o),
+
 			InitializePolicyGate: initializePolicyGate,
 			DataDir:              o.cfg.DataDir,
 			SegmentsDir:          segmentsDir,

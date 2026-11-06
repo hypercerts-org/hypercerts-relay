@@ -84,6 +84,13 @@ func (h *SegmentHandler) HandleRepo(ctx context.Context, did atmos.DID, r *repo.
 		boundary := h.writer.NextSeq()
 		id := string(did) + "/" + commit.Rev
 		metadata := &ingest.AttributionMetadata{StreamID: h.streamID, Policy: fullPolicy, Provenance: attribution.ProvenanceSnapshot, Boundary: attribution.Boundary{Seq: &boundary, SnapshotID: &id}}
+		if h.writer.HistoryEnabled() {
+			rows, err := h.collectSelectedRows(ctx, did, r, commit, policy.Collections, segment.KindCreate)
+			if err != nil {
+				return err
+			}
+			return h.writer.ReconcileSnapshot(ctx, ingest.Snapshot{DID: string(did), Rev: commit.Rev, Collections: append([]string(nil), policy.Collections...), Records: rows, AppendMetadata: metadata})
+		}
 		return h.handleRepo(ctx, did, r, commit, segment.KindCreate, false, metadata)
 	})
 }

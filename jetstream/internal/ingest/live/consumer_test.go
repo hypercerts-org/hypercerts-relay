@@ -17,8 +17,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/history"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/policygate"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/obs"
+	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/internal/tombstone"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/coder/websocket"
@@ -44,6 +49,15 @@ import (
 // a WebSocket and writes a scripted sequence of CBOR frames with
 // {op:1, t:"<type>"} headers, exactly the wire format atmos's
 // decoder consumes.
+type lifecycleOrderingStub struct{}
+
+func (lifecycleOrderingStub) AppliedLifecycleSequences(context.Context, string) (int64, int64, error) {
+	return 0, 0, nil
+}
+func (lifecycleOrderingStub) AppliedLifecycleJournalSequence(context.Context, string, segment.Kind) (uint64, error) {
+	return 0, nil
+}
+
 type fakeFirehose struct {
 	t               *testing.T
 	frames          [][]byte     // pre-encoded frames to send
@@ -160,6 +174,99 @@ func TestProcessBatch_UnknownEventDoesNotAdvanceCursor(t *testing.T) {
 	}))
 	require.Equal(t, int64(100), c.LastUpstreamSeq(),
 		"unknown trailing event must not advance the cursor past it")
+}
+
+func TestProcessBatch_CapturesOriginalHistoryBeforeStaleResyncSuppression(t *testing.T) {
+	storePath := t.TempDir()
+	st, err := store.Open(storePath, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+	streamID, domain := "original-history-test", "original-history-test"
+	attr, err := attribution.Open(st, streamID, domain)
+	require.NoError(t, err)
+	policy, err := selection.Open(st, []string{"app.bsky.feed.post"})
+	require.NoError(t, err)
+	initial := attribution.Policy{Revision: 1, Collections: []string{"app.bsky.feed.post"}}
+	require.NoError(t, attr.EnsureInitialPolicyHistory(initial, nil))
+	gate := policygate.New(policy, nil, domain)
+	journal, err := history.Open(st)
+	require.NoError(t, err)
+	var forwarded atomic.Int64
+	c, err := Open(Config{
+		SegmentsDir: filepath.Join(t.TempDir(), "segments"), Store: st, SeqKey: SteadySeqKey, CursorKey: CursorKey,
+		RelayURL: "https://example.invalid", Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Verifier: newTestVerifier(t),
+		Attribution: attr, AttributionDomain: domain, AttributionStreamID: streamID, CollectionPolicy: policy, PolicyGate: gate,
+		History: journal, HistoryProjectionTarget: history.TargetMain, HistoryCapture: &OriginalCapture{Journal: journal, Domain: domain, Epoch: "test-epoch"},
+		LifecycleOrdering: lifecycleOrderingStub{}, LifecycleJournalBoundary: func(context.Context, string, segment.Kind) (uint64, error) { return 0, nil },
+		OnEvent: func(*segment.Event) { forwarded.Add(1) },
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, c.Close()) })
+
+	did := "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
+	older, _ := buildCommit(t, did, "3l3qo2vutsw2a", struct{ Coll, Rkey string }{"app.bsky.feed.post", "old"})
+	_, payloads := buildCommit(t, did, "3l3qo2vutsw2b", struct{ Coll, Rkey string }{"app.bsky.feed.post", "new"})
+	require.NotEmpty(t, payloads)
+	boundary := ingest.Snapshot{DID: did, Rev: "3l3qo2vutsw2b", Collections: []string{"app.bsky.feed.post"}, AppendMetadata: &ingest.AttributionMetadata{StreamID: streamID, Policy: initial, Provenance: attribution.ProvenanceSnapshot}}
+	require.NoError(t, c.writer.ReconcileSnapshot(t.Context(), boundary))
+	_, err = journal.Append(history.Append{Source: history.Source{Domain: domain, Epoch: "test-epoch", Cursor: 10, Operation: 0, Path: "snapshot/app.bsky.feed.post", ContentHash: history.OriginalHash([]byte("snapshot"))}, Kind: "snapshot", DID: did, Collection: "app.bsky.feed.post", Revision: "3l3qo2vutsw2b", Original: []byte("snapshot"), InputEvent: segment.Event{Kind: segment.KindCreateResync, DID: did, Collection: "app.bsky.feed.post", Rkey: "new", Rev: "3l3qo2vutsw2b", Payload: payloads[0]}, Policy: history.Policy{Revision: 1, Collections: []string{"app.bsky.feed.post"}}, Provenance: string(attribution.ProvenanceSnapshot), Disposition: history.HistoricalOnly, Attribution: history.Attribution{StreamID: streamID, Provenance: string(attribution.ProvenanceSnapshot), Policy: history.EffectivePolicy{Revision: 1, Collections: []string{"app.bsky.feed.post"}}, Boundary: history.AttributionBoundary{Seq: new(uint64), SnapshotID: new("test-snapshot")}}})
+	require.NoError(t, err)
+	newer, _ := buildCommit(t, did, "3l3qo2vutsw2c", struct{ Coll, Rkey string }{"app.bsky.feed.post", "newer"})
+	require.NoError(t, c.processBatch(t.Context(), []streaming.Event{{Seq: 11, Commit: newer.Commit}}))
+	require.NoError(t, c.processBatch(t.Context(), []streaming.Event{{Seq: 10, Commit: older.Commit}}))
+	require.EqualValues(t, 2, c.writer.ReadLog().DurableSeq(), "the history-only snapshot boundary is not a segment row")
+	page, err := journal.Read(0, 0, 10)
+	require.NoError(t, err)
+	require.Len(t, page.Events, 4)
+	require.Equal(t, "snapshot-boundary", page.Events[0].Source.Path)
+	require.Equal(t, "new", page.Events[1].InputEvent.Rkey)
+	require.Equal(t, "newer", page.Events[2].InputEvent.Rkey)
+	require.Equal(t, "old", page.Events[3].InputEvent.Rkey)
+	require.Equal(t, history.HistoricalOnly, page.Events[1].Disposition)
+	require.Equal(t, history.Apply, page.Events[2].Disposition)
+	require.Equal(t, history.HistoricalOnly, page.Events[3].Disposition)
+	require.EqualValues(t, 1, forwarded.Load())
+	require.Equal(t, int64(11), c.LastUpstreamSeq())
+	require.Equal(t, int64(11), c.cursorValueForDurableBatch().(int64))
+	require.NoError(t, c.writer.DrainDurability(t.Context()))
+	require.NoError(t, c.Close())
+	cursor, err := LoadUpstreamCursor(st, CursorKey)
+	require.NoError(t, err)
+	require.Equal(t, int64(11), cursor)
+	require.NoError(t, st.Close())
+	st, err = store.Open(storePath, nil)
+	require.NoError(t, err)
+	cursor, err = LoadUpstreamCursor(st, CursorKey)
+	require.NoError(t, err)
+	require.Equal(t, int64(11), cursor)
+}
+func TestProcessBatch_CapturesRejectedSourceGapsBeforeAdvancing(t *testing.T) {
+	st := newTestStore(t)
+	streamID, domain := "rejected-history-test", "rejected-history-test"
+	attr, err := attribution.Open(st, streamID, domain)
+	require.NoError(t, err)
+	policy, err := selection.Open(st, []string{"app.bsky.feed.post"})
+	require.NoError(t, err)
+	initial := attribution.Policy{Revision: 1, Collections: []string{"app.bsky.feed.post"}}
+	require.NoError(t, attr.EnsureInitialPolicyHistory(initial, nil))
+	gate := policygate.New(policy, nil, domain)
+	journal, err := history.Open(st)
+	require.NoError(t, err)
+	c, err := Open(Config{SegmentsDir: filepath.Join(t.TempDir(), "segments"), Store: st, SeqKey: SteadySeqKey, CursorKey: CursorKey, RelayURL: "https://example.invalid", Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Verifier: newTestVerifier(t), Attribution: attr, AttributionDomain: domain, AttributionStreamID: streamID, CollectionPolicy: policy, PolicyGate: gate, History: journal, HistoryProjectionTarget: history.TargetMain, HistoryCapture: &OriginalCapture{Journal: journal, Domain: domain, Epoch: "test-epoch"}, LifecycleOrdering: lifecycleOrderingStub{}, LifecycleJournalBoundary: func(context.Context, string, segment.Kind) (uint64, error) { return 0, nil }})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, c.Close()) })
+	batch := []streaming.Event{{Seq: 10}, {Seq: 11, Info: &comatproto.SyncSubscribeRepos_Info{}}}
+	require.NoError(t, c.processBatch(t.Context(), batch))
+	page, err := journal.Read(0, 10, 10)
+	require.NoError(t, err)
+	require.Len(t, page.Events, 2)
+	require.Equal(t, "source-gap", page.Events[0].Kind)
+	require.JSONEq(t, `{"version":1,"reason":"unknown-kind","cursor":10}`, string(page.Events[0].Original))
+	require.Empty(t, page.Events[0].InputEvent.Payload)
+	require.Equal(t, "source-info", page.Events[1].Kind)
+	require.Equal(t, history.Noop, page.Events[1].Disposition)
+	require.Empty(t, page.Events[1].InputEvent.Payload)
+	require.Equal(t, int64(0), c.durableHistoryCursor.Load())
 }
 
 func TestProcessBatch_ObservesOrdinaryUpstreamEvents(t *testing.T) {

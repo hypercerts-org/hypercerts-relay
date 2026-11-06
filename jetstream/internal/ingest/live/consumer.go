@@ -44,21 +44,17 @@ type Consumer struct {
 	logger *slog.Logger
 	writer *ingest.Writer
 
-	// lastUpstream is the highest upstream seq witnessed by
-	// processBatch. Under atmos's default Parallelism>1 the seqs in
-	// a single batch are in completion order, not seq order, so we
-	// take a max here. This is the value persisted to relay/cursor
-	// when no streaming.Client is attached yet (test paths that
-	// drive processBatch directly, or the very first Close before
-	// the client has yielded any events).
-	//
-	// In Run, we install `client` below and prefer client.Cursor()
-	// over lastUpstream, because atmos's watermark is the only
-	// safe-to-persist value: it stays behind any seq still being
-	// verified in another worker. Persisting lastUpstream from
-	// inside Run would risk skipping a still-in-flight smaller seq
-	// across a crash, dropping it from the archive permanently.
-	lastUpstream atomic.Int64
+	// lastUpstream tracks delivered events for reporting only. Durable
+	// cursor selection uses the ordered atmos watermark and, in history
+	// mode, the source-capture completion fence.
+	lastUpstream         atomic.Int64
+	batchCursor          atomic.Int64
+	durableHistoryCursor atomic.Int64
+	historyMu            sync.Mutex
+	historyPending       map[int64]struct{}
+	historyCompleted     map[int64]struct{}
+	watermarkReader      func() int64
+	cursorSample         atomic.Int64
 
 	// client is set once at the top of Run after NewClient succeeds, and
 	// consulted by the durable-batch cursor sampler to read the
@@ -128,14 +124,36 @@ func Open(cfg Config) (*Consumer, error) {
 
 	w, err := ingest.Open(ingest.Config{
 		// hypercerts: The writer also gates sync replacements and retry materializations.
-		CollectionPolicy:      cfg.CollectionPolicy,
-		ReconcileSnapshot:     cfg.ReconcileSnapshot,
-		Attribution:           cfg.Attribution,
-		AttributionDomain:     cfg.AttributionDomain,
-		SegmentsDir:           cfg.SegmentsDir,
-		FS:                    cfg.FS,
-		DataDir:               cfg.DataDir,
-		Store:                 cfg.Store,
+		CollectionPolicy:        cfg.CollectionPolicy,
+		ReconcileSnapshot:       cfg.ReconcileSnapshot,
+		Attribution:             cfg.Attribution,
+		AttributionDomain:       cfg.AttributionDomain,
+		SegmentsDir:             cfg.SegmentsDir,
+		FS:                      cfg.FS,
+		DataDir:                 cfg.DataDir,
+		Store:                   cfg.Store,
+		History:                 cfg.History,
+		HistoryProjectionTarget: cfg.HistoryProjectionTarget,
+		LifecycleOrdering: func(ctx context.Context, did string, kind segment.Kind) (int64, error) {
+			if cfg.LifecycleOrdering != nil {
+				identity, account, err := cfg.LifecycleOrdering.AppliedLifecycleSequences(ctx, did)
+				if err != nil {
+					return 0, err
+				}
+				if kind == segment.KindIdentity {
+					return identity, nil
+				}
+				return account, nil
+			}
+			return cfg.History.LatestAppliedLifecycleSourceSequence(did, kind, cfg.HistoryProjectionTarget)
+		},
+		LifecycleJournalBoundary: func(ctx context.Context, did string, kind segment.Kind) (uint64, error) {
+			if cfg.LifecycleOrdering != nil {
+				return cfg.LifecycleOrdering.AppliedLifecycleJournalSequence(ctx, did, kind)
+			}
+			_, sequence, err := cfg.History.LatestAppliedLifecycle(did, kind, cfg.HistoryProjectionTarget)
+			return sequence, err
+		},
 		SeqKey:                cfg.SeqKey,
 		MaxSegmentBytes:       cfg.MaxSegmentBytes,
 		MaxEventsPerBlock:     cfg.MaxEventsPerBlock,
@@ -347,12 +365,12 @@ func (c *Consumer) dropReplayedIdentityEvent(ctx context.Context, segEvts []segm
 	return true, nil
 }
 
-// cursorValue returns the safe-to-persist upstream cursor: atmos's
-// watermark when a streaming.Client is attached, falling back to
-// lastUpstream otherwise (tests + early shutdown before any events
-// flow). The watermark is always <= the highest seq we've buffered,
-// so persisting it can never skip a still-in-flight smaller seq.
+// cursorValue returns the ordered atmos watermark while a client is attached.
+// Without a client, direct processBatch callers use lastUpstream.
 func (c *Consumer) cursorValue() int64 {
+	if c.watermarkReader != nil {
+		return c.watermarkReader()
+	}
 	if cl := c.client.Load(); cl != nil {
 		return cl.Cursor()
 	}
@@ -360,6 +378,32 @@ func (c *Consumer) cursorValue() int64 {
 }
 
 func (c *Consumer) cursorValueForDurableBatch() any {
+	if c.cfg.HistoryCapture != nil {
+		watermark := c.cursorValue()
+		c.historyMu.Lock()
+		defer c.historyMu.Unlock()
+		safe := c.durableHistoryCursor.Load()
+		best := safe
+		for seq := range c.historyCompleted {
+			if seq <= watermark && seq > best {
+				blocked := false
+				for pending := range c.historyPending {
+					if pending <= seq {
+						blocked = true
+						break
+					}
+				}
+				if !blocked {
+					best = seq
+				}
+			}
+		}
+		c.cursorSample.Store(best)
+		return best
+	}
+	if cursor := c.batchCursor.Load(); cursor != 0 {
+		return cursor
+	}
 	return c.cursorValue()
 }
 
@@ -379,6 +423,10 @@ func (c *Consumer) LastUpstreamSeq() int64 {
 // covers events in a later, not-yet-durable prepared block.
 func (c *Consumer) onDurableBatch(ctx context.Context, b *pebble.Batch, _ uint64, _ bool, prepareValue any) (func(), func(error), error) {
 	cur, ok := prepareValue.(int64)
+	if c.cfg.HistoryCapture != nil {
+		cur = c.cursorSample.Load()
+		ok = true
+	}
 	if !ok {
 		return nil, nil, fmt.Errorf("livestream: durable batch cursor sample has type %T", prepareValue)
 	}
@@ -412,6 +460,17 @@ func (c *Consumer) onDurableBatch(ctx context.Context, b *pebble.Batch, _ uint64
 	return func() {
 		if c.cfg.SyncStateStore != nil {
 			c.cfg.SyncStateStore.CommitStaged()
+		}
+		if c.cfg.HistoryCapture != nil {
+			c.durableHistoryCursor.Store(cur)
+			c.historyMu.Lock()
+			for seq := range c.historyCompleted {
+				if seq <= cur {
+					delete(c.historyCompleted, seq)
+					delete(c.historyPending, seq)
+				}
+			}
+			c.historyMu.Unlock()
 		}
 		c.cfg.Metrics.setUpstreamCursor(cur)
 	}, nil, nil
@@ -625,9 +684,25 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 		witnessedAt := witnessed.UnixMicro()
 
 		for _, evt := range batch {
+			if c.cfg.HistoryCapture != nil && evt.Seq > 0 && evt.Resync == streaming.ResyncNone {
+				c.historyMu.Lock()
+				if c.historyPending == nil {
+					c.historyPending = make(map[int64]struct{})
+				}
+				c.historyPending[evt.Seq] = struct{}{}
+				delete(c.historyCompleted, evt.Seq)
+				c.historyMu.Unlock()
+			}
 			c.cfg.Metrics.incEventsReceived()
-
+			if c.cfg.HistoryCapture == nil {
+				c.batchCursor.Store(evt.Seq)
+			}
 			segEvts, err := ConvertEvent(evt, witnessedAt)
+			if errors.Is(err, ErrUnknownEventKind) && c.cfg.HistoryCapture == nil {
+				c.cfg.Metrics.incUnknownEvents()
+				c.logger.WarnContext(ctx, "unknown event kind", "seq", evt.Seq)
+				continue
+			}
 			dme, isDropped := errors.AsType[*DroppedOpsError](err)
 			ive, isInvalid := errors.AsType[*InvalidEventError](err)
 			switch {
@@ -651,9 +726,17 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 				// throughput; revisit if the unknown-event rate ever
 				// becomes non-trivial.
 				c.cfg.Metrics.incUnknownEvents()
-				c.logger.WarnContext(ctx, "unknown event kind",
-					"seq", evt.Seq,
-				)
+				c.logger.WarnContext(ctx, "unknown event kind", "seq", evt.Seq)
+				if c.cfg.HistoryCapture != nil {
+					if evt.Seq > 0 {
+						if err := c.persistSkippedSource(ctx, evt, "unknown-kind", witnessedAt); err != nil {
+							return err
+						}
+					}
+				}
+				if c.cfg.HistoryCapture == nil {
+					c.noteUpstreamSeq(evt.Seq)
+				}
 				continue
 			case isInvalid:
 				// Whole-event validation drop (e.g. non-TID rev): the
@@ -663,6 +746,11 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 				// must not be able to drive our log volume; the
 				// labeled counter is the operator signal.
 				c.cfg.DropMetrics.IncDropped(ingest.DropSourceLive, ive.Reason)
+				if c.cfg.HistoryCapture != nil && evt.Seq > 0 {
+					if err := c.persistSkippedSource(ctx, evt, "invalid-event", witnessedAt); err != nil {
+						return err
+					}
+				}
 				span := trace.SpanFromContext(ctx)
 				if span.IsRecording() {
 					span.AddEvent("dropped_invalid_event", trace.WithAttributes(
@@ -671,7 +759,9 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 						attribute.Int64("seq", evt.Seq),
 					))
 				}
-				c.noteUpstreamSeq(evt.Seq)
+				if c.cfg.HistoryCapture == nil {
+					c.noteUpstreamSeq(evt.Seq)
+				}
 				continue
 			case isDropped:
 				// Per-op drops: missing record blocks (partial-CAR
@@ -701,6 +791,11 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 						"did", dme.Dropped[0].DID,
 					)
 				}
+				if len(segEvts) == 0 && c.cfg.HistoryCapture != nil && evt.Seq > 0 {
+					if err := c.persistSkippedSource(ctx, evt, "dropped-all-operations", witnessedAt); err != nil {
+						return err
+					}
+				}
 			case err != nil:
 				c.cfg.Metrics.incDecodeErrors()
 				// Bad shape from upstream is invalid external input,
@@ -712,13 +807,27 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 					"seq", evt.Seq,
 					"err", err,
 				)
-				c.noteUpstreamSeq(evt.Seq)
+				if c.cfg.HistoryCapture != nil && evt.Seq > 0 {
+					if persistErr := c.persistSkippedSource(ctx, evt, "malformed-event", witnessedAt); persistErr != nil {
+						return persistErr
+					}
+				}
+				if c.cfg.HistoryCapture == nil {
+					c.noteUpstreamSeq(evt.Seq)
+				}
 				continue
 			}
 
-			if stale, err := c.dropStaleOrderedAsyncResync(ctx, evt, segEvts); err != nil {
+			if c.cfg.HistoryCapture != nil && evt.Info != nil && evt.Seq > 0 {
+				if err := c.completeNoopHistoryEvent(ctx, evt, witnessedAt); err != nil {
+					return err
+				}
+				c.noteUpstreamSeq(evt.Seq)
+				continue
+			}
+			if handled, err := c.processOriginalHistory(ctx, evt, witnessedAt, segEvts); err != nil {
 				return err
-			} else if stale {
+			} else if handled {
 				continue
 			}
 
@@ -726,18 +835,19 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 				c.cfg.OnUpstreamEventSeen(witnessed)
 			}
 
-			if replayed, err := c.dropReplayedAccountEvent(ctx, segEvts); err != nil {
-				return err
-			} else if replayed {
-				c.noteUpstreamSeq(evt.Seq)
-				continue
-			}
-
-			if replayed, err := c.dropReplayedIdentityEvent(ctx, segEvts); err != nil {
-				return err
-			} else if replayed {
-				c.noteUpstreamSeq(evt.Seq)
-				continue
+			if c.cfg.HistoryCapture == nil {
+				if replayed, err := c.dropReplayedAccountEvent(ctx, segEvts); err != nil {
+					return err
+				} else if replayed {
+					c.noteUpstreamSeq(evt.Seq)
+					continue
+				}
+				if replayed, err := c.dropReplayedIdentityEvent(ctx, segEvts); err != nil {
+					return err
+				} else if replayed {
+					c.noteUpstreamSeq(evt.Seq)
+					continue
+				}
 			}
 
 			// hypercerts: A full sync must preserve newer per-collection snapshots.
@@ -870,6 +980,17 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 			// cursor we persist comes from cursorValue() which
 			// prefers atmos's watermark.
 			c.noteUpstreamSeq(evt.Seq)
+			if c.cfg.HistoryCapture != nil && evt.Seq > 0 {
+				if err := c.writer.DrainDurability(ctx); err != nil {
+					c.failHistoryEvent(evt.Seq)
+					return err
+				}
+				c.completeHistoryEvent(evt.Seq)
+				if err := c.writer.DrainDurability(ctx); err != nil {
+					c.failHistoryEvent(evt.Seq)
+					return err
+				}
+			}
 		}
 
 		return nil
@@ -890,6 +1011,34 @@ func (c *Consumer) maybeTriggerCompaction() {
 			c.cfg.OnCompactionTriggerCoalesced()
 		}
 	}
+}
+
+func (c *Consumer) completeHistoryEvent(seq int64) {
+	if seq <= 0 {
+		return
+	}
+	c.historyMu.Lock()
+	defer c.historyMu.Unlock()
+	if seq > c.durableHistoryCursor.Load() {
+		delete(c.historyPending, seq)
+		if c.historyCompleted == nil {
+			c.historyCompleted = make(map[int64]struct{})
+		}
+		c.historyCompleted[seq] = struct{}{}
+	}
+}
+
+func (c *Consumer) failHistoryEvent(seq int64) {
+	if seq <= 0 {
+		return
+	}
+	c.historyMu.Lock()
+	defer c.historyMu.Unlock()
+	delete(c.historyCompleted, seq)
+	if c.historyPending == nil {
+		c.historyPending = make(map[int64]struct{})
+	}
+	c.historyPending[seq] = struct{}{}
 }
 
 func (c *Consumer) noteUpstreamSeq(seq int64) {

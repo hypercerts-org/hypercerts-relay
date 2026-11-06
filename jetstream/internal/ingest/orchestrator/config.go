@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/history"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/jobs"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/policygate"
@@ -51,6 +52,8 @@ type Config struct {
 	BackfillJobs               *jobs.Manager
 	Attribution                *attribution.Manager
 	AttributionDomain          string
+	History                    *history.Store
+	HistoryPolicyDomain        string
 	AttributionStreamID        string
 	BootstrapAttribution       *attribution.Manager
 	BootstrapAttributionDomain string

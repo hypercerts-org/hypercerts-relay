@@ -13,11 +13,13 @@
 package live
 
 import (
+	"encoding/json"
 	"fmt"
 	"slices"
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/segment"
+	"github.com/jcalabro/atmos/api/comatproto"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/streaming"
 )
@@ -35,6 +37,78 @@ import (
 // for the canonical handling.
 func policyAllows(collections []string, ev *segment.Event) bool {
 	return !ev.Kind.IsCommit() || slices.Contains(collections, ev.Collection)
+}
+
+type SourceOperation struct {
+	Event   segment.Event
+	Ordinal uint32
+	CBOR    []byte
+}
+
+// ConvertSourceEvent converts source operations into a deterministic selected-operation representation.
+// It is not a raw frame or signed proof: it contains only the selected operation and its record bytes.
+func ConvertSourceEvent(evt streaming.Event, witnessedAt int64, collections []string) ([]SourceOperation, error) {
+	synthetic := evt.Resync == streaming.ResyncAsync
+	if evt.Commit == nil && !synthetic {
+		return nil, fmt.Errorf("livestream: source operation conversion requires commit: %w", ErrUnknownEventKind)
+	}
+	commit := evt.Commit
+	if synthetic {
+		commit = &comatproto.SyncSubscribeRepos_Commit{Repo: evt.Sync.DID, Rev: evt.Sync.Rev}
+	}
+	if evt.Sync != nil {
+		commit.Repo, commit.Rev = evt.Sync.DID, evt.Sync.Rev
+	}
+	if err := validateRev(commit.Repo, commit.Rev); err != nil {
+		return nil, err
+	}
+	var out []SourceOperation
+	var dropped []DroppedOp
+	ordinal := uint32(0)
+	for op, err := range evt.Operations() {
+		current := ordinal
+		ordinal++
+		if err != nil {
+			return nil, fmt.Errorf("livestream: decode commit ops for did=%s: %w", commit.Repo, err)
+		}
+		if !synthetic && int(current) >= len(commit.Ops) {
+			return nil, fmt.Errorf("livestream: commit operation correspondence mismatch")
+		}
+		kind, err := actionKind(op.Action)
+		if err != nil {
+			return nil, fmt.Errorf("livestream: did=%s: %w", commit.Repo, err)
+		}
+		if d := validateOpPath(&op); d != nil {
+			dropped = append(dropped, *d)
+			continue
+		}
+		if collections != nil && !slices.Contains(collections, string(op.Collection)) {
+			continue
+		}
+		segEv := segment.Event{WitnessedAt: witnessedAt, UpstreamRelayCursor: evt.Seq, Kind: kind, DID: commit.Repo, Collection: string(op.Collection), Rkey: string(op.RKey), Rev: commit.Rev}
+		if kind != segment.KindDelete {
+			block := op.BlockData()
+			if block == nil {
+				dropped = append(dropped, DroppedOp{Reason: ingest.DropReasonMissingBlock, DID: commit.Repo, Collection: string(op.Collection), RKey: string(op.RKey), Action: string(op.Action), CID: op.CID.String()})
+				continue
+			}
+			segEv.Payload = append([]byte(nil), block...)
+		}
+		var cbor []byte
+		if synthetic {
+			cbor, err = json.Marshal(struct { Path, Action, Revision string }{string(op.Collection) + "/" + string(op.RKey), string(op.Action), string(op.Rev)})
+		} else {
+			cbor, err = commit.Ops[current].MarshalCBOR()
+		}
+		if err != nil {
+			return nil, fmt.Errorf("livestream: marshal source operation %d: %w", current, err)
+		}
+		out = append(out, SourceOperation{Event: segEv, Ordinal: current, CBOR: cbor})
+	}
+	if len(dropped) > 0 {
+		return out, &DroppedOpsError{Dropped: dropped}
+	}
+	return out, nil
 }
 
 func ConvertEvent(evt streaming.Event, witnessedAt int64) ([]segment.Event, error) {
@@ -317,6 +391,58 @@ func convertIdentity(evt streaming.Event, witnessedAt int64) ([]segment.Event, e
 		DID:                 evt.Identity.DID,
 		Payload:             payload,
 	}}, nil
+}
+
+func ConvertSyncSourceEvent(evt streaming.Event, witnessedAt int64, collections []string) ([]SourceOperation, error) {
+	if evt.Sync == nil {
+		return nil, fmt.Errorf("livestream: sync source conversion requires envelope: %w", ErrUnknownEventKind)
+	}
+	if err := validateRev(evt.Sync.DID, evt.Sync.Rev); err != nil {
+		return nil, err
+	}
+	var out []SourceOperation
+	var dropped []DroppedOp
+	ordinal := uint32(0)
+	for op, err := range evt.Operations() {
+		current := ordinal
+		ordinal++
+		if err != nil {
+			return nil, fmt.Errorf("livestream: decode sync operations: %w", err)
+		}
+		kind, err := actionKind(op.Action)
+		if err != nil {
+			return nil, err
+		}
+		if d := validateOp(&op); d != nil {
+			dropped = append(dropped, *d)
+			continue
+		}
+		if collections != nil && !slices.Contains(collections, string(op.Collection)) {
+			continue
+		}
+		event := segment.Event{WitnessedAt: witnessedAt, UpstreamRelayCursor: evt.Seq, Kind: kind, DID: string(op.Repo), Collection: string(op.Collection), Rkey: string(op.RKey), Rev: string(op.Rev)}
+		if kind != segment.KindDelete {
+			block := op.BlockData()
+			if block == nil {
+				dropped = append(dropped, DroppedOp{Reason: ingest.DropReasonMissingBlock, DID: string(op.Repo), Collection: string(op.Collection), RKey: string(op.RKey), Action: string(op.Action), CID: opCIDString(&op)})
+				continue
+			}
+			event.Payload = append([]byte(nil), block...)
+		}
+		cbor, err := json.Marshal(struct {
+			Path     string `json:"path"`
+			Action   string `json:"action"`
+			Revision string `json:"revision"`
+		}{string(op.Collection) + "/" + string(op.RKey), string(op.Action), string(op.Rev)})
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, SourceOperation{Event: event, Ordinal: current, CBOR: cbor})
+	}
+	if len(dropped) > 0 {
+		return out, &DroppedOpsError{Dropped: dropped}
+	}
+	return out, nil
 }
 
 func convertAccount(evt streaming.Event, witnessedAt int64) ([]segment.Event, error) {

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
+	"github.com/bluesky-social/jetstream/internal/history"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/policygate"
 	"github.com/bluesky-social/jetstream/internal/ingest"
@@ -106,6 +107,15 @@ func (o *Orchestrator) prepareMergeSource(ctx context.Context, liveSegmentsDir s
 	if err != nil || cleaned {
 		return cleaned, err
 	}
+	if o.cfg.History != nil && o.cfg.BootstrapAttribution != nil {
+		sourceWriter, err := ingest.Open(ingest.Config{SegmentsDir: liveSegmentsDir, DataDir: o.cfg.DataDir, FS: o.cfg.FS, Store: o.cfg.Store, SeqKey: live.BootstrapSeqKey, Logger: o.cfg.Logger, History: o.cfg.History, HistoryProjectionTarget: history.TargetBootstrapLive, Attribution: o.cfg.BootstrapAttribution, AttributionDomain: o.cfg.BootstrapAttributionDomain})
+		if err != nil {
+			return false, fmt.Errorf("orchestrator: merge: recover bootstrap history projection: %w", err)
+		}
+		if err := sourceWriter.Close(); err != nil {
+			return false, fmt.Errorf("orchestrator: merge: close recovered bootstrap writer: %w", err)
+		}
+	}
 	if o.cfg.BootstrapAttribution != nil {
 		if err := ingest.RecoverAttributions(ingest.Config{SegmentsDir: liveSegmentsDir, DataDir: o.cfg.DataDir, FS: o.cfg.FS, Store: o.cfg.Store}, o.cfg.BootstrapAttribution, o.cfg.BootstrapAttributionDomain); err != nil {
 			return false, fmt.Errorf("orchestrator: merge: recover source attribution: %w", err)
@@ -139,19 +149,21 @@ func (o *Orchestrator) mergeRestartAfterCleanup(ctx context.Context, liveSegment
 
 func (o *Orchestrator) openMergeDestination(segmentsDir string) (*ingest.Writer, error) {
 	return ingest.Open(ingest.Config{
-		CollectionPolicy:       o.cfg.CollectionPolicy,
-		Attribution:            o.cfg.Attribution,
-		AttributionDomain:      o.cfg.AttributionDomain,
-		SegmentsDir:            segmentsDir,
-		DataDir:                o.cfg.DataDir,
-		FS:                     o.cfg.FS,
-		Store:                  o.cfg.Store,
-		SeqKey:                 live.SteadySeqKey,
-		Logger:                 o.cfg.Logger,
-		Metrics:                o.cfg.IngestMetrics,
-		SegmentMetrics:         o.cfg.SegmentMetrics,
-		OnAfterSeal:            o.cfg.IngestOnAfterSeal,
-		SegmentIOFaultInjector: o.cfg.SegmentIOFaultInjector,
+		History:                 o.cfg.History,
+		HistoryProjectionTarget: history.TargetMain,
+		CollectionPolicy:        o.cfg.CollectionPolicy,
+		Attribution:             o.cfg.Attribution,
+		AttributionDomain:       o.cfg.AttributionDomain,
+		SegmentsDir:             segmentsDir,
+		DataDir:                 o.cfg.DataDir,
+		FS:                      o.cfg.FS,
+		Store:                   o.cfg.Store,
+		SeqKey:                  live.SteadySeqKey,
+		Logger:                  o.cfg.Logger,
+		Metrics:                 o.cfg.IngestMetrics,
+		SegmentMetrics:          o.cfg.SegmentMetrics,
+		OnAfterSeal:             o.cfg.IngestOnAfterSeal,
+		SegmentIOFaultInjector:  o.cfg.SegmentIOFaultInjector,
 	})
 }
 

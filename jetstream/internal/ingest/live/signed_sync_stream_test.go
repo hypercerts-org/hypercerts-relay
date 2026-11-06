@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	historypkg "github.com/bluesky-social/jetstream/internal/history"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/policygate"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
@@ -38,6 +39,14 @@ import (
 // independently; the worker-produced verified operations are then observed via
 // Consumer.Run and processBatch, not injected through private verifier state.
 func TestConsumerStreamsVerifiedSyncWithReplacementOps(t *testing.T) {
+	runVerifiedSyncWithReplacementOps(t, false)
+}
+
+func TestAsyncResyncHistory(t *testing.T) {
+	runVerifiedSyncWithReplacementOps(t, true)
+}
+
+func runVerifiedSyncWithReplacementOps(t *testing.T, historyMode bool) {
 	t.Parallel()
 	did := atmos.DID("did:plc:selectedverifiedsync")
 	key, err := crypto.GenerateP256()
@@ -125,6 +134,8 @@ func TestConsumerStreamsVerifiedSyncWithReplacementOps(t *testing.T) {
 	st := newTestStore(t)
 	streamID := "signed-sync-managed"
 	domain := "signed-sync-managed"
+	journal, err := historypkg.Open(st)
+	require.NoError(t, err)
 	history, err := attribution.Open(st, streamID, domain)
 	require.NoError(t, err)
 	policy, err := selection.Open(st, []string{"app.bsky.feed.post"})
@@ -133,22 +144,74 @@ func TestConsumerStreamsVerifiedSyncWithReplacementOps(t *testing.T) {
 	require.NoError(t, history.EnsureInitialPolicyHistory(initial, nil))
 	gate := policygate.New(policy, nil, domain)
 	var consumer *Consumer
-	consumer, err = Open(Config{SegmentsDir: filepath.Join(t.TempDir(), "segments"), Store: st, SeqKey: SteadySeqKey, CursorKey: CursorKey, RelayURL: server.URL, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Verifier: verifier, Attribution: history, AttributionDomain: domain, AttributionStreamID: streamID, CollectionPolicy: policy, PolicyGate: gate, ReadLogRetentionBytes: 1 << 20, ReconcileSnapshot: func(ctx context.Context, snapshot ingest.Snapshot) error {
+	config := Config{SegmentsDir: filepath.Join(t.TempDir(), "segments"), Store: st, SeqKey: SteadySeqKey, CursorKey: CursorKey, RelayURL: server.URL, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Verifier: verifier, Attribution: history, AttributionDomain: domain, AttributionStreamID: streamID, CollectionPolicy: policy, PolicyGate: gate, ReadLogRetentionBytes: 1 << 20, ReconcileSnapshot: func(ctx context.Context, snapshot ingest.Snapshot) error {
 		return consumer.writer.ReconcileSnapshot(ctx, snapshot)
-	}})
+	}}
+	if historyMode {
+		config.History = journal
+		config.HistoryProjectionTarget = historypkg.TargetMain
+		config.HistoryCapture = &OriginalCapture{Journal: journal, Domain: domain, Epoch: "signed-sync-epoch", Policy: func() selection.Policy { return policy.Current() }}
+	}
+	consumer, err = Open(config)
 	require.NoError(t, err)
 	defer consumer.Close()
 	_, convertedErr := ConvertEvent(event, time.Now().UnixMicro())
 	require.NoError(t, convertedErr)
-	// Seed stale selected state with durable full-history attribution, then
-	// feed the exact verified upstream Sync through the real reconciliation path.
+	// Seed stale selected state, then feed the exact verified upstream Sync through
+	// the real reconciliation path. History mode captures an admitted source event.
 	stale := segment.Event{Kind: segment.KindCreate, DID: string(did), Rev: "3mmoojp7vgo2e", Collection: "app.bsky.feed.post", Rkey: "stale", Payload: []byte(`{"text":"stale"}`)}
-	require.NoError(t, consumer.writer.AppendAttributed(ctx, &stale, ingest.AttributionMetadata{StreamID: streamID, Policy: initial, Provenance: attribution.ProvenanceLive}))
+	if historyMode {
+		staleBytes := []byte(`{"text":"stale"}`)
+		_, err = consumer.writer.CaptureAndProject(ctx, historypkg.Source{Domain: domain, Epoch: "signed-sync-epoch", Cursor: 41, Operation: 0, Path: "app.bsky.feed.post/stale", ContentHash: historypkg.OriginalHash(staleBytes)}, stale, staleBytes, historypkg.Policy{Revision: 1, Collections: initial.Collections}, string(attribution.ProvenanceLive), ingest.AttributionMetadata{StreamID: streamID, Policy: initial, Provenance: attribution.ProvenanceLive})
+		require.NoError(t, err)
+	} else {
+		err = consumer.writer.AppendAttributed(ctx, &stale, ingest.AttributionMetadata{StreamID: streamID, Policy: initial, Provenance: attribution.ProvenanceLive})
+		require.NoError(t, err)
+	}
 	require.NoError(t, consumer.writer.Flush(ctx))
-	localBoundarySeq := consumer.writer.NextSeq() - 1
+	if historyMode {
+		event.Resync = streaming.ResyncAsync
+	}
 	require.NoError(t, consumer.processBatch(ctx, []streaming.Event{event}))
 	require.NoError(t, consumer.writer.Flush(ctx))
 	require.Equal(t, int64(42), consumer.LastUpstreamSeq())
+	page, err := journal.Read(0, 0, 20)
+	require.NoError(t, err)
+	var original, synthetic, sourceMarker int
+	syntheticResync := event.Resync == streaming.ResyncAsync
+	for _, item := range page.Events {
+		if item.Source.Epoch == "signed-sync-epoch" {
+			if item.Source.Path == "$sync" {
+				require.EqualValues(t, 42, item.Source.Cursor)
+				sourceMarker = int(item.Sequence)
+				require.Equal(t, "live", item.Provenance)
+				require.True(t, item.InputEvent.Kind == segment.KindSync)
+				require.NotEmpty(t, item.InputEvent.Payload)
+				var storedSync comatproto.SyncSubscribeRepos_Sync
+				require.NoError(t, storedSync.UnmarshalCBOR(item.InputEvent.Payload))
+				require.Empty(t, storedSync.Blocks)
+			} else if item.Source.Cursor == 42 && item.Source.Path == "app.bsky.feed.post/fresh" {
+				original = int(item.Sequence)
+				require.True(t, item.InputEvent.Kind.IsMaterialization())
+				require.Equal(t, string(attribution.ProvenanceLive), item.Provenance)
+				require.Len(t, operations, 1)
+				require.Equal(t, operations[0].BlockData(), item.InputEvent.Payload)
+			}
+		} else if item.Provenance == string(attribution.ProvenanceReconciliation) {
+			synthetic = int(item.Sequence)
+			if syntheticResync && item.InputEvent.Kind.IsMaterialization() {
+				require.Equal(t, segment.KindCreateResync, item.InputEvent.Kind)
+				require.Equal(t, "fresh", item.InputEvent.Rkey)
+				require.NotEmpty(t, item.InputEvent.Payload)
+			}
+		}
+	}
+	if historyMode {
+		require.Zero(t, original, "async resync snapshot records are synthetic, not upstream originals")
+		require.Zero(t, sourceMarker)
+		require.NotZero(t, synthetic)
+	}
+
 	entries, _, ok, _ := consumer.writer.ReadLog().ReadFrom(1, 20)
 	require.True(t, ok)
 	require.GreaterOrEqual(t, len(entries), 3)
@@ -167,18 +230,27 @@ func TestConsumerStreamsVerifiedSyncWithReplacementOps(t *testing.T) {
 	}
 	require.NotZero(t, deleteIndex)
 	require.NotZero(t, materializationIndex)
-	require.NotZero(t, markerIndex)
-	require.Less(t, deleteIndex, markerIndex)
-	require.Less(t, materializationIndex, markerIndex)
-	boundarySeq := localBoundarySeq
-	for _, seq := range []int{deleteIndex, materializationIndex} {
-		entry := entries[seq-1]
-		metadata, readErr := history.Lookup(uint64(seq))
-		require.NoError(t, readErr)
-		require.Equal(t, entry.Event().Seq, metadata.Seq)
-		require.Equal(t, attribution.ProvenanceReconciliation, metadata.Provenance)
-		require.NotNil(t, metadata.Boundary.Seq)
-		require.Equal(t, uint64(boundarySeq+1), *metadata.Boundary.Seq)
+	if !historyMode {
+		require.NotZero(t, markerIndex)
+		require.Less(t, deleteIndex, markerIndex)
+		require.Less(t, materializationIndex, markerIndex)
+	}
+	if historyMode && !syntheticResync {
+		for _, seq := range []int{deleteIndex, materializationIndex} {
+			if syntheticResync && seq == deleteIndex {
+				continue
+			}
+			entry := entries[seq-1]
+			metadataSeq := uint64(seq)
+			metadata, readErr := history.Lookup(metadataSeq)
+			require.NoError(t, readErr)
+			require.Equal(t, entry.Event().Seq, metadata.Seq)
+			if uint64(seq) == uint64(synthetic) {
+				require.Equal(t, attribution.ProvenanceReconciliation, metadata.Provenance)
+				require.NotNil(t, metadata.Boundary.Seq)
+				require.Equal(t, uint64(3), *metadata.Boundary.Seq)
+			}
+		}
 	}
 	// Re-deliver the same verified repo state at a distinct upstream cursor;
 	// only the cursor and one sync marker may advance, never a fake replacement.
@@ -186,7 +258,11 @@ func TestConsumerStreamsVerifiedSyncWithReplacementOps(t *testing.T) {
 	event.Seq = 43
 	require.NoError(t, consumer.processBatch(ctx, []streaming.Event{event}))
 	require.NoError(t, consumer.writer.Flush(ctx))
-	require.Equal(t, beforeNoop+1, consumer.writer.NextSeq())
+	if historyMode {
+		require.Equal(t, beforeNoop, consumer.writer.NextSeq())
+	} else {
+		require.Equal(t, beforeNoop+1, consumer.writer.NextSeq())
+	}
 	require.Equal(t, int64(43), consumer.LastUpstreamSeq())
 	entries, _, ok, _ = consumer.writer.ReadLog().ReadFrom(1, 20)
 	require.True(t, ok)
@@ -196,6 +272,10 @@ func TestConsumerStreamsVerifiedSyncWithReplacementOps(t *testing.T) {
 			markers++
 		}
 	}
-	require.Equal(t, 2, markers)
+	if historyMode {
+		require.Equal(t, 0, markers)
+	} else {
+		require.Equal(t, 2, markers)
+	}
 	require.GreaterOrEqual(t, verifier.Stats().Resyncs, uint64(1))
 }

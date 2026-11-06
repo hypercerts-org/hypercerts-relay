@@ -165,14 +165,15 @@ func (r *mergeRunner) processSourceSegment(ctx context.Context, sf ingest.Segmen
 						return nil, fmt.Errorf("orchestrator: merge: lookup source policy: %w", err)
 					}
 					appendImported := func(destination ingest.AttributionMetadata) error {
+						originalSource := source
 						witnessedAt, indexedAt := ev.WitnessedAt, ev.IndexedAt
 						if destination.Boundary.Seq == nil || destination.Boundary.SnapshotID == nil {
 							boundary, id := r.dst.NextSeq(), "merge/reconciliation"
 							destination.Boundary = attribution.Boundary{Seq: &boundary, SnapshotID: &id}
 						}
 						ev.WitnessedAt = r.now().UnixMicro()
-						source.Source = &attribution.ImportedSource{WitnessedAt: witnessedAt, IndexedAt: indexedAt, SegmentFingerprint: attribution.FingerprintSegment(original)}
-						return r.dst.AppendImported(ctx, ev, source, r.sourceDomain, destination, sourcePolicy...)
+											originalSource.Source = &attribution.ImportedSource{WitnessedAt: witnessedAt, IndexedAt: indexedAt, SegmentFingerprint: attribution.FingerprintSegment(original)}
+						return r.dst.AppendImported(ctx, ev, originalSource, r.sourceDomain, destination, sourcePolicy...)
 					}
 					var appendErr error
 					if r.collectionPolicy == nil {

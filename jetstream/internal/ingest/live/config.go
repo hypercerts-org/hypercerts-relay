@@ -3,6 +3,7 @@ package live
 import (
 	"context"
 	"fmt"
+	"github.com/bluesky-social/jetstream/internal/history"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/policygate"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
@@ -44,6 +45,13 @@ const (
 type Config struct {
 	// hypercerts: Filter record materialization with the shared durable policy.
 	CollectionPolicy *selection.Manager
+	// Optional immutable capture of accepted upstream originals. Disabled by default.
+	HistoryCapture           *OriginalCapture
+	History                  *history.Store
+	HistoryProjectionTarget  history.ProjectionTarget
+	LifecycleJournalBoundary func(context.Context, string, segment.Kind) (uint64, error)
+	// LifecycleOrdering reads durable lifecycle sequence ratchets for historical classification.
+	LifecycleOrdering LifecycleOrdering
 	// hypercerts: Scope syncs after direct-PDS snapshot boundaries.
 	ReconcileSnapshot    func(context.Context, ingest.Snapshot) error
 	PolicyGate           *policygate.Gate
@@ -216,6 +224,15 @@ func (c *Config) validate() error {
 	}
 	if c.Logger == nil {
 		return fmt.Errorf("%w: Logger is required", ErrInvalidConfig)
+	}
+	if c.HistoryCapture != nil && c.History == nil {
+		return fmt.Errorf("%w: history capture requires history store", ErrInvalidConfig)
+	}
+	if c.HistoryCapture != nil && (c.HistoryProjectionTarget == "" || c.HistoryCapture.Domain == "" || c.HistoryCapture.Epoch == "" || c.HistoryCapture.Journal != c.History) {
+		return fmt.Errorf("%w: history capture target domain or journal mismatch", ErrInvalidConfig)
+	}
+	if c.HistoryCapture != nil && c.Attribution == nil {
+		return fmt.Errorf("%w: history capture requires managed attribution", ErrInvalidConfig)
 	}
 	if c.Attribution != nil && (c.AttributionDomain == "" || c.AttributionStreamID == "" || (c.PolicyGate == nil && c.InitializePolicyGate == nil) || c.CollectionPolicy == nil) {
 		return fmt.Errorf("%w: managed attribution requires domain, stream ID, policy, and gate", ErrInvalidConfig)
