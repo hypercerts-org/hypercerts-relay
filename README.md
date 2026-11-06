@@ -2,15 +2,17 @@
 
 # Hypercerts Relay
 
-Hypercerts Relay is the controlled AT Protocol event source for Hypercerts services. It contains the Relay and Rainbow Indigo closure plus a separately maintained, copied Jetstream v2 runtime module.
+Hypercerts Relay is the controlled AT Protocol event source for Hypercerts services. It contains the Relay, Rainbow, and collection directory Indigo closure plus a separately maintained, copied Jetstream v2 runtime module.
 
 The Relay connects to approved PDS instances and publishes a raw `com.atproto.sync.subscribeRepos` stream. The relay does not select Hypercerts records or provide a consumer archive. The `jetstream/` module receives this stream, retains only the enabled record collections, and performs durable collection backfills. Rainbow is a deferred raw-stream fan-out option, not part of the initial launch topology.
+
+The optional collection directory consumes the raw Relay stream and crawls configured PDSs to serve `com.atproto.sync.listReposByCollection`. It helps consumers discover candidate repositories for a collection; it does not replace Jetstream's archive or backfills. Results may be stale or incomplete, so consumers must verify records. See the [collection directory operator guide](cmd/collectiondir/README.md) for bootstrap, security, and recovery limitations.
 
 The administration control plane manages PDS sources, record collections, rate limits, backfills, and relay telemetry. Its Svelte web interface is not the inherited Relay admin UI: the existing Basic-auth interface under `cmd/relay/relay-admin-ui` remains upstream code and is not the control plane.
 
 ## Status
 
-This repository contains the maintained Relay and Rainbow base, durable Relay processing and rejections, a managed PDS registry, a copied Jetstream v2 runtime, collection-selection policy, scoped backfill jobs, and the administration control plane. Their remaining acceptance, recovery, upgrade and deployment gates are tracked in the implementation plans; their presence is not deployment qualification.
+This repository contains the maintained Relay and Rainbow base, an optional collection directory, durable Relay processing and rejections, a managed PDS registry, a copied Jetstream v2 runtime, collection-selection policy, scoped backfill jobs, and the administration control plane. Their remaining acceptance, recovery, upgrade and deployment gates are tracked in the implementation plans; their presence is not deployment qualification.
 
 ## Event durability
 
@@ -19,6 +21,16 @@ Relay saves output before advancing account revisions or source cursors. Process
 An unavailable identity remains retryable. Permanent verification failures create a durable rejection containing source metadata and a fixed reason, without record contents. Signature failures require identity refresh before rejection. Startup adds the rejection table; back up Relay state before upgrading. Stored output can repeat after a failed revision update, so downstream consumers must tolerate duplicates.
 
 An ambiguous disk write or sync failure stops further persistence until restart. Startup discards only an incomplete trailing write before resuming; complete retained events remain replayable. Per-event file synchronization replaces buffered acknowledgments and can reduce throughput.
+
+## Relay-to-Jetstream source handoff
+
+The Relay's durable source lifecycle queue sends handoffs only when both
+`JETSTREAM_CONTROL_URL` and `JETSTREAM_CONTROL_TOKEN` are configured on the Relay
+process. If both are absent, delivery stays disabled and queued rows are retained.
+If exactly one is absent, Relay fails startup.
+This outbound token is separate from Jetstream's inbound `JETSTREAM_CONTROL_TOKEN_FILE`
+for its private control API; configure that on Jetstream as documented in
+[`jetstream/README.md`](jetstream/README.md).
 
 ## Managed PDS sources
 
@@ -37,7 +49,13 @@ Pages default to 100 entries and cap at 1,000. State and validation changes requ
 
 Startup creates `source` and `account_source_observation` tables. Existing host rows become admitted sources; existing bans become disabled sources. Subsequent migrations preserve managed policy. Back up the database and event store together before upgrading. Restart reconnects only enabled, validated, non-banned sources from their saved cursors, including quiet or previously unavailable sources.
 
-Public `requestCrawl` can reconnect only an already admitted, enabled source; it cannot add, validate, or re-enable a source. The existing authenticated block/unblock handlers delegate to the same durable policy. They remain legacy administration, not the planned control plane.
+Public `requestCrawl` can register a new source and synchronously validates it before returning success; validation failures return a generic client error while retaining the durable failed validation result. A failed public check is not retried for one minute; concurrent checks for the same source return HTTP 409, and a state/revision change during validation rejects the stale result without persisting it. Repeating the request for a source that already passed validation is idempotent and does not repeat the host check. Public requests cannot re-enable a disabled source, and pending/new admission observes durable desired state. Authenticated `requestCrawl` uses the same synchronous validation behavior. Both paths require HTTPS PDS origins in normal builds, even for administrators or when `AllowInsecureHosts` is set, and retain domain-ban protections; sibling relays are notified only after local admission succeeds. The existing authenticated block/unblock handlers delegate to the same durable policy. They remain legacy administration, not the planned control plane.
+
+### Operator transport policy and migration
+
+For Relay operators, PDS sources must be reachable at public HTTPS origins with valid TLS certificates. Bare hostnames select HTTPS; HTTP and WS origins are rejected before new host/source rows are saved. Source checks cannot follow HTTPS redirects to HTTP. The public-network-only dialer remains in force for source sockets and host checks.
+
+Operators already using public HTTPS PDS sources need no action. If you previously used plaintext or private-network sources, make those PDS instances available through public HTTPS before upgrading. Persisted `NoSSL` hosts fail closed during validation and restart; Relay does not rewrite their stored scheme or cursor. Inspect and explicitly migrate legacy source state through your approved state-migration procedure before restarting acquisition. Back up the database and event store first. Remove `--allow-insecure-hosts` or `RELAY_ALLOW_INSECURE_HOSTS=true`: startup now rejects that obsolete option rather than silently ignoring it.
 
 DID migration never admits or connects the resolved target automatically. Each observed source remains separately recorded while current resolution is refreshed. An explicitly admitted target remains incomplete until a separately owned Jetstream v2 recovery job reaches its durable boundary. This Relay adapter cannot claim complete coverage or reconstruct deleted historical state. Account quota exclusions use `host-account-limit`; they are distinct from stream throughput limits.
 
@@ -47,10 +65,13 @@ DID migration never admits or connects the resolved target automatically. Each o
 | --- | --- |
 | `cmd/relay` | Indigo Relay base for accepting PDS subscriptions and emitting the raw repository event stream. |
 | `cmd/rainbow` | Indigo raw-stream fan-out proxy for reducing direct Relay connections. |
+| `cmd/collectiondir` | Optional directory for discovering candidate repository DIDs by collection; see the [operator guide](cmd/collectiondir/README.md) for limitations and exposure. |
 | `jetstream/` | Copied Jetstream v2 runtime module for archive, replay, live subscriptions, and Hypercerts-owned collection/backfill work. See [`jetstream/README.md`](jetstream/README.md) for provenance and operations. |
-| `atproto`, `api`, `events`, `models`, `splitter`, `util`, `xrpc`, and `lex/util` | The dependency closure required to build and test Relay and Rainbow. |
+| `atproto`, `api`, `events`, `models`, `splitter`, `util`, `xrpc`, and `lex/util` | The dependency closure required to build and test the Indigo services. |
 
 ## Development
+
+Local plaintext PDS fixtures are limited to localhost through the existing injected test dialer; the production CLI exposes no such injection. Disposable acceptance builds retain their separate two-part gate: `-tags acceptance` **and** `RELAY_ACCEPTANCE_PRIVATE_HOSTS=true`. Neither the build tag alone nor the environment variable in a normal build permits insecure PDS traffic. Never use acceptance builds or opt-ins for production.
 
 For branch rulesets on `main`, `dev` (staging), and `production`, require these
 GitHub Actions status checks:
@@ -80,13 +101,14 @@ cd hypercerts-relay
 ./scripts/verify.sh
 ```
 
-The verification script runs focused tests for Relay and Rainbow, static checks, and builds both binaries. One Relay test is inconsistent across environments at the tracked Indigo baseline: `TestClaimDueAccountLimitAlertsRepeatsAfterInterval` fails in the local verification environment but passed the published GitHub Actions run. The script skips only that local failure. CI runs the test separately as a non-blocking signal while the difference is investigated.
+The verification script runs focused tests, static checks, and builds for Relay, Rainbow, and collection directory. One Relay test is inconsistent across environments at the tracked Indigo baseline: `TestClaimDueAccountLimitAlertsRepeatsAfterInterval` fails in the local verification environment but passed the published GitHub Actions run. The script skips only that local failure. CI runs the test separately as a non-blocking signal while the difference is investigated.
 
 Build a service locally with:
 
 ```bash
 go build ./cmd/relay
 go build ./cmd/rainbow
+go build ./cmd/collectiondir
 (cd jetstream && go build ./cmd/jetstream)
 ```
 

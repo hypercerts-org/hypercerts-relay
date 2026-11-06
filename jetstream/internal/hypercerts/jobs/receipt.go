@@ -94,7 +94,7 @@ func (s RelayReceiptSender) post(ctx context.Context, endpoint string, value any
 	request.Header.Set("Content-Type", "application/json")
 	client := s.Client
 	if client == nil {
-		client = &http.Client{Timeout: 10 * time.Second}
+		client = &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	}
 	return client.Do(request)
 }

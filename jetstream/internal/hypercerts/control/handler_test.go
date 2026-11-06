@@ -52,6 +52,21 @@ func request(h http.Handler, method, path, body, token string) *httptest.Respons
 	h.ServeHTTP(w, r)
 	return w
 }
+func TestRevisionedSourceRemovalContract(t *testing.T) {
+	h, manager := setup(t)
+	const pds = "https://control-fence.example"
+
+	removed := request(h, "DELETE", "/sources", `{"pds":"`+pds+`","sourceRevision":8}`, testToken)
+	require.Equal(t, http.StatusNoContent, removed.Code, removed.Body.String())
+	stale := request(h, "POST", "/sources", `{"pds":"`+pds+`","sourceRevision":7}`, testToken)
+	require.Equal(t, http.StatusConflict, stale.Code)
+	equal := request(h, "POST", "/sources", `{"pds":"`+pds+`","sourceRevision":8}`, testToken)
+	require.Equal(t, http.StatusConflict, equal.Code)
+	newer := request(h, "POST", "/sources", `{"pds":"`+pds+`","sourceRevision":9}`, testToken)
+	require.Equal(t, http.StatusAccepted, newer.Code, newer.Body.String())
+	require.True(t, manager.Sources()[pds])
+}
+
 func TestPrivateAuthenticationAndInputValidation(t *testing.T) {
 	h, m := setup(t)
 	for _, path := range []string{"/policy", "/sources", "/jobs", "/snapshot-rejections", "/coverage", "/jobs/unknown", "/jobs/unknown/cancel", "/jobs/unknown/retry"} {

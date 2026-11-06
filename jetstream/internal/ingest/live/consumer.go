@@ -9,15 +9,21 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"iter"
 	"log/slog"
 	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/policygate"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/obs"
 	"github.com/bluesky-social/jetstream/internal/store"
+	"github.com/bluesky-social/jetstream/internal/tombstone"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/cockroachdb/pebble"
 	"github.com/jcalabro/atmos"
@@ -57,6 +63,10 @@ type Consumer struct {
 	// across a crash, dropping it from the archive permanently.
 	lastUpstream atomic.Int64
 
+	// processedUpstream is the highest upstream seq whose source event was
+	// fully processed under selection. The persisted cursor never exceeds it.
+	processedUpstream atomic.Int64
+
 	// client is set once at the top of Run after NewClient succeeds, and
 	// consulted by the durable-batch cursor sampler to read the
 	// watermark-correct cursor. nil before Run starts, after a Run failure
@@ -81,6 +91,10 @@ func Open(cfg Config) (*Consumer, error) {
 		logger: cfg.Logger.With(slog.String("component", "livestream/consumer")),
 	}
 
+	if cfg.Attribution != nil && cfg.PolicyGate == nil && cfg.InitializePolicyGate == nil {
+		return nil, fmt.Errorf("livestream: attribution requires policy gate")
+	}
+
 	// Tombstone observation runs as the writer's OnAppend hook —
 	// under the writer mutex, after seq assignment, before the block
 	// can flush or the segment seal — NOT after Append returns. The
@@ -97,32 +111,14 @@ func Open(cfg Config) (*Consumer, error) {
 	// where the row and cursor batch are durable but the ratchet is not
 	// — a restart redelivery would then re-archive the row as a
 	// permanent duplicate, the exact bug the guards exist to prevent.
-	var onAppend func(ev *segment.Event) error
-	if cfg.Tombstones != nil || cfg.SyncStateStore != nil {
-		ts := cfg.Tombstones
-		ss := cfg.SyncStateStore
-		onAppend = func(ev *segment.Event) error {
-			if ts != nil {
-				if err := ts.Observe(ev); err != nil {
-					return err
-				}
-			}
-			if ss != nil {
-				switch ev.Kind {
-				case segment.KindAccount:
-					ss.RecordAccountSeq(atmos.DID(ev.DID), ev.UpstreamRelayCursor)
-				case segment.KindIdentity:
-					ss.RecordIdentitySeq(atmos.DID(ev.DID), ev.UpstreamRelayCursor)
-				}
-			}
-			return nil
-		}
-	}
+	onAppend := liveAppendObserver(cfg)
 
 	w, err := ingest.Open(ingest.Config{
 		// hypercerts: The writer also gates sync replacements and retry materializations.
 		CollectionPolicy:      cfg.CollectionPolicy,
 		ReconcileSnapshot:     cfg.ReconcileSnapshot,
+		Attribution:           cfg.Attribution,
+		AttributionDomain:     cfg.AttributionDomain,
 		SegmentsDir:           cfg.SegmentsDir,
 		FS:                    cfg.FS,
 		DataDir:               cfg.DataDir,
@@ -151,6 +147,21 @@ func Open(cfg Config) (*Consumer, error) {
 		return nil, fmt.Errorf("livestream: open writer: %w", err)
 	}
 	c.writer = w
+	if c.cfg.ReconcileSnapshot == nil {
+		c.cfg.ReconcileSnapshot = w.ReconcileSnapshot
+	}
+	if cfg.InitializePolicyGate != nil {
+		gate, err := cfg.InitializePolicyGate(w)
+		if err != nil {
+			_ = w.Close()
+			return nil, fmt.Errorf("livestream: initialize policy gate: %w", err)
+		}
+		if gate == nil {
+			_ = w.Close()
+			return nil, fmt.Errorf("livestream: initialize policy gate: nil gate")
+		}
+		c.cfg.PolicyGate = gate
+	}
 
 	return c, nil
 }
@@ -332,6 +343,12 @@ func (c *Consumer) dropReplayedIdentityEvent(ctx context.Context, segEvts []segm
 // flow). The watermark is always <= the highest seq we've buffered,
 // so persisting it can never skip a still-in-flight smaller seq.
 func (c *Consumer) cursorValue() int64 {
+	// hypercerts: Selection-enabled consumption persists only the boundary
+	// of fully processed source events, so an upstream warning or gap can
+	// never be checkpointed past on a later restart.
+	if c.upstreamLossEnabled() {
+		return c.processedUpstream.Load()
+	}
 	if cl := c.client.Load(); cl != nil {
 		return cl.Cursor()
 	}
@@ -441,6 +458,19 @@ func (c *Consumer) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("livestream: load start cursor: %w", err)
 	}
+	loss, err := ReadUpstreamLoss(c.cfg.Store)
+	if err != nil {
+		return fmt.Errorf("livestream: read upstream loss marker: %w", err)
+	}
+	if loss != nil {
+		if c.cfg.OnUpstreamLoss != nil {
+			c.cfg.OnUpstreamLoss(*loss)
+		}
+		return fmt.Errorf("%w: %s recorded at %s safe cursor %d", ErrUpstreamLoss, loss.Reason, loss.CursorKey, loss.SafeCursor)
+	}
+	if c.upstreamLossEnabled() {
+		c.processedUpstream.Store(startCursor)
+	}
 
 	c.logger.InfoContext(ctx, "subscribing",
 		"url", wsURL,
@@ -463,6 +493,11 @@ func (c *Consumer) Run(ctx context.Context) error {
 				"delay", delay,
 			)
 		}),
+	}
+	// hypercerts: A selection-enabled archive needs parallel delivery to stay
+	// ordered with upstream notices, so a single scheduler worker is used.
+	if c.upstreamLossEnabled() {
+		opts.Parallelism = gt.Some(1)
 	}
 	if c.cfg.ReconnectBackoff != nil {
 		opts.Backoff = gt.Some(*c.cfg.ReconnectBackoff)
@@ -517,10 +552,24 @@ func (c *Consumer) Run(ctx context.Context) error {
 		}
 	}()
 
-	for batch, err := range client.Events(ctx) {
+	return c.consumeEvents(ctx, client.Events(ctx))
+}
+
+// consumeEvents drains one upstream event sequence. It is separate from Run so
+// tests can drive the exact same loop with a deterministic event source.
+func (c *Consumer) consumeEvents(ctx context.Context, events iter.Seq2[[]streaming.Event, error]) error {
+	for batch, err := range events {
 		if err != nil {
 			// Stream-level errors flow through here; atmos has
 			// already flushed the partial batch as nil + err.
+			// hypercerts: A selection-enabled archive must not log
+			// and continue past a known continuity loss.
+			if loss, lost, lossErr := c.upstreamLoss(err); lost {
+				if lossErr != nil {
+					return errors.Join(lossErr, fmt.Errorf("%w: %s safe cursor %d", ErrUpstreamLoss, loss.Reason, loss.SafeCursor))
+				}
+				return fmt.Errorf("%w: %s safe cursor %d", ErrUpstreamLoss, loss.Reason, loss.SafeCursor)
+			}
 			// Classify, log, and continue — the next iteration
 			// will either reconnect or yield the next batch.
 			c.noteStreamError(ctx, err)
@@ -531,7 +580,6 @@ func (c *Consumer) Run(ctx context.Context) error {
 			return perr
 		}
 	}
-
 	return context.Cause(ctx)
 }
 
@@ -605,6 +653,16 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 
 		for _, evt := range batch {
 			c.cfg.Metrics.incEventsReceived()
+			if c.upstreamLossEnabled() && evt.Info != nil && evt.Info.Name == "OutdatedCursor" {
+				loss := UpstreamLoss{Version: 1, Reason: "outdated_cursor", CursorKey: c.cfg.CursorKey, SafeCursor: c.processedUpstream.Load()}
+				if c.cfg.OnUpstreamLoss != nil {
+					c.cfg.OnUpstreamLoss(loss)
+				}
+				if err := RecordUpstreamLossOnce(c.cfg.Store, loss); err != nil {
+					return err
+				}
+				return fmt.Errorf("%w: %s safe cursor %d", ErrUpstreamLoss, loss.Reason, loss.SafeCursor)
+			}
 
 			segEvts, err := ConvertEvent(evt, witnessedAt)
 			dme, isDropped := errors.AsType[*DroppedOpsError](err)
@@ -721,9 +779,61 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 
 			// hypercerts: A full sync must preserve newer per-collection snapshots.
 			if len(segEvts) > 0 && segEvts[0].Kind == segment.KindSync {
-				handled, err := c.writer.ReconcileSync(ctx, segEvts[0].DID, segEvts[0].Rev, segEvts[1:])
-				if err != nil {
-					return err
+				handled := false
+				var reconcileErr error
+				if c.cfg.Attribution != nil {
+					if c.cfg.PolicyGate == nil || c.cfg.CollectionPolicy == nil {
+						return fmt.Errorf("livestream: managed admission gate unavailable: %w", attribution.ErrInvalid)
+					}
+					reconcileErr = c.cfg.PolicyGate.Admit(ctx, func(policy selection.Policy) error {
+						admittedCtx := policygate.WithAdmission(ctx, policy)
+						if c.cfg.ReconcileSnapshot == nil {
+							return fmt.Errorf("livestream: managed snapshot reconciler unavailable: %w", attribution.ErrInvalid)
+						}
+						fullPolicy, err := c.cfg.Attribution.LookupPolicy(policy.Revision)
+						if err != nil {
+							return fmt.Errorf("livestream: lookup policy history: %w", err)
+						}
+						metadata := ingest.AttributionMetadata{
+							StreamID: c.cfg.AttributionStreamID, Policy: fullPolicy,
+							Provenance: attribution.ProvenanceReconciliation,
+						}
+						handled, reconcileErr = c.writer.ReconcileSyncWithMetadata(admittedCtx, segEvts[0].DID, segEvts[0].Rev, segEvts[1:], policy.Collections, metadata)
+						if reconcileErr != nil {
+							return reconcileErr
+						}
+						scope := tombstone.SyncScope{Collections: policy.Collections, Paths: []string{}}
+						for _, row := range segEvts[1:] {
+							if row.Kind.IsMaterialization() && slices.Contains(policy.Collections, row.Collection) {
+								scope.Paths = append(scope.Paths, row.Collection+"/"+row.Rkey)
+							}
+						}
+						segEvts[0].Payload, err = tombstone.EncodeScopedSync(segEvts[0].Payload, scope)
+						if err != nil {
+							return err
+						}
+						return c.writer.AppendAttributed(admittedCtx, &segEvts[0], ingest.AttributionMetadata{
+							StreamID: c.cfg.AttributionStreamID, Policy: fullPolicy,
+							Provenance: attribution.ProvenanceLive,
+						})
+					})
+				} else {
+					handled, reconcileErr = c.writer.ReconcileSync(ctx, segEvts[0].DID, segEvts[0].Rev, segEvts[1:])
+				}
+				if errors.Is(reconcileErr, ingest.ErrAccountUnavailable) {
+					c.promoteSyncState(segEvts)
+					c.noteUpstreamSeq(evt.Seq)
+					continue
+				}
+				if reconcileErr != nil {
+					return reconcileErr
+				}
+				if c.cfg.Attribution != nil {
+					// The sync marker was appended under the same policy admission
+					// as reconciliation, including successful empty/no-op results.
+					c.promoteSyncState(segEvts)
+					c.noteUpstreamSeq(evt.Seq)
+					continue
 				}
 				if handled {
 					c.promoteSyncState(segEvts)
@@ -758,8 +868,38 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 				}
 				// Append runs the tombstone Observe hook internally
 				// (ingest.Config.OnAppend) before any flush/seal.
-				if err := c.writer.Append(ctx, &segEvts[i]); err != nil {
-					return fmt.Errorf("livestream: append: %w", err)
+				appendEvent := func(policy selection.Policy) error {
+					if c.cfg.Attribution == nil {
+						return c.writer.Append(ctx, &segEvts[i])
+					}
+					if policy.Revision == 0 {
+						return fmt.Errorf("livestream: missing policy history: %w", attribution.ErrInvalid)
+					}
+					if !policyAllows(policy.Collections, &segEvts[i]) {
+						segEvts[i].Seq = 0
+						return nil
+					}
+					fullPolicy, err := c.cfg.Attribution.LookupPolicy(policy.Revision)
+					if err != nil {
+						return fmt.Errorf("livestream: lookup policy history: %w", err)
+					}
+					return c.writer.AppendAttributed(ctx, &segEvts[i], ingest.AttributionMetadata{
+						StreamID:   c.cfg.AttributionStreamID,
+						Policy:     fullPolicy,
+						Provenance: attribution.ProvenanceLive,
+					})
+				}
+				var appendErr error
+				if c.cfg.Attribution != nil {
+					if c.cfg.PolicyGate == nil || c.cfg.CollectionPolicy == nil {
+						return fmt.Errorf("livestream: managed admission gate unavailable: %w", attribution.ErrInvalid)
+					}
+					appendErr = c.cfg.PolicyGate.Admit(ctx, appendEvent)
+				} else {
+					appendErr = appendEvent(selection.Policy{})
+				}
+				if appendErr != nil {
+					return fmt.Errorf("livestream: append: %w", appendErr)
 				}
 				c.maybeTriggerCompaction()
 
@@ -779,6 +919,9 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 			// cursor we persist comes from cursorValue() which
 			// prefers atmos's watermark.
 			c.noteUpstreamSeq(evt.Seq)
+			if c.upstreamLossEnabled() && evt.Seq > c.processedUpstream.Load() {
+				c.processedUpstream.Store(evt.Seq)
+			}
 		}
 
 		return nil
@@ -801,6 +944,37 @@ func (c *Consumer) maybeTriggerCompaction() {
 	}
 }
 
+// upstreamLossEnabled reports whether this consumer writes the selected
+// archive. Both bootstrap-live and steady-state consumption carry a
+// collection policy; an embedded consumer without one keeps the upstream
+// best-effort stream behavior.
+func (c *Consumer) upstreamLossEnabled() bool {
+	return c.cfg.CollectionPolicy != nil
+}
+
+// upstreamLoss converts an upstream continuity event into a durable loss
+// marker for selection-enabled consumption. It reports false for notices and
+// errors that must keep the existing best-effort handling.
+// hypercerts: A known upstream discontinuity must stop selected ingestion
+// instead of being logged and skipped; see docs/contracts/selected-stream-v1.md.
+func (c *Consumer) upstreamLoss(err error) (UpstreamLoss, bool, error) {
+	if !c.upstreamLossEnabled() {
+		return UpstreamLoss{}, false, nil
+	}
+	loss := UpstreamLoss{Version: 1, CursorKey: c.cfg.CursorKey, SafeCursor: c.cursorValue()}
+	if gap, ok := errors.AsType[*streaming.GapError](err); ok {
+		loss.Reason = "sequence_gap"
+		loss.Expected = gap.Expected
+		loss.Got = gap.Got
+	} else {
+		return UpstreamLoss{}, false, nil
+	}
+	if c.cfg.OnUpstreamLoss != nil {
+		c.cfg.OnUpstreamLoss(loss)
+	}
+	return loss, true, RecordUpstreamLossOnce(c.cfg.Store, loss)
+}
+
 func (c *Consumer) noteUpstreamSeq(seq int64) {
 	if seq <= 0 {
 		return
@@ -819,4 +993,31 @@ func (c *Consumer) noteUpstreamSeq(seq int64) {
 // reference for cursor-replay handler wiring.
 func (c *Consumer) Writer() *ingest.Writer {
 	return c.writer
+}
+
+// PolicyGate returns the gate initialized with this consumer's writer.
+func (c *Consumer) PolicyGate() *policygate.Gate { return c.cfg.PolicyGate }
+
+func liveAppendObserver(cfg Config) func(*segment.Event) error {
+	if cfg.Tombstones == nil && cfg.SyncStateStore == nil {
+		return nil
+	}
+	ts := cfg.Tombstones
+	ss := cfg.SyncStateStore
+	return func(ev *segment.Event) error {
+		if ts != nil {
+			if err := ts.Observe(ev); err != nil {
+				return err
+			}
+		}
+		if ss != nil {
+			switch ev.Kind {
+			case segment.KindAccount:
+				ss.RecordAccountSeq(atmos.DID(ev.DID), ev.UpstreamRelayCursor)
+			case segment.KindIdentity:
+				ss.RecordIdentitySeq(atmos.DID(ev.DID), ev.UpstreamRelayCursor)
+			}
+		}
+		return nil
+	}
 }

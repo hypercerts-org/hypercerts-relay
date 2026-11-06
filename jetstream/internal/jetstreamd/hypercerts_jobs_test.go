@@ -2,6 +2,7 @@ package jetstreamd
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"math/rand/v2"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	client "github.com/bluesky-social/jetstream"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/jobs"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/simulator/fanout"
@@ -70,29 +72,68 @@ func TestHypercertsQuietPDSAndEnabledCollectionJobs(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() { done <- rt.Run(ctx) }()
-	defer func() { cancel(); <-done; require.NoError(t, rt.Close(context.Background())) }()
+	defer func() {
+		cancel()
+		select {
+		case runErr := <-done:
+			require.True(t, runErr == nil || errors.Is(runErr, context.Canceled), "runtime shutdown error: %v", runErr)
+		case <-time.After(10 * time.Second):
+			t.Fatal("runtime did not stop during cleanup")
+		}
+		require.NoError(t, rt.Close(context.Background()))
+	}()
 	ready, readyCancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer readyCancel()
 	require.NoError(t, rt.WaitSteadyState(ready))
 	writer := <-writers
 	waitJobs := func(count int) {
-		require.Eventually(t, func() bool {
+		deadline := time.NewTimer(10 * time.Second)
+		defer deadline.Stop()
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case runErr := <-done:
+				require.NoError(t, runErr, "runtime exited before jobs completed")
+			case <-deadline.C:
+				t.Fatalf("timed out waiting for %d jobs: %+v", count, rt.BackfillJobs.List())
+			case <-ticker.C:
+			}
 			all := rt.BackfillJobs.List()
 			if len(all) != count {
-				return false
+				continue
 			}
+			complete := true
 			for _, j := range all {
-				if j.State != jobs.Complete {
-					return false
+				if j.State == jobs.Failed || j.State == jobs.Canceled {
+					t.Fatalf("job ended in %s: %+v", j.State, j)
+				}
+				if j.State == jobs.Running || j.State == jobs.Pending {
+					complete = false
 				}
 			}
-			return true
-		}, 10*time.Second, 10*time.Millisecond, "jobs: %+v", rt.BackfillJobs.List())
+			if complete {
+				return
+			}
+		}
 	}
 	waitJobs(1)
+	selectedStreamID, err := attribution.OpenSelectedStreamIdentity(rt.metaStore)
+	require.NoError(t, err)
+	history, err := attribution.Open(rt.metaStore, selectedStreamID, "selected-stream")
+	require.NoError(t, err)
+	policyHistory, err := history.ReadPolicyHistory()
+	require.NoError(t, err)
+	require.Len(t, policyHistory, 1)
+	require.Equal(t, uint64(1), policyHistory[0].Revision)
+	require.Equal(t, []string{"app.bsky.feed.post"}, policyHistory[0].Collections)
 	_, err = rt.BackfillJobs.SetPolicy(t.Context(), 1, []string{"app.bsky.feed.post", "app.bsky.feed.like"})
 	require.NoError(t, err)
 	waitJobs(2)
+	policyHistory, err = history.ReadPolicyHistory()
+	require.NoError(t, err)
+	require.Len(t, policyHistory, 2)
+	require.Equal(t, uint64(2), policyHistory[1].Revision)
 	for _, job := range rt.BackfillJobs.List() {
 		require.Equal(t, pds.URL, job.PDS)
 		require.Equal(t, "current_state", job.Coverage)

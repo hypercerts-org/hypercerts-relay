@@ -3,6 +3,8 @@ package live
 import (
 	"context"
 	"fmt"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/policygate"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 	"log/slog"
 	"time"
@@ -43,7 +45,12 @@ type Config struct {
 	// hypercerts: Filter record materialization with the shared durable policy.
 	CollectionPolicy *selection.Manager
 	// hypercerts: Scope syncs after direct-PDS snapshot boundaries.
-	ReconcileSnapshot func(context.Context, ingest.Snapshot) error
+	ReconcileSnapshot    func(context.Context, ingest.Snapshot) error
+	PolicyGate           *policygate.Gate
+	Attribution          *attribution.Manager
+	AttributionDomain    string
+	AttributionStreamID  string
+	InitializePolicyGate func(*ingest.Writer) (*policygate.Gate, error)
 	// DataDir is the root jetstream data directory. Optional outside the
 	// production orchestrator; forwarded to ingest.Writer for fatal
 	// persistence error context.
@@ -176,6 +183,12 @@ type Config struct {
 	// the full contract. Optional.
 	OnAfterSeal func(idx uint64, path string) error
 
+	// OnUpstreamLoss is called synchronously, before the durable loss
+	// marker is written, when a selection-enabled consumer loses upstream
+	// continuity. It must fail readiness immediately and must not block
+	// on writer or compactor shutdown.
+	OnUpstreamLoss func(UpstreamLoss)
+
 	// now is overridable for tests; production uses time.Now.
 	now func() time.Time
 
@@ -209,6 +222,9 @@ func (c *Config) validate() error {
 	}
 	if c.Logger == nil {
 		return fmt.Errorf("%w: Logger is required", ErrInvalidConfig)
+	}
+	if c.Attribution != nil && (c.AttributionDomain == "" || c.AttributionStreamID == "" || (c.PolicyGate == nil && c.InitializePolicyGate == nil) || c.CollectionPolicy == nil) {
+		return fmt.Errorf("%w: managed attribution requires domain, stream ID, policy, and gate", ErrInvalidConfig)
 	}
 	if c.Verifier == nil {
 		return fmt.Errorf("%w: Verifier is required", ErrInvalidConfig)
