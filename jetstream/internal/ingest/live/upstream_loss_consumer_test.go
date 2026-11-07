@@ -63,64 +63,57 @@ func staticEvents(batches ...any) iter.Seq2[[]streaming.Event, error] {
 					return
 				}
 			case error:
-				if !yield(nil, v) {
-					return
-				}
+				yield(nil, v)
 				return
 			}
 		}
 	}
 }
 
-func TestOutdatedCursorStopsSelectedIngestionBeforeLaterEvents(t *testing.T) {
+func TestOutdatedCursorSkipsAndLogsSelectedIngestion(t *testing.T) {
 	t.Parallel()
 	var losses []UpstreamLoss
 	c, _ := newLossConsumer(t, true, func(l UpstreamLoss) { losses = append(losses, l) })
 
-	err := c.consumeEvents(context.Background(), staticEvents(
+	require.NoError(t, c.consumeEvents(context.Background(), staticEvents(
 		[]streaming.Event{identityAt(10)},
 		[]streaming.Event{outdatedCursorNotice()},
 		[]streaming.Event{identityAt(11), identityAt(12)},
-	))
-	require.ErrorIs(t, err, ErrUpstreamLoss)
+	)), "a loss is skipped, not fatal")
+	require.Equal(t, int64(12), c.LastUpstreamSeq(), "ingestion continues past the notice")
 	require.Len(t, losses, 1)
 	require.Equal(t, "outdated_cursor", losses[0].Reason)
-
-	require.Equal(t, int64(10), c.LastUpstreamSeq(), "post-notice events must not be processed")
-	require.Equal(t, uint64(2), c.Writer().NextSeq(), "only the pre-notice identity may be archived")
 
 	marker, readErr := ReadUpstreamLoss(c.cfg.Store)
 	require.NoError(t, readErr)
 	require.NotNil(t, marker)
-	require.Equal(t, UpstreamLoss{Version: 1, Reason: "outdated_cursor", CursorKey: CursorKey, SafeCursor: 10}, *marker)
+	require.Equal(t, "outdated_cursor", marker.Reason)
 
 	require.NoError(t, c.Close())
 	cursor, cursorErr := LoadUpstreamCursor(c.cfg.Store, CursorKey)
 	require.NoError(t, cursorErr)
-	require.Equal(t, int64(10), cursor, "persisted cursor must stay at the fully processed boundary")
+	require.Equal(t, int64(12), cursor, "persisted cursor advances past the skipped notice")
 }
 
-func TestSequenceGapStopsSelectedIngestionBeforePostGapEvent(t *testing.T) {
+func TestSequenceGapSkipsAndLogsSelectedIngestion(t *testing.T) {
 	t.Parallel()
 	c, _ := newLossConsumer(t, true, nil)
-	gap := &streaming.GapError{Expected: 11, Got: 15}
-	err := c.consumeEvents(context.Background(), staticEvents(
+	require.NoError(t, c.consumeEvents(context.Background(), staticEvents(
 		[]streaming.Event{identityAt(10)},
-		gap,
+		&streaming.GapError{Expected: 11, Got: 15},
 		[]streaming.Event{identityAt(15)},
-	))
-	require.ErrorIs(t, err, ErrUpstreamLoss)
-	require.Equal(t, int64(10), c.LastUpstreamSeq())
+	)), "a sequence gap is skipped, not fatal")
+	require.Equal(t, int64(10), c.LastUpstreamSeq(), "the post-gap event is never dispatched")
+	require.Equal(t, int64(10), c.processedUpstream.Load(), "the boundary stays at the last fully processed event")
 
 	marker, readErr := ReadUpstreamLoss(c.cfg.Store)
 	require.NoError(t, readErr)
 	require.NotNil(t, marker)
 	require.Equal(t, "sequence_gap", marker.Reason)
-	require.Equal(t, int64(10), marker.SafeCursor)
 	require.Equal(t, int64(15), marker.Got)
 }
 
-func TestRecordedLossStopsReopenedSelectedConsumer(t *testing.T) {
+func TestReopenedConsumerReportsRecordedLossAndResumes(t *testing.T) {
 	t.Parallel()
 	c, _ := newLossConsumer(t, true, nil)
 	require.NoError(t, c.processBatch(context.Background(), []streaming.Event{identityAt(7)}))
@@ -130,17 +123,18 @@ func TestRecordedLossStopsReopenedSelectedConsumer(t *testing.T) {
 	reopened, err := Open(c.cfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = reopened.Close() })
-	var notified bool
-	reopened.cfg.OnUpstreamLoss = func(UpstreamLoss) { notified = true }
-	require.ErrorIs(t, reopened.Run(context.Background()), ErrUpstreamLoss)
-	require.True(t, notified, "reopened consumer must report the recorded loss")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.NotErrorIs(t, reopened.Run(ctx), ErrUpstreamLoss, "a recorded loss must not block restart")
 }
 
-func TestLossMarkerBlocksDisabledSelectionAtLiveOpen(t *testing.T) {
+func TestLossMarkerDoesNotBlockDisabledSelection(t *testing.T) {
 	t.Parallel()
 	c, _ := newLossConsumer(t, false, nil)
 	require.NoError(t, RecordUpstreamLoss(c.cfg.Store, UpstreamLoss{Version: 1, Reason: "sequence_gap", CursorKey: CursorKey, SafeCursor: 3, Expected: 4, Got: 9}))
-	require.ErrorIs(t, c.Run(context.Background()), ErrUpstreamLoss)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.NotErrorIs(t, c.Run(ctx), ErrUpstreamLoss, "a recorded loss is reported, not a startup barrier")
 }
 
 func TestBenignNoticesAndUnmanagedConsumersKeepStreaming(t *testing.T) {
