@@ -1,6 +1,6 @@
 {
   "name": "hypercerts-relay",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "description": "Hypercerts-maintained Indigo Relay and Rainbow fork",
   "private": true,
   "packageManager": "npm@11.8.0",
