@@ -3,4 +3,4 @@
 package version
 
 // Version is the release version reported by Relay and Rainbow binaries.
-var Version = "0.9.0"
+var Version = "0.9.1"

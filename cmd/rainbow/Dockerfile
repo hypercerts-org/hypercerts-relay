@@ -1,4 +1,4 @@
-ARG VERSION=0.9.0
+ARG VERSION=0.9.1
 ARG COMMIT=unknown
 ARG DATE=unknown
 
