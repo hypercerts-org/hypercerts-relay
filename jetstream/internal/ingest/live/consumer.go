@@ -458,15 +458,18 @@ func (c *Consumer) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("livestream: load start cursor: %w", err)
 	}
-	loss, err := ReadUpstreamLoss(c.cfg.Store)
-	if err != nil {
-		return fmt.Errorf("livestream: read upstream loss marker: %w", err)
-	}
-	if loss != nil {
-		if c.cfg.OnUpstreamLoss != nil {
-			c.cfg.OnUpstreamLoss(*loss)
-		}
-		return fmt.Errorf("%w: %s recorded at %s safe cursor %d", ErrUpstreamLoss, loss.Reason, loss.CursorKey, loss.SafeCursor)
+	// hypercerts: A previously recorded upstream loss is evidence to report, not
+	// a startup barrier. Ingestion resumes and skips past the discontinuity.
+	if loss, lossErr := ReadUpstreamLoss(c.cfg.Store); lossErr != nil {
+		c.logger.WarnContext(ctx, "upstream loss marker unreadable", "err", lossErr)
+	} else if loss != nil {
+		c.logger.ErrorContext(ctx, "resuming past earlier upstream continuity loss",
+			"reason", loss.Reason,
+			"cursor_key", loss.CursorKey,
+			"safe_cursor", loss.SafeCursor,
+			"expected", loss.Expected,
+			"got", loss.Got,
+		)
 	}
 	if c.upstreamLossEnabled() {
 		c.processedUpstream.Store(startCursor)
@@ -493,11 +496,6 @@ func (c *Consumer) Run(ctx context.Context) error {
 				"delay", delay,
 			)
 		}),
-	}
-	// hypercerts: A selection-enabled archive needs parallel delivery to stay
-	// ordered with upstream notices, so a single scheduler worker is used.
-	if c.upstreamLossEnabled() {
-		opts.Parallelism = gt.Some(1)
 	}
 	if c.cfg.ReconnectBackoff != nil {
 		opts.Backoff = gt.Some(*c.cfg.ReconnectBackoff)
@@ -562,14 +560,11 @@ func (c *Consumer) consumeEvents(ctx context.Context, events iter.Seq2[[]streami
 		if err != nil {
 			// Stream-level errors flow through here; atmos has
 			// already flushed the partial batch as nil + err.
-			// hypercerts: A selection-enabled archive must not log
-			// and continue past a known continuity loss.
-			if loss, lost, lossErr := c.upstreamLoss(err); lost {
-				if lossErr != nil {
-					return errors.Join(lossErr, fmt.Errorf("%w: %s safe cursor %d", ErrUpstreamLoss, loss.Reason, loss.SafeCursor))
-				}
-				return fmt.Errorf("%w: %s safe cursor %d", ErrUpstreamLoss, loss.Reason, loss.SafeCursor)
-			}
+			// hypercerts: Selected ingestion skips a known upstream
+			// continuity loss rather than halting, so operators recover
+			// without a crash loop. The loss stays explicitly logged and
+			// recorded; it is never silently absorbed.
+			c.recordUpstreamLoss(ctx, err)
 			// Classify, log, and continue — the next iteration
 			// will either reconnect or yield the next batch.
 			c.noteStreamError(ctx, err)
@@ -654,14 +649,7 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 		for _, evt := range batch {
 			c.cfg.Metrics.incEventsReceived()
 			if c.upstreamLossEnabled() && evt.Info != nil && evt.Info.Name == "OutdatedCursor" {
-				loss := UpstreamLoss{Version: 1, Reason: "outdated_cursor", CursorKey: c.cfg.CursorKey, SafeCursor: c.processedUpstream.Load()}
-				if c.cfg.OnUpstreamLoss != nil {
-					c.cfg.OnUpstreamLoss(loss)
-				}
-				if err := RecordUpstreamLossOnce(c.cfg.Store, loss); err != nil {
-					return err
-				}
-				return fmt.Errorf("%w: %s safe cursor %d", ErrUpstreamLoss, loss.Reason, loss.SafeCursor)
+				c.recordUpstreamLoss(ctx, nil)
 			}
 
 			segEvts, err := ConvertEvent(evt, witnessedAt)
@@ -952,27 +940,47 @@ func (c *Consumer) upstreamLossEnabled() bool {
 	return c.cfg.CollectionPolicy != nil
 }
 
-// upstreamLoss converts an upstream continuity event into a durable loss
-// marker for selection-enabled consumption. It reports false for notices and
-// errors that must keep the existing best-effort handling.
-// hypercerts: A known upstream discontinuity must stop selected ingestion
-// instead of being logged and skipped; see docs/contracts/selected-stream-v1.md.
-func (c *Consumer) upstreamLoss(err error) (UpstreamLoss, bool, error) {
+// recordUpstreamLoss logs and durably records a known upstream continuity loss
+// for selection-enabled consumption, then lets ingestion continue past it. A
+// nil err means an OutdatedCursor info notice. Non-continuity errors are
+// ignored so noteStreamError keeps its existing classification.
+// hypercerts: Skipping is deliberate; the gap is surfaced in logs and in the
+// durable marker rather than halting the process.
+func (c *Consumer) recordUpstreamLoss(ctx context.Context, err error) {
 	if !c.upstreamLossEnabled() {
-		return UpstreamLoss{}, false, nil
+		return
 	}
-	loss := UpstreamLoss{Version: 1, CursorKey: c.cfg.CursorKey, SafeCursor: c.cursorValue()}
-	if gap, ok := errors.AsType[*streaming.GapError](err); ok {
+	loss := UpstreamLoss{Version: 1, CursorKey: c.cfg.CursorKey, SafeCursor: c.processedUpstream.Load()}
+	switch {
+	case err == nil:
+		loss.Reason = "outdated_cursor"
+	case isGapError(err):
+		gap := new(streaming.GapError)
+		_ = errors.As(err, &gap)
 		loss.Reason = "sequence_gap"
 		loss.Expected = gap.Expected
 		loss.Got = gap.Got
-	} else {
-		return UpstreamLoss{}, false, nil
+	default:
+		return
 	}
+	c.logger.ErrorContext(ctx, "skipping upstream continuity loss",
+		"reason", loss.Reason,
+		"cursor_key", loss.CursorKey,
+		"safe_cursor", loss.SafeCursor,
+		"expected", loss.Expected,
+		"got", loss.Got,
+	)
 	if c.cfg.OnUpstreamLoss != nil {
 		c.cfg.OnUpstreamLoss(loss)
 	}
-	return loss, true, RecordUpstreamLossOnce(c.cfg.Store, loss)
+	if recordErr := RecordUpstreamLossOnce(c.cfg.Store, loss); recordErr != nil {
+		// A record failure must not stop ingestion, but it must be visible.
+		c.logger.ErrorContext(ctx, "record upstream continuity loss", "err", recordErr)
+	}
+}
+
+func isGapError(err error) bool {
+	return errors.As(err, new(*streaming.GapError))
 }
 
 func (c *Consumer) noteUpstreamSeq(seq int64) {
