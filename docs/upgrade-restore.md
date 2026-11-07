@@ -59,32 +59,29 @@ revision, snapshot identifier, owner paths/volumes, and cutover result.
 
 ## Upstream continuity loss with selected collections
 
-When collection selection is enabled, a known upstream discontinuity stops
-Jetstream instead of logging and skipping it. This covers an upstream
-`OutdatedCursor` notice and a relay sequence gap. Jetstream stops consuming,
-refuses to advertise selected readiness, closes established selected
-subscriptions, and returns `/readyz` as unavailable while shutting down.
+When collection selection is enabled, a known upstream discontinuity is logged
+at error level and recorded durably in the Jetstream metadata store at
+`hypercerts/selected/upstream-loss/v1`, then skipped so ingestion continues.
+This covers an upstream `OutdatedCursor` notice and a relay sequence gap. It
+does not fail `/readyz`, close subscriptions, or block restart; the recorded loss
+is logged again on the next start so it stays visible until addressed.
 
-The first loss is recorded durably in the Jetstream metadata store at
-`hypercerts/selected/upstream-loss/v1` with the reason, the upstream cursor
-domain, and the last fully processed upstream cursor. A recorded loss also
-blocks startup, even when collection selection has since been disabled.
-Nothing clears the record automatically: the archive cannot reconstruct events
-that were never acquired, and a PDS current-state resync is not a substitute for
-the missing raw history. Never delete the record and resume the same archive.
+Nothing clears the record automatically, because the archive cannot reconstruct
+events that were never acquired and a PDS current-state resync is not a
+substitute for the missing raw history. Treat any recorded loss as a real
+history gap for that interval and decide explicitly how to proceed:
 
-Recover in one of two ways, and record which was chosen:
+1. When the upstream relay can still replay the required history, restore a
+   coherent snapshot of the archive and Jetstream metadata into a separate data
+   directory and reconcile from the truncated boundary.
+2. Otherwise accept the gap, provision a new data directory and stream identity
+   if a clean history claim is required, and retain the failed directory for
+   investigation.
 
-1. Restore a coherent pre-loss snapshot of the archive and Jetstream metadata
-   into a separate data directory, but only when the upstream relay can replay
-   the required history from the restored cursor. Stop the failed writers first.
-2. Provision a new data directory and a new selected stream identity, reconcile
-   consumers, and retain the failed directory for investigation.
-
-If writing the durable record fails, Jetstream still stops and keeps the
-upstream cursor at the last fully processed event, but it cannot guarantee that
-the loss evidence survives a crash. Report both errors and treat the directory
-as failed rather than continuing.
+Consumers must not infer completeness for the skipped interval, and operators
+should record which option was chosen. If writing the durable record fails,
+ingestion still continues but the evidence is only in the logs — preserve those
+logs, because the marker is the durable signal.
 
 ## Explicitly unqualified work
 
