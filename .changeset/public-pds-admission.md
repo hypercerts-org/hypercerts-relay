@@ -1,5 +1,5 @@
 ---
-'hypercerts-relay': minor
+'hypercerts-relay': patch
 ---
 
 Allow public `requestCrawl` to synchronously validate and admit a new PDS. Failed validation is retained with a one-minute retry cooldown. Concurrent or superseded admission checks return HTTP 409; clients should retry the request. The daily new-host limit applies when creating a source, returns HTTP 429 when reached, and does not apply to existing sources. Sibling relays are notified only after successful admission. Missing host checkers are reported as unavailable rather than as host-check failures.
