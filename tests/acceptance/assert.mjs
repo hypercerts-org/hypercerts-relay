@@ -158,10 +158,64 @@ async function assertCombined(events, bootstrap, snapshotPath, livePath) {
   }
 }
 
+// T20 proves that a verify-queue overflow becomes durable, repository-scoped
+// recovery rather than silent loss. The scenario reads the driver's evidence
+// file directly: a backlog that never overflowed proves nothing, so that case
+// fails explicitly instead of passing an empty assertion.
+async function assertT20Recovery(statePath) {
+  const state = await readJSON(statePath)
+  const backlog = state.backlog
+  if (!backlog || typeof backlog.did !== 'string' || !backlog.did.startsWith('did:')) {
+    fail('T20 has no recorded backlog DID; the driver did not run t20-backlog')
+  }
+  // The queue holds Parallelism*2 = 64 events per DID, so a smaller backlog
+  // cannot overflow it and the scenario would prove nothing.
+  if (!Number.isSafeInteger(backlog.count) || backlog.count < 65) {
+    fail(`T20 backlog was too small to exceed the per-DID verify queue: ${backlog.count}`)
+  }
+
+  const jobs = state.recoveryJobs
+  if (!Array.isArray(jobs) || jobs.length === 0) {
+    fail(`T20 booked no repository_recovery job for ${backlog.did}; the replayed backlog was silently lost`)
+  }
+  const scoped = jobs.filter((item) => Number(item.recoveryDidCount ?? 0) > 0)
+  if (scoped.length === 0) {
+    fail(`T20 booked recovery jobs but none carried a DID scope: ${JSON.stringify(jobs)}`)
+  }
+  // One PDS-wide backfill would re-download every repository. Exactly the
+  // requested DIDs must be in scope instead.
+  for (const item of jobs) {
+    if (item.reason !== undefined && item.reason !== 'repository_recovery') {
+      fail(`T20 booked a job with unexpected reason ${item.reason}`)
+    }
+  }
+
+  const job = state.job
+  if (!job || typeof job.id !== 'string') {
+    fail('T20 completed no recovery job; the driver did not run t20-complete')
+  }
+  if (!['complete', 'incomplete'].includes(job.state)) {
+    fail(`T20 recovery job ended in ${job.state}, expected complete or incomplete`)
+  }
+
+  // A repository-scoped job must never be presented as whole-source coverage.
+  const items = state.coverage?.items ?? state.coverage?.sources ?? []
+  const row = Array.isArray(items) ? items.find((item) => item?.pds === job.pds) : undefined
+  if (row) {
+    if (row.matchingJob === true && row.jobId === job.id) {
+      fail(`T20 recovery job ${job.id} was published as matching current-state coverage for ${job.pds}`)
+    }
+    const coverageLabel = row.acquisition?.state ?? row.legacyProgress?.coverage ?? row.coverage
+    if (coverageLabel === 'current_state' && row.jobId === job.id) {
+      fail(`T20 recovery job ${job.id} claimed current_state coverage for ${job.pds}`)
+    }
+  }
+}
+
 async function main() {
   const [mode, bootstrapPath, eventPath, snapshotPath, livePath] = process.argv.slice(2)
   if (!mode || !bootstrapPath || !eventPath) {
-    throw new Error('usage: assert.mjs archive|seed-ready|combined|t15-archive input.json events.ndjson [snapshot.json live.json]')
+    throw new Error('usage: assert.mjs archive|seed-ready|combined|t15-archive input.json events.ndjson [snapshot.json live.json] (t20-recovery takes a state path as its first argument)')
   }
   const bootstrap = await readJSON(bootstrapPath)
   const events = await readEvents(eventPath)
@@ -184,6 +238,11 @@ async function main() {
 
   if (mode === 't15-archive') {
     await assertT15Archive(events, bootstrap)
+    return
+  }
+
+  if (mode === 't20-recovery') {
+    await assertT20Recovery(bootstrapPath)
     return
   }
 
