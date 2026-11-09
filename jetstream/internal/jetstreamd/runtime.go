@@ -63,13 +63,15 @@ type Runtime struct {
 	processLogger *slog.Logger
 	logger        *slog.Logger
 
-	tracerShutdown  obs.TracerShutdown
-	cancelManifest  context.CancelFunc
-	metaStore       *store.Store
-	importRules     *timestamp.RuleStore
-	manifest        *manifest.Manifest
-	tail            *subscribe.Tail
-	verifier        *atmossync.Verifier
+	tracerShutdown obs.TracerShutdown
+	cancelManifest context.CancelFunc
+	metaStore      *store.Store
+	importRules    *timestamp.RuleStore
+	manifest       *manifest.Manifest
+	tail           *subscribe.Tail
+	verifier       *atmossync.Verifier
+	// recovery books durable jobs for events shed by the verify queue.
+	recovery        *recoveryCoalescer
 	orchestrator    *orchestrator.Orchestrator
 	importer        *importer.Manager
 	importRunCtx    context.Context
@@ -421,9 +423,34 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 			return atmossync.NewClient(atmossync.Options{Client: xc}), nil
 		}
 	}
+	// hypercerts: A verify-queue overflow is permanent loss, so a shed DID is
+	// booked as a durable repository-scoped recovery job. The coalescer only
+	// accumulates on the ingestion path; resolution and booking run on its own
+	// goroutine started in Run.
+	var recovery *recoveryCoalescer
+	if rt.BackfillJobs != nil {
+		recovery = &recoveryCoalescer{
+			jobs:     rt.BackfillJobs,
+			logger:   processLogger.With(slog.String("component", "recovery")),
+			interval: recoveryFlushInterval,
+			pending:  map[string]struct{}{},
+			inflight: map[string]struct{}{},
+			// Attribute a shed DID to its current PDS. The job manager normalizes
+			// the endpoint, so this returns the identity directory's value.
+			resolve: func(ctx context.Context, did string) string {
+				ident, err := directory.LookupDID(ctx, atmos.DID(did))
+				if err != nil || ident == nil {
+					return ""
+				}
+				return ident.PDSEndpoint()
+			},
+		}
+		rt.recovery = recovery
+	}
 	orch, err := orchestrator.New(orchestrator.Config{
 		// hypercerts: A single policy owner spans bootstrap, live, retries and restart.
 		CollectionPolicy: rt.CollectionPolicy,
+		DroppedEvents:    recoverySink(recovery),
 		DataDir:          opts.DataDir,
 		FS:               opts.StorageFS,
 		Store:            metaStore,
@@ -721,6 +748,15 @@ func allowedControlHTTPHost(hostname string, railwayPrivateNetwork bool) bool {
 }
 
 // PublicAddr returns the bound public listener address, or "" before Run binds.
+// recoverySink adapts the coalescer to the live consumer's drop callback. It is
+// nil when no jobs manager exists, so the consumer simply does not report.
+func recoverySink(c *recoveryCoalescer) func(did string, dropped uint64) {
+	if c == nil {
+		return nil
+	}
+	return c.observe
+}
+
 func (r *Runtime) PublicAddr() string {
 	if r == nil || r.server == nil {
 		return ""
@@ -784,6 +820,14 @@ func (r *Runtime) Run(ctx context.Context) (runErr error) {
 	if !r.opts.Headless {
 		g.Go(r.goroutineRoot("http_server", func() error {
 			return r.server.Run(gctx)
+		}))
+	}
+
+	// hypercerts: Start the recovery coalescer before the orchestrator opens the
+	// live consumer, so the first bootstrap-phase drops reach a running sink.
+	if r.recovery != nil {
+		g.Go(r.goroutineRoot("recovery", func() error {
+			return r.recovery.run(gctx)
 		}))
 	}
 

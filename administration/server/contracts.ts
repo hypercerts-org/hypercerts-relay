@@ -86,7 +86,14 @@ export const command = z.discriminatedUnion("kind", [
     .object({
       kind: z.literal("job"),
       pds: origin,
-      reason: z.enum(["backfill", "quota_recovery"]),
+      reason: z.enum(["backfill", "quota_recovery", "repository_recovery"]),
+      // A repository-recovery job is scoped to exact DIDs that lost events to a
+      // verify-queue overflow, rather than to the whole PDS.
+      dids: z
+        .array(z.string().startsWith("did:", "Use an exact DID."))
+        .max(4096)
+        .transform((v) => [...new Set(v)].sort())
+        .optional(),
     })
     .strict(),
   z

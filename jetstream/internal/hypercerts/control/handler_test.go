@@ -1535,3 +1535,26 @@ func TestCoverageRepositoryWaitFromManager(t *testing.T) {
 		require.Equal(t, deadline, *got.Diagnostics.RetryAt)
 	}
 }
+
+// A recovery request carries a DID scope, so it must route through the recovery
+// entry point rather than the legacy job request that rejects it.
+func TestRepositoryRecoveryJobRequest(t *testing.T) {
+	h, m := setup(t)
+	_, err := m.AddSourceWithRevision("https://pds.example.com", 1)
+	require.NoError(t, err)
+
+	body := `{"pds":"https://pds.example.com","reason":"repository_recovery","dids":["did:plc:bbbbbbbbbbbbbbbbbbbbbbbb","did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"]}`
+	w := request(h, "POST", "/jobs", body, testToken)
+	require.Equal(t, 202, w.Code)
+	var created jobView
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &created))
+	require.Equal(t, 2, created.RecoveryDIDCount)
+
+	// An empty scope cannot create a job; it would silently match nothing.
+	empty := `{"pds":"https://pds.example.com","reason":"repository_recovery","dids":[]}`
+	require.Equal(t, 400, request(h, "POST", "/jobs", empty, testToken).Code)
+
+	// The ordinary reasons must keep working through their own path.
+	backfill := `{"pds":"https://pds.example.com","reason":"backfill"}`
+	require.Equal(t, 202, request(h, "POST", "/jobs", backfill, testToken).Code)
+}

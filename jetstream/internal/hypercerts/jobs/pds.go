@@ -206,6 +206,21 @@ func (p PDSProcessor) Run(ctx context.Context, job Job) error {
 		return inputFailure(ctx, "identity_unavailable")
 	}
 	client := p.client(job)
+	// hypercerts: A recovery job seeds a synthetic inventory of exactly the DIDs
+	// it covers, so the per-repository ledger can resolve their coordinates
+	// without scanning the whole PDS. Re-seed whenever the inventory does not
+	// already cover every requested DID, not only on the first pass.
+	if job.Reason == ReasonRepositoryRecovery &&
+		(!job.TotalReposKnown || len(job.RecoveryDIDs) != job.EnumeratedRepos) {
+		if err := p.seedRecoveryInventory(ctx, client, &job); err != nil {
+			return err
+		}
+		var err error
+		job, err = p.Manager.Get(job.ID)
+		if err != nil {
+			return err
+		}
+	}
 	if !job.TotalReposKnown {
 		if err := p.enumerateInventory(ctx, client, &job); err != nil {
 			return err

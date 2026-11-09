@@ -155,6 +155,11 @@ export class Services {
           pds: command.pds,
           reason: command.reason,
           requestId: id,
+          // Only a repository-recovery job carries a DID scope; the schema is
+          // strict, so the field must be omitted entirely for other reasons.
+          ...(command.reason === "repository_recovery" && command.dids
+            ? { dids: command.dids }
+            : {}),
         });
       case "job_action": {
         return this.call(

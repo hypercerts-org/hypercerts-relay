@@ -49,6 +49,11 @@ var ErrPolicyMirrorRequired = errors.New("Relay policy mirror is required for a 
 var ErrReceiptStale = errors.New("recovery receipt rejected as stale")
 var ErrReceiptSourceMissing = errors.New("recovery receipt source no longer exists")
 
+// ReasonRepositoryRecovery re-acquires specific repositories whose events the
+// live consumer lost to a verify-queue overflow. It is scoped to the DIDs
+// recorded at gap detection, not to the whole PDS.
+const ReasonRepositoryRecovery = "repository_recovery"
+
 // AcquisitionEvidence is checkpoint-owned evidence for one frozen inventory.
 // A nil pointer on older jobs means attribution is unknown, never zero.
 type AcquisitionEvidence struct {
@@ -87,6 +92,10 @@ type Job struct {
 	CreatedAt       time.Time `json:"createdAt"`
 	StartedAt       time.Time `json:"startedAt,omitempty"`
 	FinishedAt      time.Time `json:"finishedAt,omitempty"`
+	// RecoveryDIDs is the exact DID set a ReasonRepositoryRecovery job covers.
+	// Empty for every other reason. The job's frozen inventory holds exactly these
+	// repositories, so it never scans the whole PDS.
+	RecoveryDIDs    []string  `json:"recoveryDids,omitempty"`
 	Coverage        string    `json:"coverage"`
 	ReceiptPending  bool      `json:"receiptPending,omitempty"`
 	ReceiptAttempts int       `json:"receiptAttempts,omitempty"`
