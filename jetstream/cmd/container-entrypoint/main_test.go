@@ -14,6 +14,10 @@ import (
 
 const fixtureSecret = "deployment-fixture-credential-32-bytes"
 
+// Distinct from fixtureSecret so the Relay token file cannot be satisfied by
+// the Jetstream credential.
+const relayFixtureSecret = "relay-fixture-credential-differs-32-bytes"
+
 var allSecrets = []secretFile{relaySecret, jetstreamSecret, administrationSecret, jetstreamRelaySecret}
 
 func setup(t *testing.T) {
@@ -48,7 +52,7 @@ func TestSecretFiles(t *testing.T) {
 					continue
 				}
 				found++
-				assertSecretFile(t, path, secret.output)
+				assertSecretFile(t, path, secret.output, fixtureSecret)
 			}
 			if found != count {
 				t.Fatalf("got %d files, want %d", found, count)
@@ -64,6 +68,7 @@ func TestSecretFiles(t *testing.T) {
 // though Jetstream never receives the Relay's own output name.
 func TestJetstreamReceivesRelayControlToken(t *testing.T) {
 	setup(t)
+	t.Setenv(relaySecret.input, relayFixtureSecret)
 	if err := prepare("jetstream"); err != nil {
 		t.Fatal(err)
 	}
@@ -71,16 +76,17 @@ func TestJetstreamReceivesRelayControlToken(t *testing.T) {
 	if path == "" {
 		t.Fatal("jetstream did not receive a Relay control token file")
 	}
-	assertSecretFile(t, path, jetstreamRelaySecret.output)
+	assertSecretFile(t, path, jetstreamRelaySecret.output, relayFixtureSecret)
 	if _, present := os.LookupEnv(relaySecret.output); present {
 		t.Fatalf("jetstream should not receive the Relay output name %s", relaySecret.output)
 	}
+	assertSecretFile(t, os.Getenv(jetstreamSecret.output), jetstreamSecret.output, fixtureSecret)
 }
 
-func assertSecretFile(t *testing.T, path, name string) {
+func assertSecretFile(t *testing.T, path, name, want string) {
 	t.Helper()
 	data, err := os.ReadFile(path)
-	if err != nil || string(data) != fixtureSecret {
+	if err != nil || string(data) != want {
 		t.Fatalf("%s did not materialize correctly", name)
 	}
 	info, err := os.Stat(path)
