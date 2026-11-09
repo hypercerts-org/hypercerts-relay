@@ -615,6 +615,7 @@ func TestPolicyChangeRequiresRelayRecoveryMirror(t *testing.T) {
 	m.SetPolicyAdvanceSender(func(context.Context, string, uint64, uint64) error { return errors.New("relay unavailable") })
 	_, err = m.SetPolicy(t.Context(), 2, []string{"app.bsky.actor.profile", "app.bsky.feed.like", "app.bsky.feed.post"})
 	require.ErrorContains(t, err, "advance Relay recovery policy")
+	require.NotErrorIs(t, err, ErrPolicyMirrorUnavailable)
 	require.Equal(t, uint64(2), m.policy.Current().Revision)
 	for _, job := range m.List() {
 		require.NotEqual(t, uint64(3), job.Policy.Revision)
@@ -668,6 +669,52 @@ func TestRelayReceiptSenderAdvancesRecoveryPolicy(t *testing.T) {
 	defer relay.Close()
 	err := (RelayReceiptSender{URL: relay.URL, Token: "fixture-service-credential-32-bytes-minimum", Client: relay.Client()}).AdvancePolicy(t.Context(), "https://pds.example", 4, 2)
 	require.NoError(t, err)
+}
+
+func TestAdvancePolicyReportsUnreachableRelay(t *testing.T) {
+	relay := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	url := relay.URL
+	relay.Close()
+
+	err := (RelayReceiptSender{URL: url, Token: "fixture-service-credential-32-bytes-minimum"}).AdvancePolicy(t.Context(), "https://pds.example", 4, 2)
+	require.ErrorIs(t, err, ErrPolicyMirrorUnavailable)
+	require.NotErrorIs(t, err, ErrReceiptStale)
+	require.NotErrorIs(t, err, ErrReceiptSourceMissing)
+}
+
+func TestAdvancePolicyReportsRejectedCredential(t *testing.T) {
+	relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer relay.Close()
+
+	err := (RelayReceiptSender{URL: relay.URL, Token: "fixture-service-credential-32-bytes-minimum", Client: relay.Client()}).AdvancePolicy(t.Context(), "https://pds.example", 4, 2)
+	require.ErrorIs(t, err, ErrPolicyMirrorUnavailable)
+	require.NotErrorIs(t, err, ErrReceiptStale)
+	require.NotErrorIs(t, err, ErrReceiptSourceMissing)
+}
+
+func TestAdvancePolicyReportsStalePolicy(t *testing.T) {
+	relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+	}))
+	defer relay.Close()
+
+	err := (RelayReceiptSender{URL: relay.URL, Token: "fixture-service-credential-32-bytes-minimum", Client: relay.Client()}).AdvancePolicy(t.Context(), "https://pds.example", 4, 2)
+	require.ErrorIs(t, err, ErrReceiptStale)
+	require.NotErrorIs(t, err, ErrPolicyMirrorUnavailable)
+}
+
+func TestAdvancePolicyReportsMissingSource(t *testing.T) {
+	relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":"source_not_found"}`))
+	}))
+	defer relay.Close()
+
+	err := (RelayReceiptSender{URL: relay.URL, Token: "fixture-service-credential-32-bytes-minimum", Client: relay.Client()}).AdvancePolicy(t.Context(), "https://pds.example", 4, 2)
+	require.ErrorIs(t, err, ErrReceiptSourceMissing)
+	require.NotErrorIs(t, err, ErrPolicyMirrorUnavailable)
 }
 
 func TestRelayReceiptSenderRetriesAmbiguousNotFoundResponses(t *testing.T) {

@@ -128,6 +128,12 @@ func failure(w http.ResponseWriter, err error) {
 	case errors.Is(err, jobs.ErrInvalidInput):
 		status = 400
 		code = "invalid_input"
+	case errors.Is(err, jobs.ErrPolicyMirrorRequired), errors.Is(err, jobs.ErrPolicyMirrorUnavailable):
+		// A Relay mirror must acknowledge the new policy before Jetstream
+		// commits it. Configuration or reachability failures are dependency
+		// errors, not storage faults.
+		status = 503
+		code = "policy_mirror_unavailable"
 	}
 	reply(w, status, map[string]string{"error": code})
 }

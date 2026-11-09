@@ -28,7 +28,7 @@ func (s RelayReceiptSender) AdvancePolicy(ctx context.Context, pds string, sourc
 		PolicyRevision uint64 `json:"policyRevision"`
 	}{pds, sourceRevision, policyRevision})
 	if err != nil {
-		return fmt.Errorf("advance recovery policy: %w", err)
+		return fmt.Errorf("%w: %w", ErrPolicyMirrorUnavailable, err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
@@ -43,7 +43,7 @@ func (s RelayReceiptSender) AdvancePolicy(ctx context.Context, pds string, sourc
 		if response.StatusCode == http.StatusConflict {
 			return ErrReceiptStale
 		}
-		return fmt.Errorf("advance recovery policy: relay returned %d", response.StatusCode)
+		return fmt.Errorf("%w: relay returned %d", ErrPolicyMirrorUnavailable, response.StatusCode)
 	}
 	return nil
 }

@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -87,6 +88,48 @@ func TestPrivateAuthenticationAndInputValidation(t *testing.T) {
 	_, err := New("", m, h.policy)
 	require.Error(t, err)
 }
+
+// A collection change must advance the Relay's policy mirror before Jetstream
+// commits it. When no mirror is configured the request fails, and the failure is
+// a missing service dependency rather than a storage fault: reporting it as
+// persistence_error sent operators looking for a database problem.
+func TestPolicyChangeWithoutRelayMirrorReportsDependencyFailure(t *testing.T) {
+	h, m := setup(t)
+	_, err := m.AddSourceWithRevision("https://pds.example.com", 1)
+	require.NoError(t, err)
+
+	body := `{"expectedRevision":1,"collections":["app.bsky.feed.post","app.bsky.feed.like"]}`
+	w := request(h, "PUT", "/policy", body, testToken)
+	require.Equal(t, 503, w.Code)
+	require.JSONEq(t, `{"error":"policy_mirror_unavailable"}`, w.Body.String())
+
+	require.Equal(t, uint64(1), h.policy.Current().Revision)
+	require.Len(t, m.List(), 1)
+	require.Equal(t, jobs.Pending, m.List()[0].State)
+	require.Equal(t, uint64(1), m.List()[0].Policy.Revision)
+}
+
+// A configured mirror that cannot be reached is the same dependency failure,
+// not a storage fault.
+func TestPolicyChangeWithUnreachableRelayReportsDependencyFailure(t *testing.T) {
+	h, m := setup(t)
+	_, err := m.AddSourceWithRevision("https://pds.example.com", 1)
+	require.NoError(t, err)
+	m.SetPolicyAdvanceSender(func(context.Context, string, uint64, uint64) error {
+		return fmt.Errorf("%w: dial", jobs.ErrPolicyMirrorUnavailable)
+	})
+
+	body := `{"expectedRevision":1,"collections":["app.bsky.feed.post","app.bsky.feed.like"]}`
+	w := request(h, "PUT", "/policy", body, testToken)
+	require.Equal(t, 503, w.Code)
+	require.JSONEq(t, `{"error":"policy_mirror_unavailable"}`, w.Body.String())
+
+	require.Equal(t, uint64(1), h.policy.Current().Revision)
+	require.Len(t, m.List(), 1)
+	require.Equal(t, jobs.Pending, m.List()[0].State)
+	require.Equal(t, uint64(1), m.List()[0].Policy.Revision)
+}
+
 func seedSnapshotRejections(t *testing.T, manager *jobs.Manager, dids []string, nextPolicy bool) string {
 	t.Helper()
 	pds := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -14,26 +14,36 @@ import (
 
 const fixtureSecret = "deployment-fixture-credential-32-bytes"
 
+// Distinct from fixtureSecret so the Relay token file cannot be satisfied by
+// the Jetstream credential.
+const relayFixtureSecret = "relay-fixture-credential-differs-32-bytes"
+
+var allSecrets = []secretFile{relaySecret, jetstreamSecret, administrationSecret, jetstreamRelaySecret}
+
 func setup(t *testing.T) {
 	t.Helper()
 	t.Setenv("TMPDIR", t.TempDir())
 	t.Setenv("HC_RAILWAY_STARTUP", "1")
 	t.Setenv("RAILWAY_VOLUME_MOUNT_PATH", "/data")
-	for _, secret := range []secretFile{relaySecret, jetstreamSecret, administrationSecret} {
+	for _, secret := range allSecrets {
 		t.Setenv(secret.input, fixtureSecret)
-		t.Setenv(secret.output, "")
+	}
+	for _, secret := range allSecrets {
+		if err := os.Unsetenv(secret.output); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
 func TestSecretFiles(t *testing.T) {
-	for component, count := range map[string]int{"relay": 1, "jetstream": 1, "administration": 3, "rainbow": 0} {
+	for component, count := range map[string]int{"relay": 1, "jetstream": 2, "administration": 3, "rainbow": 0} {
 		t.Run(component, func(t *testing.T) {
 			setup(t)
 			if err := prepare(component); err != nil {
 				t.Fatal(err)
 			}
 			found := 0
-			for _, secret := range []secretFile{relaySecret, jetstreamSecret, administrationSecret} {
+			for _, secret := range allSecrets {
 				if _, present := os.LookupEnv(secret.input); present {
 					t.Fatalf("raw %s remains in environment", secret.input)
 				}
@@ -42,7 +52,7 @@ func TestSecretFiles(t *testing.T) {
 					continue
 				}
 				found++
-				assertSecretFile(t, path, secret.output)
+				assertSecretFile(t, path, secret.output, fixtureSecret)
 			}
 			if found != count {
 				t.Fatalf("got %d files, want %d", found, count)
@@ -51,10 +61,32 @@ func TestSecretFiles(t *testing.T) {
 	}
 }
 
-func assertSecretFile(t *testing.T, path, name string) {
+// Jetstream authenticates to the Relay's private control listener for recovery
+// receipts and for advancing the policy mirror before committing a collection
+// change. A Jetstream container without this file rejects every collection
+// change with a policy-mirror error, so the token must be materialized even
+// though Jetstream never receives the Relay's own output name.
+func TestJetstreamReceivesRelayControlToken(t *testing.T) {
+	setup(t)
+	t.Setenv(relaySecret.input, relayFixtureSecret)
+	if err := prepare("jetstream"); err != nil {
+		t.Fatal(err)
+	}
+	path := os.Getenv(jetstreamRelaySecret.output)
+	if path == "" {
+		t.Fatal("jetstream did not receive a Relay control token file")
+	}
+	assertSecretFile(t, path, jetstreamRelaySecret.output, relayFixtureSecret)
+	if _, present := os.LookupEnv(relaySecret.output); present {
+		t.Fatalf("jetstream should not receive the Relay output name %s", relaySecret.output)
+	}
+	assertSecretFile(t, os.Getenv(jetstreamSecret.output), jetstreamSecret.output, fixtureSecret)
+}
+
+func assertSecretFile(t *testing.T, path, name, want string) {
 	t.Helper()
 	data, err := os.ReadFile(path)
-	if err != nil || string(data) != fixtureSecret {
+	if err != nil || string(data) != want {
 		t.Fatalf("%s did not materialize correctly", name)
 	}
 	info, err := os.Stat(path)

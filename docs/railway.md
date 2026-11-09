@@ -86,6 +86,15 @@ Setting `HC_RAILWAY_STARTUP=1` enables the following runtime contract:
 - Require `RAILWAY_VOLUME_MOUNT_PATH=/data`.
 - Relay consumes `HC_RELAY_CONTROL_SECRET` and sets `RELAY_CONTROL_TOKEN_FILE`.
 - Jetstream consumes `HC_JETSTREAM_CONTROL_SECRET` and sets `JETSTREAM_CONTROL_TOKEN_FILE`.
+- Jetstream also consumes `HC_RELAY_CONTROL_SECRET` and sets
+  `JETSTREAM_RELAY_CONTROL_TOKEN_FILE`, because it must hold the Relay's
+  credential to reach the Relay's private control listener. Also set
+  `JETSTREAM_RELAY_CONTROL_URL` to that listener (`http://relay.railway.internal:2472`
+  on Railway). Bootstrap always provides the token file, so a URL pointing at
+  an unreachable or unauthenticated Relay makes collection changes fail. Such a
+  change is rejected with `policy_mirror_unavailable` (HTTP 503) only when an
+  enabled source with a known revision requires the mirror; with no such
+  source, the change commits without consulting it.
 - Administration consumes both service credentials and `HC_ADMIN_ENCRYPTION_SECRET`,
   setting the two service file paths and `ADMIN_ENCRYPTION_KEY_FILE`.
 - Rainbow needs no credential conversion.
