@@ -1,5 +1,5 @@
 ---
-'hypercerts-relay': major
+'hypercerts-relay': patch
 ---
 
 Deliver the Hypercerts Relay with Jetstream and Admin web interface.
