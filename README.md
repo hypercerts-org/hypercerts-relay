@@ -137,8 +137,8 @@ See [RELEASING.md](RELEASING.md) for the exact process and rollback guidance.
 
 Licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option. This covers the code and documentation in the repository, which come from three sources:
 
-- **Code from Indigo**, the Indigo files in the paths listed in [`.hypercerts/upstream-paths`](.hypercerts/upstream-paths): copyright Bluesky Social PBC, `@whyrusleeping` and contributors, under Indigo's dual license ([LICENSE-DUAL](LICENSE-DUAL)).
-- **Code from Jetstream**, the files in [`jetstream/`](jetstream) listed in [`.hypercerts/jetstream-upstream-paths`](.hypercerts/jetstream-upstream-paths): copyright Bluesky Social PBC and contributors, under Jetstream's dual license ([jetstream/LICENSE-DUAL](jetstream/LICENSE-DUAL)).
+- **From Indigo**, the Indigo files in the paths listed in [`.hypercerts/upstream-paths`](.hypercerts/upstream-paths): copyright Bluesky Social PBC, `@whyrusleeping` and contributors, under Indigo's dual license ([LICENSE-DUAL](LICENSE-DUAL)).
+- **From Jetstream**, the files in [`jetstream/`](jetstream) listed in [`.hypercerts/jetstream-upstream-paths`](.hypercerts/jetstream-upstream-paths): copyright Bluesky Social PBC and contributors, under Jetstream's dual license ([jetstream/LICENSE-DUAL](jetstream/LICENSE-DUAL)).
 - **Everything else**: copyright 2026 Hypercerts Foundation, under the same two licenses. This includes the administration control plane in [`administration/`](administration), the files we added under the Indigo paths and in `jetstream/` (such as the code for managed PDS sources in `cmd/relay/relay/` and the packages in [`jetstream/internal/hypercerts/`](jetstream/internal/hypercerts)), and our changes to Indigo and Jetstream files.
 
 A file that states its own license keeps it. For example, [`util/ssrf/ssrf.go`](util/ssrf/ssrf.go) is dedicated to the public domain under CC0.
