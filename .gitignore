@@ -83,8 +83,5 @@ railway.ts
 railway.py
 railway.go
 
-# Proprietary font fetched directly from Fontshare during administration builds.
-/administration/src/brand/assets/fonts/Switzer-Variable.woff2
-
 # Local implementation plans.
 /plans/

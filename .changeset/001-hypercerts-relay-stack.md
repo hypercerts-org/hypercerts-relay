@@ -82,8 +82,8 @@ connection is preserved; retry an incomplete enable request before retrying its
 backfill. The access CLI remains available when no administrator can sign in.
 
 The administration UI uses Hypercerts branding, displays the saved profile name
-in bold with the verified handle below it, and fetches the verified Switzer font
-at build time from Fontshare. Bare PDS hostnames are normalized to HTTPS;
+in bold with the verified handle below it, and serves its fonts locally. Bare
+PDS hostnames are normalized to HTTPS;
 automatic polling is removed; coverage is grouped by PDS; audit history and
 requested changes are combined; and administrator rows show the last login.
 Backfill progress reports processed repositories out of the durable active
