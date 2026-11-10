@@ -135,10 +135,12 @@ See [RELEASING.md](RELEASING.md) for the exact process and rollback guidance.
 
 ## License
 
-Licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option. This applies to every part of the repository:
+Licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option. This covers the code in the repository, which comes from three sources:
 
-- **Code from Indigo**, the paths listed in [`.hypercerts/upstream-paths`](.hypercerts/upstream-paths): copyright Bluesky Social PBC and contributors, under Indigo's dual license ([LICENSE-DUAL](LICENSE-DUAL)).
-- **The copied Jetstream runtime** in [`jetstream/`](jetstream): copyright Bluesky Social PBC and contributors, under Jetstream's dual license ([jetstream/LICENSE-DUAL](jetstream/LICENSE-DUAL)).
-- **Everything else**, including the administration control plane in [`administration/`](administration): copyright 2026 Hypercerts Foundation, under the same two licenses. Our changes to Indigo and Jetstream files are licensed the same way.
+- **Code from Indigo**, the Indigo files in the paths listed in [`.hypercerts/upstream-paths`](.hypercerts/upstream-paths): copyright Bluesky Social PBC, `@whyrusleeping` and contributors, under Indigo's dual license ([LICENSE-DUAL](LICENSE-DUAL)).
+- **Code from Jetstream**, the files in [`jetstream/`](jetstream) listed in [`.hypercerts/jetstream-upstream-paths`](.hypercerts/jetstream-upstream-paths): copyright Bluesky Social PBC and contributors, under Jetstream's dual license ([jetstream/LICENSE-DUAL](jetstream/LICENSE-DUAL)).
+- **Everything else**: copyright 2026 Hypercerts Foundation, under the same two licenses. This includes the administration control plane in [`administration/`](administration), the files we added under the Indigo paths and in `jetstream/` (such as the managed PDS source code in `cmd/relay/relay/` and [`jetstream/internal/hypercerts/`](jetstream/internal/hypercerts)), and our changes to Indigo and Jetstream files.
 
-The licenses cover the code. They don't cover the logo or fonts in `administration/src/brand/assets/`: the logo belongs to its owner, and each font keeps its own license.
+A file that states its own license keeps it. For example, [`util/ssrf/ssrf.go`](util/ssrf/ssrf.go) is dedicated to the public domain under CC0.
+
+The licenses don't cover the Hypercerts logo in `administration/src/brand/assets/logo/` and `administration/public/favicon.svg`, which is a mark of the Hypercerts Foundation. They also don't cover the fonts in `administration/src/brand/assets/fonts/`, which keep their own licenses; see the [brand notes](administration/src/brand/README.md).
