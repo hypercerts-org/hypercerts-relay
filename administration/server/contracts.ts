@@ -79,7 +79,7 @@ export const command = z.discriminatedUnion("kind", [
             ),
         )
         .max(1000)
-        .transform((v) => [...new Set(v)].sort(compareCollections)),
+        .transform((v) => [...new Set(v)].sort(compareStrings)),
     })
     .strict(),
   z
@@ -92,7 +92,7 @@ export const command = z.discriminatedUnion("kind", [
       dids: z
         .array(z.string().startsWith("did:", "Use an exact DID."))
         .max(4096)
-        .transform((v) => [...new Set(v)].sort())
+        .transform((v) => [...new Set(v)].sort(compareStrings))
         .optional(),
     })
     .strict(),
@@ -201,7 +201,7 @@ export class ApiError extends Error {
   }
 }
 
-function compareCollections(a: string, b: string) {
+function compareStrings(a: string, b: string) {
   if (a === b) return 0;
   return a < b ? -1 : 1;
 }
