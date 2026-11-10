@@ -135,4 +135,10 @@ See [RELEASING.md](RELEASING.md) for the exact process and rollback guidance.
 
 ## License
 
-This repository retains Indigo's dual licensing under [MIT](LICENSE-MIT) and [Apache-2.0](LICENSE-APACHE). See the license files for their terms.
+Licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option. This applies to every part of the repository:
+
+- **Code from Indigo**, the paths listed in [`.hypercerts/upstream-paths`](.hypercerts/upstream-paths): copyright Bluesky Social PBC and contributors, under Indigo's dual license ([LICENSE-DUAL](LICENSE-DUAL)).
+- **The copied Jetstream runtime** in [`jetstream/`](jetstream): copyright Bluesky Social PBC and contributors, under Jetstream's dual license ([jetstream/LICENSE-DUAL](jetstream/LICENSE-DUAL)).
+- **Everything else**, including the administration control plane in [`administration/`](administration): copyright 2026 Hypercerts Foundation, under the same two licenses. Our changes to Indigo and Jetstream files are licensed the same way.
+
+The licenses cover the code. They don't cover the logo or fonts in `administration/src/brand/assets/`: the logo belongs to its owner, and each font keeps its own license.
