@@ -30,3 +30,8 @@
 **/railway.ts
 **/railway.py
 **/railway.go
+
+# Switzer, formerly downloaded from Fontshare by administration builds, is no
+# longer used. Its license forbids redistributing it, so a leftover local copy
+# must never enter a build context.
+/administration/src/brand/assets/fonts/Switzer-Variable.woff2
