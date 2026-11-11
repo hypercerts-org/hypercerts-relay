@@ -434,7 +434,6 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 			logger:   processLogger.With(slog.String("component", "recovery")),
 			interval: recoveryFlushInterval,
 			pending:  map[string]struct{}{},
-			inflight: map[string]struct{}{},
 			// Attribute a shed DID to its current PDS. The job manager normalizes
 			// the endpoint, so this returns the identity directory's value.
 			resolve: func(ctx context.Context, did string) string {

@@ -1,7 +1,10 @@
 package jetstreamd
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"sync"
@@ -20,6 +23,12 @@ const (
 	coalescePDS  = "https://pds.example"
 )
 
+type recoveryBookerFunc func(string, []string, string) (jobs.Job, error)
+
+func (book recoveryBookerFunc) RequestRepositoryRecovery(pds string, dids []string, requestID string) (jobs.Job, error) {
+	return book(pds, dids, requestID)
+}
+
 func newCoalescer(t *testing.T) (*recoveryCoalescer, *jobs.Manager) {
 	t.Helper()
 	db, err := store.Open(t.TempDir(), nil)
@@ -36,7 +45,6 @@ func newCoalescer(t *testing.T) (*recoveryCoalescer, *jobs.Manager) {
 		logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
 		interval: time.Millisecond,
 		pending:  map[string]struct{}{},
-		inflight: map[string]struct{}{},
 		resolve:  func(context.Context, string) string { return coalescePDS },
 	}, manager
 }
@@ -78,6 +86,52 @@ func TestCoalescerBatchesOneDIDIntoOneJob(t *testing.T) {
 	}
 	require.Len(t, booked, 1)
 	require.Equal(t, []string{coalesceDID1}, booked[0].RecoveryDIDs)
+}
+
+func TestCoalescerRequeuesBookingFailures(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		err   error
+		retry bool
+	}{
+		{"transient", errors.New("storage unavailable"), true},
+		{"conflict", fmt.Errorf("source: %w", jobs.ErrConflict), false},
+		{"invalid", fmt.Errorf("input: %w", jobs.ErrInvalidInput), false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			coalescer, manager := newCoalescer(t)
+			coalescer.jobs = recoveryBookerFunc(func(string, []string, string) (jobs.Job, error) { return jobs.Job{}, test.err })
+			coalescer.observe(coalesceDID1, 1)
+			coalescer.flush(t.Context())
+			_, pending := coalescer.pending[coalesceDID1]
+			require.Equal(t, test.retry, pending)
+			if test.retry {
+				coalescer.jobs = manager
+				coalescer.flush(t.Context())
+				require.Empty(t, coalescer.pending)
+				require.Len(t, manager.List(), 2)
+			}
+		})
+	}
+}
+
+func TestCoalescerLogsPendingLimitDrops(t *testing.T) {
+	coalescer, _ := newCoalescer(t)
+	var logs bytes.Buffer
+	coalescer.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	for index := 0; index < recoveryPendingLimit; index++ {
+		coalescer.pending[fmt.Sprintf("did:example:%d", index)] = struct{}{}
+	}
+	coalescer.observe(coalesceDID1, 1)
+	require.Len(t, coalescer.pending, recoveryPendingLimit)
+	require.Contains(t, logs.String(), coalesceDID1)
+	coalescer.jobs = recoveryBookerFunc(func(string, []string, string) (jobs.Job, error) {
+		coalescer.observe(coalesceDID1, 1)
+		return jobs.Job{}, errors.New("unavailable")
+	})
+	coalescer.flush(t.Context())
+	require.Len(t, coalescer.pending, recoveryPendingLimit)
+	require.Contains(t, logs.String(), "pending limit reached")
 }
 
 func TestCoalescerGroupsDIDsByPDS(t *testing.T) {
@@ -126,19 +180,16 @@ func TestCoalescerObserveIsConcurrencySafe(t *testing.T) {
 	require.Len(t, c.pending, 1, "the same DID collapses to one pending entry")
 }
 
-// A DID already under repair must not be booked again on every flush.
-func TestCoalescerSkipsDIDAlreadyRepairing(t *testing.T) {
-	c, manager := newCoalescer(t)
-	c.observe(coalesceDID1, 1)
-	c.flush(t.Context())
-	c.observe(coalesceDID1, 1)
-	c.flush(t.Context())
-
-	count := 0
-	for _, job := range manager.List() {
-		if job.Reason == jobs.ReasonRepositoryRecovery {
-			count++
-		}
+func TestCoalescerForwardsLaterObservations(t *testing.T) {
+	c, _ := newCoalescer(t)
+	calls := 0
+	c.jobs = recoveryBookerFunc(func(string, []string, string) (jobs.Job, error) {
+		calls++
+		return jobs.Job{ID: "owner"}, nil
+	})
+	for range 3 {
+		c.observe(coalesceDID1, 1)
+		c.flush(t.Context())
 	}
-	require.Equal(t, 1, count, "an in-flight repair suppresses a duplicate booking")
+	require.Equal(t, 3, calls)
 }

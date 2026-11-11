@@ -9,6 +9,7 @@ package jetstreamd
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"time"
@@ -31,16 +32,15 @@ const (
 // returns: no I/O, no blocking. All resolution and booking happens on the flush
 // goroutine.
 type recoveryCoalescer struct {
-	jobs     *jobs.Manager
+	jobs interface {
+		RequestRepositoryRecovery(string, []string, string) (jobs.Job, error)
+	}
 	logger   *slog.Logger
 	resolve  func(ctx context.Context, did string) string
 	interval time.Duration
 
 	mu      sync.Mutex
 	pending map[string]struct{}
-	// repairing records DIDs already submitted but not yet seen completing, so a
-	// sustained overflow does not book a new job every flush.
-	inflight map[string]struct{}
 }
 
 // observe records one shed DID. Safe for concurrent use and never blocks.
@@ -49,16 +49,14 @@ func (c *recoveryCoalescer) observe(did string, _ uint64) {
 		return
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if _, seen := c.inflight[did]; seen {
-		// A repair is already in flight for this DID; a second booking would
-		// duplicate work rather than narrow the gap.
-		return
-	}
-	if len(c.pending) >= recoveryPendingLimit {
+	_, alreadyPending := c.pending[did]
+	if !alreadyPending && len(c.pending) >= recoveryPendingLimit {
+		c.mu.Unlock()
+		c.logger.Warn("verify-queue loss recovery pending limit reached", "did", did)
 		return
 	}
 	c.pending[did] = struct{}{}
+	c.mu.Unlock()
 }
 
 // run flushes on a ticker until the context is cancelled.
@@ -92,6 +90,7 @@ func (c *recoveryCoalescer) flush(ctx context.Context) {
 	for did := range observed {
 		pds := c.resolve(ctx, did)
 		if pds == "" {
+			// TODO: Retry transient identity resolution failures without losing recovery intent.
 			c.logger.Warn("verify-queue loss could not be attributed to a PDS; skipping recovery", "did", did)
 			continue
 		}
@@ -102,27 +101,14 @@ func (c *recoveryCoalescer) flush(ctx context.Context) {
 		job, err := c.jobs.RequestRepositoryRecovery(pds, dids, "")
 		if err != nil {
 			c.logger.Warn("booking repository recovery failed", "pds", pds, "dids", len(dids), "err", err)
+			if !errors.Is(err, jobs.ErrConflict) && !errors.Is(err, jobs.ErrInvalidInput) {
+				for _, did := range dids {
+					c.observe(did, 0)
+				}
+			}
 			continue
 		}
-		c.mu.Lock()
-		for _, did := range dids {
-			c.inflight[did] = struct{}{}
-		}
-		c.mu.Unlock()
 		c.logger.Info("booked repository recovery for verify-queue loss",
 			"pds", pds, "dids", len(dids), "job", job.ID, "state", job.State)
-	}
-}
-
-// forget releases DIDs once their repair is no longer running, so a later loss
-// for the same DID can be booked again.
-func (c *recoveryCoalescer) forget(dids []string) {
-	if len(dids) == 0 {
-		return
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for _, did := range dids {
-		delete(c.inflight, did)
 	}
 }

@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -49,6 +50,27 @@ func TestRequestRepositoryRecoveryScopesDIDs(t *testing.T) {
 	require.Equal(t, Pending, job.State)
 }
 
+func TestRepositoryRecoveryDoesNotSendSourceReceipt(t *testing.T) {
+	m, db := newManager(t, t.TempDir())
+	defer db.Close()
+	_, err := m.AddSourceWithRevision("https://pds.example", 4)
+	require.NoError(t, err)
+	job, err := m.RequestRepositoryRecovery("https://pds.example", []string{recoveryDID1}, "")
+	require.NoError(t, err)
+	claimForSeed(t, m, job.ID)
+	_, _, err = m.persistJobOutcome(t.Context(), job.ID, nil)
+	require.NoError(t, err)
+	stored, err := m.Get(job.ID)
+	require.NoError(t, err)
+	require.Equal(t, Complete, stored.State)
+	require.Equal(t, uint64(4), stored.SourceRevision)
+	require.False(t, stored.ReceiptPending)
+	called := false
+	m.SetReceiptSender(func(_ context.Context, _ Job) error { called = true; return nil })
+	require.NoError(t, m.flushReceipts(t.Context()))
+	require.False(t, called)
+}
+
 // A second request while the first is still pending must extend that job rather
 // than book a second one, so a burst does not create a job per flush tick.
 func TestRequestRepositoryRecoveryCoalescesPending(t *testing.T) {
@@ -91,6 +113,31 @@ func TestRequestRepositoryRecoveryDoesNotExtendRunning(t *testing.T) {
 	running, err := m.Get(first.ID)
 	require.NoError(t, err)
 	require.Equal(t, []string{recoveryDID1}, running.RecoveryDIDs, "the running job keeps its original scope")
+}
+
+func TestRequestRepositoryRecoveryPreservesTerminalJobs(t *testing.T) {
+	for _, state := range []State{Complete, Failed, Incomplete, Canceled} {
+		t.Run(string(state), func(t *testing.T) {
+			m, db := newManager(t, t.TempDir())
+			defer db.Close()
+			_, err := m.AddSourceWithRevision("https://pds.example", 4)
+			require.NoError(t, err)
+			first, err := m.RequestRepositoryRecovery("https://pds.example", []string{recoveryDID1}, "")
+			require.NoError(t, err)
+			m.mu.Lock()
+			original := m.data.Jobs[first.ID]
+			original.State = state
+			m.data.Jobs[first.ID] = original
+			m.mu.Unlock()
+			second, err := m.RequestRepositoryRecovery("https://pds.example", []string{recoveryDID2}, "")
+			require.NoError(t, err)
+			require.NotEqual(t, first.ID, second.ID)
+			stored, err := m.Get(first.ID)
+			require.NoError(t, err)
+			require.Equal(t, state, stored.State)
+			require.Equal(t, []string{recoveryDID1}, stored.RecoveryDIDs)
+		})
+	}
 }
 
 func TestRequestRepositoryRecoveryIsIdempotent(t *testing.T) {
@@ -234,6 +281,8 @@ func claimForSeed(t *testing.T, m *Manager, id string) Job {
 	next := clone(m.data)
 	job := next.Jobs[id]
 	job.State = Running
+	sealed := true
+	job.RecoveryScopeSealed = &sealed
 	job.StartedAt = time.Now().UTC()
 	next.Jobs[id] = job
 	err := m.commit(next)
