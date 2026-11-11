@@ -6,7 +6,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/http"
 	"slices"
+	"time"
 
 	"github.com/jcalabro/atmos"
 	atmossync "github.com/jcalabro/atmos/sync"
@@ -168,6 +170,11 @@ func restoreRecoveryJobs(next *data) error {
 			sealed := true
 			job.RecoveryScopeSealed = &sealed
 		}
+		for index, did := range job.RecoveryDiscoveryFailures {
+			if !slices.Contains(job.RecoveryDIDs, did) || job.TotalReposKnown || (index > 0 && job.RecoveryDiscoveryFailures[index-1] >= did) {
+				return fmt.Errorf("invalid persisted repository recovery discovery failure")
+			}
+		}
 		for _, did := range job.RecoveryFollowupDIDs {
 			if !slices.Contains(job.RecoveryDIDs, did) || !recoverySealed(job) || (job.State != Pending && job.State != Running) {
 				return fmt.Errorf("invalid persisted repository recovery followup")
@@ -227,33 +234,76 @@ func mergeRecoveryDIDs(existing, added []string) []string {
 // one already recorded (`invalid_listing`), so re-submitting a seeded DID would
 // fail on the second pass or after any restart.
 func (p PDSProcessor) seedRecoveryInventory(ctx context.Context, client *atmossync.Client, job *Job) error {
-	seeded := map[string]struct{}{}
-	if job.TotalReposKnown {
-		existing, err := p.Manager.Inventory(job.ID)
+	existing, err := p.Manager.Inventory(job.ID)
+	if err != nil {
+		return err
+	}
+	seeded := make(map[string]struct{}, len(existing))
+	for _, entry := range existing {
+		seeded[entry.DID] = struct{}{}
+	}
+	for _, did := range job.RecoveryDIDs {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if _, exists := seeded[did]; exists || slices.Contains(job.RecoveryDiscoveryFailures, did) {
+			continue
+		}
+		cooldown, found, err := p.Manager.GetPDSCooldown(job.PDS)
 		if err != nil {
 			return err
 		}
-		for _, entry := range existing {
-			seeded[entry.DID] = struct{}{}
+		if found && cooldown.Until.After(time.Now()) {
+			return errJobYield
 		}
-	}
-
-	entries := make(map[string]string, len(job.RecoveryDIDs))
-	for _, did := range job.RecoveryDIDs {
-		if _, exists := seeded[did]; exists {
+		capture := &pdsResponseCapture{}
+		requestCtx := context.WithValue(ctx, pdsResponseCaptureKey{}, capture)
+		rev, _, err := client.GetLatestCommit(requestCtx, atmos.DID(did))
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err == nil {
+			_, err = atmos.ParseTID(rev)
+		}
+		if err != nil {
+			var cooldownUntil *time.Time
+			if capture.status == http.StatusTooManyRequests {
+				now := time.Now()
+				deadline := repositoryRetryDeadline(1, pdsServerRetryDeadline(capture.header, now), now)
+				cooldownUntil = &deadline
+			}
+			if err := p.Manager.recordRecoveryDiscoveryFailure(job.ID, did, cooldownUntil); err != nil {
+				return err
+			}
+			if cooldownUntil != nil {
+				return errJobYield
+			}
 			continue
 		}
-		// The ledger requires a TID-parseable revision, and the revision recorded
-		// at gap detection would already be stale.
-		rev, _, err := client.GetLatestCommit(ctx, atmos.DID(did))
-		if err != nil {
-			// TODO: Checkpoint successful DIDs and retry unavailable revisions independently.
-			return &InputError{Code: "recovery_revision_unavailable", Unavailable: true}
+		seeded[did] = struct{}{}
+		if err := p.Manager.CheckpointInventory(job.ID, "", map[string]string{did: rev}, len(seeded) == len(job.RecoveryDIDs)); err != nil {
+			return err
 		}
-		entries[did] = rev
 	}
-	if len(entries) == 0 {
-		return nil
+	return ctx.Err()
+}
+
+func (m *Manager) recordRecoveryDiscoveryFailure(id, did string, cooldownUntil *time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.active(id) {
+		return ErrConflict
 	}
-	return p.Manager.CheckpointInventory(job.ID, "", entries, true)
+	next := clone(m.data)
+	job := next.Jobs[id]
+	if job.Reason != ReasonRepositoryRecovery || !slices.Contains(job.RecoveryDIDs, did) {
+		return ErrConflict
+	}
+	cooldown, err := m.repositoryFailureCooldownLocked(job.PDS, cooldownUntil)
+	if err != nil {
+		return err
+	}
+	job.RecoveryDiscoveryFailures = mergeRecoveryDIDs(job.RecoveryDiscoveryFailures, []string{did})
+	next.Jobs[id] = job
+	return m.commitRepositoryRetryBatch(next, true, nil, nil, cooldown)
 }

@@ -95,14 +95,15 @@ type Job struct {
 	// RecoveryDIDs is the exact DID set a ReasonRepositoryRecovery job covers.
 	// Empty for every other reason. The job's frozen inventory holds exactly these
 	// repositories, so it never scans the whole PDS.
-	RecoveryDIDs         []string  `json:"recoveryDids,omitempty"`
-	RecoveryScopeSealed  *bool     `json:"recoveryScopeSealed,omitempty"`
-	RecoveryFollowupDIDs []string  `json:"recoveryFollowupDids,omitempty"`
-	Coverage             string    `json:"coverage"`
-	ReceiptPending       bool      `json:"receiptPending,omitempty"`
-	ReceiptAttempts      int       `json:"receiptAttempts,omitempty"`
-	ReceiptRetryAt       time.Time `json:"receiptRetryAt,omitempty"`
-	ReceiptError         string    `json:"receiptError,omitempty"`
+	RecoveryDIDs              []string  `json:"recoveryDids,omitempty"`
+	RecoveryDiscoveryFailures []string  `json:"recoveryDiscoveryFailures,omitempty"`
+	RecoveryScopeSealed       *bool     `json:"recoveryScopeSealed,omitempty"`
+	RecoveryFollowupDIDs      []string  `json:"recoveryFollowupDids,omitempty"`
+	Coverage                  string    `json:"coverage"`
+	ReceiptPending            bool      `json:"receiptPending,omitempty"`
+	ReceiptAttempts           int       `json:"receiptAttempts,omitempty"`
+	ReceiptRetryAt            time.Time `json:"receiptRetryAt,omitempty"`
+	ReceiptError              string    `json:"receiptError,omitempty"`
 }
 
 type JobFailure struct {
@@ -690,6 +691,7 @@ func (m *Manager) commitTransition(j Job, state State, requestID string) error {
 		return m.commit(next)
 	}
 	if state == Pending {
+		j.RecoveryDiscoveryFailures = nil
 		if err := beginAcquisition(next, &j); err != nil {
 			return err
 		}
@@ -1104,7 +1106,7 @@ func (m *Manager) Inventory(id string) ([]ListedRepository, error) {
 	if !ok {
 		return nil, ErrNotFound
 	}
-	if !job.TotalReposKnown {
+	if !job.TotalReposKnown && job.Reason != ReasonRepositoryRecovery {
 		return nil, ErrConflict
 	}
 	inv, err := m.readInventory(id)

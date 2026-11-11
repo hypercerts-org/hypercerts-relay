@@ -221,7 +221,7 @@ func (p PDSProcessor) Run(ctx context.Context, job Job) error {
 			return err
 		}
 	}
-	if !job.TotalReposKnown {
+	if !job.TotalReposKnown && job.Reason != ReasonRepositoryRecovery {
 		if err := p.enumerateInventory(ctx, client, &job); err != nil {
 			return err
 		}
@@ -330,6 +330,10 @@ func (p PDSProcessor) processFrozenInventory(ctx context.Context, client *atmoss
 		return err
 	}
 	var outcome frozenRepositoryOutcome
+	if job.Reason == ReasonRepositoryRecovery && !job.TotalReposKnown {
+		outcome.unavailable = true
+		outcome.unavailableCode = "recovery_revision_unavailable"
+	}
 	for _, frozen := range entries {
 		if completedRevisionAtLeast(job.CompletedRepos[frozen.DID], frozen.Revision) {
 			continue
@@ -459,7 +463,7 @@ func (p PDSProcessor) processReadyRepository(ctx context.Context, client *atmoss
 	}
 	if err := p.repository(ctx, client, job, entry); err == nil {
 		return frozenRepositoryOutcome{}, nil
-	} else if errors.Is(ctx.Err(), context.Canceled) {
+	} else if ctx.Err() != nil {
 		return frozenRepositoryOutcome{}, ctx.Err()
 	} else {
 		var input *InputError

@@ -1119,7 +1119,7 @@ func (m *Manager) repositoryCoordinateLocked(jobID, did string) (Job, string, er
 	if _, err := atmos.ParseDID(did); err != nil {
 		return Job{}, "", ErrInvalidInput
 	}
-	if !job.TotalReposKnown {
+	if !job.TotalReposKnown && job.Reason != ReasonRepositoryRecovery {
 		return Job{}, "", ErrConflict
 	}
 	inv, err := m.readInventory(jobID)
@@ -1196,7 +1196,7 @@ func (m *Manager) pendingJobDueLocked(job Job, now time.Time) (time.Time, bool, 
 		return time.Time{}, false, err
 	}
 	coolingDown := found && cooldown.Until.After(now)
-	if !job.TotalReposKnown {
+	if !job.TotalReposKnown && (job.Reason != ReasonRepositoryRecovery || job.EnumeratedRepos+len(job.RecoveryDiscoveryFailures) < len(job.RecoveryDIDs)) {
 		return applyPDSCooldown(now, cooldown, coolingDown), true, nil
 	}
 	inv, err := m.readInventory(job.ID)

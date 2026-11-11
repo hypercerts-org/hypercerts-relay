@@ -14,3 +14,9 @@ request, where `repository_recovery` accepts an explicit DID scope. They carry
 no whole-source evidence, so they never appear as a source's current-state
 coverage. Existing archive rows are not rewritten, and existing job identifiers
 are unchanged.
+
+For operators, unavailable latest revisions now leave only the affected DIDs
+undiscovered while healthy repositories reconcile. Discovery failures and partial
+progress survive restart without reporting complete recovery. Retry an incomplete
+job after restoring PDS availability; valid inventory and completed work are
+preserved, and automatic repository retries continue to respect cooldowns.

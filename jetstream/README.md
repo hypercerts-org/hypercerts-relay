@@ -178,6 +178,16 @@ representative, not a complete list of owners. Its nonempty idempotency receipt
 keeps that original representative even after successor promotion; replay adds no
 work.
 
+For operators retrying recovery jobs, an unavailable latest revision no longer
+blocks healthy repositories from reconciling. Successful discoveries and failed
+DIDs are durable across restart. The inventory remains incomplete until every
+scoped DID has a revision; after repository retries finish, missing discoveries
+leave the job `incomplete` with `recovery_revision_unavailable`. Retry the job with
+`POST /hypercerts/v1/jobs/{id}/retry` after restoring PDS availability. This clears
+discovery failures for the new attempt without discarding valid inventory or
+completed reconciliation. Automatic repository retries still respect their delay
+and the PDS cooldown; they do not repeatedly retry unavailable discovery DIDs.
+
 Explicit cancellation discards followups. Source removal, source-revision advance,
 and policy changes atomically invalidate stale recovery intent. Manual retry
 conflicts while any DID in the requested job has another active recovery owner.
