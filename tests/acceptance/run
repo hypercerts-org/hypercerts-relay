@@ -3,8 +3,8 @@
 set -euo pipefail
 
 case_id=${1:-}
-if [[ $# -ne 1 || ( "$case_id" != "T01" && "$case_id" != "T02" && "$case_id" != "T03-lifecycle" && "$case_id" != "T03-jobs" && "$case_id" != "T04" && "$case_id" != "T05" && "$case_id" != "T06" && "$case_id" != "T07" && "$case_id" != "T08" && "$case_id" != "T09" && "$case_id" != "T10" && "$case_id" != "T11" && "$case_id" != "T12" && "$case_id" != "T13" && "$case_id" != "T14" && "$case_id" != "T15-core" && "$case_id" != "T15-selection" && "$case_id" != "T19" ) ]]; then
-	printf '%s\n' 'usage: ./tests/acceptance/run T01|T02|T03-lifecycle|T03-jobs|T04|T05|T06|T07|T08|T09|T10|T11|T12|T13|T14|T15-core|T15-selection|T19' >&2
+if [[ $# -ne 1 || ( "$case_id" != "T01" && "$case_id" != "T02" && "$case_id" != "T03-lifecycle" && "$case_id" != "T03-jobs" && "$case_id" != "T04" && "$case_id" != "T05" && "$case_id" != "T06" && "$case_id" != "T07" && "$case_id" != "T08" && "$case_id" != "T09" && "$case_id" != "T10" && "$case_id" != "T11" && "$case_id" != "T12" && "$case_id" != "T13" && "$case_id" != "T14" && "$case_id" != "T15-core" && "$case_id" != "T15-selection" && "$case_id" != "T19" && "$case_id" != "T20" ) ]]; then
+	printf '%s\n' 'usage: ./tests/acceptance/run T01|T02|T03-lifecycle|T03-jobs|T04|T05|T06|T07|T08|T09|T10|T11|T12|T13|T14|T15-core|T15-selection|T19|T20' >&2
 	exit 64
 fi
 
@@ -213,6 +213,7 @@ wait_for_assertion() {
 
 cat >"$env_file" <<EOF
 ACCEPTANCE_STATE_DIR=$run_dir
+T20_BACKLOG_COUNT=${T20_BACKLOG_COUNT:-400}
 JETSTREAM_HOST_PORT=$(free_port)
 RELAY_CONTROL_TOKEN=$(random_hex 32)
 JETSTREAM_CONTROL_TOKEN=$(random_hex 32)
@@ -238,6 +239,26 @@ jetstream_url="http://127.0.0.1:$jetstream_port"
 if [[ "$case_id" == "T01" ]]; then
   wait_for_http "$jetstream_url/" Jetstream
 fi
+if [[ "$case_id" == "T20" ]]; then
+  # The Relay buffers events while Jetstream is stopped, then replays them as
+  # fast as the socket allows on restart. That backlog - not the PDS write rate -
+  # is what overflows the per-DID verify queue.
+  "${compose[@]}" up --detach --wait --wait-timeout 300
+  "${compose[@]}" exec --no-TTY driver node /app/driver.mjs bootstrap >/dev/null
+  # The recovery job is booked against a source the job manager knows, so admit it
+  # while Jetstream is still up.
+  "${compose[@]}" exec --no-TTY driver node /app/driver.mjs t20-admit | tee "$run_dir/t20-admit.json"
+  "${compose[@]}" stop --timeout 30 jetstream
+  "${compose[@]}" exec --no-TTY driver node /app/driver.mjs t20-backlog | tee "$run_dir/t20-backlog.json"
+  "${compose[@]}" start jetstream
+  "${compose[@]}" exec --no-TTY driver node /app/driver.mjs t20-wait-job | tee "$run_dir/t20-job.json"
+  "${compose[@]}" exec --no-TTY driver node /app/driver.mjs t20-complete | tee "$run_dir/t20-complete.json"
+  "${compose[@]}" exec --no-TTY driver cat /state/t20-state.json >"$run_dir/t20-state.json"
+  node "$root/tests/acceptance/assert.mjs" t20-recovery "$run_dir/t20-state.json"
+  printf '%s\n' 'T20 passed: a replayed single-DID backlog overflowed the verify queue, and the loss was booked as a durable repository-scoped recovery job instead of being discarded.'
+  exit 0
+fi
+
 
 if [[ "$case_id" == "T15-core" ]]; then
   # Each phase writes sanitized job/rejection coordinates. The driver reads the

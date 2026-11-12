@@ -7,7 +7,13 @@ import express, { type ErrorRequestHandler } from "express";
 import { z, ZodError } from "zod";
 import { join } from "node:path";
 import { Auth, type Session } from "./auth.ts";
-import { ApiError, archiveKeyInput, command, origin } from "./contracts.ts";
+import {
+  ApiError,
+  archiveKeyInput,
+  command,
+  operationBodyLimit,
+  origin,
+} from "./contracts.ts";
 import { Store } from "./store.ts";
 import { Services } from "./services.ts";
 import type { AdministratorProfile } from "./profile.ts";
@@ -47,7 +53,18 @@ export function createApp(
     });
     next();
   });
-  app.use(express.json({ limit: "64kb", type: "application/json" }));
+  // Operation requests may carry a full repository-recovery DID scope, so they
+  // are parsed with a larger limit on their own route, after authentication.
+  const jsonBody = express.json({ limit: "64kb", type: "application/json" });
+  const operationBody = express.json({
+    limit: operationBodyLimit,
+    type: "application/json",
+  });
+  app.use((req, res, next) =>
+    req.method === "POST" && req.path === "/api/v1/operations"
+      ? next()
+      : jsonBody(req, res, next),
+  );
   app.use(express.urlencoded({ extended: false, limit: "4kb" }));
   app.get("/health", (_req, res) => res.json({ status: "ok" }));
   app.get("/oauth-client-metadata.json", (_req, res) => res.json(metadata));
@@ -99,7 +116,7 @@ export function createApp(
     res.clearCookie("relay_session", auth.options(0));
     res.status(204).end();
   });
-  app.post("/api/v1/operations", (req, res) => {
+  app.post("/api/v1/operations", operationBody, (req, res) => {
     const input = command.parse(req.body),
       key = z.uuid().parse(req.get("Idempotency-Key"));
     res

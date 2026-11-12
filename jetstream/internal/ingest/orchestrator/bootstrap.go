@@ -144,6 +144,7 @@ func (o *Orchestrator) openBootstrapLive(liveSegmentsDir string) (*live.Consumer
 		RelayURL:             o.cfg.RelayURL,
 		Logger:               o.cfg.Logger,
 		Metrics:              o.cfg.LiveMetrics,
+		DroppedEvents:        o.cfg.DroppedEvents,
 		DropMetrics:          o.cfg.DropMetrics,
 		Verifier:             o.cfg.Verifier,
 		SyncStateStore:       o.cfg.SyncStateStore,

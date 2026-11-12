@@ -826,6 +826,34 @@ test("quota requests require administrator CSRF and validated integer values", a
   assert.equal((await request("/api/v1/operations", body)).status, 202);
   assert.equal(store.page("operations", "", 50).items.length, 1);
 });
+test("repository recovery operations accept a full DID scope only after authentication", async (t) => {
+  const { request, store } = await fixture(t);
+  const dids = Array.from(
+    { length: 4096 },
+    (_, i) => `did:plc:${String(i).padStart(24, "0")}`,
+  );
+  const body = {
+    kind: "job",
+    pds: "https://pds.example",
+    reason: "repository_recovery",
+    dids,
+  };
+  assert.ok(JSON.stringify(body).length > 64 * 1024);
+  assert.equal(
+    (await request("/api/v1/operations", body, { Cookie: "" })).status,
+    401,
+  );
+  assert.equal((await request("/api/v1/operations", body)).status, 202);
+  assert.equal(store.page("operations", "", 50).items.length, 1);
+  const overlong = { ...body, dids: [`did:web:${"a".repeat(512)}.example`] };
+  assert.equal((await request("/api/v1/operations", overlong)).status, 400);
+  // Other routes keep the default request limit.
+  assert.equal(
+    (await request("/api/v1/administrators", { did: "x".repeat(70 * 1024) }))
+      .status,
+    413,
+  );
+});
 test("durable operations recover after restart and retain actor and failure states", async () => {
   const path = join(mkdtempSync(join(tmpdir(), "control-test-")), "state.db");
   let store = new Store(path);

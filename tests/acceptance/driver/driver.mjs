@@ -15,7 +15,9 @@ const collection = 'app.bsky.feed.post'
 const origins = { a: 'https://pds-a.test', b: 'https://pds-b.test' }
 const directPDS = origins.a
 const plcURL = 'https://plc.test'
+const relayPublicURL = 'http://relay:2470'
 const acceptanceOrigins = new Set([
+  relayPublicURL,
   'http://relay:2471',
   'http://jetstream:8081',
   'http://fault-proxy:3000',
@@ -35,7 +37,7 @@ async function request(url, options = {}) {
   } catch {
     body = text
   }
-  if (!response.ok) throw new Error(`${options.method ?? 'GET'} ${url}: ${response.status}`)
+  if (!response.ok) throw new Error(`${options.method ?? 'GET'} ${url}: ${response.status} ${typeof body === 'string' ? body.slice(0, 400) : JSON.stringify(body).slice(0, 400)}`)
   return body
 }
 
@@ -94,6 +96,8 @@ async function createAccount(origin, handle, email) {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ handle, email, password }),
+  }).catch((error) => {
+    throw new Error(`createAccount(${origin}, ${handle}): ${error.message}`)
   })
   if (!account.did || !account.accessJwt) throw new Error('invalid createAccount response')
   return account
@@ -328,6 +332,7 @@ function jobEvidence(value) {
     cursor: value.cursor,
     errorCode: value.errorCode ?? '',
     coverage: value.coverage,
+    recoveryDidCount: value.recoveryDidCount,
   }
 }
 
@@ -441,6 +446,137 @@ async function t15CheckRejection() {
   writeJSON(state.invalid.rejection)
 }
 
+// T20: Jetstream is stopped while the Relay accumulates events for one account.
+// When Jetstream restarts it resumes from its persisted cursor and the Relay
+// replays the whole backlog as fast as the socket allows, with no write pacing.
+// That backlog is what overflows the per-DID verify queue -- driving a live PDS
+// burst cannot, because a PDS emits only ~80 signed commits/second while a
+// replay is bounded only by the socket. The overflow must be booked as a
+// durable, repository-scoped recovery job rather than lost silently.
+const t20StatePath = '/state/t20-state.json'
+const t20BacklogCount = Number(process.env.T20_BACKLOG_COUNT ?? '400')
+
+async function t20State() {
+  try {
+    return JSON.parse(await readFile(t20StatePath, 'utf8'))
+  } catch {
+    return {}
+  }
+}
+
+async function saveT20State(state) {
+  await mkdir('/state', { recursive: true })
+  await writeFile(t20StatePath, `${JSON.stringify(state)}\n`)
+}
+
+// Admits the direct-PDS source to the job manager. A recovery job is booked
+// against a source that manager already knows, and the request is idempotent when
+// it is already admitted, so this runs once before Jetstream is stopped.
+async function t20AdmitSource() {
+  await control('/sources', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ pds: origins.a }),
+  })
+  writeJSON({ pds: origins.a })
+}
+
+// Waits until the Relay holds the backlog account's final commit. The Relay
+// persists an outbound event before it advances that account's revision, so a
+// Relay revision equal to the PDS head proves the whole backlog is replayable.
+// The source cursor cannot prove this: bootstrap has already advanced it, and
+// account lifecycle events share it.
+async function t20WaitForRelayBacklog(did) {
+  const query = `/xrpc/com.atproto.sync.getLatestCommit?did=${encodeURIComponent(did)}`
+  const head = (await request(`${origins.a}${query}`)).rev
+  if (typeof head !== 'string' || head === '') throw new TypeError('T20 PDS reported no head revision for the backlog account')
+  const deadline = Date.now() + 180_000
+  let observed = 'not attempted'
+  while (Date.now() < deadline) {
+    try {
+      observed = (await request(`${relayPublicURL}${query}`)).rev
+      if (observed === head) return
+    } catch (error) {
+      observed = error instanceof Error ? error.message : String(error)
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250))
+  }
+  throw new Error(`T20 Relay did not ingest the backlog for ${did}: PDS head=${head}, Relay last=${observed}`)
+}
+
+// Runs while Jetstream is stopped. Each await is a distinct signed commit, so
+// the Relay persists one subscribeRepos event per record for this DID.
+async function t20ReleaseBacklog() {
+  await waitFor(`${origins.a}/xrpc/com.atproto.server.describeServer`, 'T20 PDS')
+  await admit(origins.a)
+  // Handles have a strict length budget, so the unique segment stays short.
+  const suffix = Date.now().toString(32).slice(-6)
+  const account = await createAccount(origins.a, `b${suffix}.pds-a.test`, `b${suffix}@example.test`)
+  const started = Date.now()
+  const concurrency = 16
+  let lastRkey = ''
+  for (let offset = 0; offset < t20BacklogCount; offset += concurrency) {
+    const batch = []
+    for (let index = offset; index < Math.min(offset + concurrency, t20BacklogCount); index += 1) {
+      batch.push(createRecord(origins.a, account, `t20-backlog-${index}`))
+    }
+    const results = await Promise.all(batch)
+    lastRkey = results.at(-1)?.rkey ?? lastRkey
+  }
+  // The Relay must have persisted this DID's events before Jetstream resumes,
+  // otherwise the replay carries fewer events than the scenario assumes.
+  await t20WaitForRelayBacklog(account.did)
+  const state = await t20State()
+  state.backlog = {
+    did: account.did,
+    count: t20BacklogCount,
+    elapsedMs: Date.now() - started,
+    lastRkey,
+  }
+  await saveT20State(state)
+  writeJSON(state.backlog)
+}
+
+// Wait for the restarted consumer to book a DID-scoped recovery job. No booking
+// after a proven replay backlog is exactly the silent-loss failure T20 exists
+// to catch, so this fails rather than passing empty.
+async function t20WaitJob() {
+  const state = await t20State()
+  const did = state.backlog?.did
+  if (!did) throw new Error('t20-wait-job requires a prior t20-backlog')
+  const deadline = Date.now() + 240_000
+  let latest = []
+  while (Date.now() < deadline) {
+    const listing = await control(`/jobs?pds=${encodeURIComponent(origins.a)}`)
+    latest = (listing?.jobs ?? []).filter((item) => item.reason === 'repository_recovery')
+    const match = latest.find((item) => Number(item.recoveryDidCount ?? 0) > 0)
+    if (match) {
+      state.job = jobEvidence({ ...(await job(match.id)), recoveryDidCount: match.recoveryDidCount })
+      state.recoveryJobs = latest.map((item) => ({ id: item.id, state: item.state, recoveryDidCount: item.recoveryDidCount }))
+      await saveT20State(state)
+      writeJSON(state.job)
+      return
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1000))
+  }
+  state.recoveryJobs = latest.map((item) => ({ id: item.id, state: item.state, recoveryDidCount: item.recoveryDidCount }))
+  await saveT20State(state)
+  writeJSON({ did, recoveryJobs: state.recoveryJobs })
+  throw new Error(`no repository_recovery job was booked for ${did} after the replay backlog; a verify-queue overflow was silently lost`)
+}
+
+// The recovery job must reach a terminal state without claiming whole-source
+// coverage over a PDS it never scanned.
+async function t20Complete() {
+  const state = await t20State()
+  if (!state.job?.id) throw new Error('t20-complete requires a prior t20-wait-job')
+  const terminal = await waitForJob(state.job.id, ['complete', 'incomplete'], 'T20 recovery job')
+  state.job = jobEvidence({ ...terminal, recoveryDidCount: state.job.recoveryDidCount })
+  state.coverage = await control(`/coverage?pds=${encodeURIComponent(origins.a)}`)
+  await saveT20State(state)
+  writeJSON({ job: state.job, coverage: state.coverage })
+}
+
 const command = process.argv[2]
 if (command === 'bootstrap') await bootstrap()
 else if (command === 'live') await live()
@@ -451,5 +587,9 @@ else if (command === 't15-source-fault') await t15SourceFault()
 else if (command === 't15-source-retry') await t15SourceRetry()
 else if (command === 't15-invalid-signature') await t15InvalidSignature()
 else if (command === 't15-check-rejection') await t15CheckRejection()
+else if (command === 't20-admit') await t20AdmitSource()
+else if (command === 't20-backlog') await t20ReleaseBacklog()
+else if (command === 't20-wait-job') await t20WaitJob()
+else if (command === 't20-complete') await t20Complete()
 else if (command === 'idle') await new Promise(() => setInterval(() => {}, 2 ** 30))
-else throw new Error('usage: driver.mjs bootstrap|live|t15-valid|t15-identity-fault|t15-identity-retry|t15-source-fault|t15-source-retry|t15-invalid-signature|t15-check-rejection|idle')
+else throw new Error('usage: driver.mjs bootstrap|live|t15-valid|t15-identity-fault|t15-identity-retry|t15-source-fault|t15-source-retry|t15-invalid-signature|t15-check-rejection|t20-admit|t20-backlog|t20-wait-job|t20-complete|idle')

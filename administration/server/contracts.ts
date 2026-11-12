@@ -30,6 +30,13 @@ export const origin = z
       return z.NEVER;
     }
   });
+// Repository recovery scope bounds, matching Jetstream's control API.
+export const recoveryScopeLimit = 4096;
+export const recoveryDIDMaxLength = 512;
+// A full scope of maximum-length DIDs: each DID adds its quotes and a
+// separator, and the remaining fields fit in the default 64 KiB allowance.
+export const operationBodyLimit =
+  recoveryScopeLimit * (recoveryDIDMaxLength + 3) + 64 * 1024;
 export const rate = z.number().int().min(1).max(1_000_000);
 export const archiveKeyInput = z
   .object({
@@ -79,14 +86,26 @@ export const command = z.discriminatedUnion("kind", [
             ),
         )
         .max(1000)
-        .transform((v) => [...new Set(v)].sort(compareCollections)),
+        .transform((v) => [...new Set(v)].sort(compareStrings)),
     })
     .strict(),
   z
     .object({
       kind: z.literal("job"),
       pds: origin,
-      reason: z.enum(["backfill", "quota_recovery"]),
+      reason: z.enum(["backfill", "quota_recovery", "repository_recovery"]),
+      // A repository-recovery job is scoped to exact DIDs that lost events to a
+      // verify-queue overflow, rather than to the whole PDS.
+      dids: z
+        .array(
+          z
+            .string()
+            .startsWith("did:", "Use an exact DID.")
+            .max(recoveryDIDMaxLength),
+        )
+        .max(recoveryScopeLimit)
+        .transform((v) => [...new Set(v)].sort(compareStrings))
+        .optional(),
     })
     .strict(),
   z
@@ -194,7 +213,7 @@ export class ApiError extends Error {
   }
 }
 
-function compareCollections(a: string, b: string) {
+function compareStrings(a: string, b: string) {
   if (a === b) return 0;
   return a < b ? -1 : 1;
 }

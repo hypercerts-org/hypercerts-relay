@@ -627,7 +627,13 @@ func (c *Consumer) noteStreamError(ctx context.Context, err error) {
 		return
 	}
 	if de, ok := errors.AsType[*streaming.DropError](err); ok {
-		c.cfg.Metrics.noteVerifyQueueDrops(de.AdditionalDropsSuppressed + 1)
+		dropped := de.AdditionalDropsSuppressed + 1
+		c.cfg.Metrics.noteVerifyQueueDrops(dropped)
+		// hypercerts: report the shed DID so a durable recovery job can be booked;
+		// without it the loss is unrecoverable.
+		if c.cfg.DroppedEvents != nil {
+			c.cfg.DroppedEvents(de.DID, dropped)
+		}
 		c.logger.WarnContext(ctx, "verify queue overflow dropped event",
 			"did", de.DID,
 			"seq", de.Seq,
