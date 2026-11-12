@@ -73,6 +73,40 @@ safe to combine it with Relay's database or event-store backup.
 `Dockerfile` builds this module with `docker build -f jetstream/Dockerfile
 jetstream`. It does not publish a service or make a deployment decision.
 
+### Live ingestion reconnects and pacing
+
+The live consumer retries an upstream dial that the Relay or its proxy rejects
+with HTTP 408, 425, 429 or any 5xx. It backs off and resumes from the same
+cursor. These rejections are expected while the Relay restarts. Each retry logs
+`upstream dial rejected; retrying`, and each successful connection logs
+`upstream connected` with the resume cursor. Other HTTP rejections, such as a
+wrong URL, end the stream. The process then exits with an `upstream stream ended
+unexpectedly` error so its supervisor restarts it, instead of running without
+ingestion. Watch `jetstream_livestream_upstream_connects_total` and
+`jetstream_livestream_upstream_transient_dial_rejections_total` alongside the
+reconnect counter.
+
+Upstream reads are paced, and verification is sized, so catching up after a
+restart does not overflow the per-account verify queue:
+
+| Flag | Environment | Default | Meaning |
+| --- | --- | --- | --- |
+| `--live-verify-parallelism` | `JETSTREAM_LIVE_VERIFY_PARALLELISM` | 128 | Verification workers. Each account's verify queue holds twice this many events. `1` gives strict ordering with an unbounded queue and full backpressure. |
+| `--live-upstream-read-rate` | `JETSTREAM_LIVE_UPSTREAM_READ_RATE` | 500 | Maximum upstream frames read per second. `0` disables pacing. |
+| `--live-upstream-read-burst` | `JETSTREAM_LIVE_UPSTREAM_READ_BURST` | 0 | Frames read without waiting. `0` uses the verify parallelism. |
+
+Pacing bounds catch-up speed. At 500 frames per second, a backlog of one million
+Relay events takes about 35 minutes to replay. Raise the rate if the Relay's
+sustained event rate approaches it; `jetstream_livestream_verify_queue_dropped_events_total`
+shows whether the queue still overflows. A dropped event still books repository
+recovery, as described below.
+
+Verification failures are logged once per account and failure class each minute.
+Later failures in that minute are counted and reported in one `verification
+failures repeated` line with the count and the last error. A resyncing account
+reports a failure for every commit it buffers. The
+`jetstream_verifier_failures_total` metric still counts every failure.
+
 ## Hypercerts policy work
 
 `serve` opens a durable global exact-NSID policy before ingestion. On a new data

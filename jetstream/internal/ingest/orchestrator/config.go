@@ -228,6 +228,13 @@ type Config struct {
 	// nil; deterministic harnesses feed the firehose in-memory.
 	LiveDial streaming.DialFunc
 
+	// hypercerts: LiveVerifyParallelism, LiveUpstreamReadRate and
+	// LiveUpstreamReadBurst size atmos's verify workers and pace upstream
+	// reads for both live consumers. See live.Config for zero-value meaning.
+	LiveVerifyParallelism int
+	LiveUpstreamReadRate  float64
+	LiveUpstreamReadBurst int
+
 	// IngestOnAfterSeal is forwarded to every writer that appends to
 	// <DataDir>/segments. Used by cmd/jetstream to wire the manifest's
 	// OnSegmentSealed callback. Optional.

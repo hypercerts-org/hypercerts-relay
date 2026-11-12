@@ -155,6 +155,9 @@ func (o *Orchestrator) openBootstrapLive(liveSegmentsDir string) (*live.Consumer
 		OnUpstreamLoss:       o.cfg.OnUpstreamLoss,
 		ReconnectBackoff:     o.cfg.LiveReconnectBackoff,
 		Dial:                 o.cfg.LiveDial,
+		VerifyParallelism:    o.cfg.LiveVerifyParallelism,
+		UpstreamReadRate:     o.cfg.LiveUpstreamReadRate,
+		UpstreamReadBurst:    o.cfg.LiveUpstreamReadBurst,
 
 		SegmentIOFaultInjector: o.cfg.SegmentIOFaultInjector,
 	})

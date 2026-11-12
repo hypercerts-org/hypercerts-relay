@@ -7,6 +7,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/hypercerts/policygate"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 	"log/slog"
+	"math"
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
@@ -208,6 +209,20 @@ type Config struct {
 	// Intended for deterministic harnesses that feed the firehose over an
 	// in-memory connection.
 	Dial streaming.DialFunc
+
+	// hypercerts: VerifyParallelism is the number of atmos verification
+	// workers. atmos caps each DID's verify queue at twice this value and
+	// drops events beyond it. Zero selects DefaultVerifyParallelism; 1 gives
+	// strict ordering with an unbounded queue and full backpressure.
+	VerifyParallelism int
+
+	// hypercerts: UpstreamReadRate paces upstream frame reads, in frames per
+	// second, so catch-up cannot outrun verification. Zero disables pacing.
+	UpstreamReadRate float64
+
+	// hypercerts: UpstreamReadBurst is the number of frames that may be read
+	// without waiting. Zero selects VerifyParallelism (half the per-DID queue).
+	UpstreamReadBurst int
 }
 
 func (c *Config) validate() error {
@@ -235,11 +250,26 @@ func (c *Config) validate() error {
 	if c.Verifier == nil {
 		return fmt.Errorf("%w: Verifier is required", ErrInvalidConfig)
 	}
+	if c.VerifyParallelism < 0 {
+		return fmt.Errorf("%w: VerifyParallelism must not be negative", ErrInvalidConfig)
+	}
+	if c.UpstreamReadRate < 0 || math.IsNaN(c.UpstreamReadRate) || math.IsInf(c.UpstreamReadRate, 0) {
+		return fmt.Errorf("%w: UpstreamReadRate must be a finite non-negative number", ErrInvalidConfig)
+	}
+	if c.UpstreamReadBurst < 0 {
+		return fmt.Errorf("%w: UpstreamReadBurst must not be negative", ErrInvalidConfig)
+	}
 	return nil
 }
 
 func (c *Config) applyDefaults() {
 	if c.now == nil {
 		c.now = time.Now
+	}
+	if c.VerifyParallelism == 0 {
+		c.VerifyParallelism = DefaultVerifyParallelism
+	}
+	if c.UpstreamReadBurst == 0 {
+		c.UpstreamReadBurst = c.VerifyParallelism
 	}
 }

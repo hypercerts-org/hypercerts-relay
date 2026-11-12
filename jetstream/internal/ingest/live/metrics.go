@@ -16,8 +16,11 @@ const (
 // consumer. A nil *Metrics is a valid zero-value: every method is a
 // no-op, so tests can skip metric registration entirely.
 type Metrics struct {
-	EventsReceived                 prometheus.Counter
-	Reconnects                     prometheus.Counter
+	EventsReceived prometheus.Counter
+	Reconnects     prometheus.Counter
+	// hypercerts: Upstream connection visibility (TECH-883).
+	UpstreamConnects               prometheus.Counter
+	TransientDialRejections        prometheus.Counter
 	DecodeErrors                   prometheus.Counter
 	SequenceGaps                   prometheus.Counter
 	SequenceGapMissedSeqs          prometheus.Counter
@@ -47,6 +50,19 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 			Name: "reconnects_total",
 			Help: "Number of websocket reconnect attempts the atmos client has made.",
+		}),
+		// hypercerts: Successful dials and retried HTTP rejections make a
+		// stalled live consumer visible (TECH-883).
+		UpstreamConnects: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "upstream_connects_total",
+			Help: "Number of successful upstream subscribeRepos websocket connections.",
+		}),
+		TransientDialRejections: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+			Name: "upstream_transient_dial_rejections_total",
+			Help: "Number of upstream dials rejected with a transient HTTP status " +
+				"(408, 425, 429 or 5xx) and retried with backoff.",
 		}),
 		DecodeErrors: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Subsystem: metricsSubsystem,
@@ -140,7 +156,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		}),
 	}
 	reg.MustRegister(
-		m.EventsReceived, m.Reconnects,
+		m.EventsReceived, m.Reconnects, m.UpstreamConnects, m.TransientDialRejections,
 		m.DecodeErrors, m.SequenceGaps, m.SequenceGapMissedSeqs,
 		m.UnknownEvents, m.VerifyQueueDrops, m.StreamErrorFrames, m.StaleResyncsDropped,
 		m.ReplayedAccountsDrop, m.ReplayedIdentityDrop, m.UpstreamCursor, m.LastSeenUpstreamEventTimestamp,
@@ -157,6 +173,19 @@ func (m *Metrics) incEventsReceived() {
 func (m *Metrics) incReconnects() {
 	if m != nil {
 		m.Reconnects.Inc()
+	}
+}
+
+// hypercerts: Helpers for the TECH-883 upstream connection counters.
+func (m *Metrics) incUpstreamConnects() {
+	if m != nil {
+		m.UpstreamConnects.Inc()
+	}
+}
+
+func (m *Metrics) incTransientDialRejections() {
+	if m != nil {
+		m.TransientDialRejections.Inc()
 	}
 }
 
