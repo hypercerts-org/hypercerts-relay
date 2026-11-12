@@ -429,6 +429,60 @@ func TestNoteStreamError_DropErrorClassifiedAsVerifyQueueLoss(t *testing.T) {
 		"verify-queue loss must NOT be miscounted as a decode error")
 }
 
+// The shed DID must reach the configured sink so a durable recovery job can be
+// booked; the metric alone cannot name the DID.
+func TestNoteStreamError_ReportsDroppedDIDToSink(t *testing.T) {
+	t.Parallel()
+
+	st := newTestStore(t)
+	type observed struct {
+		did     string
+		dropped uint64
+	}
+	var calls []observed
+	sink := func(did string, dropped uint64) { calls = append(calls, observed{did, dropped}) }
+
+	c, err := Open(Config{
+		SegmentsDir:   filepath.Join(t.TempDir(), "live_segments"),
+		Store:         st,
+		SeqKey:        "live_segments/seq/next",
+		CursorKey:     "relay/cursor",
+		RelayURL:      "https://example.invalid",
+		Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Verifier:      newTestVerifier(t),
+		Metrics:       NewMetrics(prometheus.NewRegistry()),
+		DroppedEvents: sink,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Close() })
+
+	c.noteStreamError(t.Context(), &streaming.DropError{DID: "did:plc:hot", Seq: 42, QueueLen: 64})
+	c.noteStreamError(t.Context(), &streaming.DropError{DID: "did:plc:hot", Seq: 99, QueueLen: 64, AdditionalDropsSuppressed: 4})
+	require.Equal(t, []observed{{"did:plc:hot", 1}, {"did:plc:hot", 5}}, calls,
+		"the sink sees the shed DID and the coalesced loss count")
+}
+
+// A nil sink must not panic: most callers do not book recovery.
+func TestNoteStreamError_NilSinkIsSafe(t *testing.T) {
+	t.Parallel()
+
+	st := newTestStore(t)
+	c, err := Open(Config{
+		SegmentsDir: filepath.Join(t.TempDir(), "live_segments"),
+		Store:       st,
+		SeqKey:      "live_segments/seq/next",
+		CursorKey:   "relay/cursor",
+		RelayURL:    "https://example.invalid",
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Verifier:    newTestVerifier(t),
+		Metrics:     NewMetrics(prometheus.NewRegistry()),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Close() })
+
+	c.noteStreamError(t.Context(), &streaming.DropError{DID: "did:plc:hot", Seq: 42, QueueLen: 64})
+}
+
 func TestProcessBatch_OverwideRecordKeyDoesNotShutDownConsumer(t *testing.T) {
 	t.Parallel()
 

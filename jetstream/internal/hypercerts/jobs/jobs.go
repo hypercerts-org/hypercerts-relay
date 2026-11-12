@@ -49,6 +49,11 @@ var ErrPolicyMirrorRequired = errors.New("Relay policy mirror is required for a 
 var ErrReceiptStale = errors.New("recovery receipt rejected as stale")
 var ErrReceiptSourceMissing = errors.New("recovery receipt source no longer exists")
 
+// ReasonRepositoryRecovery re-acquires specific repositories whose events the
+// live consumer lost to a verify-queue overflow. It is scoped to the DIDs
+// recorded at gap detection, not to the whole PDS.
+const ReasonRepositoryRecovery = "repository_recovery"
+
 // AcquisitionEvidence is checkpoint-owned evidence for one frozen inventory.
 // A nil pointer on older jobs means attribution is unknown, never zero.
 type AcquisitionEvidence struct {
@@ -87,11 +92,18 @@ type Job struct {
 	CreatedAt       time.Time `json:"createdAt"`
 	StartedAt       time.Time `json:"startedAt,omitempty"`
 	FinishedAt      time.Time `json:"finishedAt,omitempty"`
-	Coverage        string    `json:"coverage"`
-	ReceiptPending  bool      `json:"receiptPending,omitempty"`
-	ReceiptAttempts int       `json:"receiptAttempts,omitempty"`
-	ReceiptRetryAt  time.Time `json:"receiptRetryAt,omitempty"`
-	ReceiptError    string    `json:"receiptError,omitempty"`
+	// RecoveryDIDs is the exact DID set a ReasonRepositoryRecovery job covers.
+	// Empty for every other reason. The job's frozen inventory holds exactly these
+	// repositories, so it never scans the whole PDS.
+	RecoveryDIDs              []string  `json:"recoveryDids,omitempty"`
+	RecoveryDiscoveryFailures []string  `json:"recoveryDiscoveryFailures,omitempty"`
+	RecoveryScopeSealed       *bool     `json:"recoveryScopeSealed,omitempty"`
+	RecoveryFollowupDIDs      []string  `json:"recoveryFollowupDids,omitempty"`
+	Coverage                  string    `json:"coverage"`
+	ReceiptPending            bool      `json:"receiptPending,omitempty"`
+	ReceiptAttempts           int       `json:"receiptAttempts,omitempty"`
+	ReceiptRetryAt            time.Time `json:"receiptRetryAt,omitempty"`
+	ReceiptError              string    `json:"receiptError,omitempty"`
 }
 
 type JobFailure struct {
@@ -224,6 +236,9 @@ func restorePersistedData(persisted *data) error {
 		return err
 	}
 	trimSnapshotRejections(persisted.SnapshotRejections)
+	if err := restoreRecoveryJobs(persisted); err != nil {
+		return err
+	}
 	if err := resumePersistedJobs(persisted.Jobs); err != nil {
 		return err
 	}
@@ -410,6 +425,7 @@ func (m *Manager) RemoveSource(raw string) error {
 	for id, j := range next.Jobs {
 		if j.PDS == pds && (j.State == Pending || j.State == Running) {
 			j.State = Canceled
+			j.RecoveryFollowupDIDs = nil
 			j.ErrorCode = "source_removed"
 			j.FinishedAt = time.Now().UTC()
 			next.Jobs[id] = j
@@ -458,6 +474,7 @@ func (m *Manager) SetPolicy(ctx context.Context, expected uint64, collections []
 		for id, j := range next.Jobs {
 			if j.State == Pending || j.State == Running {
 				j.State = Canceled
+				j.RecoveryFollowupDIDs = nil
 				j.ErrorCode = "policy_changed"
 				j.FinishedAt = time.Now().UTC()
 				next.Jobs[id] = j
@@ -589,6 +606,7 @@ func (m *Manager) cancelStaleSourceJobs(next *data, pds string, sourceRevision u
 			continue
 		}
 		job.State = Canceled
+		job.RecoveryFollowupDIDs = nil
 		job.ErrorCode = "source_revision_changed"
 		job.FinishedAt = time.Now().UTC()
 		next.Jobs[id] = job
@@ -673,6 +691,7 @@ func (m *Manager) commitTransition(j Job, state State, requestID string) error {
 		return m.commit(next)
 	}
 	if state == Pending {
+		j.RecoveryDiscoveryFailures = nil
 		if err := beginAcquisition(next, &j); err != nil {
 			return err
 		}
@@ -687,6 +706,7 @@ func (m *Manager) commitTransition(j Job, state State, requestID string) error {
 		resetRetryInventory(&j)
 	}
 	if state == Canceled {
+		j.RecoveryFollowupDIDs = nil
 		j.FinishedAt = time.Now().UTC()
 	}
 	next.Jobs[j.ID] = j
@@ -1086,7 +1106,7 @@ func (m *Manager) Inventory(id string) ([]ListedRepository, error) {
 	if !ok {
 		return nil, ErrNotFound
 	}
-	if !job.TotalReposKnown {
+	if !job.TotalReposKnown && job.Reason != ReasonRepositoryRecovery {
 		return nil, ErrConflict
 	}
 	inv, err := m.readInventory(id)
@@ -1233,6 +1253,7 @@ func (m *Manager) claimNextLocked() (Job, error) {
 		if current := m.data.SourceRevisions[job.PDS]; current > 0 && job.SourceRevision != current {
 			next := clone(m.data)
 			job.State = Canceled
+			job.RecoveryFollowupDIDs = nil
 			job.ErrorCode = "source_revision_changed"
 			job.FinishedAt = time.Now().UTC()
 			next.Jobs[job.ID] = job
@@ -1243,6 +1264,10 @@ func (m *Manager) claimNextLocked() (Job, error) {
 		}
 		next := clone(m.data)
 		job.State = Running
+		if job.Reason == ReasonRepositoryRecovery {
+			sealed := true
+			job.RecoveryScopeSealed = &sealed
+		}
 		job.Attempts++
 		job.StartedAt = time.Now().UTC()
 		next.Jobs[job.ID] = job
@@ -1306,13 +1331,16 @@ func (m *Manager) persistJobOutcome(ctx context.Context, id string, processErr e
 			job.FailureRepository = boundedFailure.repositoryDID
 		}
 	}
-	if state == Complete && job.SourceRevision != 0 {
+	if state == Complete && job.SourceRevision != 0 && job.Reason != ReasonRepositoryRecovery {
 		// This flag is written in the same durable job record as Complete, so a
 		// process loss after local success replays the acknowledgement on restart.
 		job.ReceiptPending = true
 	}
 	if code != "" {
 		job.ErrorCode = code
+	}
+	if err := promoteRecoveryFollowups(&next, &job); err != nil {
+		return nil, "", err
 	}
 	next.Jobs[id] = job
 	if err := m.commit(next); err != nil {
@@ -1471,6 +1499,28 @@ func (m *Manager) rememberRequest(next data, job Job, requestID string) (Job, er
 }
 func (m *Manager) canTransition(j Job, state State, hasReceipt bool) bool {
 	if state == Pending {
+		if j.Reason == ReasonRepositoryRecovery {
+			if j.SourceRevision != m.data.SourceRevisions[j.PDS] {
+				return false
+			}
+			owners, err := recoveryOwners(m.data)
+			if err != nil {
+				return false
+			}
+			admissions := 0
+			for _, did := range j.RecoveryDIDs {
+				if owner, exists := owners[did]; exists {
+					if owner != j.ID {
+						return false
+					}
+				} else {
+					admissions++
+				}
+			}
+			if len(owners)+admissions > recoveryScopeLimit {
+				return false
+			}
+		}
 		return m.data.Sources[j.PDS] && j.Policy.Revision == m.policy.Current().Revision && (j.State != Running || hasReceipt)
 	}
 	return j.State == Pending || j.State == Running || (hasReceipt && j.State == Canceled)

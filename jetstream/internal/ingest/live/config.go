@@ -87,6 +87,12 @@ type Config struct {
 	// by (source, reason). Optional; nil skips counting.
 	DropMetrics *ingest.DropMetrics
 
+	// DroppedEvents, when set, is called once per verify-queue overflow with the
+	// DID whose events were shed and how many were lost. It runs on the ingestion
+	// path and must not block. The count is diagnostic only: recovery is scoped
+	// by DID, not by event count.
+	DroppedEvents func(did string, dropped uint64)
+
 	// WriterMetrics flows through to the consumer's internal ingest.Writer.
 	// Steady-state callers pass the canonical ingest metrics for the durable
 	// archive; bootstrap-time live_segments callers leave it nil because that

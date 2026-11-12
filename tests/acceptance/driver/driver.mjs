@@ -469,6 +469,18 @@ async function saveT20State(state) {
   await writeFile(t20StatePath, `${JSON.stringify(state)}\n`)
 }
 
+// Admits the direct-PDS source to the job manager. A recovery job is booked
+// against a source that manager already knows, and the request is idempotent when
+// it is already admitted, so this runs once before Jetstream is stopped.
+async function t20AdmitSource() {
+  await control('/sources', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ pds: origins.a }),
+  })
+  writeJSON({ pds: origins.a })
+}
+
 // Waits until the Relay holds the backlog account's final commit. The Relay
 // persists an outbound event before it advances that account's revision, so a
 // Relay revision equal to the PDS head proves the whole backlog is replayable.
@@ -575,8 +587,9 @@ else if (command === 't15-source-fault') await t15SourceFault()
 else if (command === 't15-source-retry') await t15SourceRetry()
 else if (command === 't15-invalid-signature') await t15InvalidSignature()
 else if (command === 't15-check-rejection') await t15CheckRejection()
+else if (command === 't20-admit') await t20AdmitSource()
 else if (command === 't20-backlog') await t20ReleaseBacklog()
 else if (command === 't20-wait-job') await t20WaitJob()
 else if (command === 't20-complete') await t20Complete()
 else if (command === 'idle') await new Promise(() => setInterval(() => {}, 2 ** 30))
-else throw new Error('usage: driver.mjs bootstrap|live|t15-valid|t15-identity-fault|t15-identity-retry|t15-source-fault|t15-source-retry|t15-invalid-signature|t15-check-rejection|t20-backlog|t20-wait-job|t20-complete|idle')
+else throw new Error('usage: driver.mjs bootstrap|live|t15-valid|t15-identity-fault|t15-identity-retry|t15-source-fault|t15-source-retry|t15-invalid-signature|t15-check-rejection|t20-admit|t20-backlog|t20-wait-job|t20-complete|idle')

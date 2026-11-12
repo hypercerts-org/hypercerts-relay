@@ -245,6 +245,9 @@ if [[ "$case_id" == "T20" ]]; then
   # is what overflows the per-DID verify queue.
   "${compose[@]}" up --detach --wait --wait-timeout 300
   "${compose[@]}" exec --no-TTY driver node /app/driver.mjs bootstrap >/dev/null
+  # The recovery job is booked against a source the job manager knows, so admit it
+  # while Jetstream is still up.
+  "${compose[@]}" exec --no-TTY driver node /app/driver.mjs t20-admit | tee "$run_dir/t20-admit.json"
   "${compose[@]}" stop --timeout 30 jetstream
   "${compose[@]}" exec --no-TTY driver node /app/driver.mjs t20-backlog | tee "$run_dir/t20-backlog.json"
   "${compose[@]}" start jetstream

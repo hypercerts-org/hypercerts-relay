@@ -79,14 +79,21 @@ export const command = z.discriminatedUnion("kind", [
             ),
         )
         .max(1000)
-        .transform((v) => [...new Set(v)].sort(compareCollections)),
+        .transform((v) => [...new Set(v)].sort(compareStrings)),
     })
     .strict(),
   z
     .object({
       kind: z.literal("job"),
       pds: origin,
-      reason: z.enum(["backfill", "quota_recovery"]),
+      reason: z.enum(["backfill", "quota_recovery", "repository_recovery"]),
+      // A repository-recovery job is scoped to exact DIDs that lost events to a
+      // verify-queue overflow, rather than to the whole PDS.
+      dids: z
+        .array(z.string().startsWith("did:", "Use an exact DID."))
+        .max(4096)
+        .transform((v) => [...new Set(v)].sort(compareStrings))
+        .optional(),
     })
     .strict(),
   z
@@ -194,7 +201,7 @@ export class ApiError extends Error {
   }
 }
 
-function compareCollections(a: string, b: string) {
+function compareStrings(a: string, b: string) {
   if (a === b) return 0;
   return a < b ? -1 : 1;
 }

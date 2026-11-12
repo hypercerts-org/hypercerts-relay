@@ -113,7 +113,9 @@ func failure(w http.ResponseWriter, err error) {
 	case errors.Is(err, jobs.ErrNotFound):
 		status = 404
 		code = "not_found"
-	case errors.Is(err, jobs.ErrConflict) || errors.Is(err, selection.ErrRevision):
+	// A recovery request that meets ownership at another coordinate, or the
+	// active-DID capacity, was never persisted: it is a retryable state conflict.
+	case errors.Is(err, jobs.ErrConflict) || errors.Is(err, jobs.ErrRecoveryBusy) || errors.Is(err, selection.ErrRevision):
 		status = 409
 		code = "state_conflict"
 	case errors.Is(err, jobs.ErrRepositoryDetailsSnapshotExpired):
@@ -186,15 +188,24 @@ func (h *Handler) removeSource(w http.ResponseWriter, r *http.Request) {
 }
 func (h *Handler) requestJob(w http.ResponseWriter, r *http.Request) {
 	var input struct {
-		PDS            string `json:"pds"`
-		Reason         string `json:"reason"`
-		RequestID      string `json:"requestId,omitempty"`
-		SourceRevision uint64 `json:"sourceRevision,omitempty"`
+		PDS            string   `json:"pds"`
+		Reason         string   `json:"reason"`
+		RequestID      string   `json:"requestId,omitempty"`
+		SourceRevision uint64   `json:"sourceRevision,omitempty"`
+		DIDs           []string `json:"dids,omitempty"`
 	}
 	if !decode(w, r, &input) {
 		return
 	}
-	j, err := h.jobs.RequestOnceWithSourceRevision(input.PDS, input.Reason, input.RequestID, input.SourceRevision)
+	// The recovery reason takes a DID scope and must never route through
+	// RequestOnceWithSourceRevision, which rejects it for lacking one.
+	var j jobs.Job
+	var err error
+	if input.Reason == jobs.ReasonRepositoryRecovery {
+		j, err = h.jobs.RequestRepositoryRecovery(input.PDS, input.DIDs, input.RequestID)
+	} else {
+		j, err = h.jobs.RequestOnceWithSourceRevision(input.PDS, input.Reason, input.RequestID, input.SourceRevision)
+	}
 	if err != nil {
 		failure(w, err)
 		return
@@ -544,28 +555,31 @@ func (h *Handler) listJobs(w http.ResponseWriter, r *http.Request) {
 // jobView reports bounded progress counters instead of embedding every DID in
 // each response. Current-state coverage and historical coverage stay separate.
 type jobView struct {
-	ID              string              `json:"id"`
-	PDS             string              `json:"pds"`
-	Policy          selection.Policy    `json:"policy"`
-	Reason          string              `json:"reason"`
-	State           jobs.State          `json:"state"`
-	Attempts        int                 `json:"attempts"`
-	CompletedRepos  int                 `json:"completedRepos"`
-	TotalRepos      int                 `json:"totalRepos"`
-	TotalReposKnown bool                `json:"totalReposKnown"`
-	Cursor          string              `json:"cursor"`
-	ErrorCode       string              `json:"errorCode,omitempty"`
-	LastFailure     *jobs.JobFailure    `json:"lastFailure,omitempty"`
-	CreatedAt       time.Time           `json:"createdAt"`
-	StartedAt       time.Time           `json:"startedAt"`
-	FinishedAt      time.Time           `json:"finishedAt"`
-	LastProgressAt  *time.Time          `json:"lastProgressAt,omitempty"`
-	Coverage        string              `json:"coverage"`
-	Diagnostics     jobs.JobDiagnostics `json:"diagnostics"`
+	ID              string           `json:"id"`
+	PDS             string           `json:"pds"`
+	Policy          selection.Policy `json:"policy"`
+	Reason          string           `json:"reason"`
+	State           jobs.State       `json:"state"`
+	Attempts        int              `json:"attempts"`
+	CompletedRepos  int              `json:"completedRepos"`
+	TotalRepos      int              `json:"totalRepos"`
+	TotalReposKnown bool             `json:"totalReposKnown"`
+	Cursor          string           `json:"cursor"`
+	ErrorCode       string           `json:"errorCode,omitempty"`
+	LastFailure     *jobs.JobFailure `json:"lastFailure,omitempty"`
+	CreatedAt       time.Time        `json:"createdAt"`
+	StartedAt       time.Time        `json:"startedAt"`
+	FinishedAt      time.Time        `json:"finishedAt"`
+	LastProgressAt  *time.Time       `json:"lastProgressAt,omitempty"`
+	Coverage        string           `json:"coverage"`
+	// RecoveryDIDCount reports a recovery job's scope as a bounded counter, like
+	// CompletedRepos, rather than embedding the DID list in every response.
+	RecoveryDIDCount int                 `json:"recoveryDidCount,omitempty"`
+	Diagnostics      jobs.JobDiagnostics `json:"diagnostics"`
 }
 
 func view(j jobs.Job, completedRepos int, diagnostics jobs.JobDiagnostics) jobView {
-	return jobView{ID: j.ID, PDS: j.PDS, Policy: j.Policy, Reason: j.Reason, State: j.State, Attempts: j.Attempts, CompletedRepos: completedRepos, TotalRepos: j.TotalRepos, TotalReposKnown: j.TotalReposKnown, Cursor: j.Cursor, ErrorCode: j.ErrorCode, LastFailure: j.LastFailure, CreatedAt: j.CreatedAt, StartedAt: j.StartedAt, FinishedAt: j.FinishedAt, LastProgressAt: j.LastProgressAt, Coverage: j.Coverage, Diagnostics: diagnostics}
+	return jobView{ID: j.ID, PDS: j.PDS, Policy: j.Policy, Reason: j.Reason, State: j.State, Attempts: j.Attempts, CompletedRepos: completedRepos, TotalRepos: j.TotalRepos, TotalReposKnown: j.TotalReposKnown, Cursor: j.Cursor, ErrorCode: j.ErrorCode, LastFailure: j.LastFailure, CreatedAt: j.CreatedAt, StartedAt: j.StartedAt, FinishedAt: j.FinishedAt, LastProgressAt: j.LastProgressAt, Coverage: j.Coverage, RecoveryDIDCount: len(j.RecoveryDIDs), Diagnostics: diagnostics}
 }
 
 type coverageView struct {
