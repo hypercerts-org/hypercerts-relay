@@ -74,6 +74,7 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 			// Bare cfg.Logger; live.Open sets its own component.
 			Logger:                o.cfg.Logger,
 			Metrics:               o.cfg.LiveMetrics,
+			DroppedEvents:         o.cfg.DroppedEvents,
 			DropMetrics:           o.cfg.DropMetrics,
 			WriterMetrics:         o.cfg.IngestMetrics,
 			Verifier:              o.cfg.Verifier,

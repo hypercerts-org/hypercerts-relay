@@ -7,7 +7,7 @@ operations interface. The product remains an operator tool: preserve routes,
 forms, status meanings, accessible names and durable command behavior.
 
 - Instrument Serif for page and section headings, with a roman/italic turn.
-  Switzer for structure, navigation, forms, identity and data.
+  Hanken Grotesk for structure, navigation, forms, identity and data.
 - Cream main surface; white sidebar and detail panels; grey table headings
   and selected navigation. Black controls and headings, grey body text,
   rust accent for heading emphasis, focus and failure states. Sage is the
@@ -37,8 +37,6 @@ Names and handles are presentation metadata, refreshed by OAuth sign-in.
 Authorization and administrator changes always use the authenticated DID.
 
 Brand assets and their pinned source revision are documented in
-`administration/src/brand/README.md`. Instrument Serif ships with its SIL Open
-Font License. Switzer is downloaded from Fontshare and checksum-verified during
-development/build preparation, then served locally; its license does not permit
-including the font in this public source repository. Keep that distinction when
-updating assets and confirm all three font faces load after building.
+`administration/src/brand/README.md`. Instrument Serif and Hanken Grotesk ship
+with their SIL Open Font License texts and are served locally. Confirm all three
+font faces load after building.

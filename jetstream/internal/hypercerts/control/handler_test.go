@@ -1593,3 +1593,63 @@ func TestCoverageRepositoryWaitFromManager(t *testing.T) {
 		require.Equal(t, deadline, *got.Diagnostics.RetryAt)
 	}
 }
+
+// A recovery request carries a DID scope, so it must route through the recovery
+// entry point rather than the legacy job request that rejects it.
+func TestRepositoryRecoveryJobRequest(t *testing.T) {
+	h, m := setup(t)
+	_, err := m.AddSourceWithRevision("https://pds.example.com", 1)
+	require.NoError(t, err)
+
+	body := `{"pds":"https://pds.example.com","reason":"repository_recovery","dids":["did:plc:bbbbbbbbbbbbbbbbbbbbbbbb","did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"]}`
+	w := request(h, "POST", "/jobs", body, testToken)
+	require.Equal(t, 202, w.Code)
+	var created jobView
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &created))
+	require.Equal(t, 2, created.RecoveryDIDCount)
+
+	// An empty scope cannot create a job; it would silently match nothing.
+	empty := `{"pds":"https://pds.example.com","reason":"repository_recovery","dids":[]}`
+	require.Equal(t, 400, request(h, "POST", "/jobs", empty, testToken).Code)
+
+	// The ordinary reasons must keep working through their own path.
+	backfill := `{"pds":"https://pds.example.com","reason":"backfill"}`
+	require.Equal(t, 202, request(h, "POST", "/jobs", backfill, testToken).Code)
+
+	// A DID already owned by active recovery at another PDS is a retryable state
+	// conflict. Nothing was persisted, so it must not read as a storage failure.
+	_, err = m.AddSourceWithRevision("https://other.example.com", 1)
+	require.NoError(t, err)
+	busy := `{"pds":"https://other.example.com","reason":"repository_recovery","dids":["did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"]}`
+	w = request(h, "POST", "/jobs", busy, testToken)
+	require.Equal(t, 409, w.Code)
+	require.JSONEq(t, `{"error":"state_conflict"}`, w.Body.String())
+}
+
+// The documented scope limit must be reachable through the HTTP decoder: a full
+// 4,096-DID scope of did:plc identifiers is far larger than the default 64 KiB
+// control request limit.
+func TestRepositoryRecoveryJobRequestAcceptsFullScope(t *testing.T) {
+	h, m := setup(t)
+	_, err := m.AddSourceWithRevision("https://pds.example.com", 1)
+	require.NoError(t, err)
+
+	dids := make([]string, 4096)
+	for i := range dids {
+		dids[i] = fmt.Sprintf("did:plc:%024d", i)
+	}
+	body, err := json.Marshal(map[string]any{"pds": "https://pds.example.com", "reason": "repository_recovery", "dids": dids})
+	require.NoError(t, err)
+	require.Greater(t, len(body), 64<<10)
+	w := request(h, "POST", "/jobs", string(body), testToken)
+	require.Equal(t, 202, w.Code, w.Body.String())
+	var created jobView
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &created))
+	require.Equal(t, 4096, created.RecoveryDIDCount)
+
+	// An overlong DID is invalid input rather than an oversized body.
+	long := `{"pds":"https://pds.example.com","reason":"repository_recovery","dids":["did:web:` + strings.Repeat("a", jobs.RecoveryDIDMaxLength) + `.example"]}`
+	w = request(h, "POST", "/jobs", long, testToken)
+	require.Equal(t, 400, w.Code)
+	require.NotContains(t, w.Body.String(), "invalid_json")
+}

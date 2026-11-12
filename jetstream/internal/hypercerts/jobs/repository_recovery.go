@@ -1,0 +1,346 @@
+package jobs
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"slices"
+	"time"
+
+	"github.com/jcalabro/atmos"
+	atmossync "github.com/jcalabro/atmos/sync"
+)
+
+// normalizeRecoveryDIDs validates, deduplicates and sorts the DID set a
+// repository-recovery job covers. An empty set or a malformed DID is rejected:
+// either would silently widen the job's scope or guarantee it matches nothing.
+func normalizeRecoveryDIDs(dids []string) ([]string, error) {
+	if len(dids) == 0 {
+		return nil, fmt.Errorf("%w: recovery requires at least one DID", ErrInvalidInput)
+	}
+	seen := make(map[string]struct{}, len(dids))
+	out := make([]string, 0, len(dids))
+	for _, did := range dids {
+		if len(did) > RecoveryDIDMaxLength {
+			return nil, fmt.Errorf("%w: recovery DID exceeds %d characters", ErrInvalidInput, RecoveryDIDMaxLength)
+		}
+		if _, err := atmos.ParseDID(did); err != nil {
+			return nil, fmt.Errorf("%w: invalid recovery DID %q", ErrInvalidInput, did)
+		}
+		if _, dup := seen[did]; dup {
+			continue
+		}
+		seen[did] = struct{}{}
+		out = append(out, did)
+	}
+	slices.Sort(out)
+	return out, nil
+}
+
+const recoveryScopeLimit = 4096
+
+// RecoveryDIDMaxLength bounds each recovery DID. It covers did:plc and a
+// did:web with a maximum-length host and an encoded port, and it keeps the
+// request byte limit below consistent with the 4,096-DID scope limit.
+const RecoveryDIDMaxLength = 512
+
+// MaxRepositoryRecoveryRequestBytes bounds a job request body so a full scope
+// of maximum-length DIDs fits: each DID adds its quotes and a separator, and the
+// remaining fields fit in the 64 KiB allowed for other control requests.
+const MaxRepositoryRecoveryRequestBytes = recoveryScopeLimit*(RecoveryDIDMaxLength+3) + 64<<10
+
+var ErrRecoveryBusy = errors.New("repository recovery ownership or capacity unavailable")
+
+func recoverySealed(job Job) bool {
+	return job.RecoveryScopeSealed == nil || *job.RecoveryScopeSealed || job.State == Running
+}
+
+func recoveryOwners(next data) (map[string]string, error) {
+	owners := make(map[string]string)
+	for id, job := range next.Jobs {
+		if job.Reason != ReasonRepositoryRecovery || (job.State != Pending && job.State != Running) {
+			continue
+		}
+		for _, did := range job.RecoveryDIDs {
+			if _, exists := owners[did]; exists {
+				return nil, fmt.Errorf("ambiguous active repository recovery ownership")
+			}
+			owners[did] = id
+		}
+	}
+	return owners, nil
+}
+
+func addRecoveryJob(next data, predecessor Job, dids []string) (Job, error) {
+	job := newJob(predecessor.PDS, predecessor.Policy, ReasonRepositoryRecovery, predecessor.SourceRevision)
+	job.RecoveryDIDs = slices.Clone(dids)
+	job.RecoveryScopeSealed = new(bool)
+	if err := beginAcquisition(next, &job); err != nil {
+		return Job{}, err
+	}
+	baseID := job.ID
+	for ordinal := len(next.Jobs); ; ordinal++ {
+		if _, exists := next.Jobs[job.ID]; !exists {
+			break
+		}
+		job.ID = distinctRecoveryJobID(baseID, ordinal)
+	}
+	next.Jobs[job.ID] = job
+	return job, nil
+}
+
+func (m *Manager) RequestRepositoryRecovery(raw string, dids []string, requestID string) (Job, error) {
+	if len(requestID) > 128 || len(dids) > recoveryScopeLimit {
+		return Job{}, ErrInvalidInput
+	}
+	normalized, err := normalizeRecoveryDIDs(dids)
+	if err != nil {
+		return Job{}, err
+	}
+	pds, err := normalizeSource(raw)
+	if err != nil {
+		return Job{}, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if existing, found, err := m.requestReceipt(pds, ReasonRepositoryRecovery, requestID, 0); found {
+		return existing, err
+	}
+	if !m.data.Sources[pds] {
+		return Job{}, ErrConflict
+	}
+	next := clone(m.data)
+	ensureSourceRevisions(&next)
+	policy := m.policy.Current()
+	owners, err := recoveryOwners(next)
+	if err != nil {
+		return Job{}, err
+	}
+	var unowned []string
+	representativeID := ""
+	for _, did := range normalized {
+		id, exists := owners[did]
+		if !exists {
+			unowned = append(unowned, did)
+			continue
+		}
+		owner := next.Jobs[id]
+		if owner.PDS != pds || owner.SourceRevision != next.SourceRevisions[pds] || owner.Policy.Revision != policy.Revision {
+			return Job{}, ErrRecoveryBusy
+		}
+		if recoverySealed(owner) {
+			owner.RecoveryFollowupDIDs = mergeRecoveryDIDs(owner.RecoveryFollowupDIDs, []string{did})
+			next.Jobs[id] = owner
+		}
+		if representativeID == "" || id < representativeID {
+			representativeID = id
+		}
+	}
+	if len(owners)+len(unowned) > recoveryScopeLimit {
+		return Job{}, ErrRecoveryBusy
+	}
+	if len(unowned) > 0 {
+		candidateID := ""
+		for id, candidate := range next.Jobs {
+			if candidate.PDS == pds && candidate.Reason == ReasonRepositoryRecovery &&
+				candidate.SourceRevision == next.SourceRevisions[pds] && candidate.Policy.Revision == policy.Revision &&
+				candidate.State == Pending && !recoverySealed(candidate) && len(candidate.RecoveryDIDs)+len(unowned) <= recoveryScopeLimit &&
+				(candidateID == "" || id < candidateID) {
+				candidateID = id
+			}
+		}
+		if candidateID == "" {
+			job, err := addRecoveryJob(next, newJob(pds, policy, ReasonRepositoryRecovery, next.SourceRevisions[pds]), unowned)
+			if err != nil {
+				return Job{}, err
+			}
+			candidateID = job.ID
+		} else {
+			candidate := next.Jobs[candidateID]
+			candidate.RecoveryDIDs = mergeRecoveryDIDs(candidate.RecoveryDIDs, unowned)
+			next.Jobs[candidateID] = candidate
+		}
+		if representativeID == "" || candidateID < representativeID {
+			representativeID = candidateID
+		}
+	}
+	return m.rememberRequest(next, next.Jobs[representativeID], requestID)
+}
+
+func restoreRecoveryJobs(next *data) error {
+	for id, job := range next.Jobs {
+		if job.Reason != ReasonRepositoryRecovery {
+			continue
+		}
+		normalized, err := normalizeRecoveryDIDs(job.RecoveryDIDs)
+		if err != nil || len(normalized) > recoveryScopeLimit || !slices.Equal(normalized, job.RecoveryDIDs) {
+			return fmt.Errorf("invalid persisted repository recovery scope")
+		}
+		if job.RecoveryScopeSealed == nil || job.State == Running || job.Attempts > 0 || !job.StartedAt.IsZero() || job.TotalReposKnown || job.EnumeratedRepos > 0 || len(job.CompletedRepos) > 0 {
+			sealed := true
+			job.RecoveryScopeSealed = &sealed
+		}
+		for index, did := range job.RecoveryDiscoveryFailures {
+			if !slices.Contains(job.RecoveryDIDs, did) || job.TotalReposKnown || (index > 0 && job.RecoveryDiscoveryFailures[index-1] >= did) {
+				return fmt.Errorf("invalid persisted repository recovery discovery failure")
+			}
+		}
+		for _, did := range job.RecoveryFollowupDIDs {
+			if !slices.Contains(job.RecoveryDIDs, did) || !recoverySealed(job) || (job.State != Pending && job.State != Running) {
+				return fmt.Errorf("invalid persisted repository recovery followup")
+			}
+		}
+		next.Jobs[id] = job
+	}
+	owners, err := recoveryOwners(*next)
+	if err != nil {
+		return err
+	}
+	if len(owners) > recoveryScopeLimit {
+		return fmt.Errorf("persisted repository recovery capacity exceeded")
+	}
+	return nil
+}
+
+func promoteRecoveryFollowups(next *data, job *Job) error {
+	if job.Reason != ReasonRepositoryRecovery || (job.State != Complete && job.State != Failed && job.State != Incomplete) || len(job.RecoveryFollowupDIDs) == 0 {
+		return nil
+	}
+	if _, err := addRecoveryJob(*next, *job, job.RecoveryFollowupDIDs); err != nil {
+		return err
+	}
+	job.RecoveryFollowupDIDs = nil
+	return nil
+}
+
+// distinctRecoveryJobID derives a fresh job identifier for a recovery request
+// whose deterministic identity is already occupied.
+func distinctRecoveryJobID(base string, ordinal int) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("recovery/%s/%d", base, ordinal)))
+	return hex.EncodeToString(sum[:16])
+}
+
+// mergeRecoveryDIDs returns the sorted union of two normalized DID sets.
+func mergeRecoveryDIDs(existing, added []string) []string {
+	seen := make(map[string]struct{}, len(existing)+len(added))
+	out := make([]string, 0, len(existing)+len(added))
+	for _, did := range append(append([]string{}, existing...), added...) {
+		if _, dup := seen[did]; dup {
+			continue
+		}
+		seen[did] = struct{}{}
+		out = append(out, did)
+	}
+	slices.Sort(out)
+	return out
+}
+
+// seedRecoveryInventory persists a frozen inventory holding exactly the DIDs a
+// recovery job covers, so the per-repository ledger can resolve their listing
+// coordinates without a listRepos traversal of the whole PDS.
+//
+// It is re-runnable. Only DIDs absent from the current inventory are submitted:
+// CheckpointInventory rejects a DID whose newly fetched revision conflicts with
+// one already recorded (`invalid_listing`), so re-submitting a seeded DID would
+// fail on the second pass or after any restart.
+//
+// A failed DID is recorded and skipped by later passes, and the job can end
+// several passes afterwards without attempting discovery again. The bounded
+// cause is therefore reported here, once for the pass that observed it.
+func (p PDSProcessor) seedRecoveryInventory(ctx context.Context, client *atmossync.Client, job *Job) error {
+	existing, err := p.Manager.Inventory(job.ID)
+	if err != nil {
+		return err
+	}
+	var lastFailure *pdsAttemptFailure
+	failed := 0
+	defer func() { warnRecoveryDiscoveryFailures(job.ID, lastFailure, failed) }()
+	seeded := make(map[string]struct{}, len(existing))
+	for _, entry := range existing {
+		seeded[entry.DID] = struct{}{}
+	}
+	for _, did := range job.RecoveryDIDs {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if _, exists := seeded[did]; exists || slices.Contains(job.RecoveryDiscoveryFailures, did) {
+			continue
+		}
+		cooldown, found, err := p.Manager.GetPDSCooldown(job.PDS)
+		if err != nil {
+			return err
+		}
+		if found && cooldown.Until.After(time.Now()) {
+			return errJobYield
+		}
+		capture := &pdsResponseCapture{}
+		requestCtx := context.WithValue(ctx, pdsResponseCaptureKey{}, capture)
+		rev, _, err := client.GetLatestCommit(requestCtx, atmos.DID(did))
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err == nil {
+			_, err = atmos.ParseTID(rev)
+		}
+		if err != nil {
+			lastFailure = newPDSAttemptFailure(&InputError{Code: "recovery_revision_unavailable", Unavailable: true}, err, pdsStageLatestCommit, did, false, capture)
+			failed++
+			var cooldownUntil *time.Time
+			if capture.status == http.StatusTooManyRequests {
+				now := time.Now()
+				deadline := repositoryRetryDeadline(1, pdsServerRetryDeadline(capture.header, now), now)
+				cooldownUntil = &deadline
+			}
+			if err := p.Manager.recordRecoveryDiscoveryFailure(job.ID, did, cooldownUntil); err != nil {
+				return err
+			}
+			if cooldownUntil != nil {
+				return errJobYield
+			}
+			continue
+		}
+		seeded[did] = struct{}{}
+		if err := p.Manager.CheckpointInventory(job.ID, "", map[string]string{did: rev}, len(seeded) == len(job.RecoveryDIDs)); err != nil {
+			return err
+		}
+	}
+	return ctx.Err()
+}
+
+// warnRecoveryDiscoveryFailures reports one seeding pass's discovery failures
+// as a single warning: the count, plus the stage, bounded cause category and
+// repository of the most recent one. It never logs a raw error.
+func warnRecoveryDiscoveryFailures(jobID string, last *pdsAttemptFailure, failed int) {
+	if last == nil {
+		return
+	}
+	fields := []any{"job_id", jobID, "stage", last.stage, "cause_class", last.causeClass, "repository_did", last.repositoryDID, "failed_dids", failed}
+	if last.causeClass == pdsCauseHTTP && last.httpStatus > 0 {
+		fields = append(fields, "http_status", last.httpStatus)
+	}
+	slog.Default().Warn("repository recovery revision discovery failed", fields...)
+}
+
+func (m *Manager) recordRecoveryDiscoveryFailure(id, did string, cooldownUntil *time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.active(id) {
+		return ErrConflict
+	}
+	next := clone(m.data)
+	job := next.Jobs[id]
+	if job.Reason != ReasonRepositoryRecovery || !slices.Contains(job.RecoveryDIDs, did) {
+		return ErrConflict
+	}
+	cooldown, err := m.repositoryFailureCooldownLocked(job.PDS, cooldownUntil)
+	if err != nil {
+		return err
+	}
+	job.RecoveryDiscoveryFailures = mergeRecoveryDIDs(job.RecoveryDiscoveryFailures, []string{did})
+	next.Jobs[id] = job
+	return m.commitRepositoryRetryBatch(next, true, nil, nil, cooldown)
+}

@@ -45,6 +45,10 @@ type CompactionPassResult struct {
 // prometheus registry. The orchestrator-level Metrics covers
 // transitions and per-state durations.
 type Config struct {
+	// hypercerts: DroppedEvents, when set, receives each verify-queue overflow so
+	// a durable recovery job can be booked for the affected DID.
+	DroppedEvents func(did string, dropped uint64)
+
 	// hypercerts: Filter record materialization with the shared durable policy.
 	CollectionPolicy *selection.Manager
 	// Optional managed attribution is deliberately off unless a manager is supplied.

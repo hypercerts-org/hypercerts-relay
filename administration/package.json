@@ -1,6 +1,7 @@
 {
   "name": "@hypercerts/relay-administration",
-  "version": "0.9.1",
+  "version": "0.10.0",
+  "license": "MIT OR Apache-2.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -10,9 +11,7 @@
     "check": "svelte-check --tsconfig ./tsconfig.json && tsc --noEmit",
     "test": "CONTROL_GO_BINARY=\"$(command -v go)\" tsx --test tests/*.test.ts",
     "test:components": "vitest run",
-    "test:browser": "CONTROL_GO_BINARY=\"$(command -v go)\" playwright test",
-    "prebuild": "node scripts/prepare-fonts.mjs",
-    "predev": "node scripts/prepare-fonts.mjs"
+    "test:browser": "CONTROL_GO_BINARY=\"$(command -v go)\" playwright test"
   },
   "engines": {
     "node": ">=24.18.0"

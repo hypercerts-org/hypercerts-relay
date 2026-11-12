@@ -526,7 +526,7 @@ test("branded sign-in and sidebar identity work with and without profile metadat
       await Promise.all([
         document.fonts.load('400 48px "Instrument Serif"'),
         document.fonts.load('italic 400 48px "Instrument Serif"'),
-        document.fonts.load('700 16px "Switzer Variable"'),
+        document.fonts.load('700 16px "Hanken Grotesk"'),
       ]);
       return [...document.fonts].map(({ family, status }) => ({
         family,

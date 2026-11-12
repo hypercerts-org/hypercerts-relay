@@ -93,7 +93,7 @@ request before selecting the names in the ruleset. GitHub requires a successful
 check within the past seven days; see
 [troubleshooting required status checks](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks).
 
-Install Go 1.26.10 or the toolchain selected by `go.mod`. Relay links SQLite through CGO, so a working C compiler is also required.
+Install Go 1.27.3 or the toolchain selected by `go.mod`. Relay links SQLite through CGO, so a working C compiler is also required.
 
 ```bash
 git clone git@github.com:hypercerts-org/hypercerts-relay.git
@@ -135,4 +135,12 @@ See [RELEASING.md](RELEASING.md) for the exact process and rollback guidance.
 
 ## License
 
-This repository retains Indigo's dual licensing under [MIT](LICENSE-MIT) and [Apache-2.0](LICENSE-APACHE). See the license files for their terms.
+Licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option. This covers the code and documentation in the repository, which come from three sources:
+
+- **From Indigo**, the Indigo files in the paths listed in [`.hypercerts/upstream-paths`](.hypercerts/upstream-paths), which hold the Relay (`cmd/relay`), Rainbow (`cmd/rainbow`), the collection directory (`cmd/collectiondir`) and the Go packages they need: copyright Bluesky Social PBC, `@whyrusleeping` and contributors, under Indigo's dual license ([LICENSE-DUAL](LICENSE-DUAL)).
+- **From Jetstream**, the files in [`jetstream/`](jetstream) listed in [`.hypercerts/jetstream-upstream-paths`](.hypercerts/jetstream-upstream-paths): copyright Bluesky Social PBC and contributors, under Jetstream's dual license ([jetstream/LICENSE-DUAL](jetstream/LICENSE-DUAL)).
+- **Everything else**: copyright 2026 Hypercerts Foundation, under the same two licenses. This includes the administration control plane in [`administration/`](administration), the files we added under the Indigo paths and in `jetstream/` (such as the code for managed PDS sources in `cmd/relay/relay/` and the packages in [`jetstream/internal/hypercerts/`](jetstream/internal/hypercerts)), and our changes to Indigo and Jetstream files.
+
+A file that states its own license keeps it. For example, [`util/ssrf/ssrf.go`](util/ssrf/ssrf.go) is dedicated to the public domain under CC0.
+
+The licenses don't cover the Hypercerts logo in `administration/src/brand/assets/logo/` and `administration/public/favicon.svg`, which is a mark of the Hypercerts Foundation. They also don't cover the fonts in `administration/src/brand/assets/fonts/`, which keep their own licenses; see the [brand notes](administration/src/brand/README.md).

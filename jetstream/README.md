@@ -217,6 +217,67 @@ data directory persistent: losing it discards both the accepted lifecycle state
 and its fences, so Relay's durable queue may be replayed but cannot reconstruct
 older accepted policy history without operator reconciliation.
 
+### Repository recovery after verify-queue loss
+
+For operators investigating verify-queue overflow, Jetstream batches shed DIDs
+in memory before booking repository-scoped recovery. Observations remain volatile
+until booking succeeds: process loss, unresolved PDS attribution, or the bounded
+4,096-DID memory queue can lose an unbooked observation. Check recovery warnings;
+a live cursor alone does not prove those gaps have been repaired. A failed
+identity lookup is retried on each flush for about five minutes (60 attempts)
+and then dropped with an `identity lookup kept failing` warning naming the DID;
+an identity with no PDS endpoint or an unsupported DID method is dropped at once.
+
+A booking for a PDS that is not an admitted source is rejected and not retried,
+because it cannot succeed until an operator acts. Admitting the source later does
+not book that work. The `booking repository recovery failed` warning names the
+PDS and the number of DIDs; the overflow warnings that precede it name each DID.
+After admitting the source, request recovery for those DIDs with `POST /jobs`.
+
+Successful booking durably accepts every DID in the request. The job manager
+allows at most one active recovery owner and one followup flag per DID, across
+all PDS origins. Unclaimed jobs absorb observations at the exact source revision,
+PDS and collection-policy revision. First claim durably seals the scope; later
+observations set a followup flag rather than extending that frozen inventory.
+Yields and restarts retain both the seal and followup intent. Completion, failure,
+or incomplete input atomically promotes flagged DIDs to fresh successor work.
+Repeated observations do not create a job per flush. Recovery snapshots establish
+current state, not historical event completeness, and do not clear Relay's
+source-wide recovery requirement.
+
+Requests and individual job scopes are limited to 4,096 DIDs of at most 512
+characters each, with a global limit of 4,096 actively owned DIDs. A request needing new admissions beyond that global
+limit is rejected in full; updates to already owned DIDs still succeed. Ownership
+at another source/PDS/policy coordinate is retryable, not silently reassigned.
+Both rejections return 409 `state_conflict` from `POST /jobs` and persist nothing.
+A mixed request returns the lexicographically smallest participating job ID as its
+representative, not a complete list of owners. Its nonempty idempotency receipt
+keeps that original representative even after successor promotion; replay adds no
+work.
+
+For operators retrying recovery jobs, an unavailable latest revision no longer
+blocks healthy repositories from reconciling. Successful discoveries and failed
+DIDs are durable across restart. The inventory remains incomplete until every
+scoped DID has a revision; after repository retries finish, missing discoveries
+leave the job `incomplete` with `recovery_revision_unavailable`. Each pass that
+fails to discover a revision emits one `repository recovery revision discovery
+failed` warning with the job ID, the `getLatestCommit` stage, the number of DIDs
+that failed, and the bounded cause category and DID of the most recent one. A
+later pass does not repeat it, because it skips those DIDs. Retry the job with
+`POST /hypercerts/v1/jobs/{id}/retry` after restoring PDS availability. This clears
+discovery failures for the new attempt without discarding valid inventory or
+completed reconciliation. Automatic repository retries still respect their delay
+and the PDS cooldown; they do not repeatedly retry unavailable discovery DIDs.
+
+Explicit cancellation discards followups. Source removal, source-revision advance,
+and policy changes atomically invalidate stale recovery intent. Manual retry
+conflicts while any DID in the requested job has another active recovery owner.
+On upgrade, legacy recovery scopes are conservatively treated as sealed, even
+when pending. Ambiguous duplicate active ownership or oversized legacy active
+state stops opening the job store without rewriting it; preserve the data directory
+and obtain a reviewed migration rather than editing durable metadata by hand.
+Do not downgrade while sealed scopes or followup intent remain in durable state.
+
 Coverage is explicitly `current_state`: a PDS snapshot cannot prove historical
 event completeness. The private coverage endpoint returns schema v1 scoped to
 enabled sources and the current collection-policy revision. Its aggregate covers

@@ -236,6 +236,12 @@ func latestMatchingAcquisition(pds string, sourceRevision, policyRevision uint64
 		if j.PDS != pds || j.SourceRevision != sourceRevision || j.Policy.Revision != policyRevision {
 			continue
 		}
+		// hypercerts: a repository-scoped recovery job re-acquires a few DIDs and
+		// carries no whole-source evidence, so it must never be presented as the
+		// source's current-state coverage.
+		if j.Reason == jobs.ReasonRepositoryRecovery {
+			continue
+		}
 		if selected == nil || newerAcquisition(*j, *selected) {
 			selected = j
 		}

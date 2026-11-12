@@ -20,6 +20,15 @@ forward-upgrade and restore-only qualification. It proves selected Relay and
 Jetstream durable coordinates survive both a forward candidate open and an
 independent restored copy; it does not claim a production Railway snapshot,
 capacity budget, live blue/green cutover, or binary rollback.
+`./tests/acceptance/run T20` owns the verify-queue overflow recovery contract. It
+stops Jetstream, writes a single-account backlog to a real PDS, then restarts
+Jetstream so the Relay replays the backlog at socket speed. That replay overflows
+atmos's per-DID verify queue, and the loss must be booked as a durable,
+repository-scoped recovery job. It fails if no backlog event was shed, if no
+recovery job was booked, or if such a job is published as whole-source coverage.
+Before the replay it waits until the Relay's revision for the backlog account
+equals the PDS head, so a lagging Relay cannot shrink the backlog. It does not
+prove signature verification, which T15-core owns.
 Unknown selectors fail with exit 64.
 
 ## Topology
@@ -96,6 +105,7 @@ directory and removes containers and named volumes on exit.
 ./tests/acceptance/run T15-core
 ./tests/acceptance/run T15-selection
 ./tests/acceptance/run T19
+./tests/acceptance/run T20
 ```
 
 T04 runs the real owned Relay-to-Jetstream archive/replay/restart path with one
