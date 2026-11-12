@@ -74,6 +74,8 @@ type Runtime struct {
 	manifest       *manifest.Manifest
 	tail           *subscribe.Tail
 	verifier       *atmossync.Verifier
+	// hypercerts: verifyFailures summarises repeated verification failure log lines.
+	verifyFailures *verifyFailureLog
 	// recovery books durable jobs for events shed by the verify queue.
 	recovery        *recoveryCoalescer
 	orchestrator    *orchestrator.Orchestrator
@@ -402,16 +404,18 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	rt.tail = tail
 
 	verifierLogger := processLogger.With(slog.String("component", "verifier"))
+	// hypercerts: Repeated failures for one DID are summarised rather than
+	// logged per commit; the failure metric still counts every one (TECH-883).
+	verifyFailures := newVerifyFailureLog(verifierLogger)
+	rt.verifyFailures = verifyFailures
 	verifier, err := atmossync.NewVerifier(atmossync.VerifierOptions{
 		Directory:  directory,
 		StateStore: stateStore,
 		SyncClient: gt.Some(syncClient),
 		OnVerificationFailure: gt.Some(func(did atmos.DID, vErr error) {
-			verifierMetrics.IncFailure(obs.Classify(vErr))
-			verifierLogger.Warn("verification failure",
-				"did", did,
-				"err", vErr,
-			)
+			class := obs.Classify(vErr)
+			verifierMetrics.IncFailure(class)
+			verifyFailures.observe(string(did), class, vErr)
 		}),
 	})
 	if err != nil {
@@ -567,6 +571,9 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		FailedRepoRetryMaxDelay:        opts.FailedRepoRetryMaxDelay,
 		LiveReconnectBackoff:           opts.LiveReconnectBackoff,
 		LiveDial:                       opts.LiveDial,
+		LiveVerifyParallelism:          opts.LiveVerifyParallelism,
+		LiveUpstreamReadRate:           opts.LiveUpstreamReadRate,
+		LiveUpstreamReadBurst:          opts.LiveUpstreamReadBurst,
 		IngestOnAfterSeal:              mft.OnSegmentSealed,
 		OnSegmentCompacted:             onSegmentCompacted,
 		SegmentManifestChecksums:       mft.SegmentChecksums,
@@ -943,6 +950,13 @@ func (r *Runtime) Run(ctx context.Context) (runErr error) {
 	if !r.opts.Headless {
 		g.Go(r.goroutineRoot("http_server", func() error {
 			return r.server.Run(gctx)
+		}))
+	}
+
+	// hypercerts: Flush verification failure log summaries (TECH-883).
+	if r.verifyFailures != nil {
+		g.Go(r.goroutineRoot("verify_failure_log", func() error {
+			return r.verifyFailures.run(gctx)
 		}))
 	}
 

@@ -74,6 +74,11 @@ type Consumer struct {
 	// processBatch in isolation.
 	client atomic.Pointer[streaming.Client]
 
+	// hypercerts: lastStreamErr is the most recent stream-level error yielded by the
+	// upstream iterator. Owned by the Run goroutine; reported when the
+	// iterator ends while the consumer is still meant to run.
+	lastStreamErr error
+
 	closeMu sync.Mutex
 	closed  bool
 }
@@ -440,7 +445,9 @@ func (c *Consumer) saveCursorAndSyncState(cur int64) error {
 //
 // Reconnects with exponential backoff are handled internally by
 // atmos's streaming.Client; Run does not see transient network
-// errors as terminal.
+// errors or transient HTTP rejections as terminal. If the upstream
+// iterator ends while ctx is still live, Run returns an error wrapping
+// ErrUpstreamStreamEnded rather than stopping silently.
 func (c *Consumer) Run(ctx context.Context) error {
 	c.closeMu.Lock()
 	closed := c.closed
@@ -500,9 +507,15 @@ func (c *Consumer) Run(ctx context.Context) error {
 	if c.cfg.ReconnectBackoff != nil {
 		opts.Backoff = gt.Some(*c.cfg.ReconnectBackoff)
 	}
-	if c.cfg.Dial != nil {
-		opts.Dial = gt.Some(c.cfg.Dial)
-	}
+	// hypercerts: Retry transient relay rejections, log connections, pace
+	// reads and size the per-DID verify queue (TECH-883).
+	opts.Parallelism = gt.Some(c.cfg.VerifyParallelism)
+	opts.Dial = gt.Some(upstreamDial(
+		c.cfg.Dial,
+		c.logger,
+		c.cfg.Metrics,
+		newUpstreamReadLimiter(c.cfg.UpstreamReadRate, c.cfg.UpstreamReadBurst),
+	))
 
 	client, err := streaming.NewClient(opts)
 	if err != nil {
@@ -550,7 +563,18 @@ func (c *Consumer) Run(ctx context.Context) error {
 		}
 	}()
 
-	return c.consumeEvents(ctx, client.Events(ctx))
+	err = c.consumeEvents(ctx, client.Events(ctx))
+	if err == nil && ctx.Err() == nil {
+		// hypercerts: atmos ends the iterator only on a non-retryable dial
+		// error. Returning nil here would leave the process up with no live
+		// ingestion; fail so the orchestrator tears the process down and the
+		// supervisor restarts it from the persisted cursor (TECH-883).
+		if c.lastStreamErr == nil {
+			return ErrUpstreamStreamEnded
+		}
+		return fmt.Errorf("%w: last stream error: %w", ErrUpstreamStreamEnded, c.lastStreamErr)
+	}
+	return err
 }
 
 // consumeEvents drains one upstream event sequence. It is separate from Run so
@@ -564,6 +588,8 @@ func (c *Consumer) consumeEvents(ctx context.Context, events iter.Seq2[[]streami
 			// continuity loss rather than halting, so operators recover
 			// without a crash loop. The loss stays explicitly logged and
 			// recorded; it is never silently absorbed.
+			// hypercerts: Kept to report why the iterator ended (TECH-883).
+			c.lastStreamErr = err
 			c.recordUpstreamLoss(ctx, err)
 			// Classify, log, and continue — the next iteration
 			// will either reconnect or yield the next batch.
