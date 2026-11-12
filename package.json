@@ -1,6 +1,6 @@
 {
   "name": "hypercerts-relay",
-  "version": "0.9.1",
+  "version": "0.10.0",
   "description": "Hypercerts-maintained Indigo Relay and Rainbow fork",
   "license": "MIT OR Apache-2.0",
   "private": true,
