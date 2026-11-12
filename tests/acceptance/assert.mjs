@@ -164,6 +164,13 @@ async function assertCombined(events, bootstrap, snapshotPath, livePath) {
 // fails explicitly instead of passing an empty assertion.
 async function assertT20Recovery(statePath) {
   const state = await readJSON(statePath)
+  const backlog = t20Backlog(state)
+  assertT20RecoveryJobs(state.recoveryJobs, backlog)
+  const job = t20TerminalJob(state)
+  assertT20CoverageExcludesJob(state.coverage, job)
+}
+
+function t20Backlog(state) {
   const backlog = state.backlog
   if (!backlog || typeof backlog.did !== 'string' || !backlog.did.startsWith('did:')) {
     fail('T20 has no recorded backlog DID; the driver did not run t20-backlog')
@@ -173,23 +180,25 @@ async function assertT20Recovery(statePath) {
   if (!Number.isSafeInteger(backlog.count) || backlog.count < 65) {
     fail(`T20 backlog was too small to exceed the per-DID verify queue: ${backlog.count}`)
   }
+  return backlog
+}
 
-  const jobs = state.recoveryJobs
+function assertT20RecoveryJobs(jobs, backlog) {
   if (!Array.isArray(jobs) || jobs.length === 0) {
     fail(`T20 booked no repository_recovery job for ${backlog.did}; the replayed backlog was silently lost`)
   }
-  const scoped = jobs.filter((item) => Number(item.recoveryDidCount ?? 0) > 0)
-  if (scoped.length === 0) {
+  if (!jobs.some((item) => Number(item.recoveryDidCount ?? 0) > 0)) {
     fail(`T20 booked recovery jobs but none carried a DID scope: ${JSON.stringify(jobs)}`)
   }
   // One PDS-wide backfill would re-download every repository. Exactly the
   // requested DIDs must be in scope instead.
-  for (const item of jobs) {
-    if (item.reason !== undefined && item.reason !== 'repository_recovery') {
-      fail(`T20 booked a job with unexpected reason ${item.reason}`)
-    }
+  const unexpected = jobs.find((item) => item.reason !== undefined && item.reason !== 'repository_recovery')
+  if (unexpected) {
+    fail(`T20 booked a job with unexpected reason ${unexpected.reason}`)
   }
+}
 
+function t20TerminalJob(state) {
   const job = state.job
   if (!job || typeof job.id !== 'string') {
     fail('T20 completed no recovery job; the driver did not run t20-complete')
@@ -197,18 +206,28 @@ async function assertT20Recovery(statePath) {
   if (!['complete', 'incomplete'].includes(job.state)) {
     fail(`T20 recovery job ended in ${job.state}, expected complete or incomplete`)
   }
+  return job
+}
 
-  // A repository-scoped job must never be presented as whole-source coverage.
-  const items = state.coverage?.items ?? state.coverage?.sources ?? []
-  const row = Array.isArray(items) ? items.find((item) => item?.pds === job.pds) : undefined
-  if (row) {
-    if (row.matchingJob === true && row.jobId === job.id) {
-      fail(`T20 recovery job ${job.id} was published as matching current-state coverage for ${job.pds}`)
-    }
-    const coverageLabel = row.acquisition?.state ?? row.legacyProgress?.coverage ?? row.coverage
-    if (coverageLabel === 'current_state' && row.jobId === job.id) {
-      fail(`T20 recovery job ${job.id} claimed current_state coverage for ${job.pds}`)
-    }
+// A repository-scoped job must never be presented as whole-source coverage.
+// The source is admitted before the backlog, so its coverage row must exist: a
+// missing row or an unrecognised response shape fails instead of skipping the
+// checks and passing without evidence.
+function assertT20CoverageExcludesJob(coverage, job) {
+  const items = coverage?.items ?? coverage?.sources
+  if (!Array.isArray(items)) {
+    fail(`T20 recorded no recognisable coverage listing for ${job.pds}, so the recovery job's exclusion from source coverage is unproven`)
+  }
+  const row = items.find((item) => item?.pds === job.pds)
+  if (!row) {
+    fail(`T20 coverage has no row for ${job.pds}, so the recovery job's exclusion from source coverage is unproven`)
+  }
+  if (row.matchingJob === true && row.jobId === job.id) {
+    fail(`T20 recovery job ${job.id} was published as matching current-state coverage for ${job.pds}`)
+  }
+  const coverageLabel = row.acquisition?.state ?? row.legacyProgress?.coverage ?? row.coverage
+  if (coverageLabel === 'current_state' && row.jobId === job.id) {
+    fail(`T20 recovery job ${job.id} claimed current_state coverage for ${job.pds}`)
   }
 }
 
