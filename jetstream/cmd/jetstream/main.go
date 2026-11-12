@@ -390,6 +390,27 @@ func serveCommand() *cli.Command {
 				Sources: cli.EnvVars("JETSTREAM_SUBSCRIBE_SLOW_MIN_RATE"),
 				Value:   5,
 			},
+			// hypercerts: Size the upstream verify queue and pace catch-up reads
+			// so a restart backlog cannot overflow it (TECH-883).
+			&cli.IntFlag{
+				Name: "live-verify-parallelism",
+				Usage: "Upstream verification workers. Each DID's verify queue holds twice this many events; " +
+					"events beyond it are dropped and repaired by repository recovery. 1 gives strict ordering with full backpressure.",
+				Sources: cli.EnvVars("JETSTREAM_LIVE_VERIFY_PARALLELISM"),
+				Value:   jetstreamd.DefaultLiveVerifyParallelism,
+			},
+			&cli.FloatFlag{
+				Name:    "live-upstream-read-rate",
+				Usage:   "Maximum upstream subscribeRepos frames read per second, so catch-up cannot outrun verification. 0 disables pacing.",
+				Sources: cli.EnvVars("JETSTREAM_LIVE_UPSTREAM_READ_RATE"),
+				Value:   jetstreamd.DefaultLiveUpstreamReadRate,
+			},
+			&cli.IntFlag{
+				Name:    "live-upstream-read-burst",
+				Usage:   "Upstream frames that may be read without waiting for pacing. 0 uses --live-verify-parallelism.",
+				Sources: cli.EnvVars("JETSTREAM_LIVE_UPSTREAM_READ_BURST"),
+				Value:   0,
+			},
 			&cli.IntFlag{
 				Name:    "cursor-block-index-cache-size",
 				Usage:   "Deprecated compatibility no-op: sealed segment metadata is always resident in the manifest.",
@@ -531,6 +552,9 @@ func serveOptionsFromCommand(cmd *cli.Command) (jetstreamd.Options, error) {
 		SubscribeReadBatch:             cmd.Int("subscribe-read-batch"),
 		SubscribeSlowWindow:            cmd.Duration("subscribe-slow-window"),
 		SubscribeSlowMinRate:           cmd.Float("subscribe-slow-min-rate"),
+		LiveVerifyParallelism:          cmd.Int("live-verify-parallelism"),
+		LiveUpstreamReadRate:           cmd.Float("live-upstream-read-rate"),
+		LiveUpstreamReadBurst:          cmd.Int("live-upstream-read-burst"),
 		CursorBlockIndexCacheSize:      cmd.Int("cursor-block-index-cache-size"),
 		CompactionInterval:             cmd.Duration("compaction-interval"),
 		CompactionTombstoneCap:         cmd.Int("compaction-tombstone-cap"),

@@ -91,6 +91,9 @@ func (o *Orchestrator) runSteadyState(ctx context.Context) error {
 			TimestampStamper:      o.cfg.TimestampStamper,
 			ReconnectBackoff:      o.cfg.LiveReconnectBackoff,
 			Dial:                  o.cfg.LiveDial,
+			VerifyParallelism:     o.cfg.LiveVerifyParallelism,
+			UpstreamReadRate:      o.cfg.LiveUpstreamReadRate,
+			UpstreamReadBurst:     o.cfg.LiveUpstreamReadBurst,
 
 			SegmentIOFaultInjector: o.cfg.SegmentIOFaultInjector,
 		})
