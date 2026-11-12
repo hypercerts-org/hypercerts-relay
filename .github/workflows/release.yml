@@ -83,6 +83,18 @@ jobs:
           (github.event_name == 'workflow_dispatch' && inputs.tag_current_version) ||
           steps.changesets.outputs.published == 'true'
         run: npm run check-component-versions -- --require-tag
+      # The Changesets step and the current-version path tag only the runner's
+      # checkout. Publish the validated tag, refusing one that does not resolve to
+      # the checked-out release commit; a plain push never moves an existing tag.
+      - name: Push validated release tag
+        if: >-
+          (github.event_name == 'workflow_dispatch' && inputs.tag_current_version) ||
+          steps.changesets.outputs.published == 'true'
+        run: |
+          set -euo pipefail
+          tag="v$(node -p "require('./package.json').version")"
+          test "$(git rev-list -n 1 "refs/tags/$tag")" = "$(git rev-parse HEAD)"
+          git push origin "refs/tags/$tag"
       - name: Rename release pull request with version
         if: steps.changesets.outputs.pr-number != ''
         env:
