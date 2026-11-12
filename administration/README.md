@@ -219,7 +219,7 @@ scripts remain required for Go service changes.
 
 ## Brand assets
 
-The UI uses the Hypercerts theme, logo and fonts. See [the brand source notes](src/brand/README.md) for asset provenance and licensing, and [DESIGN.md](../DESIGN.md) for the operator UI conventions. The first `npm run build` or `npm run dev` downloads a checksum-verified Switzer font from Fontshare; subsequent builds reuse the ignored cache. The built application serves its fonts locally.
+The UI uses the Hypercerts theme, logo and fonts. See [the brand source notes](src/brand/README.md) for asset provenance and licensing, and [DESIGN.md](../DESIGN.md) for the operator UI conventions. The built application serves its fonts locally.
 
 ## Proxy and storage boundaries
 
