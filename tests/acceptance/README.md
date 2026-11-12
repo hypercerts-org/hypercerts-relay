@@ -26,7 +26,8 @@ Jetstream so the Relay replays the backlog at socket speed. That replay overflow
 atmos's per-DID verify queue, and the loss must be booked as a durable,
 repository-scoped recovery job. It fails if no backlog event was shed, if no
 recovery job was booked, or if such a job is published as whole-source coverage.
-The scenario is expected to fail until that recovery path exists; it does not
+Before the replay it waits until the Relay's revision for the backlog account
+equals the PDS head, so a lagging Relay cannot shrink the backlog. It does not
 prove signature verification, which T15-core owns.
 Unknown selectors fail with exit 64.
 
@@ -104,6 +105,7 @@ directory and removes containers and named volumes on exit.
 ./tests/acceptance/run T15-core
 ./tests/acceptance/run T15-selection
 ./tests/acceptance/run T19
+./tests/acceptance/run T20
 ```
 
 T04 runs the real owned Relay-to-Jetstream archive/replay/restart path with one
