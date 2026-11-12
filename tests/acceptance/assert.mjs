@@ -214,6 +214,17 @@ async function assertT20Recovery(statePath) {
 
 async function main() {
   const [mode, bootstrapPath, eventPath, snapshotPath, livePath] = process.argv.slice(2)
+
+  // t20-recovery reads one state document rather than an event stream, so it is
+  // dispatched before the stream-shaped argument check below.
+  if (mode === 't20-recovery') {
+    if (!bootstrapPath) {
+      throw new Error('usage: assert.mjs t20-recovery state.json')
+    }
+    await assertT20Recovery(bootstrapPath)
+    return
+  }
+
   if (!mode || !bootstrapPath || !eventPath) {
     throw new Error('usage: assert.mjs archive|seed-ready|combined|t15-archive input.json events.ndjson [snapshot.json live.json] (t20-recovery takes a state path as its first argument)')
   }
@@ -238,11 +249,6 @@ async function main() {
 
   if (mode === 't15-archive') {
     await assertT15Archive(events, bootstrap)
-    return
-  }
-
-  if (mode === 't20-recovery') {
-    await assertT20Recovery(bootstrapPath)
     return
   }
 
