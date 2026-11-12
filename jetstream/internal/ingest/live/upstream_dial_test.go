@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -192,17 +193,19 @@ func TestConsumer_Run_RetriesTransientRelayRejection(t *testing.T) {
 	t.Parallel()
 
 	frames := [][]byte{
-		encodeIdentityFrame(t, "did:plc:aaa", 1),
-		encodeIdentityFrame(t, "did:plc:bbb", 2),
+		encodeIdentityFrame(t, "did:plc:aaa", 42),
+		encodeIdentityFrame(t, "did:plc:bbb", 43),
 	}
 	conn := newMemConn(frames...)
 	metrics := NewMetrics(prometheus.NewRegistry())
+	st := newTestStore(t)
 
 	var dials atomic.Int64
+	var dialedCursors sync.Map
 	var delivered atomic.Int64
 	c, err := Open(Config{
 		SegmentsDir:       filepath.Join(t.TempDir(), "live_segments"),
-		Store:             newTestStore(t),
+		Store:             st,
 		SeqKey:            "live_segments/seq/next",
 		CursorKey:         "relay/cursor",
 		RelayURL:          "https://relay.invalid",
@@ -213,8 +216,10 @@ func TestConsumer_Run_RetriesTransientRelayRejection(t *testing.T) {
 		ReconnectBackoff:  fastBackoff(),
 		UpstreamReadRate:  1000,
 		OnEvent:           func(*segment.Event) { delivered.Add(1) },
-		Dial: func(context.Context, string, streaming.DialConfig) (streaming.Conn, *http.Response, error) {
-			if dials.Add(1) <= 2 {
+		Dial: func(_ context.Context, u string, _ streaming.DialConfig) (streaming.Conn, *http.Response, error) {
+			n := dials.Add(1)
+			dialedCursors.Store(n, dialCursor(u))
+			if n <= 2 {
 				resp, _ := httpRejection(http.StatusServiceUnavailable)
 				return nil, resp, errors.New("expected handshake response status code 101 but got 503")
 			}
@@ -223,6 +228,7 @@ func TestConsumer_Run_RetriesTransientRelayRejection(t *testing.T) {
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.Close() })
+	require.NoError(t, c.saveCursorAndSyncState(41))
 
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	t.Cleanup(cancel)
@@ -234,6 +240,11 @@ func TestConsumer_Run_RetriesTransientRelayRejection(t *testing.T) {
 	require.Equal(t, 2.0, testutil.ToFloat64(metrics.TransientDialRejections))
 	require.Equal(t, 1.0, testutil.ToFloat64(metrics.UpstreamConnects))
 	require.GreaterOrEqual(t, testutil.ToFloat64(metrics.Reconnects), 2.0)
+	for i := int64(1); i <= 3; i++ {
+		cur, ok := dialedCursors.Load(i)
+		require.True(t, ok, "dial %d not observed", i)
+		require.Equal(t, "41", cur, "dial %d must resume from the persisted cursor", i)
+	}
 
 	select {
 	case err := <-runErr:

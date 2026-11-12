@@ -74,7 +74,7 @@ type Consumer struct {
 	// processBatch in isolation.
 	client atomic.Pointer[streaming.Client]
 
-	// lastStreamErr is the most recent stream-level error yielded by the
+	// hypercerts: lastStreamErr is the most recent stream-level error yielded by the
 	// upstream iterator. Owned by the Run goroutine; reported when the
 	// iterator ends while the consumer is still meant to run.
 	lastStreamErr error
@@ -588,6 +588,7 @@ func (c *Consumer) consumeEvents(ctx context.Context, events iter.Seq2[[]streami
 			// continuity loss rather than halting, so operators recover
 			// without a crash loop. The loss stays explicitly logged and
 			// recorded; it is never silently absorbed.
+			// hypercerts: Kept to report why the iterator ended (TECH-883).
 			c.lastStreamErr = err
 			c.recordUpstreamLoss(ctx, err)
 			// Classify, log, and continue — the next iteration

@@ -13,8 +13,6 @@ import (
 	"log/slog"
 	"sync"
 	"time"
-
-	"github.com/bluesky-social/jetstream/internal/obs"
 )
 
 const (
@@ -137,10 +135,4 @@ func (l *verifyFailureLog) run(ctx context.Context) error {
 			l.flush(false)
 		}
 	}
-}
-
-// classifyVerifyFailure is the metric class used for the log key, so log
-// summaries line up with jetstream_verifier_failures_total labels.
-func classifyVerifyFailure(err error) string {
-	return obs.Classify(err)
 }

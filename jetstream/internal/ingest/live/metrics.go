@@ -16,8 +16,9 @@ const (
 // consumer. A nil *Metrics is a valid zero-value: every method is a
 // no-op, so tests can skip metric registration entirely.
 type Metrics struct {
-	EventsReceived                 prometheus.Counter
-	Reconnects                     prometheus.Counter
+	EventsReceived prometheus.Counter
+	Reconnects     prometheus.Counter
+	// hypercerts: Upstream connection visibility (TECH-883).
 	UpstreamConnects               prometheus.Counter
 	TransientDialRejections        prometheus.Counter
 	DecodeErrors                   prometheus.Counter
@@ -175,6 +176,7 @@ func (m *Metrics) incReconnects() {
 	}
 }
 
+// hypercerts: Helpers for the TECH-883 upstream connection counters.
 func (m *Metrics) incUpstreamConnects() {
 	if m != nil {
 		m.UpstreamConnects.Inc()

@@ -74,7 +74,7 @@ type Runtime struct {
 	manifest       *manifest.Manifest
 	tail           *subscribe.Tail
 	verifier       *atmossync.Verifier
-	// verifyFailures summarises repeated verification failure log lines.
+	// hypercerts: verifyFailures summarises repeated verification failure log lines.
 	verifyFailures *verifyFailureLog
 	// recovery books durable jobs for events shed by the verify queue.
 	recovery        *recoveryCoalescer
@@ -413,7 +413,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		StateStore: stateStore,
 		SyncClient: gt.Some(syncClient),
 		OnVerificationFailure: gt.Some(func(did atmos.DID, vErr error) {
-			class := classifyVerifyFailure(vErr)
+			class := obs.Classify(vErr)
 			verifierMetrics.IncFailure(class)
 			verifyFailures.observe(string(did), class, vErr)
 		}),
@@ -953,6 +953,7 @@ func (r *Runtime) Run(ctx context.Context) (runErr error) {
 		}))
 	}
 
+	// hypercerts: Flush verification failure log summaries (TECH-883).
 	if r.verifyFailures != nil {
 		g.Go(r.goroutineRoot("verify_failure_log", func() error {
 			return r.verifyFailures.run(gctx)
