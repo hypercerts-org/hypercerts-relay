@@ -1,5 +1,5 @@
 ---
-'hypercerts-relay': minor
+'hypercerts-relay': patch
 ---
 
 Jetstream live ingestion no longer stops silently when the Relay restarts.
