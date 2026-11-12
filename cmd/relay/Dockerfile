@@ -1,6 +1,6 @@
 # Build from the repository root:
 # docker build -f cmd/relay/Dockerfile -t hypercerts-relay .
-ARG VERSION=0.9.1
+ARG VERSION=0.10.0
 ARG COMMIT=unknown
 ARG DATE=unknown
 
