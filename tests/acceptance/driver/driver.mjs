@@ -15,7 +15,9 @@ const collection = 'app.bsky.feed.post'
 const origins = { a: 'https://pds-a.test', b: 'https://pds-b.test' }
 const directPDS = origins.a
 const plcURL = 'https://plc.test'
+const relayPublicURL = 'http://relay:2470'
 const acceptanceOrigins = new Set([
+  relayPublicURL,
   'http://relay:2471',
   'http://jetstream:8081',
   'http://fault-proxy:3000',
@@ -479,6 +481,29 @@ async function t20AdmitSource() {
   writeJSON({ pds: origins.a })
 }
 
+// Waits until the Relay holds the backlog account's final commit. The Relay
+// persists an outbound event before it advances that account's revision, so a
+// Relay revision equal to the PDS head proves the whole backlog is replayable.
+// The source cursor cannot prove this: bootstrap has already advanced it, and
+// account lifecycle events share it.
+async function t20WaitForRelayBacklog(did) {
+  const query = `/xrpc/com.atproto.sync.getLatestCommit?did=${encodeURIComponent(did)}`
+  const head = (await request(`${origins.a}${query}`)).rev
+  if (typeof head !== 'string' || head === '') throw new TypeError('T20 PDS reported no head revision for the backlog account')
+  const deadline = Date.now() + 180_000
+  let observed = 'not attempted'
+  while (Date.now() < deadline) {
+    try {
+      observed = (await request(`${relayPublicURL}${query}`)).rev
+      if (observed === head) return
+    } catch (error) {
+      observed = error instanceof Error ? error.message : String(error)
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250))
+  }
+  throw new Error(`T20 Relay did not ingest the backlog for ${did}: PDS head=${head}, Relay last=${observed}`)
+}
+
 // Runs while Jetstream is stopped. Each await is a distinct signed commit, so
 // the Relay persists one subscribeRepos event per record for this DID.
 async function t20ReleaseBacklog() {
@@ -500,7 +525,7 @@ async function t20ReleaseBacklog() {
   }
   // The Relay must have persisted this DID's events before Jetstream resumes,
   // otherwise the replay carries fewer events than the scenario assumes.
-  await waitForCursorAdvance(origins.a, -1, 'T20 backlog ingestion')
+  await t20WaitForRelayBacklog(account.did)
   const state = await t20State()
   state.backlog = {
     did: account.did,
