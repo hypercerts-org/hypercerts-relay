@@ -3,9 +3,11 @@ package jobs
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -122,6 +124,7 @@ func TestRecoveryPartialDiscoveryReconcilesAndRetriesAcrossRestart(t *testing.T)
 }
 
 func testRecoveryPartialDiscovery(t *testing.T, malformed bool) {
+	logOutput := captureDefaultLogs(t)
 	key, err := atmoscrypto.GenerateP256()
 	require.NoError(t, err)
 	cars := map[string][]byte{}
@@ -190,6 +193,30 @@ func testRecoveryPartialDiscovery(t *testing.T, malformed bool) {
 	require.NoError(t, err)
 	require.False(t, pending.TotalReposKnown)
 	require.Equal(t, []string{recoveryDID1}, pending.RecoveryDiscoveryFailures)
+	// The job ends passes later without attempting discovery again, so the pass
+	// that observed the failure reports its bounded cause.
+	var warning map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(logOutput.String()), "\n") {
+		var entry map[string]any
+		require.NoError(t, json.Unmarshal([]byte(line), &entry))
+		if entry["msg"] == "repository recovery revision discovery failed" {
+			require.Nil(t, warning, "one seeding pass reports once")
+			warning = entry
+		}
+	}
+	require.NotNil(t, warning)
+	require.Equal(t, job.ID, warning["job_id"])
+	require.Equal(t, "getLatestCommit", warning["stage"])
+	require.Equal(t, recoveryDID1, warning["repository_did"])
+	require.EqualValues(t, 1, warning["failed_dids"])
+	if malformed {
+		require.Equal(t, pdsCauseUnknown, warning["cause_class"])
+		require.NotContains(t, warning, "http_status")
+	} else {
+		require.Equal(t, pdsCauseHTTP, warning["cause_class"])
+		require.EqualValues(t, http.StatusNotFound, warning["http_status"])
+	}
+	require.NotContains(t, warning, "err")
 	retry, err := m.GetRepositoryRetry(job.ID, recoveryDID2)
 	require.NoError(t, err)
 	now := time.Now()
@@ -245,6 +272,7 @@ func testRecoveryPartialDiscovery(t *testing.T, malformed bool) {
 	require.Equal(t, int64(3), downloads.Load())
 	require.Equal(t, int64(2), reconciled.Load())
 	require.False(t, complete.ReceiptPending)
+	require.Equal(t, 1, strings.Count(logOutput.String(), "repository recovery revision discovery failed"))
 }
 
 func TestRecoveryDiscoveryCancellationDoesNotRecordUnavailable(t *testing.T) {

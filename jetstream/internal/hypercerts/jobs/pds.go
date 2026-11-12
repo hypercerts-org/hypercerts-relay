@@ -34,6 +34,7 @@ type PDSProcessor struct {
 
 const (
 	pdsStageListRepos      = "listRepos"
+	pdsStageLatestCommit   = "getLatestCommit"
 	pdsStageGetRepoRequest = "getRepo/request"
 	pdsStageGetRepoBody    = "getRepo/body"
 

@@ -158,6 +158,12 @@ until booking succeeds: process loss, unresolved PDS attribution, or the bounded
 4,096-DID memory queue can lose an unbooked observation. Check recovery warnings;
 a live cursor alone does not prove those gaps have been repaired.
 
+A booking for a PDS that is not an admitted source is rejected and not retried,
+because it cannot succeed until an operator acts. Admitting the source later does
+not book that work. The `booking repository recovery failed` warning names the
+PDS and the number of DIDs; the overflow warnings that precede it name each DID.
+After admitting the source, request recovery for those DIDs with `POST /jobs`.
+
 Successful booking durably accepts every DID in the request. The job manager
 allows at most one active recovery owner and one followup flag per DID, across
 all PDS origins. Unclaimed jobs absorb observations at the exact source revision,
@@ -173,6 +179,7 @@ Requests and individual job scopes are limited to 4,096 DIDs, with a global limi
 of 4,096 actively owned DIDs. A request needing new admissions beyond that global
 limit is rejected in full; updates to already owned DIDs still succeed. Ownership
 at another source/PDS/policy coordinate is retryable, not silently reassigned.
+Both rejections return 409 `state_conflict` from `POST /jobs` and persist nothing.
 A mixed request returns the lexicographically smallest participating job ID as its
 representative, not a complete list of owners. Its nonempty idempotency receipt
 keeps that original representative even after successor promotion; replay adds no
@@ -182,7 +189,11 @@ For operators retrying recovery jobs, an unavailable latest revision no longer
 blocks healthy repositories from reconciling. Successful discoveries and failed
 DIDs are durable across restart. The inventory remains incomplete until every
 scoped DID has a revision; after repository retries finish, missing discoveries
-leave the job `incomplete` with `recovery_revision_unavailable`. Retry the job with
+leave the job `incomplete` with `recovery_revision_unavailable`. Each pass that
+fails to discover a revision emits one `repository recovery revision discovery
+failed` warning with the job ID, the `getLatestCommit` stage, the number of DIDs
+that failed, and the bounded cause category and DID of the most recent one. A
+later pass does not repeat it, because it skips those DIDs. Retry the job with
 `POST /hypercerts/v1/jobs/{id}/retry` after restoring PDS availability. This clears
 discovery failures for the new attempt without discarding valid inventory or
 completed reconciliation. Automatic repository retries still respect their delay

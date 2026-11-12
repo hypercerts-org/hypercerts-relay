@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"slices"
 	"time"
@@ -233,11 +234,18 @@ func mergeRecoveryDIDs(existing, added []string) []string {
 // CheckpointInventory rejects a DID whose newly fetched revision conflicts with
 // one already recorded (`invalid_listing`), so re-submitting a seeded DID would
 // fail on the second pass or after any restart.
+//
+// A failed DID is recorded and skipped by later passes, and the job can end
+// several passes afterwards without attempting discovery again. The bounded
+// cause is therefore reported here, once for the pass that observed it.
 func (p PDSProcessor) seedRecoveryInventory(ctx context.Context, client *atmossync.Client, job *Job) error {
 	existing, err := p.Manager.Inventory(job.ID)
 	if err != nil {
 		return err
 	}
+	var lastFailure *pdsAttemptFailure
+	failed := 0
+	defer func() { warnRecoveryDiscoveryFailures(job.ID, lastFailure, failed) }()
 	seeded := make(map[string]struct{}, len(existing))
 	for _, entry := range existing {
 		seeded[entry.DID] = struct{}{}
@@ -266,6 +274,8 @@ func (p PDSProcessor) seedRecoveryInventory(ctx context.Context, client *atmossy
 			_, err = atmos.ParseTID(rev)
 		}
 		if err != nil {
+			lastFailure = newPDSAttemptFailure(&InputError{Code: "recovery_revision_unavailable", Unavailable: true}, err, pdsStageLatestCommit, did, false, capture)
+			failed++
 			var cooldownUntil *time.Time
 			if capture.status == http.StatusTooManyRequests {
 				now := time.Now()
@@ -286,6 +296,20 @@ func (p PDSProcessor) seedRecoveryInventory(ctx context.Context, client *atmossy
 		}
 	}
 	return ctx.Err()
+}
+
+// warnRecoveryDiscoveryFailures reports one seeding pass's discovery failures
+// as a single warning: the count, plus the stage, bounded cause category and
+// repository of the most recent one. It never logs a raw error.
+func warnRecoveryDiscoveryFailures(jobID string, last *pdsAttemptFailure, failed int) {
+	if last == nil {
+		return
+	}
+	fields := []any{"job_id", jobID, "stage", last.stage, "cause_class", last.causeClass, "repository_did", last.repositoryDID, "failed_dids", failed}
+	if last.causeClass == pdsCauseHTTP && last.httpStatus > 0 {
+		fields = append(fields, "http_status", last.httpStatus)
+	}
+	slog.Default().Warn("repository recovery revision discovery failed", fields...)
 }
 
 func (m *Manager) recordRecoveryDiscoveryFailure(id, did string, cooldownUntil *time.Time) error {

@@ -113,7 +113,9 @@ func failure(w http.ResponseWriter, err error) {
 	case errors.Is(err, jobs.ErrNotFound):
 		status = 404
 		code = "not_found"
-	case errors.Is(err, jobs.ErrConflict) || errors.Is(err, selection.ErrRevision):
+	// A recovery request that meets ownership at another coordinate, or the
+	// active-DID capacity, was never persisted: it is a retryable state conflict.
+	case errors.Is(err, jobs.ErrConflict) || errors.Is(err, jobs.ErrRecoveryBusy) || errors.Is(err, selection.ErrRevision):
 		status = 409
 		code = "state_conflict"
 	case errors.Is(err, jobs.ErrRepositoryDetailsSnapshotExpired):

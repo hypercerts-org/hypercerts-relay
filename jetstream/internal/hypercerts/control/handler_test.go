@@ -1557,4 +1557,13 @@ func TestRepositoryRecoveryJobRequest(t *testing.T) {
 	// The ordinary reasons must keep working through their own path.
 	backfill := `{"pds":"https://pds.example.com","reason":"backfill"}`
 	require.Equal(t, 202, request(h, "POST", "/jobs", backfill, testToken).Code)
+
+	// A DID already owned by active recovery at another PDS is a retryable state
+	// conflict. Nothing was persisted, so it must not read as a storage failure.
+	_, err = m.AddSourceWithRevision("https://other.example.com", 1)
+	require.NoError(t, err)
+	busy := `{"pds":"https://other.example.com","reason":"repository_recovery","dids":["did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"]}`
+	w = request(h, "POST", "/jobs", busy, testToken)
+	require.Equal(t, 409, w.Code)
+	require.JSONEq(t, `{"error":"state_conflict"}`, w.Body.String())
 }
