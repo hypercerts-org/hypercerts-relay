@@ -93,7 +93,11 @@ func reply(w http.ResponseWriter, status int, value any) {
 	}
 }
 func decode(w http.ResponseWriter, r *http.Request, value any) bool {
-	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+	return decodeWithin(w, r, value, 64<<10)
+}
+
+func decodeWithin(w http.ResponseWriter, r *http.Request, value any, limit int64) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(value); err != nil {
@@ -204,7 +208,9 @@ func (h *Handler) requestJob(w http.ResponseWriter, r *http.Request) {
 		SourceRevision uint64   `json:"sourceRevision,omitempty"`
 		DIDs           []string `json:"dids,omitempty"`
 	}
-	if !decode(w, r, &input) {
+	// A repository-recovery scope may carry up to 4,096 DIDs, which exceeds the
+	// default control request limit.
+	if !decodeWithin(w, r, &input, jobs.MaxRepositoryRecoveryRequestBytes) {
 		return
 	}
 	// The recovery reason takes a DID scope and must never route through

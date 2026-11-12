@@ -1625,3 +1625,31 @@ func TestRepositoryRecoveryJobRequest(t *testing.T) {
 	require.Equal(t, 409, w.Code)
 	require.JSONEq(t, `{"error":"state_conflict"}`, w.Body.String())
 }
+
+// The documented scope limit must be reachable through the HTTP decoder: a full
+// 4,096-DID scope of did:plc identifiers is far larger than the default 64 KiB
+// control request limit.
+func TestRepositoryRecoveryJobRequestAcceptsFullScope(t *testing.T) {
+	h, m := setup(t)
+	_, err := m.AddSourceWithRevision("https://pds.example.com", 1)
+	require.NoError(t, err)
+
+	dids := make([]string, 4096)
+	for i := range dids {
+		dids[i] = fmt.Sprintf("did:plc:%024d", i)
+	}
+	body, err := json.Marshal(map[string]any{"pds": "https://pds.example.com", "reason": "repository_recovery", "dids": dids})
+	require.NoError(t, err)
+	require.Greater(t, len(body), 64<<10)
+	w := request(h, "POST", "/jobs", string(body), testToken)
+	require.Equal(t, 202, w.Code, w.Body.String())
+	var created jobView
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &created))
+	require.Equal(t, 4096, created.RecoveryDIDCount)
+
+	// An overlong DID is invalid input rather than an oversized body.
+	long := `{"pds":"https://pds.example.com","reason":"repository_recovery","dids":["did:web:` + strings.Repeat("a", jobs.RecoveryDIDMaxLength) + `.example"]}`
+	w = request(h, "POST", "/jobs", long, testToken)
+	require.Equal(t, 400, w.Code)
+	require.NotContains(t, w.Body.String(), "invalid_json")
+}

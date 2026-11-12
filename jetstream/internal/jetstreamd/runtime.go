@@ -474,12 +474,21 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 			pending:  map[string]struct{}{},
 			// Attribute a shed DID to its current PDS. The job manager normalizes
 			// the endpoint, so this returns the identity directory's value.
-			resolve: func(ctx context.Context, did string) string {
+			// An unsupported DID method or an identity without a PDS endpoint is
+			// terminal. Other lookup errors, including network failures that the
+			// resolver reports as not found, are retried by the coalescer.
+			resolve: func(ctx context.Context, did string) (string, error) {
 				ident, err := directory.LookupDID(ctx, atmos.DID(did))
-				if err != nil || ident == nil {
-					return ""
+				if errors.Is(err, identity.ErrUnsupportedDIDMethod) {
+					return "", nil
 				}
-				return ident.PDSEndpoint()
+				if err != nil {
+					return "", err
+				}
+				if ident == nil {
+					return "", nil
+				}
+				return ident.PDSEndpoint(), nil
 			},
 		}
 		rt.recovery = recovery

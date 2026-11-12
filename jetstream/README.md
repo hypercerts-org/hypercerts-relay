@@ -223,7 +223,10 @@ For operators investigating verify-queue overflow, Jetstream batches shed DIDs
 in memory before booking repository-scoped recovery. Observations remain volatile
 until booking succeeds: process loss, unresolved PDS attribution, or the bounded
 4,096-DID memory queue can lose an unbooked observation. Check recovery warnings;
-a live cursor alone does not prove those gaps have been repaired.
+a live cursor alone does not prove those gaps have been repaired. A failed
+identity lookup is retried on each flush for about five minutes (60 attempts)
+and then dropped with an `identity lookup kept failing` warning naming the DID;
+an identity with no PDS endpoint or an unsupported DID method is dropped at once.
 
 A booking for a PDS that is not an admitted source is rejected and not retried,
 because it cannot succeed until an operator acts. Admitting the source later does
@@ -242,8 +245,8 @@ Repeated observations do not create a job per flush. Recovery snapshots establis
 current state, not historical event completeness, and do not clear Relay's
 source-wide recovery requirement.
 
-Requests and individual job scopes are limited to 4,096 DIDs, with a global limit
-of 4,096 actively owned DIDs. A request needing new admissions beyond that global
+Requests and individual job scopes are limited to 4,096 DIDs of at most 512
+characters each, with a global limit of 4,096 actively owned DIDs. A request needing new admissions beyond that global
 limit is rejected in full; updates to already owned DIDs still succeed. Ownership
 at another source/PDS/policy coordinate is retryable, not silently reassigned.
 Both rejections return 409 `state_conflict` from `POST /jobs` and persist nothing.

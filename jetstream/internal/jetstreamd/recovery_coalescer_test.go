@@ -45,7 +45,7 @@ func newCoalescer(t *testing.T) (*recoveryCoalescer, *jobs.Manager) {
 		logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
 		interval: time.Millisecond,
 		pending:  map[string]struct{}{},
-		resolve:  func(context.Context, string) string { return coalescePDS },
+		resolve:  func(context.Context, string) (string, error) { return coalescePDS, nil },
 	}, manager
 }
 
@@ -153,13 +153,66 @@ func TestCoalescerGroupsDIDsByPDS(t *testing.T) {
 // An unattributable DID must be skipped, not booked against a guessed PDS.
 func TestCoalescerSkipsUnresolvableDID(t *testing.T) {
 	c, manager := newCoalescer(t)
-	c.resolve = func(context.Context, string) string { return "" }
+	c.resolve = func(context.Context, string) (string, error) { return "", nil }
 	c.observe(coalesceDID1, 1)
 	c.flush(t.Context())
 
 	for _, job := range manager.List() {
 		require.NotEqual(t, jobs.ReasonRepositoryRecovery, job.Reason)
 	}
+}
+
+// A failed identity lookup must not lose the recovery intent: the DID is
+// requeued and booked once the identity service answers again.
+func TestCoalescerRetriesFailedIdentityLookup(t *testing.T) {
+	c, manager := newCoalescer(t)
+	lookupErr := errors.New("identity: DID not found: connection refused")
+	failing := true
+	c.resolve = func(context.Context, string) (string, error) {
+		if failing {
+			return "", lookupErr
+		}
+		return coalescePDS, nil
+	}
+	c.observe(coalesceDID1, 1)
+	c.flush(t.Context())
+	for _, job := range manager.List() {
+		require.NotEqual(t, jobs.ReasonRepositoryRecovery, job.Reason)
+	}
+	require.Contains(t, c.pending, coalesceDID1, "a failed lookup is requeued")
+
+	failing = false
+	c.flush(t.Context())
+	var booked []jobs.Job
+	for _, job := range manager.List() {
+		if job.Reason == jobs.ReasonRepositoryRecovery {
+			booked = append(booked, job)
+		}
+	}
+	require.Len(t, booked, 1)
+	require.Equal(t, []string{coalesceDID1}, booked[0].RecoveryDIDs)
+	require.Empty(t, c.resolveFailures, "a successful lookup clears the failure count")
+}
+
+// The resolver cannot distinguish an outage from a missing identity, so a lookup
+// that keeps failing is given up after a bounded number of flushes.
+func TestCoalescerBoundsFailedIdentityLookupRetries(t *testing.T) {
+	c, _ := newCoalescer(t)
+	var logs bytes.Buffer
+	c.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	lookups := 0
+	c.resolve = func(context.Context, string) (string, error) {
+		lookups++
+		return "", errors.New("identity: DID not found")
+	}
+	c.observe(coalesceDID1, 1)
+	for range recoveryResolveAttempts + 5 {
+		c.flush(t.Context())
+	}
+	require.Equal(t, recoveryResolveAttempts, lookups)
+	require.Empty(t, c.pending)
+	require.Empty(t, c.resolveFailures)
+	require.Contains(t, logs.String(), "identity lookup kept failing")
 }
 
 // observe is called from the verifier's drop path on another goroutine.

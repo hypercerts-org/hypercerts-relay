@@ -251,7 +251,14 @@ func TestSeedRecoveryInventoryIsRerunnable(t *testing.T) {
 	job := seedRecoveryJob(t, m, []string{recoveryDID1})
 
 	rev := "3m3b4fywvy22a"
+	// Count lookups per DID: an unchanged revision would let CheckpointInventory
+	// accept a repeated discovery, so the count is what detects one.
+	var requestsMu sync.Mutex
+	requests := map[string]int{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestsMu.Lock()
+		requests[r.URL.Query().Get("did")]++
+		requestsMu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"cid":"bafyreibrj4xfbvcicomna6bal32tecjzlrjh2k7u7hs7amdamgov4onuiy","rev":"` + rev + `"}`))
 	}))
@@ -273,6 +280,9 @@ func TestSeedRecoveryInventoryIsRerunnable(t *testing.T) {
 	entries, err := m.Inventory(job.ID)
 	require.NoError(t, err)
 	require.Len(t, entries, 2, "the second pass added only the missing DID")
+	requestsMu.Lock()
+	defer requestsMu.Unlock()
+	require.Equal(t, map[string]int{recoveryDID1: 1, recoveryDID2: 1}, requests, "each DID is discovered exactly once")
 }
 
 // claimForSeed moves the named job to Running so CheckpointInventory accepts
@@ -296,4 +306,46 @@ func claimForSeed(t *testing.T, m *Manager, id string) Job {
 	require.NoError(t, err)
 	require.Equal(t, Running, claimed.State)
 	return claimed
+}
+
+// A retry keeps CompletedRepos while restarting the inventory, and a partial
+// rediscovery never prunes a stale completion. A DID completed at an older
+// revision must be retried at the newer listed revision; reporting it complete
+// makes the frozen-inventory runner stop with an invalid retry state.
+func TestRepositoryRetryRetriesNewerRevisionAfterStaleCompletion(t *testing.T) {
+	const (
+		olderRev = "3l3qo2vutsw2b"
+		newerRev = "3l3qo2vutsw2c"
+	)
+	m, db := newManager(t, t.TempDir())
+	defer db.Close()
+	_, err := m.AddSourceWithRevision("https://pds.example", 4)
+	require.NoError(t, err)
+	job := seedRecoveryJob(t, m, []string{recoveryDID1, recoveryDID2})
+	claimForSeed(t, m, job.ID)
+
+	setCompleted := func(rev string) {
+		t.Helper()
+		m.mu.Lock()
+		next := clone(m.data)
+		current := next.Jobs[job.ID]
+		current.CompletedRepos = map[string]string{recoveryDID1: rev}
+		next.Jobs[job.ID] = current
+		err := m.commit(next)
+		m.mu.Unlock()
+		require.NoError(t, err)
+	}
+	setCompleted(olderRev)
+	// recoveryDID2 failed discovery, so the inventory stays partial.
+	require.NoError(t, m.CheckpointInventory(job.ID, "", map[string]string{recoveryDID1: newerRev}, false))
+
+	retry, err := m.GetRepositoryRetry(job.ID, recoveryDID1)
+	require.NoError(t, err)
+	require.Equal(t, RepositoryRetryReady, retry.State)
+	require.Equal(t, newerRev, retry.ListedRevision)
+
+	setCompleted(newerRev)
+	retry, err = m.GetRepositoryRetry(job.ID, recoveryDID1)
+	require.NoError(t, err)
+	require.Equal(t, RepositoryRetryComplete, retry.State)
 }

@@ -1138,7 +1138,10 @@ func (m *Manager) repositoryCoordinateLocked(jobID, did string) (Job, string, er
 
 func (m *Manager) repositoryRetryLocked(job Job, did, listedRevision string) (RepositoryRetry, error) {
 	base := RepositoryRetry{JobID: job.ID, DID: did, ListedRevision: listedRevision, State: RepositoryRetryReady}
-	if _, complete := job.CompletedRepos[did]; complete {
+	// A retry restarts the inventory but keeps CompletedRepos, and only a complete
+	// rediscovery prunes completions older than the listing. Compare revisions so
+	// a newer listed revision is retried rather than reported as complete.
+	if completedRevisionAtLeast(job.CompletedRepos[did], listedRevision) {
 		base.State = RepositoryRetryComplete
 		return base, nil
 	}

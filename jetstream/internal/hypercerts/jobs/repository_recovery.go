@@ -25,6 +25,9 @@ func normalizeRecoveryDIDs(dids []string) ([]string, error) {
 	seen := make(map[string]struct{}, len(dids))
 	out := make([]string, 0, len(dids))
 	for _, did := range dids {
+		if len(did) > RecoveryDIDMaxLength {
+			return nil, fmt.Errorf("%w: recovery DID exceeds %d characters", ErrInvalidInput, RecoveryDIDMaxLength)
+		}
 		if _, err := atmos.ParseDID(did); err != nil {
 			return nil, fmt.Errorf("%w: invalid recovery DID %q", ErrInvalidInput, did)
 		}
@@ -39,6 +42,16 @@ func normalizeRecoveryDIDs(dids []string) ([]string, error) {
 }
 
 const recoveryScopeLimit = 4096
+
+// RecoveryDIDMaxLength bounds each recovery DID. It covers did:plc and a
+// did:web with a maximum-length host and an encoded port, and it keeps the
+// request byte limit below consistent with the 4,096-DID scope limit.
+const RecoveryDIDMaxLength = 512
+
+// MaxRepositoryRecoveryRequestBytes bounds a job request body so a full scope
+// of maximum-length DIDs fits: each DID adds its quotes and a separator, and the
+// remaining fields fit in the 64 KiB allowed for other control requests.
+const MaxRepositoryRecoveryRequestBytes = recoveryScopeLimit*(RecoveryDIDMaxLength+3) + 64<<10
 
 var ErrRecoveryBusy = errors.New("repository recovery ownership or capacity unavailable")
 

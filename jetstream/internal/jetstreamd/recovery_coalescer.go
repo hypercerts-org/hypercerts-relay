@@ -24,6 +24,10 @@ const (
 	// recoveryPendingLimit bounds the per-flush DID set. Beyond it further DIDs
 	// are dropped and logged rather than growing without limit.
 	recoveryPendingLimit = 4096
+	// recoveryResolveAttempts bounds how many flushes retry a DID whose identity
+	// lookup failed. The resolver cannot tell a transient outage from a missing
+	// identity, so the retry is bounded: about five minutes at the flush interval.
+	recoveryResolveAttempts = 60
 )
 
 // recoveryCoalescer accumulates shed DIDs and books one recovery job per PDS.
@@ -35,12 +39,16 @@ type recoveryCoalescer struct {
 	jobs interface {
 		RequestRepositoryRecovery(string, []string, string) (jobs.Job, error)
 	}
-	logger   *slog.Logger
-	resolve  func(ctx context.Context, did string) string
+	logger *slog.Logger
+	// resolve returns the DID's current PDS. An empty endpoint with a nil error
+	// is terminal (no PDS to attribute); an error is a lookup failure to retry.
+	resolve  func(ctx context.Context, did string) (string, error)
 	interval time.Duration
 
 	mu      sync.Mutex
 	pending map[string]struct{}
+	// resolveFailures counts consecutive failed lookups for requeued DIDs.
+	resolveFailures map[string]int
 }
 
 // observe records one shed DID. Safe for concurrent use and never blocks.
@@ -88,9 +96,13 @@ func (c *recoveryCoalescer) flush(ctx context.Context) {
 
 	byPDS := make(map[string][]string, len(observed))
 	for did := range observed {
-		pds := c.resolve(ctx, did)
+		pds, err := c.resolve(ctx, did)
+		if err != nil {
+			c.retryResolve(did, err)
+			continue
+		}
+		c.clearResolveFailures(did)
 		if pds == "" {
-			// TODO: Retry transient identity resolution failures without losing recovery intent.
 			c.logger.Warn("verify-queue loss could not be attributed to a PDS; skipping recovery", "did", did)
 			continue
 		}
@@ -111,4 +123,38 @@ func (c *recoveryCoalescer) flush(ctx context.Context) {
 		c.logger.Info("booked repository recovery for verify-queue loss",
 			"pds", pds, "dids", len(dids), "job", job.ID, "state", job.State)
 	}
+}
+
+// retryResolve requeues a DID whose identity lookup failed so the recovery
+// intent survives a transient identity outage, up to recoveryResolveAttempts.
+func (c *recoveryCoalescer) retryResolve(did string, err error) {
+	c.mu.Lock()
+	if c.resolveFailures == nil {
+		c.resolveFailures = map[string]int{}
+	}
+	c.resolveFailures[did]++
+	attempts := c.resolveFailures[did]
+	if attempts >= recoveryResolveAttempts {
+		delete(c.resolveFailures, did)
+		c.mu.Unlock()
+		c.logger.Warn("verify-queue loss identity lookup kept failing; skipping recovery",
+			"did", did, "attempts", attempts, "err", err)
+		return
+	}
+	c.mu.Unlock()
+	c.logger.Warn("verify-queue loss identity lookup failed; retrying",
+		"did", did, "attempts", attempts, "err", err)
+	c.observe(did, 0)
+	c.mu.Lock()
+	if _, requeued := c.pending[did]; !requeued {
+		// The pending limit dropped it; observe already logged the drop.
+		delete(c.resolveFailures, did)
+	}
+	c.mu.Unlock()
+}
+
+func (c *recoveryCoalescer) clearResolveFailures(did string) {
+	c.mu.Lock()
+	delete(c.resolveFailures, did)
+	c.mu.Unlock()
 }
