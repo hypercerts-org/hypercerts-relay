@@ -34,6 +34,7 @@ type PDSProcessor struct {
 
 const (
 	pdsStageListRepos      = "listRepos"
+	pdsStageLatestCommit   = "getLatestCommit"
 	pdsStageGetRepoRequest = "getRepo/request"
 	pdsStageGetRepoBody    = "getRepo/body"
 
@@ -206,7 +207,22 @@ func (p PDSProcessor) Run(ctx context.Context, job Job) error {
 		return inputFailure(ctx, "identity_unavailable")
 	}
 	client := p.client(job)
-	if !job.TotalReposKnown {
+	// hypercerts: A recovery job seeds a synthetic inventory of exactly the DIDs
+	// it covers, so the per-repository ledger can resolve their coordinates
+	// without scanning the whole PDS. Re-seed whenever the inventory does not
+	// already cover every requested DID, not only on the first pass.
+	if job.Reason == ReasonRepositoryRecovery &&
+		(!job.TotalReposKnown || len(job.RecoveryDIDs) != job.EnumeratedRepos) {
+		if err := p.seedRecoveryInventory(ctx, client, &job); err != nil {
+			return err
+		}
+		var err error
+		job, err = p.Manager.Get(job.ID)
+		if err != nil {
+			return err
+		}
+	}
+	if !job.TotalReposKnown && job.Reason != ReasonRepositoryRecovery {
 		if err := p.enumerateInventory(ctx, client, &job); err != nil {
 			return err
 		}
@@ -315,6 +331,10 @@ func (p PDSProcessor) processFrozenInventory(ctx context.Context, client *atmoss
 		return err
 	}
 	var outcome frozenRepositoryOutcome
+	if job.Reason == ReasonRepositoryRecovery && !job.TotalReposKnown {
+		outcome.unavailable = true
+		outcome.unavailableCode = "recovery_revision_unavailable"
+	}
 	for _, frozen := range entries {
 		if completedRevisionAtLeast(job.CompletedRepos[frozen.DID], frozen.Revision) {
 			continue
@@ -444,7 +464,7 @@ func (p PDSProcessor) processReadyRepository(ctx context.Context, client *atmoss
 	}
 	if err := p.repository(ctx, client, job, entry); err == nil {
 		return frozenRepositoryOutcome{}, nil
-	} else if errors.Is(ctx.Err(), context.Canceled) {
+	} else if ctx.Err() != nil {
 		return frozenRepositoryOutcome{}, ctx.Err()
 	} else {
 		var input *InputError
@@ -711,7 +731,7 @@ func (p PDSProcessor) repository(ctx context.Context, client *atmossync.Client, 
 	if err != nil {
 		return err
 	}
-	if err := p.Manager.Apply(job.ID, func() error { return p.Reconcile(ctx, snapshot) }); err != nil {
+	if err := p.Manager.ApplyContext(ctx, job.ID, func(admittedCtx context.Context) error { return p.Reconcile(admittedCtx, snapshot) }); err != nil {
 		if errors.Is(err, ingest.ErrAccountUnavailable) {
 			return &InputError{Code: "account_unavailable", Unavailable: true}
 		}

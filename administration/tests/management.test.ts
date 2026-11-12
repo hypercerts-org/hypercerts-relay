@@ -64,7 +64,9 @@ test(
             CONTROL_ACCEPTANCE_READY: ready,
             ...(relayURL === undefined
               ? {}
-              : { CONTROL_ACCEPTANCE_RELAY_URL: relayURL }),
+              : {
+                  CONTROL_ACCEPTANCE_RELAY_URL: relayURL,
+                }),
           },
         },
       );
@@ -103,6 +105,12 @@ test(
       relay,
     );
     const token = "fixture-service-credential-32-bytes-minimum";
+    const configured = await fetch(`${relay}/_test/configure-handoff`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ targetURL: jetstream, token }),
+    });
+    assert.equal(configured.status, 204, "Relay handoff fixture configuration");
     const services = new Services(
       { url: relay, token },
       { url: jetstream, token },
@@ -116,6 +124,24 @@ test(
       const result = store.operation(op.id)!;
       assert.equal(result.state, "applied", JSON.stringify(result));
       return result;
+    }
+    async function waitForSourceHandoff(pds: string, revision: number) {
+      const deadline = Date.now() + 10_000;
+      for (;;) {
+        const result = await services.call<{
+          Sources: { Hostname: string; NoSSL: boolean; Revision: number; Handoff?: { SourceRevision: number } }[];
+        }>("relay", "/sources?limit=100");
+        const url = new URL(pds);
+        const source = result.Sources.find(
+          (item) =>
+            item.Hostname === url.hostname &&
+            item.NoSSL === (url.protocol === "http:"),
+        );
+        if (source?.Revision === revision && !source.Handoff) return;
+        if (Date.now() >= deadline)
+          assert.fail("durable source handoff was not acknowledged");
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
     }
     async function waitForBackfillWorkers() {
       const deadline = Date.now() + 10_000;
@@ -140,8 +166,15 @@ test(
     const sources = await services.sources();
     assert.equal((sources.Sources as unknown[]).length, 1);
     const source = (
-      sources.Sources as { AccountQuota: { Limit: number } }[]
+      sources.Sources as {
+        AccountQuota: { Limit: number };
+        Revision: number;
+        Validation: { Status: string };
+        Handoff?: { sourceRevision: number; state: string };
+      }[]
     )[0];
+    assert.ok(source, "managed Relay source is present");
+    await waitForSourceHandoff("https://pds.example", source.Revision);
     const quota = await apply({
       kind: "account_quota",
       pds: "https://pds.example",
@@ -152,14 +185,7 @@ test(
       (quota.result as { AccountQuota: { Limit: number } }).AccountQuota.Limit,
       250,
     );
-    assert.equal(
-      (
-        (await services.apply(quota.command, quota.id)) as {
-          AccountQuota: { Limit: number };
-        }
-      ).AccountQuota.Limit,
-      250,
-    );
+    assert.equal((quota.result as { Handoff?: unknown }).Handoff ?? null, null);
     const observed = await services.call<{ AccountQuota: { Limit: number } }>(
       "relay",
       "/source?pds=https%3A%2F%2Fpds.example",
@@ -186,12 +212,14 @@ test(
       "/limits",
     );
     assert.equal(limits.items.length, 2);
+    await waitForSourceHandoff("https://pds.example", source.Revision);
     const job = await apply({
       kind: "job",
       pds: "https://pds.example",
-      reason: "quota_recovery",
+      reason: "backfill",
     });
     const jobID = (job.result as { id: string }).id;
+
     const again = await services.apply(job.command, job.id);
     assert.equal((again as { id: string }).id, jobID);
     let jobs = await services.jobs();

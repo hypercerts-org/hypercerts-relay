@@ -19,8 +19,10 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/hypercerts/archivekeys"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/control"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/jobs"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/policygate"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 	identcache "github.com/bluesky-social/jetstream/internal/identity"
 	"github.com/bluesky-social/jetstream/internal/importer"
@@ -51,6 +53,8 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+const selectedAttributionDomain = "selected-stream"
+
 // Runtime is one fully constructed jetstream daemon instance.
 type Runtime struct {
 	// hypercerts: Durable scoped backfill jobs share the process lifecycle.
@@ -63,13 +67,17 @@ type Runtime struct {
 	processLogger *slog.Logger
 	logger        *slog.Logger
 
-	tracerShutdown  obs.TracerShutdown
-	cancelManifest  context.CancelFunc
-	metaStore       *store.Store
-	importRules     *timestamp.RuleStore
-	manifest        *manifest.Manifest
-	tail            *subscribe.Tail
-	verifier        *atmossync.Verifier
+	tracerShutdown obs.TracerShutdown
+	cancelManifest context.CancelFunc
+	metaStore      *store.Store
+	importRules    *timestamp.RuleStore
+	manifest       *manifest.Manifest
+	tail           *subscribe.Tail
+	verifier       *atmossync.Verifier
+	// hypercerts: verifyFailures summarises repeated verification failure log lines.
+	verifyFailures *verifyFailureLog
+	// recovery books durable jobs for events shed by the verify queue.
+	recovery        *recoveryCoalescer
 	orchestrator    *orchestrator.Orchestrator
 	importer        *importer.Manager
 	importRunCtx    context.Context
@@ -81,8 +89,14 @@ type Runtime struct {
 	runMu     sync.Mutex
 	runCancel context.CancelFunc
 	runDone   chan struct{}
+	// cancelRun lets a lost upstream path stop the runtime before writer or
+	// compactor shutdown completes. It is set when Run starts.
+	cancelRun atomic.Pointer[context.CancelFunc]
 
 	closeMu sync.Mutex
+
+	jobsRunCancel context.CancelFunc
+	jobsRunDone   chan struct{}
 }
 
 // Build constructs the production service graph without starting listeners or
@@ -237,7 +251,14 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	}
 	rt.metaStore = metaStore
 	// hypercerts: Restore policy before any archive producer starts.
+	var selectedStreamID string
+	var eventAttribution *attribution.Manager
+	var bootstrapAttribution *attribution.Manager
 	if opts.CollectionSelection {
+		selectedStreamID, err = attribution.OpenSelectedStreamIdentity(metaStore)
+		if err != nil {
+			return fail(fmt.Errorf("serve: initialize selected stream identity: %w", err))
+		}
 		rt.CollectionPolicy, err = selection.Open(metaStore, opts.InitialCollections)
 		if err != nil {
 			return fail(err)
@@ -246,8 +267,17 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		if err != nil {
 			return fail(err)
 		}
+		rt.BackfillJobs.AddRequirePolicyAdoption(opts.RequirePolicyAdoption)
 		if err := rt.BackfillJobs.SeedSources(opts.InitialPDSSources); err != nil {
 			return fail(err)
+		}
+		eventAttribution, err = attribution.Open(metaStore, selectedStreamID, selectedAttributionDomain)
+		if err != nil {
+			return fail(fmt.Errorf("serve: open selected stream attribution: %w", err))
+		}
+		bootstrapAttribution, err = attribution.Open(metaStore, selectedStreamID, "bootstrap-live")
+		if err != nil {
+			return fail(fmt.Errorf("serve: open bootstrap-live attribution: %w", err))
 		}
 	}
 
@@ -279,6 +309,18 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	// atomically. Before steady-state the lifecycle.IsSteadyState gate
 	// returns 503, so the nil-pointer window is harmless.
 	var writerPtr atomic.Pointer[ingest.Writer]
+	// hypercerts: An upstream continuity loss is logged and recorded by the
+	// consumer, which then skips past it. It must not fail readiness, close
+	// selected sockets, or stop the process.
+	onUpstreamLoss := func(loss live.UpstreamLoss) {
+		processLogger.Error("upstream continuity loss skipped",
+			"reason", loss.Reason,
+			"cursor_key", loss.CursorKey,
+			"safe_cursor", loss.SafeCursor,
+			"expected", loss.Expected,
+			"got", loss.Got,
+		)
+	}
 
 	// Verifier setup (shared across phases). The verifier itself is
 	// owned by the orchestrator's per-phase live consumers, but we
@@ -362,16 +404,18 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	rt.tail = tail
 
 	verifierLogger := processLogger.With(slog.String("component", "verifier"))
+	// hypercerts: Repeated failures for one DID are summarised rather than
+	// logged per commit; the failure metric still counts every one (TECH-883).
+	verifyFailures := newVerifyFailureLog(verifierLogger)
+	rt.verifyFailures = verifyFailures
 	verifier, err := atmossync.NewVerifier(atmossync.VerifierOptions{
 		Directory:  directory,
 		StateStore: stateStore,
 		SyncClient: gt.Some(syncClient),
 		OnVerificationFailure: gt.Some(func(did atmos.DID, vErr error) {
-			verifierMetrics.IncFailure(obs.Classify(vErr))
-			verifierLogger.Warn("verification failure",
-				"did", did,
-				"err", vErr,
-			)
+			class := obs.Classify(vErr)
+			verifierMetrics.IncFailure(class)
+			verifyFailures.observe(string(did), class, vErr)
 		}),
 	})
 	if err != nil {
@@ -421,18 +465,79 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 			return atmossync.NewClient(atmossync.Options{Client: xc}), nil
 		}
 	}
+	// hypercerts: A verify-queue overflow is permanent loss, so a shed DID is
+	// booked as a durable repository-scoped recovery job. The coalescer only
+	// accumulates on the ingestion path; resolution and booking run on its own
+	// goroutine started in Run.
+	var recovery *recoveryCoalescer
+	if rt.BackfillJobs != nil {
+		recovery = &recoveryCoalescer{
+			jobs:     rt.BackfillJobs,
+			logger:   processLogger.With(slog.String("component", "recovery")),
+			interval: recoveryFlushInterval,
+			pending:  map[string]struct{}{},
+			// Attribute a shed DID to its current PDS. The job manager normalizes
+			// the endpoint, so this returns the identity directory's value.
+			// An unsupported DID method or an identity without a PDS endpoint is
+			// terminal. Other lookup errors, including network failures that the
+			// resolver reports as not found, are retried by the coalescer.
+			resolve: func(ctx context.Context, did string) (string, error) {
+				ident, err := directory.LookupDID(ctx, atmos.DID(did))
+				if errors.Is(err, identity.ErrUnsupportedDIDMethod) {
+					return "", nil
+				}
+				if err != nil {
+					return "", err
+				}
+				if ident == nil {
+					return "", nil
+				}
+				return ident.PDSEndpoint(), nil
+			},
+		}
+		rt.recovery = recovery
+	}
 	orch, err := orchestrator.New(orchestrator.Config{
 		// hypercerts: A single policy owner spans bootstrap, live, retries and restart.
-		CollectionPolicy: rt.CollectionPolicy,
-		DataDir:          opts.DataDir,
-		FS:               opts.StorageFS,
-		Store:            metaStore,
-		RelayURL:         opts.RelayURL,
-		HTTPClient:       xrpcClient.HTTPClient.Val(),
-		Directory:        directory,
-		Verifier:         verifier,
-		SyncStateStore:   stateStore,
-		Tombstones:       tombstones,
+		CollectionPolicy:           rt.CollectionPolicy,
+		DroppedEvents:              recoverySink(recovery),
+		BackfillJobs:               rt.BackfillJobs,
+		Attribution:                eventAttribution,
+		AttributionDomain:          selectedAttributionDomain,
+		AttributionStreamID:        selectedStreamID,
+		BootstrapAttribution:       bootstrapAttribution,
+		BootstrapAttributionDomain: "bootstrap-live",
+		PolicyGate:                 nil,
+		InitializePolicyGate: func(w *ingest.Writer) (*policygate.Gate, error) {
+			if rt.CollectionPolicy == nil {
+				return policygate.New(nil, w, selectedAttributionDomain), nil
+			}
+			if eventAttribution == nil {
+				return nil, fmt.Errorf("selected-stream attribution unavailable")
+			}
+			gate := policygate.New(rt.CollectionPolicy, w, selectedAttributionDomain)
+			if err := gate.Adopt(ctx, selectedAttributionDomain, func(boundary *uint64) error {
+				current := rt.CollectionPolicy.Current()
+				return eventAttribution.EnsureInitialPolicyHistory(attribution.Policy{
+					Revision: current.Revision, Collections: current.Collections,
+				}, boundary)
+			}); err != nil {
+				return nil, fmt.Errorf("initialize selected-stream policy history: %w", err)
+			}
+			if rt.BackfillJobs != nil {
+				rt.BackfillJobs.BindPolicyAdoption(gate, eventAttribution, selectedAttributionDomain)
+			}
+			return gate, nil
+		},
+		DataDir:        opts.DataDir,
+		FS:             opts.StorageFS,
+		Store:          metaStore,
+		RelayURL:       opts.RelayURL,
+		HTTPClient:     xrpcClient.HTTPClient.Val(),
+		Directory:      directory,
+		Verifier:       verifier,
+		SyncStateStore: stateStore,
+		Tombstones:     tombstones,
 		// Bare logger; orchestrator.New attaches component=orchestrator
 		// itself, and its children (live, ingest, backfill) attach
 		// their own component on top of the bare parent.
@@ -466,6 +571,9 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		FailedRepoRetryMaxDelay:        opts.FailedRepoRetryMaxDelay,
 		LiveReconnectBackoff:           opts.LiveReconnectBackoff,
 		LiveDial:                       opts.LiveDial,
+		LiveVerifyParallelism:          opts.LiveVerifyParallelism,
+		LiveUpstreamReadRate:           opts.LiveUpstreamReadRate,
+		LiveUpstreamReadBurst:          opts.LiveUpstreamReadBurst,
 		IngestOnAfterSeal:              mft.OnSegmentSealed,
 		OnSegmentCompacted:             onSegmentCompacted,
 		SegmentManifestChecksums:       mft.SegmentChecksums,
@@ -484,6 +592,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		AfterRepoComplete:              opts.AfterRepoComplete,
 		CrashInjector:                  opts.CrashInjector,
 		SegmentIOFaultInjector:         opts.SegmentIOFaultInjector,
+		OnUpstreamLoss:                 onUpstreamLoss,
 		OnSteadyStateWriter: func(w *ingest.Writer) {
 			// hypercerts: Expose the ready writer to deterministic integration fixtures.
 			if opts.OnSteadyStateWriter != nil {
@@ -618,6 +727,48 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		}))
 	}
 
+	selectedProvider := subscribe.SelectedConfigProvider(nil)
+	if opts.CollectionSelection {
+		selectedProvider = subscribe.SelectedConfigProviderFunc(func() (subscribe.SelectedConfig, error) {
+			writer := writerPtr.Load()
+			if writer == nil || rt.CollectionPolicy == nil || eventAttribution == nil {
+				return subscribe.SelectedConfig{}, errors.New("selected stream not ready")
+			}
+			policy, history, err := selectedPolicySnapshot(rt.CollectionPolicy.Current, eventAttribution.ReadPolicyHistory)
+			if err != nil {
+				return subscribe.SelectedConfig{}, err
+			}
+			readLog := writer.ReadLog()
+			durable := readLog.DurableSeq()
+			tip := uint64(0)
+			if durable > 0 {
+				tip = durable - 1
+			}
+			var replayFloor *uint64
+			if opts.CursorLookback > 0 {
+				floor := uint64(0)
+				floor, _ = mft.LookbackFloor(opts.CursorLookback)
+				// The active segment and hot readable log may contain
+				// committed events newer than the last sealed manifest
+				// entry. Never advertise durable-next as a replay floor:
+				// it would exclude those events while they remain replayable.
+				if _, ok := mft.SegmentForSeq(floor); !ok {
+					if durable == 0 {
+						floor = 0
+					} else if floor >= durable {
+						floor = durable - 1
+					}
+				}
+				replayFloor = &floor
+			}
+			effectiveAfter := history[len(history)-1].EffectiveAfterSeq
+			activation, err := eventAttribution.ActivationSeq()
+			if err != nil {
+				return subscribe.SelectedConfig{}, err
+			}
+			return subscribe.ApplySelectedReplayBoundary(subscribe.SelectedConfig{StreamID: selectedStreamID, PolicyRevision: policy.Revision, PolicyEffectiveAfterSeq: effectiveAfter, Collections: policy.Collections, EffectiveAfterSeq: effectiveAfter, ReplayFloor: replayFloor, CurrentSeq: tip, ReplayEnabled: opts.CursorLookback > 0, HistoryMode: "materialized", Coverage: "unknown", Gaps: subscribe.PolicyGaps(history)}, activation), nil
+		})
+	}
 	// HandlerDeps.WriterRef is read at request time via writerPtr.Load();
 	// before steady-state, lifecycle.IsSteadyState gates with 503 so
 	// nil-pointer reads are harmless.
@@ -636,15 +787,19 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	// "/xrpc/" xrpcserver subtree registered below, so the bespoke
 	// handler owns this one NSID while atmos xrpcserver keeps the rest.
 	srv.RegisterPublicRoute("GET /xrpc/network.bsky.jetstream.subscribeEvents", subscribe.NewHandler(subscribe.Subscription{
-		Tail:      tail,
-		Store:     metaStore,
-		Manifest:  mft,
-		FS:        opts.StorageFS,
-		WriterRef: &writerPtr,
-		Logger:    processLogger,
-		Metrics:   subscribeMetrics,
-		Lookback:  opts.CursorLookback,
-		V2:        true,
+		Tail:                tail,
+		Store:               metaStore,
+		Manifest:            mft,
+		FS:                  opts.StorageFS,
+		WriterRef:           &writerPtr,
+		Logger:              processLogger,
+		Metrics:             subscribeMetrics,
+		Lookback:            opts.CursorLookback,
+		V2:                  true,
+		SelectedConfig:      selectedProvider,
+		SelectedAttribution: eventAttribution,
+		SelectedPolicy:      rt.CollectionPolicy,
+		SelectedStreamID:    selectedStreamID,
 	}))
 
 	// XRPC surface: whole-file segment download + listing. The atmos
@@ -721,6 +876,15 @@ func allowedControlHTTPHost(hostname string, railwayPrivateNetwork bool) bool {
 }
 
 // PublicAddr returns the bound public listener address, or "" before Run binds.
+// recoverySink adapts the coalescer to the live consumer's drop callback. It is
+// nil when no jobs manager exists, so the consumer simply does not report.
+func recoverySink(c *recoveryCoalescer) func(did string, dropped uint64) {
+	if c == nil {
+		return nil
+	}
+	return c.observe
+}
+
 func (r *Runtime) PublicAddr() string {
 	if r == nil || r.server == nil {
 		return ""
@@ -745,6 +909,8 @@ func (r *Runtime) WaitSteadyState(ctx context.Context) error {
 // fatal subsystem error.
 func (r *Runtime) Run(ctx context.Context) (runErr error) {
 	runCtx, cancelRun := context.WithCancel(ctx)
+	r.cancelRun.Store(&cancelRun)
+	defer r.cancelRun.Store(nil)
 	runDone := make(chan struct{})
 	r.runMu.Lock()
 	if r.runDone != nil {
@@ -787,6 +953,21 @@ func (r *Runtime) Run(ctx context.Context) (runErr error) {
 		}))
 	}
 
+	// hypercerts: Flush verification failure log summaries (TECH-883).
+	if r.verifyFailures != nil {
+		g.Go(r.goroutineRoot("verify_failure_log", func() error {
+			return r.verifyFailures.run(gctx)
+		}))
+	}
+
+	// hypercerts: Start the recovery coalescer before the orchestrator opens the
+	// live consumer, so the first bootstrap-phase drops reach a running sink.
+	if r.recovery != nil {
+		g.Go(r.goroutineRoot("recovery", func() error {
+			return r.recovery.run(gctx)
+		}))
+	}
+
 	g.Go(r.goroutineRoot("orchestrator", func() error {
 		return r.orchestrator.Run(gctx)
 	}))
@@ -797,7 +978,13 @@ func (r *Runtime) Run(ctx context.Context) (runErr error) {
 			if err := r.WaitSteadyState(gctx); err != nil {
 				return err
 			}
-			return r.BackfillJobs.Run(gctx, r.jobProcessor)
+			jobsCtx, cancel := context.WithCancel(gctx)
+			jobsDone := make(chan struct{})
+			r.runMu.Lock()
+			r.jobsRunCancel, r.jobsRunDone = cancel, jobsDone
+			r.runMu.Unlock()
+			defer close(jobsDone)
+			return r.BackfillJobs.Run(jobsCtx, r.jobProcessor)
 		}))
 	}
 
@@ -982,15 +1169,26 @@ func (r *Runtime) stopRun(ctx context.Context) error {
 	r.runMu.Lock()
 	cancel := r.runCancel
 	done := r.runDone
+	jobsCancel, jobsDone := r.jobsRunCancel, r.jobsRunDone
 	r.runMu.Unlock()
 	if cancel != nil {
 		cancel()
+	}
+	if jobsCancel != nil {
+		jobsCancel()
 	}
 	if done == nil {
 		return nil
 	}
 	select {
 	case <-done:
+		if jobsDone != nil {
+			select {
+			case <-jobsDone:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -1004,6 +1202,12 @@ func (r *Runtime) cancelImportRun() {
 	r.closeMu.Unlock()
 	if cancel != nil {
 		cancel()
+	}
+	r.runMu.Lock()
+	jobsCancel := r.jobsRunCancel
+	r.runMu.Unlock()
+	if jobsCancel != nil {
+		jobsCancel()
 	}
 }
 

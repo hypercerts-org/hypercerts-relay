@@ -9,7 +9,7 @@ package version
 //	go build -ldflags "-X github.com/bluesky-social/jetstream/internal/version.Version=v1.2.3 ..."
 var (
 	// hypercerts: Keep the local default aligned with the repository release version.
-	Version = "0.9.0"
+	Version = "0.10.1"
 	Commit  = "unknown"
 	Date    = "unknown"
 )

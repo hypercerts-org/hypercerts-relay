@@ -57,6 +57,32 @@ revision, snapshot identifier, owner paths/volumes, and cutover result.
    the same bounded checks represented by T19 before resuming source admission.
 5. Record the observed recovery time and remaining gap/current-state limits.
 
+## Upstream continuity loss with selected collections
+
+When collection selection is enabled, a known upstream discontinuity is logged
+at error level and recorded durably in the Jetstream metadata store at
+`hypercerts/selected/upstream-loss/v1`, then skipped so ingestion continues.
+This covers an upstream `OutdatedCursor` notice and a relay sequence gap. It
+does not fail `/readyz`, close subscriptions, or block restart; the recorded loss
+is logged again on the next start so it stays visible until addressed.
+
+Nothing clears the record automatically, because the archive cannot reconstruct
+events that were never acquired and a PDS current-state resync is not a
+substitute for the missing raw history. Treat any recorded loss as a real
+history gap for that interval and decide explicitly how to proceed:
+
+1. When the upstream relay can still replay the required history, restore a
+   coherent snapshot of the archive and Jetstream metadata into a separate data
+   directory and reconcile from the truncated boundary.
+2. Otherwise accept the gap, provision a new data directory and stream identity
+   if a clean history claim is required, and retain the failed directory for
+   investigation.
+
+Consumers must not infer completeness for the skipped interval, and operators
+should record which option was chosen. If writing the durable record fails,
+ingestion still continues but the evidence is only in the logs — preserve those
+logs, because the marker is the durable signal.
+
 ## Explicitly unqualified work
 
 No real Railway resource, PostgreSQL snapshot, image publication, consumer, or

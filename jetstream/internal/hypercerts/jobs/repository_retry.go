@@ -1119,7 +1119,7 @@ func (m *Manager) repositoryCoordinateLocked(jobID, did string) (Job, string, er
 	if _, err := atmos.ParseDID(did); err != nil {
 		return Job{}, "", ErrInvalidInput
 	}
-	if !job.TotalReposKnown {
+	if !job.TotalReposKnown && job.Reason != ReasonRepositoryRecovery {
 		return Job{}, "", ErrConflict
 	}
 	inv, err := m.readInventory(jobID)
@@ -1138,7 +1138,10 @@ func (m *Manager) repositoryCoordinateLocked(jobID, did string) (Job, string, er
 
 func (m *Manager) repositoryRetryLocked(job Job, did, listedRevision string) (RepositoryRetry, error) {
 	base := RepositoryRetry{JobID: job.ID, DID: did, ListedRevision: listedRevision, State: RepositoryRetryReady}
-	if _, complete := job.CompletedRepos[did]; complete {
+	// A retry restarts the inventory but keeps CompletedRepos, and only a complete
+	// rediscovery prunes completions older than the listing. Compare revisions so
+	// a newer listed revision is retried rather than reported as complete.
+	if completedRevisionAtLeast(job.CompletedRepos[did], listedRevision) {
 		base.State = RepositoryRetryComplete
 		return base, nil
 	}
@@ -1196,7 +1199,7 @@ func (m *Manager) pendingJobDueLocked(job Job, now time.Time) (time.Time, bool, 
 		return time.Time{}, false, err
 	}
 	coolingDown := found && cooldown.Until.After(now)
-	if !job.TotalReposKnown {
+	if !job.TotalReposKnown && (job.Reason != ReasonRepositoryRecovery || job.EnumeratedRepos+len(job.RecoveryDiscoveryFailures) < len(job.RecoveryDIDs)) {
 		return applyPDSCooldown(now, cooldown, coolingDown), true, nil
 	}
 	inv, err := m.readInventory(job.ID)

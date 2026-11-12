@@ -1,7 +1,10 @@
 package xrpcapi
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +14,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
+	"github.com/bluesky-social/jetstream/segment"
 	"github.com/stretchr/testify/require"
 )
 
@@ -159,4 +163,141 @@ func TestGetSegment_DeletedFileRace(t *testing.T) {
 	resp := doGet(t, getSegURL(ts.URL, name))
 	defer func() { _ = resp.Body.Close() }()
 	require.Equal(t, http.StatusInternalServerError, resp.StatusCode)
+}
+
+func TestRepresentationValidatorsAfterPatch(t *testing.T) {
+	ts, path := newBlockTestServer(t, 2, 1)
+	_, err := segment.Patch(path, func(event *segment.Event) bool {
+		event.IndexedAt = 1000000000000001
+		return true
+	}, segment.PatchOptions{})
+	require.NoError(t, err)
+	name := ingest.SegmentFilename(0)
+	urls := []string{getSegURL(ts.URL, name), blockURL(ts.URL, name, 0)}
+	oldTags := make([]string, len(urls))
+	oldBodies := make([][]byte, len(urls))
+	for i, url := range urls {
+		resp := doGet(t, url)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		oldTags[i] = resp.Header.Get("ETag")
+		var err error
+		oldBodies[i], err = io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		require.NoError(t, resp.Body.Close())
+	}
+	oldFile, err := os.Open(path)
+	require.NoError(t, err)
+	defer oldFile.Close()
+	oldInfo, err := oldFile.Stat()
+	require.NoError(t, err)
+	oldHeader, err := segment.ReadSealedHeader(oldFile)
+	require.NoError(t, err)
+	var result segment.PatchResult
+	for timestamp := int64(1000000000000002); timestamp <= 1000000000000256; timestamp++ {
+		require.NoError(t, os.WriteFile(path+".fixture", oldBodies[0], 0600))
+		require.NoError(t, os.Rename(path+".fixture", path))
+		result, err = segment.Patch(path, func(event *segment.Event) bool {
+			event.IndexedAt = timestamp
+			return true
+		}, segment.PatchOptions{})
+		require.NoError(t, err)
+		if result.NewChecksum == oldHeader.Checksum {
+			break
+		}
+	}
+	require.True(t, result.Patched)
+	require.Equal(t, oldHeader.Checksum, result.NewChecksum)
+	require.NoError(t, os.Chtimes(path, oldInfo.ModTime(), oldInfo.ModTime()))
+	newInfo, err := os.Stat(path)
+	require.NoError(t, err)
+	require.Equal(t, oldInfo.ModTime(), newInfo.ModTime())
+	pinned, err := io.ReadAll(io.NewSectionReader(oldFile, 0, oldInfo.Size()))
+	require.NoError(t, err)
+	require.Equal(t, oldBodies[0], pinned)
+
+	for i, url := range urls {
+		t.Run(fmt.Sprint(i), func(t *testing.T) {
+			resp := doGet(t, url)
+			body, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			require.NoError(t, resp.Body.Close())
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+			require.Empty(t, resp.Header.Get("Last-Modified"))
+			require.NotEqual(t, oldBodies[i], body)
+			digest := sha256.Sum256(body)
+			etag := fmt.Sprintf("\"sha256-%x-%d\"", digest, len(body))
+			require.Equal(t, etag, resp.Header.Get("ETag"))
+			require.NotEqual(t, oldTags[i], etag)
+			date := time.Now().Add(24 * time.Hour).UTC().Format(http.TimeFormat)
+			cases := []struct {
+				name, header, value string
+				ranged              bool
+				status              int
+				want                []byte
+			}{
+				{"old none match", "If-None-Match", oldTags[i], false, 200, body},
+				{"old if range", "If-Range", oldTags[i], true, 200, body},
+				{"current none match", "If-None-Match", etag, false, 304, nil},
+				{"current if range", "If-Range", etag, true, 206, body[:4]},
+				{"date modified", "If-Modified-Since", date, false, 200, body},
+				{"date if range", "If-Range", date, true, 200, body},
+			}
+			for _, tc := range cases {
+				t.Run(tc.name, func(t *testing.T) {
+					got := doGetWith(t, url, func(req *http.Request) {
+						req.Header.Set(tc.header, tc.value)
+						if tc.ranged {
+							req.Header.Set("Range", "bytes=0-3")
+						}
+					})
+					defer got.Body.Close()
+					actual, err := io.ReadAll(got.Body)
+					require.NoError(t, err)
+					require.Equal(t, tc.status, got.StatusCode)
+					require.Empty(t, got.Header.Get("Last-Modified"))
+					require.True(t, bytes.Equal(tc.want, actual))
+				})
+			}
+		})
+	}
+}
+
+type failingReaderAt struct{}
+
+func (failingReaderAt) ReadAt(p []byte, off int64) (int, error) { return 0, errors.New("read failure") }
+
+func TestRepresentationETagReadFailures(t *testing.T) {
+	_, err := representationETag(bytes.NewReader([]byte("short")), 10)
+	require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+	_, err = representationETag(failingReaderAt{}, 10)
+	require.EqualError(t, err, "read failure")
+}
+
+type renameOnHeader struct {
+	http.ResponseWriter
+	replace func()
+}
+
+func (w *renameOnHeader) WriteHeader(status int) {
+	w.replace()
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func TestGetSegmentPinsDescriptorAcrossRename(t *testing.T) {
+	s, dir := newTestServer(t, 1)
+	path := dir + "/" + ingest.SegmentFilename(0)
+	original := rawFile(t, path)
+	replacement := append([]byte(nil), original...)
+	replacement[len(replacement)-1] ^= 1
+	require.NoError(t, os.WriteFile(path+".replacement", replacement, 0600))
+	handler := s.Handler()
+	recorder := httptest.NewRecorder()
+	writer := &renameOnHeader{ResponseWriter: recorder, replace: func() { require.NoError(t, os.Rename(path+".replacement", path)) }}
+	request := httptest.NewRequest(http.MethodGet, getSegURL("", ingest.SegmentFilename(0)), nil)
+	handler.ServeHTTP(writer, request)
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.Equal(t, original, recorder.Body.Bytes())
+	digest := sha256.Sum256(original)
+	require.Equal(t, fmt.Sprintf("\"sha256-%x-%d\"", digest, len(original)), recorder.Header().Get("ETag"))
+	require.Equal(t, replacement, rawFile(t, path))
 }

@@ -1,10 +1,10 @@
 # Build from the repository root:
 # docker build -f cmd/relay/Dockerfile -t hypercerts-relay .
-ARG VERSION=0.9.0
+ARG VERSION=0.10.1
 ARG COMMIT=unknown
 ARG DATE=unknown
 
-FROM golang:1.26.10-alpine3.24 AS build
+FROM golang:1.27.3-alpine3.24 AS build
 ARG VERSION
 RUN apk add --no-cache build-base
 

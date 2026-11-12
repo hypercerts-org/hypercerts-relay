@@ -3,10 +3,14 @@ package orchestrator
 import (
 	"context"
 	"fmt"
-	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/jobs"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/policygate"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
 	"github.com/bluesky-social/jetstream/internal/ingest"
@@ -41,8 +45,26 @@ type CompactionPassResult struct {
 // prometheus registry. The orchestrator-level Metrics covers
 // transitions and per-state durations.
 type Config struct {
+	// hypercerts: DroppedEvents, when set, receives each verify-queue overflow so
+	// a durable recovery job can be booked for the affected DID.
+	DroppedEvents func(did string, dropped uint64)
+
 	// hypercerts: Filter record materialization with the shared durable policy.
 	CollectionPolicy *selection.Manager
+	// Optional managed attribution is deliberately off unless a manager is supplied.
+	BackfillJobs               *jobs.Manager
+	Attribution                *attribution.Manager
+	AttributionDomain          string
+	AttributionStreamID        string
+	BootstrapAttribution       *attribution.Manager
+	BootstrapAttributionDomain string
+	PolicyGate                 *policygate.Gate
+	InitializePolicyGate       func(*ingest.Writer) (*policygate.Gate, error)
+	OnManagedLiveError         func(error)
+	// OnUpstreamLoss reports a durable upstream continuity loss from the
+	// bootstrap or steady live consumer. It must be synchronous and must not
+	// block on writer or compactor shutdown.
+	OnUpstreamLoss func(live.UpstreamLoss)
 	// DataDir is the root data directory. The orchestrator writes to
 	// <DataDir>/segments and <DataDir>/backfill/live_segments.
 	DataDir string
@@ -205,6 +227,13 @@ type Config struct {
 	// bootstrap-time and steady-state live consumers. Production leaves it
 	// nil; deterministic harnesses feed the firehose in-memory.
 	LiveDial streaming.DialFunc
+
+	// hypercerts: LiveVerifyParallelism, LiveUpstreamReadRate and
+	// LiveUpstreamReadBurst size atmos's verify workers and pace upstream
+	// reads for both live consumers. See live.Config for zero-value meaning.
+	LiveVerifyParallelism int
+	LiveUpstreamReadRate  float64
+	LiveUpstreamReadBurst int
 
 	// IngestOnAfterSeal is forwarded to every writer that appends to
 	// <DataDir>/segments. Used by cmd/jetstream to wire the manifest's

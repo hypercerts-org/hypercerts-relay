@@ -13,6 +13,7 @@ atproto/repo
 :(exclude)atproto/repo/cmd
 atproto/syntax
 :(exclude)atproto/syntax/cmd
+cmd/collectiondir
 cmd/rainbow
 cmd/relay
 :(exclude)cmd/relay/relay-admin-ui

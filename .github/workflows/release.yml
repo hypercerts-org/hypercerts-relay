@@ -71,23 +71,35 @@ jobs:
         id: changesets
         uses: changesets/action@ae32849d5ba541f9ae29e40e22a623bc13562f51 # v2.1.2
         with:
-          publish: npm run release
-          version: npm run version-packages
-          title: 'prepare for release'
-          commit: 'chore: release'
-          createGithubReleases: false
-        env:
-          GITHUB_TOKEN: ${{ steps.generate-token.outputs.token }}
+          publish-script: npm run release
+          version-script: npm run version-packages
+          pr-title: 'prepare for release'
+          commit-message: 'chore: release'
+          create-github-releases: 'false'
+          push-git-tags: 'false'
+          github-token: ${{ steps.generate-token.outputs.token }}
       - name: Validate release tag and component versions
         if: >-
           (github.event_name == 'workflow_dispatch' && inputs.tag_current_version) ||
           steps.changesets.outputs.published == 'true'
         run: npm run check-component-versions -- --require-tag
+      # The Changesets step and the current-version path tag only the runner's
+      # checkout. Publish the validated tag, refusing one that does not resolve to
+      # the checked-out release commit; a plain push never moves an existing tag.
+      - name: Push validated release tag
+        if: >-
+          (github.event_name == 'workflow_dispatch' && inputs.tag_current_version) ||
+          steps.changesets.outputs.published == 'true'
+        run: |
+          set -euo pipefail
+          tag="v$(node -p "require('./package.json').version")"
+          test "$(git rev-list -n 1 "refs/tags/$tag")" = "$(git rev-parse HEAD)"
+          git push origin "refs/tags/$tag"
       - name: Rename release pull request with version
-        if: steps.changesets.outputs.pullRequestNumber != ''
+        if: steps.changesets.outputs.pr-number != ''
         env:
           GH_TOKEN: ${{ steps.generate-token.outputs.token }}
-          PR_NUMBER: ${{ steps.changesets.outputs.pullRequestNumber }}
+          PR_NUMBER: ${{ steps.changesets.outputs.pr-number }}
         run: |
           set -euo pipefail
           version=$(gh api \
