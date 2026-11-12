@@ -22,6 +22,16 @@ An unavailable identity remains retryable. Permanent verification failures creat
 
 An ambiguous disk write or sync failure stops further persistence until restart. Startup discards only an incomplete trailing write before resuming; complete retained events remain replayable. Per-event file synchronization replaces buffered acknowledgments and can reduce throughput.
 
+## Relay-to-Jetstream source handoff
+
+The Relay's durable source lifecycle queue sends handoffs only when both
+`JETSTREAM_CONTROL_URL` and `JETSTREAM_CONTROL_TOKEN` are configured on the Relay
+process. If both are absent, delivery stays disabled and queued rows are retained.
+If exactly one is absent, Relay fails startup.
+This outbound token is separate from Jetstream's inbound `JETSTREAM_CONTROL_TOKEN_FILE`
+for its private control API; configure that on Jetstream as documented in
+[`jetstream/README.md`](jetstream/README.md).
+
 ## Managed PDS sources
 
 The Go adapter on `relay.Relay` separates durable desired state from connection state. It does not expose a new HTTP API or OAuth UI.
@@ -39,7 +49,13 @@ Pages default to 100 entries and cap at 1,000. State and validation changes requ
 
 Startup creates `source` and `account_source_observation` tables. Existing host rows become admitted sources; existing bans become disabled sources. Subsequent migrations preserve managed policy. Back up the database and event store together before upgrading. Restart reconnects only enabled, validated, non-banned sources from their saved cursors, including quiet or previously unavailable sources.
 
-Public `requestCrawl` can reconnect only an already admitted, enabled source; it cannot add, validate, or re-enable a source. The existing authenticated block/unblock handlers delegate to the same durable policy. They remain legacy administration, not the planned control plane.
+Public `requestCrawl` can register a new source and synchronously validates it before returning success; validation failures return a generic client error while retaining the durable failed validation result. A failed public check is not retried for one minute; concurrent checks for the same source return HTTP 409, and a state/revision change during validation rejects the stale result without persisting it. Repeating the request for a source that already passed validation is idempotent and does not repeat the host check. Public requests cannot re-enable a disabled source, and pending/new admission observes durable desired state. Authenticated `requestCrawl` uses the same synchronous validation behavior. Both paths require HTTPS PDS origins in normal builds, even for administrators or when `AllowInsecureHosts` is set, and retain domain-ban protections; sibling relays are notified only after local admission succeeds. The existing authenticated block/unblock handlers delegate to the same durable policy. They remain legacy administration, not the planned control plane.
+
+### Operator transport policy and migration
+
+For Relay operators, PDS sources must be reachable at public HTTPS origins with valid TLS certificates. Bare hostnames select HTTPS; HTTP and WS origins are rejected before new host/source rows are saved. Source checks cannot follow HTTPS redirects to HTTP. The public-network-only dialer remains in force for source sockets and host checks.
+
+Operators already using public HTTPS PDS sources need no action. If you previously used plaintext or private-network sources, make those PDS instances available through public HTTPS before upgrading. Persisted `NoSSL` hosts fail closed during validation and restart; Relay does not rewrite their stored scheme or cursor. Inspect and explicitly migrate legacy source state through your approved state-migration procedure before restarting acquisition. Back up the database and event store first. Remove `--allow-insecure-hosts` or `RELAY_ALLOW_INSECURE_HOSTS=true`: startup now rejects that obsolete option rather than silently ignoring it.
 
 DID migration never admits or connects the resolved target automatically. Each observed source remains separately recorded while current resolution is refreshed. An explicitly admitted target remains incomplete until a separately owned Jetstream v2 recovery job reaches its durable boundary. This Relay adapter cannot claim complete coverage or reconstruct deleted historical state. Account quota exclusions use `host-account-limit`; they are distinct from stream throughput limits.
 
@@ -54,6 +70,8 @@ DID migration never admits or connects the resolved target automatically. Each o
 | `atproto`, `api`, `events`, `models`, `splitter`, `util`, `xrpc`, and `lex/util` | The dependency closure required to build and test the Indigo services. |
 
 ## Development
+
+Local plaintext PDS fixtures are limited to localhost through the existing injected test dialer; the production CLI exposes no such injection. Disposable acceptance builds retain their separate two-part gate: `-tags acceptance` **and** `RELAY_ACCEPTANCE_PRIVATE_HOSTS=true`. Neither the build tag alone nor the environment variable in a normal build permits insecure PDS traffic. Never use acceptance builds or opt-ins for production.
 
 For branch rulesets on `main`, `dev` (staging), and `production`, require these
 GitHub Actions status checks:
@@ -75,7 +93,7 @@ request before selecting the names in the ruleset. GitHub requires a successful
 check within the past seven days; see
 [troubleshooting required status checks](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks).
 
-Install Go 1.26.10 or the toolchain selected by `go.mod`. Relay links SQLite through CGO, so a working C compiler is also required.
+Install Go 1.27.3 or the toolchain selected by `go.mod`. Relay links SQLite through CGO, so a working C compiler is also required.
 
 ```bash
 git clone git@github.com:hypercerts-org/hypercerts-relay.git

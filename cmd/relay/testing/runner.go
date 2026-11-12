@@ -54,6 +54,8 @@ func MustSimpleRelay(dir identity.Directory, tmpd string, lenient bool) *SimpleR
 	relayConfig := relay.DefaultRelayConfig()
 	relayConfig.SkipAccountHostCheck = true
 	relayConfig.LenientSyncValidation = lenient
+	// Test fixture only: allow the deliberately local fake PDS websocket.
+	relayConfig.TestDialContext = (&net.Dialer{}).DialContext
 
 	db, err := cliutil.SetupDatabase("sqlite://:memory:", 40)
 	if err != nil {
@@ -195,32 +197,39 @@ func RunScenario(ctx context.Context, s *Scenario) error {
 
 	for i, msg := range s.Messages {
 		slog.Info("sending test message", "index", i)
-		c.Clear()
-		evt, err := msg.Frame.XRPCStreamEvent()
+		if err := runScenarioMessage(p, c, msg); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func runScenarioMessage(p *Producer, c *Consumer, msg ScenarioMessage) error {
+	c.Clear()
+	evt, err := msg.Frame.XRPCStreamEvent()
+	if err != nil {
+		return fmt.Errorf("preparing XRPCStreamEvent: %w", err)
+	}
+	if err := p.Emit(evt); err != nil {
+		return fmt.Errorf("failed sending test event: %w", err)
+	}
+	if !msg.Drop {
+		evts, err := c.ConsumeEvents(1)
 		if err != nil {
-			return fmt.Errorf("preparing XRPCStreamEvent: %w", err)
+			return err
 		}
-		if err := p.Emit(evt); err != nil {
-			return fmt.Errorf("failed sending test event: %w", err)
+		if len(evts) != 1 {
+			return fmt.Errorf("consumed unexpected additional events: %d", len(evts))
 		}
-		if !msg.Drop {
-			evts, err := c.ConsumeEvents(1)
-			if err != nil {
-				return err
-			}
-			if len(evts) != 1 {
-				return fmt.Errorf("consumed unexpected additional events: %d", len(evts))
-			}
-			if !EqualEvents(evt, evts[0]) {
-				evt.RepoCommit.Blocks = nil
-				evts[0].RepoCommit.Blocks = nil
-				fmt.Printf("%+v\n", evt.RepoCommit)
-				fmt.Printf("%+v\n", evts[0].RepoCommit)
-				return fmt.Errorf("events didn't match")
-			}
-		} else {
-			// TODO: verify nothing returned? especially if last message in set
+		if !EqualEvents(evt, evts[0]) {
+			evt.RepoCommit.Blocks = nil
+			evts[0].RepoCommit.Blocks = nil
+			fmt.Printf("%+v\n", evt.RepoCommit)
+			fmt.Printf("%+v\n", evts[0].RepoCommit)
+			return fmt.Errorf("events didn't match")
 		}
+	} else {
+		// TODO: verify nothing returned? especially if last message in set
 	}
 	return nil
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -67,7 +68,9 @@ func TestRepositoryRecoveryDoesNotSendSourceReceipt(t *testing.T) {
 	require.False(t, stored.ReceiptPending)
 	called := false
 	m.SetReceiptSender(func(_ context.Context, _ Job) error { called = true; return nil })
-	require.NoError(t, m.flushReceipts(t.Context()))
+	var receipts sync.WaitGroup
+	require.NoError(t, m.flushReceipts(t.Context(), &receipts))
+	receipts.Wait()
 	require.False(t, called)
 }
 

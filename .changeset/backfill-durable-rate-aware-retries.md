@@ -1,5 +1,5 @@
 ---
-'hypercerts-relay': minor
+'hypercerts-relay': patch
 ---
 
 Jetstream now retries failed PDS downloads up to three times without losing

@@ -110,6 +110,9 @@ func failure(w http.ResponseWriter, err error) {
 	status := http.StatusInternalServerError
 	code := "persistence_error"
 	switch {
+	case errors.Is(err, jobs.ErrPolicyAdoptionNotReady):
+		status = http.StatusServiceUnavailable
+		code = "policy_adoption_not_ready"
 	case errors.Is(err, jobs.ErrNotFound):
 		status = 404
 		code = "not_found"
@@ -127,6 +130,12 @@ func failure(w http.ResponseWriter, err error) {
 	case errors.Is(err, jobs.ErrInvalidInput):
 		status = 400
 		code = "invalid_input"
+	case errors.Is(err, jobs.ErrPolicyMirrorRequired), errors.Is(err, jobs.ErrPolicyMirrorUnavailable):
+		// A Relay mirror must acknowledge the new policy before Jetstream
+		// commits it. Configuration or reachability failures are dependency
+		// errors, not storage faults.
+		status = 503
+		code = "policy_mirror_unavailable"
 	}
 	reply(w, status, map[string]string{"error": code})
 }
@@ -175,12 +184,13 @@ func (h *Handler) addSource(w http.ResponseWriter, r *http.Request) {
 }
 func (h *Handler) removeSource(w http.ResponseWriter, r *http.Request) {
 	var input struct {
-		PDS string `json:"pds"`
+		PDS            string `json:"pds"`
+		SourceRevision uint64 `json:"sourceRevision,omitempty"`
 	}
 	if !decode(w, r, &input) {
 		return
 	}
-	if err := h.jobs.RemoveSource(input.PDS); err != nil {
+	if err := h.jobs.RemoveSourceWithRevision(input.PDS, input.SourceRevision); err != nil {
 		failure(w, err)
 		return
 	}
@@ -557,6 +567,8 @@ func (h *Handler) listJobs(w http.ResponseWriter, r *http.Request) {
 type jobView struct {
 	ID              string           `json:"id"`
 	PDS             string           `json:"pds"`
+	SourceRevision  uint64           `json:"sourceRevision"`
+	PolicyRevision  uint64           `json:"policyRevision"`
 	Policy          selection.Policy `json:"policy"`
 	Reason          string           `json:"reason"`
 	State           jobs.State       `json:"state"`
@@ -579,7 +591,7 @@ type jobView struct {
 }
 
 func view(j jobs.Job, completedRepos int, diagnostics jobs.JobDiagnostics) jobView {
-	return jobView{ID: j.ID, PDS: j.PDS, Policy: j.Policy, Reason: j.Reason, State: j.State, Attempts: j.Attempts, CompletedRepos: completedRepos, TotalRepos: j.TotalRepos, TotalReposKnown: j.TotalReposKnown, Cursor: j.Cursor, ErrorCode: j.ErrorCode, LastFailure: j.LastFailure, CreatedAt: j.CreatedAt, StartedAt: j.StartedAt, FinishedAt: j.FinishedAt, LastProgressAt: j.LastProgressAt, Coverage: j.Coverage, RecoveryDIDCount: len(j.RecoveryDIDs), Diagnostics: diagnostics}
+	return jobView{ID: j.ID, PDS: j.PDS, SourceRevision: j.SourceRevision, PolicyRevision: j.Policy.Revision, Policy: j.Policy, Reason: j.Reason, State: j.State, Attempts: j.Attempts, CompletedRepos: completedRepos, TotalRepos: j.TotalRepos, TotalReposKnown: j.TotalReposKnown, Cursor: j.Cursor, ErrorCode: j.ErrorCode, LastFailure: j.LastFailure, CreatedAt: j.CreatedAt, StartedAt: j.StartedAt, FinishedAt: j.FinishedAt, LastProgressAt: j.LastProgressAt, Coverage: j.Coverage, RecoveryDIDCount: len(j.RecoveryDIDs), Diagnostics: diagnostics}
 }
 
 type coverageView struct {

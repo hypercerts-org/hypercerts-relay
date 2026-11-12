@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -68,6 +69,8 @@ type SlurperConfig struct {
 	// callback functions. technically optional but effectively required
 	PersistCursorCallback     PersistCursorFunc
 	PersistHostStatusCallback PersistHostStatusFunc
+	// Test-only socket injection seam; production defaults remain public-only.
+	TestDialContext func(context.Context, string, string) (net.Conn, error)
 }
 
 func DefaultSlurperConfig() *SlurperConfig {
@@ -273,6 +276,10 @@ func (s *Slurper) CheckIfSubscribed(hostname string) bool {
 //
 // NOTE: the `host` parameter (a database row) contains metadata about the host at a point in time. Subsequent changes to the database aren't reflected in that struct, and changes to the struct don't get persisted to database.
 func (s *Slurper) Subscribe(host *models.Host) error {
+	// hypercerts: Persisted source schemes must pass transport policy before any socket starts.
+	if err := sourceTransportAllowed(host.Hostname, host.NoSSL, s.Config != nil && s.Config.TestDialContext != nil); err != nil {
+		return err
+	}
 	s.subsLk.Lock()
 	defer s.subsLk.Unlock()
 	if s.closed {
@@ -342,11 +349,12 @@ func (s *Slurper) subscribeWithRedialer(ctx context.Context, host *models.Host, 
 
 	d := websocket.Dialer{
 		HandshakeTimeout: time.Second * 5,
+		NetDialContext:   s.Config.TestDialContext,
 	}
 
 	// hypercerts: the acceptance build alone reaches private Docker PDS hosts;
-	// all normal builds keep SSRF protection for HTTPS sources.
-	if !host.NoSSL && !acceptancePrivateHostsEnabled() {
+	// all normal builds retain SSRF protection for source sockets.
+	if s.Config.TestDialContext == nil && !acceptancePrivateHostsEnabled() {
 		netDialer := ssrf.PublicOnlyDialer()
 		d.NetDialContext = netDialer.DialContext
 	}
@@ -368,6 +376,10 @@ func (s *Slurper) subscribeWithRedialer(ctx context.Context, host *models.Host, 
 			}
 		}
 
+		if err := sourceTransportAllowed(host.Hostname, host.NoSSL, s.Config.TestDialContext != nil); err != nil {
+			sub.setState("failing")
+			return
+		}
 		u := host.SubscribeReposURL()
 		if cursor > 0 {
 			u = fmt.Sprintf("%s?cursor=%d", u, cursor)

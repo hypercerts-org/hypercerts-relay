@@ -1,9 +1,9 @@
 # Shared bootstrap can also be built from Jetstream's isolated context.
-ARG VERSION=0.9.0
+ARG VERSION=0.9.1
 ARG COMMIT=unknown
 ARG DATE=unknown
 
-FROM golang:1.26.10-bookworm AS bootstrap
+FROM golang:1.27.3-bookworm AS bootstrap
 WORKDIR /src
 COPY jetstream/cmd/container-entrypoint/main.go ./main.go
 RUN CGO_ENABLED=0 go build -trimpath -o /container-entrypoint main.go

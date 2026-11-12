@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/jetstream/internal/hypercerts/policygate"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/segment"
@@ -89,6 +91,50 @@ func collectActiveEvents(t *testing.T, path string) []segment.Event {
 		return nil
 	}))
 	return events
+}
+
+func TestUnattributedResyncUsesCapturedPolicy(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(filepath.Join(dir, "db"), nil)
+	require.NoError(t, err)
+	defer db.Close()
+	policy, err := selection.Open(db, []string{"app.bsky.feed.post"})
+	require.NoError(t, err)
+	var projected ingest.Snapshot
+	writer, err := ingest.Open(ingest.Config{SegmentsDir: filepath.Join(dir, "segments"), Store: db, CollectionPolicy: policy, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), ReconcileSnapshot: func(_ context.Context, snapshot ingest.Snapshot) error { projected = snapshot; return nil }})
+	require.NoError(t, err)
+	defer writer.Close()
+	handler := NewSegmentHandler(writer, nil, nil)
+	handler.policyGate = policygate.New(policy, writer, "test")
+	did := atmos.DID("did:plc:test")
+	repository, commit := buildSingleRecordRepo(t, did, "app.bsky.feed.post", "key", map[string]any{"text": "hello"})
+	require.NoError(t, handler.HandleRepoResync(t.Context(), did, repository, commit))
+	require.Equal(t, []string{"app.bsky.feed.post"}, projected.Collections)
+	require.Len(t, projected.Records, 1)
+	require.Nil(t, projected.AppendMetadata)
+}
+
+func TestCollectSelectedRowsDropsOverlongKeyKeepsSibling(t *testing.T) {
+	writer := newTestIngest(t)
+	handler := NewSegmentHandler(writer, nil, nil)
+	handler.dropMetrics = ingest.NewDropMetrics(prometheus.NewRegistry())
+	did := atmos.DID("did:plc:test")
+	repo, commit := buildHostileKeyRepo(t, did, "app.bsky.feed.post/good", "app.bsky.feed.post/"+strings.Repeat("x", 256))
+	rows, err := handler.collectSelectedRows(t.Context(), did, repo, commit, []string{"app.bsky.feed.post"}, segment.KindCreateResync)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	require.Equal(t, "good", rows[0].Rkey)
+	require.Equal(t, float64(1), testutil.ToFloat64(handler.dropMetrics.Counter(ingest.DropSourceBackfill, ingest.DropReasonFieldTooLong)))
+}
+
+func TestCollectSelectedRowsRejectsOtherOverlongFields(t *testing.T) {
+	writer := newTestIngest(t)
+	handler := NewSegmentHandler(writer, nil, nil)
+	did := atmos.DID("did:plc:test")
+	repo, commit := buildSingleRecordRepo(t, did, "app.bsky.feed.post", "key", map[string]any{"text": "hello"})
+	commit.Rev = strings.Repeat("x", 256)
+	_, err := handler.collectSelectedRows(t.Context(), did, repo, commit, nil, segment.KindCreateResync)
+	require.ErrorIs(t, err, segment.ErrFieldTooLong)
 }
 
 // TestSegmentHandler_EmitsOneEventPerRecord pins the contract: a

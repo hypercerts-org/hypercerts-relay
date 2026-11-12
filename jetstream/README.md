@@ -117,13 +117,62 @@ and required identity/account/sync markers are retained. Filtered-only commits
 still advance the durable source/verifier boundary. Archive merging and compaction
 do not apply the current acquisition policy to previously retained rows.
 
+### Selected `subscribeEvents` contract
+
+Clients may opt into `hypercerts-selected-v1` with the `contract` query parameter
+on `network.bsky.jetstream.subscribeEvents`. The selector is validated before
+WebSocket upgrade; ordinary clients that omit it retain the upstream v2 event
+shape. Selected clients receive `SelectedFeed` and ordered `PolicyAdopted` info
+frames, plus per-event stream, policy and provenance metadata. A selected `#sync`
+frame carries its DID, revision and exact admitted collection scope with
+`reconciliationRequired: true`; its upstream CAR blocks and unselected operation
+payloads are never sent. Identity and account lifecycle markers remain available
+for selected DIDs and identity refresh must not be treated as account deletion.
+
+The first capability frame is truthful materialized history only: no original
+history boundary or complete-coverage claim. Selected `streamId` and numeric
+`cursor` resume coordinates must be supplied together, and selected cursors are
+validated without timestamp heuristics. See the
+[Selected Stream Contract v1](../docs/contracts/selected-stream-v1.md) for the
+wire fields and stable negotiation/replay errors.
+
+For selected-stream consumers upgrading an existing archive, the advertised
+`replayFloor` excludes the region before the first durably attributed event,
+not the first policy-history entry (which can predate attribution). The capability
+frame reports that region as a `legacy-scope-unknown` gap. Until attribution
+activates, selected replay is unavailable and `replayFloor` is null; an existing
+legacy archive is disclosed as a gap through its durable tip. An empty archive
+has no legacy gap. Live-only subscription remains available in both cases. A
+selected cursor in that region is rejected before WebSocket upgrade with
+`ReplayUnavailable`, even when a DID or collection filter would hide its rows.
+Legacy syncs have no recoverable exact policy scope, so the server cannot safely
+represent them under this contract. Consumers must explicitly reconcile their
+selected state before starting at the advertised floor or choosing live-only
+subscription; the boundary is not evidence that reconciliation is complete.
+Ordinary subscriptions and archive downloads keep their existing legacy access.
+
 This boundary concerns Jetstream record materialization. Raw Relay/Rainbow data
 and transient full-repository CAR downloads can contain excluded records; this
 does not promise their absence from upstream storage or transient input buffers.
 The internal embedding API retains upstream behavior unless `CollectionSelection`
 is enabled; the production `serve` command always enables it.
 
+With selection enabled, a known upstream continuity loss — an upstream
+`OutdatedCursor` notice or a relay sequence gap — is logged at error level and
+recorded durably, then skipped so ingestion continues. Readiness, established
+subscriptions and restart are unaffected. The recorded loss is reported again on
+the next start, and recovery follows `docs/upgrade-restore.md`. Selected replay
+cannot recover raw events that were never acquired, so consumer reconciliation
+cannot assume that missing upstream history is recoverable.
+
 ## Scoped PDS backfill jobs
+
+Relay sends durable source lifecycle handoffs using `JETSTREAM_CONTROL_URL` and
+`JETSTREAM_CONTROL_TOKEN`, configured together on the Relay process. When both
+are absent, handoff delivery is disabled and the Relay retains queued rows. If
+exactly one is absent, Relay fails startup. The
+Relay's outbound `JETSTREAM_CONTROL_TOKEN` is distinct from Jetstream's
+`JETSTREAM_CONTROL_TOKEN_FILE`, which supplies the inbound private API credential.
 
 On a new data directory, `JETSTREAM_PDS_SOURCES` (or `--pds-sources`) initializes
 explicit direct-PDS origins, separated by commas. HTTPS is required except for
@@ -142,13 +191,31 @@ Jobs enumerate repositories directly from the named PDS, verify signed snapshots
 against the DID identity, and reconcile only selected collections. Missing selected
 records produce per-record deletes; another collection is not replaced by a
 DID-wide tombstone. Managed steady-state whole-repository live/retry syncs use scoped record
-replacements and deletes instead of a DID-wide sync tombstone. This preserves newer collection snapshots across delayed sync delivery.
+replacements and deletes instead of a DID-wide sync tombstone. Bootstrap syncs
+persist their admitted collections and verified present-record paths; merging
+reconciles missing records against the destination archive, not only the temporary
+live archive. Compaction retains this scoped lifecycle marker without deleting its
+replacement rows or unrelated collections. Ordinary unmanaged whole-repository
+syncs retain their DID-wide tombstone behavior. This preserves newer collection
+snapshots across delayed sync delivery.
 Inactive account events block stale snapshot publication. Archive writes and
 per-collection revision boundaries are synced before repository progress is
 acknowledged. Delayed older live/retry rows cannot overwrite a completed
 snapshot; newer live rows win. Restart resumes a running job from its persisted
 page and repository progress. A crash before progress acknowledgment may replay
-work safely.
+work safely. Relay-owned desired-state changes are handed off through its durable
+source queue; Jetstream accepts each PDS lifecycle revision independently of the
+current collection-policy revision and deduplicates retries against that durable
+acceptance. Thus a lost POST acknowledgment remains safe across policy changes and
+Jetstream restarts. Relay removes a queued handoff only after a validated 202
+acceptance body for an enable (PDS, source revision, pending state, policy
+revision, and job identity) or an explicit 204 removal acknowledgment. Redirects,
+malformed or mismatched 2xx responses, and transport failures remain pending and
+are retried with backoff. A disable received before any enable leaves a durable
+tombstone; only a newer explicit enable can revive that PDS. Keep Jetstream's
+data directory persistent: losing it discards both the accepted lifecycle state
+and its fences, so Relay's durable queue may be replayed but cannot reconstruct
+older accepted policy history without operator reconciliation.
 
 ### Repository recovery after verify-queue loss
 
