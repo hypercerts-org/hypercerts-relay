@@ -3,6 +3,7 @@ package relay
 import (
 	"context"
 	"fmt"
+	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -69,6 +70,7 @@ func TestT11RateAdmissionFencesTwoRelayLifecycleAndRestart(t *testing.T) {
 		t.Helper()
 		config := DefaultRelayConfig()
 		config.RequireRateAdmission = true
+		config.TestDialContext = (&net.Dialer{}).DialContext
 		r, err := NewRelay(testDB.DB, nil, nil, config)
 		require.NoError(t, err)
 		t.Cleanup(func() { require.NoError(t, r.Slurper.Shutdown()) })
@@ -192,6 +194,7 @@ func TestT11RateAdmissionFencesEveryRedial(t *testing.T) {
 	fixture := newSourceFixture(t)
 	config := DefaultSlurperConfig()
 	config.PersistCursorPeriod = time.Hour
+	config.TestDialContext = (&net.Dialer{}).DialContext
 	var admitted atomic.Bool
 	admitted.Store(true)
 	var checks atomic.Int32

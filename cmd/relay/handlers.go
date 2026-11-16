@@ -28,23 +28,8 @@ func (s *Service) handleComAtprotoSyncRequestCrawl(c echo.Context, body *comatpr
 		return c.JSON(http.StatusBadRequest, atclient.ErrorBody{Name: "BadRequest", Message: "hostname field is empty or invalid"})
 	}
 
-	if noSSL && !s.config.AllowInsecureHosts && !admin {
-		return c.JSON(http.StatusBadRequest, atclient.ErrorBody{Name: "BadRequest", Message: "this relay requires host SSL"})
-	}
-
-	if strings.HasPrefix(hostname, "localhost:") {
-		if !admin {
-			return c.JSON(http.StatusBadRequest, atclient.ErrorBody{Name: "BadRequest", Message: "can not configure localhost via public endpoint"})
-		}
-		// else, allowed
-	} else {
-		banned, err := s.relay.DomainIsBanned(ctx, hostname)
-		if err != nil {
-			return err
-		}
-		if banned {
-			return c.JSON(http.StatusForbidden, atclient.ErrorBody{Name: "DomainBan", Message: "hostname is not allowed"})
-		}
+	if allowed, err := s.checkRequestCrawlDomain(c, hostname, admin); !allowed {
+		return err
 	}
 
 	// hypercerts: Delegate admission and validation to the durable source policy.
@@ -62,8 +47,31 @@ func (s *Service) handleComAtprotoSyncRequestCrawl(c echo.Context, body *comatpr
 	return nil
 }
 
+func (s *Service) checkRequestCrawlDomain(c echo.Context, hostname string, admin bool) (bool, error) {
+	if strings.HasPrefix(hostname, "localhost:") {
+		if !admin {
+			return false, c.JSON(http.StatusBadRequest, atclient.ErrorBody{Name: "BadRequest", Message: "can not configure localhost via public endpoint"})
+		}
+		return true, nil
+	}
+	banned, err := s.relay.DomainIsBanned(c.Request().Context(), hostname)
+	if err != nil {
+		return false, err
+	}
+	if banned {
+		return false, c.JSON(http.StatusForbidden, atclient.ErrorBody{Name: "DomainBan", Message: "hostname is not allowed"})
+	}
+	return true, nil
+}
+
 func requestCrawlError(c echo.Context, err error) error {
 	switch {
+	case errors.Is(err, relay.ErrInvalidSourceURL):
+		return c.JSON(http.StatusBadRequest, atclient.ErrorBody{Name: "BadRequest", Message: "PDS sources require HTTPS"})
+	case errors.Is(err, relay.ErrNewHostsDisabled):
+		return c.JSON(http.StatusTooManyRequests, atclient.ErrorBody{Name: "RateLimitExceeded", Message: "daily public source admission limit reached"})
+	case errors.Is(err, relay.ErrSourceRevisionConflict):
+		return c.JSON(http.StatusConflict, atclient.ErrorBody{Name: "Conflict", Message: "source admission changed; retry request"})
 	case errors.Is(err, relay.ErrHostNotFound), errors.Is(err, relay.ErrSourceNotFound):
 		return c.JSON(http.StatusNotFound, atclient.ErrorBody{Name: "HostNotFound", Message: "managed source not found"})
 	case errors.Is(err, relay.ErrSourceDisabled):

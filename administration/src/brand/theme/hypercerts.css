@@ -26,8 +26,8 @@
   font-display: swap;
 }
 @font-face {
-  font-family: "Switzer Variable";
-  src: url("../assets/fonts/Switzer-Variable.woff2") format("woff2");
+  font-family: "Hanken Grotesk";
+  src: url("../assets/fonts/HankenGrotesk-Variable.woff2") format("woff2");
   font-weight: 100 900;
   font-style: normal;
   font-display: swap;
@@ -80,7 +80,7 @@
 
   /* TYPE */
   --font-display: "Instrument Serif", Georgia, serif;
-  --font-body: "Switzer Variable", system-ui, sans-serif;
+  --font-body: "Hanken Grotesk", system-ui, sans-serif;
 
   --text-display-1: 160px;
   --text-display-1--line-height: 0.81;

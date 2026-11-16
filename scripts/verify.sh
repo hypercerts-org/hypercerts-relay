@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo 'Testing Relay and Rainbow'
-go test ./cmd/relay/... ./cmd/rainbow
+echo 'Testing Relay, Rainbow and collection directory'
+go test ./cmd/relay/... ./cmd/rainbow ./cmd/collectiondir
 
 echo 'Running static checks'
-go vet ./cmd/relay/... ./cmd/rainbow
+go vet ./cmd/relay/... ./cmd/rainbow ./cmd/collectiondir
 
-echo 'Building Relay and Rainbow'
-go build ./cmd/relay ./cmd/rainbow
+echo 'Building Relay, Rainbow and collection directory'
+go build ./cmd/relay ./cmd/rainbow ./cmd/collectiondir

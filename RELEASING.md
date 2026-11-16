@@ -17,7 +17,7 @@ The `Release` workflow uses the standard Hypercerts release bot credentials, `RE
 1. Open **Actions → Release → Run workflow** on `main`.
 2. The workflow verifies Relay and Rainbow, then opens or updates a `prepare for release vX.Y.Z` pull request. That pull request updates the root package, Administration package, Relay/Rainbow and Jetstream build versions, Docker build defaults, and `CHANGELOG.md` together.
 3. Review and merge the version pull request normally.
-4. Its merge triggers the workflow again. Before Changesets creates `vX.Y.Z`, the workflow checks that the source tag name, root package, Administration package, Relay/Rainbow runtime metadata, Jetstream runtime metadata, and all four Docker build defaults use the same version. It then verifies that the tag resolves to the merged release commit.
+4. Its merge triggers the workflow again. Before Changesets creates `vX.Y.Z`, the workflow checks that the source tag name, root package, Administration package, Relay/Rainbow runtime metadata, Jetstream runtime metadata, and all four Docker build defaults use the same version. It then verifies that the tag resolves to the merged release commit and pushes that tag to GitHub.
 5. Use the `hypercerts-github-release` skill to create the GitHub Release from that existing validated tag with GitHub CLI generated notes. Review the generated notes for accurate operator impact before creating it.
 
 For the one-time initial tag of an already-versioned tree, a maintainer can dispatch the workflow from `main` with **Create the missing tag for the checked-out package version** enabled. It validates and creates only the current `vX.Y.Z` tag; it does not bypass review for later Changesets releases or create a GitHub Release.

@@ -44,10 +44,11 @@ func newTestWriter(t *testing.T, overrides Config) *Writer {
 	segDir := filepath.Join(t.TempDir(), "segments")
 
 	cfg := Config{
-		SegmentsDir: segDir,
-		Store:       newTestStore(t),
-		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Metrics:     NewMetrics(prometheus.NewRegistry()),
+		SegmentsDir:           segDir,
+		Store:                 newTestStore(t),
+		Logger:                slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Metrics:               NewMetrics(prometheus.NewRegistry()),
+		ReadLogRetentionBytes: overrides.ReadLogRetentionBytes,
 	}
 	if overrides.MaxSegmentBytes != 0 {
 		cfg.MaxSegmentBytes = overrides.MaxSegmentBytes

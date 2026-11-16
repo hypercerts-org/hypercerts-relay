@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"github.com/urfave/cli/v3"
 	"io"
 	"net"
 	"net/http"
@@ -94,4 +96,10 @@ func TestAdminRoutesRequireAdminAuth(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for test relay server to stop")
 	}
+}
+
+func TestRelayRejectsAllowInsecureHostsBeforeStartup(t *testing.T) {
+	command := &cli.Command{Action: runRelay, Flags: []cli.Flag{&cli.BoolFlag{Name: "allow-insecure-hosts"}}}
+	err := command.Run(context.Background(), []string{"relay", "--allow-insecure-hosts"})
+	require.ErrorContains(t, err, "allow-insecure-hosts is disabled: PDS sources require HTTPS")
 }

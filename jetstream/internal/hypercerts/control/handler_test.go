@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -52,6 +53,21 @@ func request(h http.Handler, method, path, body, token string) *httptest.Respons
 	h.ServeHTTP(w, r)
 	return w
 }
+func TestRevisionedSourceRemovalContract(t *testing.T) {
+	h, manager := setup(t)
+	const pds = "https://control-fence.example"
+
+	removed := request(h, "DELETE", "/sources", `{"pds":"`+pds+`","sourceRevision":8}`, testToken)
+	require.Equal(t, http.StatusNoContent, removed.Code, removed.Body.String())
+	stale := request(h, "POST", "/sources", `{"pds":"`+pds+`","sourceRevision":7}`, testToken)
+	require.Equal(t, http.StatusConflict, stale.Code)
+	equal := request(h, "POST", "/sources", `{"pds":"`+pds+`","sourceRevision":8}`, testToken)
+	require.Equal(t, http.StatusConflict, equal.Code)
+	newer := request(h, "POST", "/sources", `{"pds":"`+pds+`","sourceRevision":9}`, testToken)
+	require.Equal(t, http.StatusAccepted, newer.Code, newer.Body.String())
+	require.True(t, manager.Sources()[pds])
+}
+
 func TestPrivateAuthenticationAndInputValidation(t *testing.T) {
 	h, m := setup(t)
 	for _, path := range []string{"/policy", "/sources", "/jobs", "/snapshot-rejections", "/coverage", "/jobs/unknown", "/jobs/unknown/cancel", "/jobs/unknown/retry"} {
@@ -72,6 +88,48 @@ func TestPrivateAuthenticationAndInputValidation(t *testing.T) {
 	_, err := New("", m, h.policy)
 	require.Error(t, err)
 }
+
+// A collection change must advance the Relay's policy mirror before Jetstream
+// commits it. When no mirror is configured the request fails, and the failure is
+// a missing service dependency rather than a storage fault: reporting it as
+// persistence_error sent operators looking for a database problem.
+func TestPolicyChangeWithoutRelayMirrorReportsDependencyFailure(t *testing.T) {
+	h, m := setup(t)
+	_, err := m.AddSourceWithRevision("https://pds.example.com", 1)
+	require.NoError(t, err)
+
+	body := `{"expectedRevision":1,"collections":["app.bsky.feed.post","app.bsky.feed.like"]}`
+	w := request(h, "PUT", "/policy", body, testToken)
+	require.Equal(t, 503, w.Code)
+	require.JSONEq(t, `{"error":"policy_mirror_unavailable"}`, w.Body.String())
+
+	require.Equal(t, uint64(1), h.policy.Current().Revision)
+	require.Len(t, m.List(), 1)
+	require.Equal(t, jobs.Pending, m.List()[0].State)
+	require.Equal(t, uint64(1), m.List()[0].Policy.Revision)
+}
+
+// A configured mirror that cannot be reached is the same dependency failure,
+// not a storage fault.
+func TestPolicyChangeWithUnreachableRelayReportsDependencyFailure(t *testing.T) {
+	h, m := setup(t)
+	_, err := m.AddSourceWithRevision("https://pds.example.com", 1)
+	require.NoError(t, err)
+	m.SetPolicyAdvanceSender(func(context.Context, string, uint64, uint64) error {
+		return fmt.Errorf("%w: dial", jobs.ErrPolicyMirrorUnavailable)
+	})
+
+	body := `{"expectedRevision":1,"collections":["app.bsky.feed.post","app.bsky.feed.like"]}`
+	w := request(h, "PUT", "/policy", body, testToken)
+	require.Equal(t, 503, w.Code)
+	require.JSONEq(t, `{"error":"policy_mirror_unavailable"}`, w.Body.String())
+
+	require.Equal(t, uint64(1), h.policy.Current().Revision)
+	require.Len(t, m.List(), 1)
+	require.Equal(t, jobs.Pending, m.List()[0].State)
+	require.Equal(t, uint64(1), m.List()[0].Policy.Revision)
+}
+
 func seedSnapshotRejections(t *testing.T, manager *jobs.Manager, dids []string, nextPolicy bool) string {
 	t.Helper()
 	pds := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1534,4 +1592,64 @@ func TestCoverageRepositoryWaitFromManager(t *testing.T) {
 		require.Equal(t, jobs.JobExecutionWaiting, got.Diagnostics.Execution)
 		require.Equal(t, deadline, *got.Diagnostics.RetryAt)
 	}
+}
+
+// A recovery request carries a DID scope, so it must route through the recovery
+// entry point rather than the legacy job request that rejects it.
+func TestRepositoryRecoveryJobRequest(t *testing.T) {
+	h, m := setup(t)
+	_, err := m.AddSourceWithRevision("https://pds.example.com", 1)
+	require.NoError(t, err)
+
+	body := `{"pds":"https://pds.example.com","reason":"repository_recovery","dids":["did:plc:bbbbbbbbbbbbbbbbbbbbbbbb","did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"]}`
+	w := request(h, "POST", "/jobs", body, testToken)
+	require.Equal(t, 202, w.Code)
+	var created jobView
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &created))
+	require.Equal(t, 2, created.RecoveryDIDCount)
+
+	// An empty scope cannot create a job; it would silently match nothing.
+	empty := `{"pds":"https://pds.example.com","reason":"repository_recovery","dids":[]}`
+	require.Equal(t, 400, request(h, "POST", "/jobs", empty, testToken).Code)
+
+	// The ordinary reasons must keep working through their own path.
+	backfill := `{"pds":"https://pds.example.com","reason":"backfill"}`
+	require.Equal(t, 202, request(h, "POST", "/jobs", backfill, testToken).Code)
+
+	// A DID already owned by active recovery at another PDS is a retryable state
+	// conflict. Nothing was persisted, so it must not read as a storage failure.
+	_, err = m.AddSourceWithRevision("https://other.example.com", 1)
+	require.NoError(t, err)
+	busy := `{"pds":"https://other.example.com","reason":"repository_recovery","dids":["did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"]}`
+	w = request(h, "POST", "/jobs", busy, testToken)
+	require.Equal(t, 409, w.Code)
+	require.JSONEq(t, `{"error":"state_conflict"}`, w.Body.String())
+}
+
+// The documented scope limit must be reachable through the HTTP decoder: a full
+// 4,096-DID scope of did:plc identifiers is far larger than the default 64 KiB
+// control request limit.
+func TestRepositoryRecoveryJobRequestAcceptsFullScope(t *testing.T) {
+	h, m := setup(t)
+	_, err := m.AddSourceWithRevision("https://pds.example.com", 1)
+	require.NoError(t, err)
+
+	dids := make([]string, 4096)
+	for i := range dids {
+		dids[i] = fmt.Sprintf("did:plc:%024d", i)
+	}
+	body, err := json.Marshal(map[string]any{"pds": "https://pds.example.com", "reason": "repository_recovery", "dids": dids})
+	require.NoError(t, err)
+	require.Greater(t, len(body), 64<<10)
+	w := request(h, "POST", "/jobs", string(body), testToken)
+	require.Equal(t, 202, w.Code, w.Body.String())
+	var created jobView
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &created))
+	require.Equal(t, 4096, created.RecoveryDIDCount)
+
+	// An overlong DID is invalid input rather than an oversized body.
+	long := `{"pds":"https://pds.example.com","reason":"repository_recovery","dids":["did:web:` + strings.Repeat("a", jobs.RecoveryDIDMaxLength) + `.example"]}`
+	w = request(h, "POST", "/jobs", long, testToken)
+	require.Equal(t, 400, w.Code)
+	require.NotContains(t, w.Body.String(), "invalid_json")
 }

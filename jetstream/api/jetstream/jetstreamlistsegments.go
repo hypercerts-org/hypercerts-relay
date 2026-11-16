@@ -337,7 +337,7 @@ func JetstreamListSegments(ctx context.Context, c *xrpc.Client, cursor string, l
 // JetstreamListSegments_Segment is a "segment" in the network.bsky.jetstream.listSegments schema.
 type JetstreamListSegments_Segment struct {
 	LexiconTypeID  string `json:"$type,omitempty"`
-	Checksum       string `json:"checksum"`   // Segment-format xxh3 metadata checksum as 16-char hex; equals the getSegment ETag.
+	Checksum       string `json:"checksum"`   // Segment-format xxh3 metadata checksum as 16-char hex; excludes row bytes and is not the getSegment ETag.
 	EventCount     int64  `json:"eventCount"` // Number of events in the segment.
 	Index          int64  `json:"index"`      // Zero-based segment index.
 	MaxSeq         int64  `json:"maxSeq"`

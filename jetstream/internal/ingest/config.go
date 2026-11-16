@@ -3,6 +3,7 @@ package ingest
 import (
 	"context"
 	"fmt"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 	"log/slog"
 
@@ -38,6 +39,10 @@ const defaultMaxEventsPerBlock = segment.DefaultMaxEventsPerBlock
 type Config struct {
 	// hypercerts: Filter record materialization with the shared durable policy.
 	CollectionPolicy *selection.Manager
+	// Attribution optionally records selected-stream event provenance.
+	Attribution *attribution.Manager
+	// AttributionDomain binds recovery to the attribution namespace.
+	AttributionDomain string
 	// hypercerts: Steady-state replacements share the archive rewrite lock.
 	ReconcileSnapshot func(context.Context, Snapshot) error
 	// DataDir is the root jetstream data directory. Optional outside the
@@ -167,6 +172,9 @@ type Config struct {
 }
 
 func (c *Config) validate() error {
+	if c.Attribution != nil && c.AttributionDomain == "" {
+		return fmt.Errorf("%w: AttributionDomain is required when attribution is enabled", ErrInvalidConfig)
+	}
 	if c.SegmentsDir == "" {
 		return fmt.Errorf("%w: SegmentsDir is required", ErrInvalidConfig)
 	}

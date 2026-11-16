@@ -23,6 +23,13 @@ var relaySecret = secretFile{"HC_RELAY_CONTROL_SECRET", "RELAY_CONTROL_TOKEN_FIL
 var jetstreamSecret = secretFile{"HC_JETSTREAM_CONTROL_SECRET", "JETSTREAM_CONTROL_TOKEN_FILE"}
 var administrationSecret = secretFile{"HC_ADMIN_ENCRYPTION_SECRET", "ADMIN_ENCRYPTION_KEY_FILE"}
 
+// jetstreamRelaySecret carries the Relay credential into Jetstream under its own
+// output name. Jetstream authenticates to the Relay's private control listener
+// for recovery receipts and for advancing the policy mirror before it commits a
+// collection change; without this file every collection change fails. It reads
+// the same input as relaySecret because both services must hold the same value.
+var jetstreamRelaySecret = secretFile{"HC_RELAY_CONTROL_SECRET", "JETSTREAM_RELAY_CONTROL_TOKEN_FILE"}
+
 func clearRawSecrets() {
 	for _, secret := range []secretFile{relaySecret, jetstreamSecret, administrationSecret} {
 		_ = os.Unsetenv(secret.input)
@@ -36,7 +43,7 @@ func prepare(component string) error {
 	case "relay":
 		secrets = []secretFile{relaySecret}
 	case "jetstream":
-		secrets = []secretFile{jetstreamSecret}
+		secrets = []secretFile{jetstreamSecret, jetstreamRelaySecret}
 	case "administration":
 		secrets = []secretFile{relaySecret, jetstreamSecret, administrationSecret}
 	case "rainbow":

@@ -196,3 +196,31 @@ func TestClassifiedFailuresAndLatestDurableProgress(t *testing.T) {
 	job.Evidence = nil
 	require.Nil(t, JobAcquisition(job).Diagnostics.LastProgressAt)
 }
+
+// A repository-scoped recovery job re-acquires a few DIDs. It must never be
+// selected as a source's current-state coverage, or a one-DID repair would be
+// reported as whole-source evidence.
+func TestRecoveryJobNeverProvidesSourceCoverage(t *testing.T) {
+	policy := selection.Policy{Revision: 2, Collections: []string{"app.bsky.feed.post"}}
+	pds := "https://a.example"
+	recovery := jobs.Job{
+		ID:                    "recovery",
+		PDS:                   pds,
+		SourceRevision:        3,
+		Policy:                policy,
+		Reason:                jobs.ReasonRepositoryRecovery,
+		State:                 jobs.Complete,
+		RecoveryDIDs:          []string{"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"},
+		TotalReposKnown:       true,
+		TotalRepos:            1,
+		Evidence:              &jobs.AcquisitionEvidence{Scanned: 1, NoMatch: 1},
+		AcquisitionGeneration: 9,
+	}
+
+	snapshot := New(map[string]bool{pds: true}, map[string]uint64{pds: 3}, policy, []jobs.Job{recovery})
+	require.Len(t, snapshot.Items, 1)
+	row := snapshot.Items[0]
+	require.False(t, row.MatchingJob, "the recovery job must not be treated as matching coverage")
+	require.Empty(t, row.JobID)
+	require.Equal(t, AcquisitionState("unknown"), row.Acquisition.State)
+}

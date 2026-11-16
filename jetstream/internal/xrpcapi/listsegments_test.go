@@ -93,10 +93,10 @@ func TestListSegments_RowMetadata(t *testing.T) {
 	require.Len(t, seg.Checksum, 16, "checksum is 16 hex chars")
 	require.Positive(t, seg.EventCount)
 
-	// Row checksum must equal the getSegment ETag (sans quotes).
+	// The metadata checksum is not the representation validator.
 	g := doGet(t, fmt.Sprintf("%s/xrpc/network.bsky.jetstream.getSegment?name=%s", ts.URL, seg.Name))
 	_ = g.Body.Close()
-	require.Equal(t, fmt.Sprintf("%q", seg.Checksum), g.Header.Get("ETag"))
+	require.NotEqual(t, fmt.Sprintf("%q", seg.Checksum), g.Header.Get("ETag"))
 }
 
 func TestListSegments_BadParams(t *testing.T) {

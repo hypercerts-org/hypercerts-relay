@@ -12,6 +12,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/crashpoint"
 	"github.com/bluesky-social/jetstream/internal/ingest"
 	"github.com/bluesky-social/jetstream/internal/ingest/backfill"
+	"github.com/bluesky-social/jetstream/internal/ingest/live"
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/cockroachdb/pebble/vfs"
@@ -30,6 +31,9 @@ const (
 	DefaultFailedRepoRetryWorkers     = backfill.DefaultFailedRepoRetryWorkers
 	DefaultFailedRepoRetryHostWorkers = backfill.DefaultFailedRepoRetryHostWorkers
 	DefaultFailedRepoRetryMaxDelay    = backfill.DefaultFailedRepoRetryMaxDelay
+	// hypercerts: Live ingestion verify sizing and read pacing (TECH-883).
+	DefaultLiveVerifyParallelism = live.DefaultVerifyParallelism
+	DefaultLiveUpstreamReadRate  = live.DefaultUpstreamReadRate
 )
 
 // PhaseBarrier is a test hook that can pause execution after a major
@@ -52,9 +56,11 @@ type Options struct {
 	ArchiveKeyAuthEnabled bool
 	// hypercerts: The CLI always enables policy; initial collections apply only to new state.
 	CollectionSelection bool
-	InitialCollections  []string
-	PublicAddr          string
-	DebugAddr           string
+	// RequirePolicyAdoption gates managed policy mutation until steady-state binding.
+	RequirePolicyAdoption bool
+	InitialCollections    []string
+	PublicAddr            string
+	DebugAddr             string
 	// hypercerts: Explicitly opt in to profiling on the private listener.
 	EnablePprof bool
 	// AcceptancePrivateHosts activates disposable fixture behavior only when the
@@ -114,6 +120,13 @@ type Options struct {
 	// consumer. Production leaves it nil; deterministic harnesses feed the
 	// firehose over an in-memory connection.
 	LiveDial streaming.DialFunc
+
+	// hypercerts: LiveVerifyParallelism, LiveUpstreamReadRate and
+	// LiveUpstreamReadBurst size atmos's verify workers and pace upstream
+	// reads for both live consumers. See live.Config for zero-value meaning.
+	LiveVerifyParallelism int
+	LiveUpstreamReadRate  float64
+	LiveUpstreamReadBurst int
 
 	// HTTPTransport, when non-nil, is the RoundTripper for every outbound
 	// HTTP client (backfill getRepo/listRepos, identity/PLC resolution).

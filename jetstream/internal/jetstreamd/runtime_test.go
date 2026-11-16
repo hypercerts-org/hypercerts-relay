@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/importer"
+	"github.com/bluesky-social/jetstream/internal/ingest/live"
 	"github.com/bluesky-social/jetstream/internal/ingest/orchestrator"
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/store"
@@ -427,4 +428,19 @@ func testOptions(t *testing.T) Options {
 		SubscribeSlowMinRate:           5,
 		CursorBlockIndexCacheSize:      32,
 	}
+}
+
+// hypercerts: A recorded upstream continuity loss is reported, not a startup barrier.
+func TestBuildToleratesRecordedUpstreamLoss(t *testing.T) {
+	t.Parallel()
+
+	opts := testOptions(t)
+	st, err := store.Open(opts.DataDir, nil, store.WithFS(opts.StorageFS))
+	require.NoError(t, err)
+	require.NoError(t, live.RecordUpstreamLoss(st, live.UpstreamLoss{Version: 1, Reason: "sequence_gap", CursorKey: live.CursorKey, SafeCursor: 12, Expected: 13, Got: 20}))
+	require.NoError(t, st.Close())
+
+	rt, err := Build(t.Context(), opts)
+	require.NoError(t, err, "a recorded loss must not block startup")
+	t.Cleanup(func() { _ = rt.Close(context.Background()) })
 }

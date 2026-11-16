@@ -205,6 +205,13 @@ func observeLocked(records map[RecordKey]uint64, dids map[string]DIDTombstone, e
 		records[key] = ev.Seq
 		return recordEntryBytes(key), nil
 	case segment.KindSync:
+		scope, err := DecodeScopedSync(ev)
+		if err != nil {
+			return 0, err
+		}
+		if scope != nil {
+			return 0, nil
+		}
 		if old, ok := dids[ev.DID]; ok {
 			if ev.Seq > old.Seq {
 				dids[ev.DID] = DIDTombstone{Seq: ev.Seq, Reason: "sync"}

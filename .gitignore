@@ -40,6 +40,8 @@ test-coverage.out
 
 # Don't ignore this file itself, or other specific dotfiles
 !.gitignore
+!.changeset/
+!.changeset/**
 !.agents/
 !.agents/skills/
 !.agents/skills/hypercerts-railway-release/
@@ -81,7 +83,9 @@ railway.ts
 railway.py
 railway.go
 
-# Proprietary font fetched directly from Fontshare during administration builds.
+# Switzer, formerly downloaded from Fontshare by administration builds, is no
+# longer used. Its license forbids committing it, so a leftover local copy must
+# never be committed.
 /administration/src/brand/assets/fonts/Switzer-Variable.woff2
 
 # Local implementation plans.

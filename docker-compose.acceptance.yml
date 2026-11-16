@@ -89,7 +89,10 @@ services:
       PDS_DID_PLC_URL: https://plc.test
       PDS_SERVICE_HANDLE_DOMAINS: .pds-a.test
       PDS_INVITE_REQUIRED: "false"
-      PDS_RATE_LIMITS_ENABLED: "true"
+      # T20 must write a real single-DID backlog while jetstream is stopped. This
+      # PDS is a disposable acceptance fixture on a private network, so its write
+      # limiter would otherwise pace the backlog well beyond the test budget.
+      PDS_RATE_LIMITS_ENABLED: "false"
       NODE_EXTRA_CA_CERTS: /certs/root.crt
     volumes:
       - acceptance-ca:/certs:ro
@@ -123,7 +126,10 @@ services:
       PDS_DID_PLC_URL: https://plc.test
       PDS_SERVICE_HANDLE_DOMAINS: .pds-b.test
       PDS_INVITE_REQUIRED: "false"
-      PDS_RATE_LIMITS_ENABLED: "true"
+      # T20 must write a real single-DID backlog while jetstream is stopped. This
+      # PDS is a disposable acceptance fixture on a private network, so its write
+      # limiter would otherwise pace the backlog well beyond the test budget.
+      PDS_RATE_LIMITS_ENABLED: "false"
       NODE_EXTRA_CA_CERTS: /certs/root.crt
     volumes:
       - acceptance-ca:/certs:ro

@@ -2,7 +2,7 @@ package xrpcapi
 
 import (
 	"context"
-	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -68,7 +68,7 @@ func (h *getSegmentHandler) ServeXRPC(ctx context.Context, w http.ResponseWriter
 	// resuming client splice two file generations together.
 	// ReadSealedHeader validates magic/version, so a corrupt or
 	// foreign file errors instead of serving a confident strong ETag.
-	hdr, err := segment.ReadSealedHeader(f)
+	_, err = segment.ReadSealedHeader(f)
 	if err != nil {
 		h.logger.Error("getSegment: read sealed header failed",
 			slog.String("name", name), slog.String("path", ref.Path),
@@ -76,9 +76,20 @@ func (h *getSegmentHandler) ServeXRPC(ctx context.Context, w http.ResponseWriter
 		return xrpcserver.InternalError("failed to read segment header")
 	}
 
+	// hypercerts: Hash the exact representation on the pinned descriptor, not
+	// the metadata checksum, which excludes stored row bytes.
+	etag, err := representationETag(f, info.Size())
+	if err != nil {
+		h.logger.Error("getSegment: hash sealed file failed", slog.String("name", name), slog.Any("err", err))
+		return xrpcserver.InternalError("failed to hash segment")
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		h.logger.Error("getSegment: seek sealed file failed", slog.String("name", name), slog.Any("err", err))
+		return xrpcserver.InternalError("failed to seek segment")
+	}
+
 	w.Header().Set("Content-Type", "application/octet-stream")
-	// A strong ETag is the value wrapped in double quotes per RFC 9110.
-	w.Header().Set("ETag", fmt.Sprintf("%q", checksumHex(hdr.Checksum)))
+	w.Header().Set("ETag", etag)
 	w.Header().Set("Cache-Control", cacheControlHeader(h.cacheMaxAge))
 
 	// ServeContent handles Range, Accept-Ranges, Content-Length,
@@ -86,7 +97,7 @@ func (h *getSegmentHandler) ServeXRPC(ctx context.Context, w http.ResponseWriter
 	// statusRecorder.ReadFrom delegation. Per the xrpcserver.Handler contract
 	// we MUST return nil after this point: the response may already be
 	// partially written, so an error envelope is no longer possible.
-	http.ServeContent(w, r.HTTPReq, name, info.ModTime(), f)
+	http.ServeContent(w, r.HTTPReq, name, time.Time{}, f)
 	return nil
 }
 

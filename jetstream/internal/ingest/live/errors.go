@@ -24,6 +24,12 @@ var (
 	// cursor for such events, so a later jetstream build that knows
 	// the new kind can be replayed from the gap.
 	ErrUnknownEventKind = errors.New("livestream: unknown event kind")
+
+	// hypercerts: ErrUpstreamStreamEnded is returned by Run when the upstream
+	// event iterator ends while the consumer's context is still live, so a
+	// non-retryable dial failure stops the process instead of leaving it
+	// running without ingestion.
+	ErrUpstreamStreamEnded = errors.New("livestream: upstream stream ended unexpectedly")
 )
 
 // InvalidEventError is returned by ConvertEvent when a whole upstream

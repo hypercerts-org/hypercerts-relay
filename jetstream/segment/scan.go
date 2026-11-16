@@ -3,6 +3,7 @@ package segment
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 	"math"
 
 	"github.com/cockroachdb/pebble/vfs"
@@ -31,66 +32,45 @@ func ScanMaxSeq(path string) (maxSeq uint64, found bool, err error) {
 
 // ScanMaxSeqFS is ScanMaxSeq against fs. Nil fs uses the host OS filesystem.
 func ScanMaxSeqFS(fs vfs.FS, path string) (maxSeq uint64, found bool, err error) {
+	return extractScanActiveFS(fs, path, nil)
+}
+
+// ScanActiveFS scans fully durable blocks from an active segment, ignoring a
+// torn trailing frame. Sealed segments are rejected; use Reader for those.
+func ScanActiveFS(fs vfs.FS, path string, visit func([]Event) error) error {
+	_, _, err := extractScanActiveFS(fs, path, visit)
+	return err
+}
+
+// extractScanActiveFS scans fully durable blocks from an active segment. visit
+// receives each decoded block before its sequence envelope is accumulated.
+func extractScanActiveFS(fs vfs.FS, path string, visit func([]Event) error) (maxSeq uint64, found bool, err error) {
 	f, err := openSegmentReadOnly(fs, path)
 	if err != nil {
 		return 0, false, fmt.Errorf("segment: scan open %s: %w", path, err)
 	}
 	defer func() { _ = f.Close() }()
 
-	info, err := f.Stat()
+	size, err := activeScanSize(f, path)
 	if err != nil {
-		return 0, false, fmt.Errorf("segment: scan stat: %w", err)
-	}
-	size := info.Size()
-	if size < ReservedHeaderBytes {
-		return 0, false, fmt.Errorf("%w: %s is %d bytes", ErrCorruptSegment, path, size)
-	}
-
-	var checksumBuf [8]byte
-	if _, err := f.ReadAt(checksumBuf[:], 4); err != nil {
-		return 0, false, fmt.Errorf("segment: scan read checksum: %w", err)
-	}
-	if binary.LittleEndian.Uint64(checksumBuf[:]) != 0 {
-		return 0, false, fmt.Errorf("%w: %s", ErrSegmentSealed, path)
+		return 0, false, err
 	}
 
 	off := int64(ReservedHeaderBytes)
-	var lenBuf [8]byte
 	for off < size {
-		if size-off < int64(len(lenBuf)) {
-			return maxSeq, found, nil
-		}
-		if _, err := f.ReadAt(lenBuf[:], off); err != nil {
-			return 0, false, fmt.Errorf("segment: scan read frame length at %d: %w", off, err)
-		}
-		frameLen := binary.LittleEndian.Uint64(lenBuf[:])
-		// Reject frames that would extend past EOF (torn tail) or
-		// that overflow int on the make() below. lastGoodOffset uses
-		// the same torn-tail short-circuit semantics.
-		remaining := uint64(size - off - int64(len(lenBuf)))
-		if frameLen > remaining || frameLen > math.MaxInt {
-			return maxSeq, found, nil
-		}
-		next := off + int64(len(lenBuf)) + int64(frameLen)
-
-		frame := make([]byte, frameLen)
-		if _, err := f.ReadAt(frame, off+int64(len(lenBuf))); err != nil {
-			return 0, false, fmt.Errorf("segment: scan read frame body at %d: %w", off, err)
-		}
-
-		events, err := decodeBlockCompressed(frame)
+		events, next, err := scanActiveBlock(f, off, size)
 		if err != nil {
-			return 0, false, fmt.Errorf("segment: scan decode block at %d: %w", off, err)
+			return 0, false, err
 		}
 		if len(events) == 0 {
 			return maxSeq, found, nil
 		}
-		for _, ev := range events {
-			if !found || ev.Seq > maxSeq {
-				maxSeq = ev.Seq
-				found = true
+		if visit != nil {
+			if err := visit(events); err != nil {
+				return 0, false, err
 			}
 		}
+		maxSeq, found = accumulateScanSequences(events, maxSeq, found)
 		off = next
 	}
 	return maxSeq, found, nil
@@ -203,4 +183,68 @@ func WalkActiveRangeFS(fs vfs.FS, path string, startOffset, endOffset uint64, fn
 		return fmt.Errorf("%w: active range ended at %d, want %d", ErrCorruptSegment, off, end)
 	}
 	return nil
+}
+
+func scanActiveBlock(f io.ReaderAt, off, size int64) ([]Event, int64, error) {
+	var lenBuf [8]byte
+	if size-off < int64(len(lenBuf)) {
+		return nil, off, nil
+	}
+	if _, err := f.ReadAt(lenBuf[:], off); err != nil {
+		return nil, 0, fmt.Errorf("segment: scan read frame length at %d: %w", off, err)
+	}
+	frameLen := binary.LittleEndian.Uint64(lenBuf[:])
+	// Reject frames that would extend past EOF (torn tail) or
+	// that overflow int on the make() below. lastGoodOffset uses
+	// the same torn-tail short-circuit semantics.
+	remaining := uint64(size - off - int64(len(lenBuf)))
+	if frameLen > remaining || frameLen > math.MaxInt {
+		return nil, off, nil
+	}
+	next := off + int64(len(lenBuf)) + int64(frameLen)
+
+	frame := make([]byte, frameLen)
+	if _, err := f.ReadAt(frame, off+int64(len(lenBuf))); err != nil {
+		return nil, 0, fmt.Errorf("segment: scan read frame body at %d: %w", off, err)
+	}
+
+	events, err := decodeBlockCompressed(frame)
+	if err != nil {
+		return nil, 0, fmt.Errorf("segment: scan decode block at %d: %w", off, err)
+	}
+	if len(events) == 0 {
+		return nil, off, nil
+	}
+	return events, next, nil
+}
+
+func activeScanSize(f vfs.File, path string) (int64, error) {
+	info, err := f.Stat()
+	if err != nil {
+		return 0, fmt.Errorf("segment: scan stat: %w", err)
+	}
+	size := info.Size()
+	if size < ReservedHeaderBytes {
+		return 0, fmt.Errorf("%w: %s is %d bytes", ErrCorruptSegment, path, size)
+	}
+
+	var checksumBuf [8]byte
+	if _, err := f.ReadAt(checksumBuf[:], 4); err != nil {
+		return 0, fmt.Errorf("segment: scan read checksum: %w", err)
+	}
+	if binary.LittleEndian.Uint64(checksumBuf[:]) != 0 {
+		return 0, fmt.Errorf("%w: %s", ErrSegmentSealed, path)
+	}
+
+	return size, nil
+}
+
+func accumulateScanSequences(events []Event, maxSeq uint64, found bool) (uint64, bool) {
+	for _, ev := range events {
+		if !found || ev.Seq > maxSeq {
+			maxSeq = ev.Seq
+			found = true
+		}
+	}
+	return maxSeq, found
 }

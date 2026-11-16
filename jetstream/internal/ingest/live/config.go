@@ -3,8 +3,11 @@ package live
 import (
 	"context"
 	"fmt"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
+	"github.com/bluesky-social/jetstream/internal/hypercerts/policygate"
 	"github.com/bluesky-social/jetstream/internal/hypercerts/selection"
 	"log/slog"
+	"math"
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
@@ -43,7 +46,12 @@ type Config struct {
 	// hypercerts: Filter record materialization with the shared durable policy.
 	CollectionPolicy *selection.Manager
 	// hypercerts: Scope syncs after direct-PDS snapshot boundaries.
-	ReconcileSnapshot func(context.Context, ingest.Snapshot) error
+	ReconcileSnapshot    func(context.Context, ingest.Snapshot) error
+	PolicyGate           *policygate.Gate
+	Attribution          *attribution.Manager
+	AttributionDomain    string
+	AttributionStreamID  string
+	InitializePolicyGate func(*ingest.Writer) (*policygate.Gate, error)
 	// DataDir is the root jetstream data directory. Optional outside the
 	// production orchestrator; forwarded to ingest.Writer for fatal
 	// persistence error context.
@@ -86,6 +94,12 @@ type Config struct {
 	// DropMetrics is the shared ingest drop counter family, labeled
 	// by (source, reason). Optional; nil skips counting.
 	DropMetrics *ingest.DropMetrics
+
+	// DroppedEvents, when set, is called once per verify-queue overflow with the
+	// DID whose events were shed and how many were lost. It runs on the ingestion
+	// path and must not block. The count is diagnostic only: recovery is scoped
+	// by DID, not by event count.
+	DroppedEvents func(did string, dropped uint64)
 
 	// WriterMetrics flows through to the consumer's internal ingest.Writer.
 	// Steady-state callers pass the canonical ingest metrics for the durable
@@ -176,6 +190,12 @@ type Config struct {
 	// the full contract. Optional.
 	OnAfterSeal func(idx uint64, path string) error
 
+	// OnUpstreamLoss is called synchronously, before the durable loss
+	// marker is written, when a selection-enabled consumer loses upstream
+	// continuity. It must fail readiness immediately and must not block
+	// on writer or compactor shutdown.
+	OnUpstreamLoss func(UpstreamLoss)
+
 	// now is overridable for tests; production uses time.Now.
 	now func() time.Time
 
@@ -189,6 +209,20 @@ type Config struct {
 	// Intended for deterministic harnesses that feed the firehose over an
 	// in-memory connection.
 	Dial streaming.DialFunc
+
+	// hypercerts: VerifyParallelism is the number of atmos verification
+	// workers. atmos caps each DID's verify queue at twice this value and
+	// drops events beyond it. Zero selects DefaultVerifyParallelism; 1 gives
+	// strict ordering with an unbounded queue and full backpressure.
+	VerifyParallelism int
+
+	// hypercerts: UpstreamReadRate paces upstream frame reads, in frames per
+	// second, so catch-up cannot outrun verification. Zero disables pacing.
+	UpstreamReadRate float64
+
+	// hypercerts: UpstreamReadBurst is the number of frames that may be read
+	// without waiting. Zero selects VerifyParallelism (half the per-DID queue).
+	UpstreamReadBurst int
 }
 
 func (c *Config) validate() error {
@@ -210,8 +244,20 @@ func (c *Config) validate() error {
 	if c.Logger == nil {
 		return fmt.Errorf("%w: Logger is required", ErrInvalidConfig)
 	}
+	if c.Attribution != nil && (c.AttributionDomain == "" || c.AttributionStreamID == "" || (c.PolicyGate == nil && c.InitializePolicyGate == nil) || c.CollectionPolicy == nil) {
+		return fmt.Errorf("%w: managed attribution requires domain, stream ID, policy, and gate", ErrInvalidConfig)
+	}
 	if c.Verifier == nil {
 		return fmt.Errorf("%w: Verifier is required", ErrInvalidConfig)
+	}
+	if c.VerifyParallelism < 0 {
+		return fmt.Errorf("%w: VerifyParallelism must not be negative", ErrInvalidConfig)
+	}
+	if c.UpstreamReadRate < 0 || math.IsNaN(c.UpstreamReadRate) || math.IsInf(c.UpstreamReadRate, 0) {
+		return fmt.Errorf("%w: UpstreamReadRate must be a finite non-negative number", ErrInvalidConfig)
+	}
+	if c.UpstreamReadBurst < 0 {
+		return fmt.Errorf("%w: UpstreamReadBurst must not be negative", ErrInvalidConfig)
 	}
 	return nil
 }
@@ -219,5 +265,11 @@ func (c *Config) validate() error {
 func (c *Config) applyDefaults() {
 	if c.now == nil {
 		c.now = time.Now
+	}
+	if c.VerifyParallelism == 0 {
+		c.VerifyParallelism = DefaultVerifyParallelism
+	}
+	if c.UpstreamReadBurst == 0 {
+		c.UpstreamReadBurst = c.VerifyParallelism
 	}
 }

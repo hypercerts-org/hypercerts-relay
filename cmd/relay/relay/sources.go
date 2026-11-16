@@ -66,6 +66,7 @@ type SourceView struct {
 	RuntimeState      string
 	LastDurableCursor int64
 	AccountQuota      SourceAccountQuota
+	Handoff           *models.SourceHandoff
 }
 
 type SourcePage struct {
@@ -117,13 +118,25 @@ type SourceAccountsPage struct {
 	NextAfterDID string
 }
 
-// AddSource records a new administrative source without retaining raw URL
-// material. A repeat for the same normalized hostname is a no-op that still
-// reconciles its desired socket state.
+// AddSource records an administrative source without retaining raw URL material.
+// A repeat for the same normalized hostname is a no-op that still reconciles its desired socket state.
 func (r *Relay) AddSource(ctx context.Context, rawURL string) (*SourceView, error) {
+	return r.addSource(ctx, rawURL, false)
+}
+
+// AddPublicSource applies the new-host limiter atomically with source creation.
+func (r *Relay) AddPublicSource(ctx context.Context, rawURL string) (*SourceView, error) {
+	return r.addSource(ctx, rawURL, true)
+}
+
+func (r *Relay) addSource(ctx context.Context, rawURL string, public bool) (*SourceView, error) {
 	hostname, noSSL, err := ParseHostname(rawURL)
 	if err != nil {
 		return nil, ErrInvalidSourceURL
+	}
+
+	if _, err := r.sourceURL(hostname, noSSL); err != nil {
+		return nil, err
 	}
 
 	r.sourcesLk.Lock()
@@ -140,33 +153,11 @@ func (r *Relay) AddSource(ctx context.Context, rawURL string) (*SourceView, erro
 	var host models.Host
 	var source models.Source
 	err = r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := r.ensureSourceHost(tx, &host, hostname, noSSL); err != nil {
+		if err := r.loadOrCreateSource(tx, &host, &source, hostname, noSSL, public); err != nil {
 			return err
 		}
-
-		err := tx.Where(sourceHostIDPredicate, host.ID).First(&source).Error
-		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-			return fmt.Errorf("loading source: %w", err)
-		}
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			state := models.SourceStateEnabled
-			if host.Status == models.HostStatusBanned {
-				state = models.SourceStateDisabled
-			}
-			source = models.Source{
-				HostID:           host.ID,
-				State:            state,
-				Revision:         1,
-				ValidationStatus: models.SourceValidationPending,
-				ValidationReason: models.SourceValidationReasonNone,
-				RecoveryRequired: true,
-				LastOperation:    "add",
-			}
-			if err := tx.Create(&source).Error; err != nil {
-				return fmt.Errorf("creating source: %w", err)
-			}
-		}
-		return nil
+		_, err := r.sourceURL(host.Hostname, host.NoSSL)
+		return err
 	})
 	if err != nil {
 		return nil, err
@@ -180,6 +171,53 @@ func (r *Relay) AddSource(ctx context.Context, rawURL string) (*SourceView, erro
 		return view, err
 	}
 	return r.sourceViewLocked(ctx, &source, &host)
+}
+
+func (r *Relay) loadOrCreateSource(tx *gorm.DB, host *models.Host, source *models.Source, hostname string, noSSL, public bool) error {
+	if err := tx.Joins("JOIN host ON host.id = source.host_id").Where("host.hostname = ?", hostname).First(source).Error; err == nil {
+		if err := tx.Where("id = ?", source.HostID).First(host).Error; err != nil {
+			return fmt.Errorf("loading source host: %w", err)
+		}
+		return nil
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return fmt.Errorf("loading source: %w", err)
+	}
+	if public && r.HostPerDayLimiter != nil {
+		if !r.HostPerDayLimiter.Allow() {
+			return ErrNewHostsDisabled
+		}
+	}
+	if err := r.ensureSourceHost(tx, host, hostname, noSSL); err != nil {
+		return err
+	}
+
+	return ensureSourceRow(tx, host, source)
+}
+
+func ensureSourceRow(tx *gorm.DB, host *models.Host, source *models.Source) error {
+	err := tx.Where(sourceHostIDPredicate, host.ID).First(source).Error
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return fmt.Errorf("loading source: %w", err)
+	}
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		state := models.SourceStateEnabled
+		if host.Status == models.HostStatusBanned {
+			state = models.SourceStateDisabled
+		}
+		*source = models.Source{
+			HostID:           host.ID,
+			State:            state,
+			Revision:         1,
+			ValidationStatus: models.SourceValidationPending,
+			ValidationReason: models.SourceValidationReasonNone,
+			RecoveryRequired: true,
+			LastOperation:    "add",
+		}
+		if err := tx.Create(source).Error; err != nil {
+			return fmt.Errorf("creating source: %w", err)
+		}
+	}
+	return nil
 }
 
 // ensureSourceHost loads or creates the host within the caller's source transaction.
@@ -212,28 +250,29 @@ func (r *Relay) ensureSourceHost(tx *gorm.DB, host *models.Host, hostname string
 // failure code.
 func (r *Relay) ValidateSource(ctx context.Context, hostID, expectedRevision uint64) (*SourceView, error) {
 	r.sourcesLk.Lock()
-	defer r.sourcesLk.Unlock()
-
 	source, host, err := r.sourceAndHostLocked(ctx, hostID)
 	if err != nil {
+		r.sourcesLk.Unlock()
 		return nil, err
 	}
 	if source.Revision != expectedRevision {
-		if source.Revision == expectedRevision+1 && source.LastOperation == "validate" {
-			if err := r.reconcileSourceLocked(ctx, source, host); err != nil {
-				return nil, err
-			}
-			view, err := r.sourceViewLocked(ctx, source, host)
-			if err != nil {
-				return nil, err
-			}
-			if source.ValidationStatus == models.SourceValidationFailed {
-				return view, ErrSourceValidationFailed
-			}
-			return view, nil
+		if source.Revision == expectedRevision+1 && source.LastOperation == "validate" && source.State == models.SourceStateEnabled {
+			view, err := r.replaySourceValidationLocked(ctx, source, host)
+			r.sourcesLk.Unlock()
+			return view, err
 		}
+		r.sourcesLk.Unlock()
 		return nil, ErrSourceRevisionConflict
 	}
+
+	if err := r.beginSourceCheck(hostID); err != nil {
+		r.sourcesLk.Unlock()
+		return nil, err
+	}
+	revision := source.Revision
+	checkHost, transportErr := r.sourceURL(host.Hostname, host.NoSSL)
+	r.sourcesLk.Unlock()
+	defer r.endSourceCheck(hostID)
 
 	status := models.SourceValidationPassed
 	reason := models.SourceValidationReasonNone
@@ -242,29 +281,74 @@ func (r *Relay) ValidateSource(ctx context.Context, hostID, expectedRevision uin
 	if r.HostChecker == nil {
 		status = models.SourceValidationFailed
 		reason = models.SourceValidationReasonCheckerMissing
-	} else if err := r.HostChecker.CheckHost(checkCtx, sourceHostURL(host)); err != nil {
+	} else if transportErr != nil {
+		status = models.SourceValidationFailed
+		reason = models.SourceValidationReasonHostCheckFailed
+	} else if err := r.HostChecker.CheckHost(checkCtx, checkHost); err != nil {
 		status = models.SourceValidationFailed
 		reason = models.SourceValidationReasonHostCheckFailed
 	}
 
-	now := time.Now().UTC()
-	updatedRevision := source.Revision + 1
-	result := r.db.WithContext(ctx).Model(&models.Source{}).
-		Where("host_id = ? AND revision = ?", source.HostID, source.Revision).
-		Updates(map[string]interface{}{
-			"validation_status":     status,
-			"validation_checked_at": now,
-			"validation_reason":     reason,
-			"revision":              updatedRevision,
-			"last_operation":        "validate",
-			// hypercerts: Any source revision invalidates an older recovery receipt.
-			"recovery_required": true,
-		})
-	if result.Error != nil {
-		return nil, fmt.Errorf("saving source validation: %w", result.Error)
+	return r.finalizeSourceValidation(hostID, revision, status, reason)
+}
+
+func (r *Relay) replaySourceValidationLocked(ctx context.Context, source *models.Source, host *models.Host) (*SourceView, error) {
+	reconcileErr := r.reconcileSourceLocked(ctx, source, host)
+	view, viewErr := r.sourceViewLocked(ctx, source, host)
+	failed := source.ValidationStatus == models.SourceValidationFailed
+	if reconcileErr != nil {
+		return nil, reconcileErr
 	}
-	if result.RowsAffected != 1 {
+	if viewErr != nil {
+		return nil, viewErr
+	}
+	if failed {
+		return view, ErrSourceValidationFailed
+	}
+	return view, nil
+}
+
+func (r *Relay) finalizeSourceValidation(hostID, revision uint64, status models.SourceValidationStatus, reason models.SourceValidationReason) (*SourceView, error) {
+	finalizeCtx, finalizeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer finalizeCancel()
+	r.sourcesLk.Lock()
+	defer r.sourcesLk.Unlock()
+	current, host, err := r.sourceAndHostLocked(finalizeCtx, hostID)
+	if err != nil || current.Revision != revision || current.State != models.SourceStateEnabled {
+		if err == nil && current.State != models.SourceStateEnabled {
+			_ = r.db.WithContext(finalizeCtx).Transaction(func(tx *gorm.DB) error {
+				return enqueueSourceHandoff(tx, host, current.Revision, current.State)
+			})
+		}
 		return nil, ErrSourceRevisionConflict
+	}
+	source := current
+	now := time.Now().UTC()
+	updatedRevision := revision + 1
+	err = r.db.WithContext(finalizeCtx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&models.Source{}).
+			Where("host_id = ? AND revision = ? AND state = ?", source.HostID, revision, models.SourceStateEnabled).
+			Updates(map[string]interface{}{
+				"validation_status": status, "validation_checked_at": now,
+				"validation_reason": reason, "revision": updatedRevision,
+				"last_operation": "validate", "recovery_required": true,
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return ErrSourceRevisionConflict
+		}
+		if status == models.SourceValidationPassed {
+			return enqueueSourceHandoff(tx, host, updatedRevision, models.SourceStateEnabled)
+		}
+		return enqueueSourceHandoff(tx, host, updatedRevision, models.SourceStateDisabled)
+	})
+	if err != nil {
+		if errors.Is(err, ErrSourceRevisionConflict) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("saving source validation: %w", err)
 	}
 
 	source.ValidationStatus = status
@@ -273,17 +357,36 @@ func (r *Relay) ValidateSource(ctx context.Context, hostID, expectedRevision uin
 	source.Revision = updatedRevision
 	source.LastOperation = "validate"
 	source.RecoveryRequired = true
-	view, err := r.sourceViewLocked(ctx, source, host)
+	view, err := r.sourceViewLocked(finalizeCtx, source, host)
 	if err != nil {
 		return nil, err
 	}
-	if err := r.reconcileSourceLocked(ctx, source, host); err != nil {
+	if err := r.reconcileSourceLocked(finalizeCtx, source, host); err != nil {
 		return view, err
 	}
 	if status == models.SourceValidationFailed {
 		return view, ErrSourceValidationFailed
 	}
-	return r.sourceViewLocked(ctx, source, host)
+	return r.sourceViewLocked(finalizeCtx, source, host)
+}
+
+func (r *Relay) beginSourceCheck(hostID uint64) error {
+	r.publicCheckLk.Lock()
+	defer r.publicCheckLk.Unlock()
+	if r.publicChecks == nil {
+		r.publicChecks = make(map[uint64]struct{})
+	}
+	if _, pending := r.publicChecks[hostID]; pending {
+		return ErrSourceRevisionConflict
+	}
+	r.publicChecks[hostID] = struct{}{}
+	return nil
+}
+
+func (r *Relay) endSourceCheck(hostID uint64) {
+	r.publicCheckLk.Lock()
+	delete(r.publicChecks, hostID)
+	r.publicCheckLk.Unlock()
 }
 
 // SetSourceState records desired state before starting or stopping a socket. A
@@ -310,6 +413,21 @@ func (r *Relay) SetSourceState(ctx context.Context, hostID, expectedRevision uin
 			return nil, err
 		}
 	}
+	if source.State == state && state == models.SourceStateEnabled && source.ValidationStatus == models.SourceValidationPassed {
+		// An explicit enable acknowledges a newer validation revision even when
+		// desired state was already enabled. Keep the source revision stable.
+		var handoff models.SourceHandoff
+		err := r.db.WithContext(ctx).Where("host_id = ?", source.HostID).First(&handoff).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) || (err == nil && (handoff.SourceRevision != source.Revision || handoff.State != string(state))) {
+			if err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+				return enqueueSourceHandoff(tx, host, source.Revision, state)
+			}); err != nil {
+				return nil, fmt.Errorf("queuing source handoff: %w", err)
+			}
+		} else if err != nil {
+			return nil, fmt.Errorf("loading source handoff: %w", err)
+		}
+	}
 	if source.State != state {
 		updates := map[string]interface{}{
 			"state":          state,
@@ -318,14 +436,23 @@ func (r *Relay) SetSourceState(ctx context.Context, hostID, expectedRevision uin
 		}
 		// hypercerts: A source revision invalidates every older recovery receipt.
 		updates["recovery_required"] = true
-		result := r.db.WithContext(ctx).Model(&models.Source{}).
-			Where("host_id = ? AND revision = ?", source.HostID, source.Revision).
-			Updates(updates)
-		if result.Error != nil {
-			return nil, fmt.Errorf("saving source state: %w", result.Error)
-		}
-		if result.RowsAffected != 1 {
-			return nil, ErrSourceRevisionConflict
+		err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			result := tx.Model(&models.Source{}).
+				Where("host_id = ? AND revision = ?", source.HostID, source.Revision).
+				Updates(updates)
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected != 1 {
+				return ErrSourceRevisionConflict
+			}
+			return enqueueSourceHandoff(tx, host, source.Revision+1, state)
+		})
+		if err != nil {
+			if errors.Is(err, ErrSourceRevisionConflict) {
+				return nil, err
+			}
+			return nil, fmt.Errorf("saving source state: %w", err)
 		}
 		source.State = state
 		source.Revision++
@@ -490,6 +617,9 @@ func validRecoveryCoordinate(value string, maximum int) bool {
 
 // checkSourceEnablement enforces validation and bans before acquisition is enabled.
 func (r *Relay) checkSourceEnablement(ctx context.Context, source *models.Source, host *models.Host) error {
+	if _, err := r.sourceURL(host.Hostname, host.NoSSL); err != nil {
+		return err
+	}
 	if source.ValidationStatus != models.SourceValidationPassed {
 		return ErrSourceValidationFailed
 	}
@@ -734,6 +864,11 @@ func (r *Relay) sourceViewLocked(ctx context.Context, source *models.Source, hos
 	} else if runtimeState == "configured" && (source.ValidationStatus == models.SourceValidationFailed || host.Status == models.HostStatusOffline || host.Status == models.HostStatusBanned) {
 		runtimeState = "failing"
 	}
+	var handoff *models.SourceHandoff
+	var row models.SourceHandoff
+	if err := r.db.WithContext(ctx).First(&row, "host_id = ?", source.HostID).Error; err == nil {
+		handoff = &row
+	}
 	return &SourceView{
 		HostID:       host.ID,
 		Hostname:     host.Hostname,
@@ -753,10 +888,21 @@ func (r *Relay) sourceViewLocked(ctx context.Context, source *models.Source, hos
 			Limit: host.AccountLimit,
 			Count: host.AccountCount,
 		},
+		Handoff: handoff,
 	}, nil
 }
 
 func (r *Relay) reconcileSourceLocked(ctx context.Context, source *models.Source, host *models.Host) error {
+	if source.State == models.SourceStateEnabled && source.ValidationStatus == models.SourceValidationPassed {
+		if _, err := r.sourceURL(host.Hostname, host.NoSSL); err != nil {
+			if r.Slurper != nil {
+				if stopErr := r.Slurper.StopSource(ctx, host.Hostname); stopErr != nil {
+					return stopErr
+				}
+			}
+			return err
+		}
+	}
 	if r.Slurper == nil {
 		return nil
 	}
@@ -823,10 +969,7 @@ func (r *Relay) sourceDomainIsBanned(ctx context.Context, hostname string) (bool
 }
 
 func sourceHostURL(host *models.Host) string {
-	if host.NoSSL {
-		return "http://" + host.Hostname
-	}
-	return "https://" + host.Hostname
+	return host.BaseURL()
 }
 
 // SetSourceBlocked delegates legacy block actions to the durable source policy.
@@ -857,20 +1000,33 @@ func (r *Relay) SetSourceBlocked(ctx context.Context, hostname string, blocked b
 		}
 	}
 	if source.State == state && host.Status == status {
+		if !blocked {
+			return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+				return enqueueSourceHandoff(tx, host, source.Revision, state)
+			})
+		}
 		return r.reconcileSourceLocked(ctx, source, host)
 	}
 	err = r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Model(&models.Host{}).Where("id = ?", host.ID).Update("status", status).Error; err != nil {
 			return err
 		}
-		return tx.Model(&models.Source{}).Where(sourceHostIDPredicate, host.ID).Updates(map[string]any{
-			"state": state, "revision": gorm.Expr("revision + 1"), "last_operation": "block", "recovery_required": true,
-		}).Error
+		result := tx.Model(&models.Source{}).Where("host_id = ? AND revision = ?", host.ID, source.Revision).Updates(map[string]any{
+			"state": state, "revision": source.Revision + 1, "last_operation": "block", "recovery_required": true,
+		})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return ErrSourceRevisionConflict
+		}
+		return enqueueSourceHandoff(tx, host, source.Revision+1, state)
 	})
 	if err != nil {
 		return err
 	}
 	source.State, host.Status = state, status
+	source.Revision++
 	return r.reconcileSourceLocked(ctx, source, host)
 }
 

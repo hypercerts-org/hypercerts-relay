@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sync"
 
+	"github.com/bluesky-social/jetstream/internal/hypercerts/attribution"
 	"github.com/bluesky-social/jetstream/internal/obs"
 	"github.com/bluesky-social/jetstream/segment"
 	"go.opentelemetry.io/otel/trace"
@@ -16,6 +17,7 @@ type asyncFlushJob struct {
 	id           uint64
 	prepared     *segment.PreparedBlock
 	nextSeq      uint64
+	attributions []attribution.Prepared
 	prepareValue any
 	done         chan asyncFlushDone
 }
@@ -110,10 +112,20 @@ func (w *Writer) prepareAsyncFlushLocked() (*asyncFlushJob, error) {
 	if prepared == nil {
 		return nil, nil
 	}
+	var attributions []attribution.Prepared
+	if w.cfg.Attribution != nil {
+		previousDurableSeq := w.durableNextSeq
+		for _, pending := range w.pendingAttributions {
+			if pending.Event.Seq >= previousDurableSeq && pending.Event.Seq < prepared.MaxSeq()+1 {
+				attributions = append(attributions, pending)
+			}
+		}
+	}
 	job := &asyncFlushJob{
 		id:           w.nextAsyncFlushID,
 		prepared:     prepared,
 		nextSeq:      prepared.MaxSeq() + 1,
+		attributions: attributions,
 		prepareValue: prepareValue,
 		done:         make(chan asyncFlushDone, 1),
 	}
@@ -160,8 +172,11 @@ func (w *Writer) commitAsyncFlush(ctx context.Context, job *asyncFlushJob, frame
 		}
 		w.cfg.Metrics.incBlocksFlushed()
 
-		if err := w.commitDurableBatchLocked(ctx, job.nextSeq, false, job.prepareValue); err != nil {
+		if err := w.commitDurableBatchWithAttributionsLocked(ctx, job.nextSeq, false, job.prepareValue, job.attributions); err != nil {
 			return err
+		}
+		if len(job.attributions) > 0 {
+			w.pruneCommittedAttributions(job.attributions)
 		}
 
 		path := filepath.Join(w.cfg.SegmentsDir, SegmentFilename(w.activeIdx))

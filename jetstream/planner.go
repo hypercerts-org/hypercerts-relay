@@ -46,9 +46,8 @@ type planEntry struct {
 	// Index is the zero-based segment index (ascending = creation order).
 	Index uint32
 	// Checksum is the segment-format xxh3 metadata checksum (16-char hex).
-	// It equals the getSegment ETag and uniquely identifies a segment
-	// generation: a compaction rewrite produces a new checksum. Used to key
-	// decoded-block caches and (later) resumable-download progress.
+	// It excludes row bytes and is neither the getSegment ETag nor a unique
+	// identifier for a segment generation.
 	Checksum string
 	// MinSeq and MaxSeq bound the sequence numbers the planner believes this
 	// entry may contain. Transport hints, not exact: the planner has a

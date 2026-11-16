@@ -2,6 +2,7 @@ package xrpcapi
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -99,19 +100,9 @@ func TestGetBlock_BytesMatchOnDisk(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, want, body, "block %d", idx)
 
-		require.Equal(t, fmt.Sprintf("%q", checksumHex(hdr.Checksum)+":"+fmt.Sprint(idx)),
-			resp.Header.Get("ETag"))
+		digest := sha256.Sum256(want)
+		require.Equal(t, fmt.Sprintf("\"sha256-%x-%d\"", digest, len(want)), resp.Header.Get("ETag"))
 	}
-}
-
-func TestGetBlock_ETagDiffersPerBlock(t *testing.T) {
-	t.Parallel()
-
-	ts, _ := newBlockTestServer(t, 2, 2)
-	segName := ingest.SegmentFilename(0)
-	e0 := getHeader(t, blockURL(ts.URL, segName, 0), "ETag")
-	e1 := getHeader(t, blockURL(ts.URL, segName, 1), "ETag")
-	require.NotEqual(t, e0, e1)
 }
 
 func TestGetBlock_NotModified(t *testing.T) {

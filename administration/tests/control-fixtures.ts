@@ -115,9 +115,18 @@ export async function startControlFixtures(): Promise<ControlFixtures> {
       specs[1],
       readFileSync(relay.ready, "utf8"),
     );
+    const relayURL = readFileSync(relay.ready, "utf8");
+    const jetstreamURL = readFileSync(jetstream.ready, "utf8");
+    const configured = await fetch(`${relayURL}/_test/configure-handoff`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ targetURL: jetstreamURL, token }),
+    });
+    if (!configured.ok)
+      throw new Error(`Relay handoff fixture configuration failed: ${configured.status}`);
     return {
-      relayURL: readFileSync(relay.ready, "utf8"),
-      jetstreamURL: readFileSync(jetstream.ready, "utf8"),
+      relayURL,
+      jetstreamURL,
       token,
       async close() {
         await Promise.all(

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -40,7 +41,7 @@ func getForTest(t *testing.T, ctx context.Context, url string) (*http.Response, 
 //  1. getBlock returns 200 with Content-Type application/octet-stream.
 //  2. The served body is byte-identical to segment.ReadBlockFrame on an
 //     independently-opened fd + segment.ReadSealedHeader.
-//  3. The ETag equals "%q" of fmt.Sprintf("%016x:%d", hdr.Checksum, idx).
+//  3. The ETag identifies the frame's SHA-256 digest and byte length.
 //  4. A second request carrying If-None-Match: <ETag> returns 304.
 //
 // Plus negatives: blockIndex == blockCount -> 404; an unknown but well-formed
@@ -207,9 +208,10 @@ func TestEndToEnd_GetBlockMatchesOracle(t *testing.T) {
 			require.NoErrorf(t, err, "%s block %d ReadBlockFrame", seg.Name, idx)
 			require.Equalf(t, wantFrame, body, "%s block %d frame bytes", seg.Name, idx)
 
-			// (3) ETag == "%q" of "%016x:%d".
+			// (3) ETag identifies the exact frame bytes.
+			digest := sha256.Sum256(wantFrame)
 			require.Equalf(t,
-				fmt.Sprintf("%q", fmt.Sprintf("%016x:%d", hdr.Checksum, idx)),
+				fmt.Sprintf("\"sha256-%x-%d\"", digest, len(wantFrame)),
 				etag, "%s block %d etag", seg.Name, idx)
 
 			// (4) second request with If-None-Match -> 304.

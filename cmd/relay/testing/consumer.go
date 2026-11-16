@@ -3,6 +3,7 @@ package testing
 import (
 	"context"
 	"fmt"
+	"net"
 	"sync"
 	"time"
 
@@ -73,7 +74,7 @@ func (c *Consumer) Connect(ctx context.Context, cursor int) error {
 		u = u + fmt.Sprintf("?cursor=%d", cursor)
 	}
 
-	dialer := websocket.Dialer{}
+	dialer := websocket.Dialer{NetDialContext: (&net.Dialer{}).DialContext}
 	conn, _, err := dialer.DialContext(ctx, u, nil)
 	if err != nil {
 		return err

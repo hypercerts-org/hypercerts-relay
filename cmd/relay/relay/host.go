@@ -141,13 +141,9 @@ func (r *Relay) PersistHostCursors(ctx context.Context, cursors *[]HostCursor) e
 // Hostnames must be DNS names, not IP addresses.
 func ParseHostname(raw string) (hostname string, noSSL bool, err error) {
 
-	// handle case of bare hostname
+	// hypercerts: Bare names use TLS, including localhost; fixtures must request plaintext explicitly.
 	if !strings.Contains(raw, "://") {
-		if strings.HasPrefix(raw, "localhost:") {
-			raw = "http://" + raw
-		} else {
-			raw = "https://" + raw
-		}
+		raw = "https://" + raw
 	}
 
 	u, err := url.Parse(raw)

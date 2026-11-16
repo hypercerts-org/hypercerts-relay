@@ -15,6 +15,7 @@ import (
 
 	"github.com/bluesky-social/jetstream/internal/obs"
 	"github.com/stretchr/testify/require"
+	"sync/atomic"
 )
 
 // PublicHandler returns the handler attached to the public listener.
@@ -456,4 +457,29 @@ func TestRegisterPublicRoute(t *testing.T) {
 
 	cancel()
 	require.NoError(t, <-runErr)
+}
+
+// hypercerts: A lost upstream path must stop advertising readiness while the
+// process is still draining writers and sockets.
+func TestDebugHandler_ReadyzReportsUnhealthyIngestion(t *testing.T) {
+	t.Parallel()
+
+	var reason atomic.Value
+	reason.Store("")
+	srv := New(Config{
+		PublicAddr:      "127.0.0.1:0",
+		DebugAddr:       "127.0.0.1:0",
+		ShutdownTimeout: 5 * time.Second,
+		Unhealthy:       func() string { return reason.Load().(string) },
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)), obs.NewMetrics())
+	base := mountDebug(t, srv)
+	srv.SetReady(true)
+	require.Equal(t, "ok\n", mustGet(t, base+"/readyz"))
+
+	reason.Store("upstream continuity loss: sequence_gap")
+	resp, err := doGet(t.Context(), base+"/readyz")
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	require.Equal(t, "ok\n", mustGet(t, base+"/healthz"))
 }

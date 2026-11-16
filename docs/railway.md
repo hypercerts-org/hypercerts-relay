@@ -86,9 +86,53 @@ Setting `HC_RAILWAY_STARTUP=1` enables the following runtime contract:
 - Require `RAILWAY_VOLUME_MOUNT_PATH=/data`.
 - Relay consumes `HC_RELAY_CONTROL_SECRET` and sets `RELAY_CONTROL_TOKEN_FILE`.
 - Jetstream consumes `HC_JETSTREAM_CONTROL_SECRET` and sets `JETSTREAM_CONTROL_TOKEN_FILE`.
+- Jetstream also consumes `HC_RELAY_CONTROL_SECRET` and sets
+  `JETSTREAM_RELAY_CONTROL_TOKEN_FILE`, because it must hold the Relay's
+  credential to reach the Relay's private control listener. Also set
+  `JETSTREAM_RELAY_CONTROL_URL` to that listener (`http://relay.railway.internal:2472`
+  on Railway). Bootstrap always provides the token file, so a URL pointing at
+  an unreachable or unauthenticated Relay makes collection changes fail. Such a
+  change is rejected with `policy_mirror_unavailable` (HTTP 503) only when an
+  enabled source with a known revision requires the mirror; with no such
+  source, the change commits without consulting it.
 - Administration consumes both service credentials and `HC_ADMIN_ENCRYPTION_SECRET`,
   setting the two service file paths and `ADMIN_ENCRYPTION_KEY_FILE`.
 - Rainbow needs no credential conversion.
+
+### Required variables per environment
+
+Set these on each environment before deploying. Every URL below is a Railway
+private hostname; a public domain reaches the API port instead of the private
+listener and returns 404, which Jetstream reports as `policy_mirror_unavailable`.
+
+| Service | Variable | Value |
+| --- | --- | --- |
+| Relay | `HC_RAILWAY_STARTUP` | `1` |
+| Relay | `RAILWAY_VOLUME_MOUNT_PATH` | `/data` |
+| Relay | `RELAY_CONTROL_ADDR` | `[::]:2472` |
+| Relay | `HC_RELAY_CONTROL_SECRET` | At least 32 bytes |
+| Jetstream | `HC_RAILWAY_STARTUP` | `1` |
+| Jetstream | `RAILWAY_VOLUME_MOUNT_PATH` | `/data` |
+| Jetstream | `HC_JETSTREAM_CONTROL_SECRET` | At least 32 bytes |
+| Jetstream | `HC_RELAY_CONTROL_SECRET` | Same value as the Relay service |
+| Jetstream | `JETSTREAM_RELAY_CONTROL_URL` | `http://relay.railway.internal:2472` |
+| Administration | `HC_RAILWAY_STARTUP` | `1` |
+| Administration | `RAILWAY_VOLUME_MOUNT_PATH` | `/data` |
+| Administration | `HC_RELAY_CONTROL_SECRET` | Same value as the Relay service |
+| Administration | `HC_JETSTREAM_CONTROL_SECRET` | Same value as the Jetstream service |
+| Administration | `HC_ADMIN_ENCRYPTION_SECRET` | At least 32 bytes |
+| Administration | `RELAY_CONTROL_URL` | `http://relay.railway.internal:2472` |
+| Administration | `JETSTREAM_CONTROL_URL` | `http://jetstream.railway.internal:6060` |
+
+`HC_RELAY_CONTROL_SECRET` must be identical on Relay, Jetstream and
+Administration. Bootstrap writes each service its own token file, so only the
+input secret is shared. `JETSTREAM_RELAY_CONTROL_URL` and the two administration
+control URLs are ordinary variables, not secrets, and survive bootstrap.
+
+A missing `JETSTREAM_RELAY_CONTROL_URL` leaves Jetstream without a policy mirror,
+so any collection change that has an enabled source with a known revision is
+rejected. Verify an environment by changing a collection through Administration
+after deploying.
 
 Credential values must contain at least 32 bytes after trimming whitespace. The
 helper creates a mode-0700 temporary directory and mode-0600 files, removes the

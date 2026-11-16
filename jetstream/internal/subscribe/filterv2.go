@@ -101,6 +101,18 @@ func (f *FilterV2) Wants(evt *segment.Event) bool {
 	if f == nil {
 		return true
 	}
+	// Selected sync is a scope/reconciliation marker, not a record payload;
+	// explicit kind and DID predicates still apply, but collection filters do not.
+	if evt.Kind == segment.KindSync {
+		if f.kindsSet && f.kinds&kindClassOf(evt.Kind) == 0 {
+			return false
+		}
+		if f.dids != nil {
+			_, ok := f.dids[evt.DID]
+			return ok
+		}
+		return true
+	}
 
 	// Kinds axis. Unset matches everything, including a future kind
 	// class this build can't name (class 0); an explicit selection drops
