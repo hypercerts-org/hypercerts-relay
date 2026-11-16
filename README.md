@@ -144,3 +144,5 @@ Licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at you
 A file that states its own license keeps it. For example, [`util/ssrf/ssrf.go`](util/ssrf/ssrf.go) is dedicated to the public domain under CC0.
 
 The licenses don't cover the Hypercerts logo in `administration/src/brand/assets/logo/` and `administration/public/favicon.svg`, which is a mark of the Hypercerts Foundation. They also don't cover the fonts in `administration/src/brand/assets/fonts/`, which keep their own licenses; see the [brand notes](administration/src/brand/README.md).
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
