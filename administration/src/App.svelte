@@ -226,7 +226,10 @@
     const keepOlder = olderCrawlsLoaded;
     let directoryStatus: CollectionDirectoryStatus;
     let crawlPage: CrawlPage;
-    let bootstrapPage: { items: CollectionBootstrapView[]; next: string | null };
+    let bootstrapPage: {
+      items: CollectionBootstrapView[];
+      next: string | null;
+    };
     try {
       [directoryStatus, crawlPage, bootstrapPage] = await Promise.all([
         api<CollectionDirectoryStatus>("/collection-directory/status"),
