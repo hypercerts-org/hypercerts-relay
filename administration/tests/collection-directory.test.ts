@@ -144,7 +144,7 @@ async function fixture(
   services.call = async <T>(...args: Parameters<Services["call"]>) => {
     const [service, path] = args;
     assert.equal(service, "relay");
-    const pds = new URL(path, "http://relay").searchParams.get("pds")!;
+    const pds = new URLSearchParams(path.split("?")[1] ?? "").get("pds")!;
     relayLookups.push(pds);
     const view = relaySources[pds];
     if (!view) throw new ApiError(404, "relay_rejected_404");
@@ -507,18 +507,22 @@ test("collectiondir configuration requires both settings and a distinct private 
     "http://collectiondir.example",
     "https://collectiondir.example/admin",
     "https://user:pass@collectiondir.example",
-    "http://collectiondir.railway.internal:2510",
+    // Plain HTTP is only allowed on Railway's private network; this case
+    // checks it is refused without that opt-in.
+    "http://collectiondir.railway.internal:2510", // NOSONAR
   ])
     assert.throws(() => new Collectiondir({ url, token }), /requires HTTPS/);
   assert.equal(
     new Collectiondir(
-      { url: "http://collectiondir.railway.internal:2510", token },
+      // The private-network opt-in is what permits plain HTTP here.
+      { url: "http://collectiondir.railway.internal:2510", token }, // NOSONAR
       { railwayPrivateNetwork: true },
     ).configured,
     true,
   );
   for (const forbidden of [
-    "http://relay.railway.internal:2471",
+    // A forbidden Relay control origin is plain HTTP on the private network.
+    "http://relay.railway.internal:2471", // NOSONAR
     "https://rainbow.example",
   ])
     assert.throws(
