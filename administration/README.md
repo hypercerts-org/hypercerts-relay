@@ -126,7 +126,7 @@ The browser-facing API is `/api/v1`; all endpoints below require authorization.
 | `POST /operations/{id}/retry`, `/cancel` | Retry failed/incomplete work or cancel work not yet applying; actor audited.                               |
 | `GET /sources`, `/source?pds=…`          | Relay's desired, validation, connection, admission-quota, Relay-observed-account and durable-cursor state. |
 | `GET /policy`                            | Jetstream's applied collection-policy revision.                                                            |
-| `GET /jobs`, `/coverage`                 | Jetstream job state, bounded execution diagnostics, last progress and inventory-failure details, and source/policy-scoped current-state coverage; optional exact `pds` filter. |
+| `GET /jobs`, `/coverage`                 | Jetstream job state, bounded execution diagnostics, last progress and inventory-failure details, and source/policy-scoped current-state coverage; optional exact `pds` filter. Jobs are listed newest created first across pages, in the order Jetstream returns. `GET /jobs` also accepts an optional `state` filter (`active`, `pending`, `running`, `incomplete`, `failed`, `canceled` or `complete`); another value returns `400` `invalid_input`. A job without a recorded creation time omits `createdAt`. |
 | `GET /jobs/{id}/repositories`            | Lazy, cursor-paginated unresolved repository details from Jetstream's frozen inventory, including recorded failure times. |
 | `GET /limits`, `/status`, `/audit`       | Applied policies, bounded service health, durable actor-attributed history.                                |
 
@@ -170,6 +170,14 @@ not repository download attempts. Job rows show the run count only above one, an
 the unresolved count and per-repository attempt limit only while repositories
 remain unresolved. The page notice, not each row, states that diagnostics describe
 current state rather than historical coverage; API field names and error codes are unchanged.
+
+Each job row shows “Created:” with the recorded creation time in the browser's
+locale and time zone, or “Not recorded” when Jetstream has none; this is when the
+job was created, not when it last made progress. The status links above the table
+(All, Active, Pending, Running, Incomplete, Failed, Canceled, Complete) reload the
+list at its first page, showing only jobs in that durable state; Active means
+pending or running. Jetstream applies the filter across all pages, and it combines
+with the PDS filter.
 
 Viewing does not change jobs. Retry is an audited action that preserves completed
 work, resets eligible retries for incomplete jobs, and refreshes the inventory for

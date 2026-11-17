@@ -1,4 +1,8 @@
-import type { Command, CoverageSource } from "../server/contracts";
+import type {
+  Command,
+  CoverageSource,
+  JobStateFilter,
+} from "../server/contracts";
 export type {
   Command,
   Operation,
@@ -11,7 +15,21 @@ export type {
   JobLastFailure,
   RepositoryDetail,
   RepositoryDetailsPage,
+  JobStateFilter,
 } from "../server/contracts";
+// Display labels for the job status filters, in link order. The record type
+// requires exactly the server contract's filters; importing the contract's
+// runtime list would bundle server-only validation into the browser.
+export const jobStateLabels: Record<JobStateFilter, string> = {
+  active: "Active",
+  pending: "Pending",
+  running: "Running",
+  incomplete: "Incomplete",
+  failed: "Failed",
+  canceled: "Canceled",
+  complete: "Complete",
+};
+export const jobStateOptions = Object.keys(jobStateLabels) as JobStateFilter[];
 export interface Administrator {
   did: string;
   handle?: string | null;

@@ -7,6 +7,7 @@ import {
   type Job,
   type JobDiagnostics,
   type JobLastFailure,
+  type JobStateFilter,
   type Policy,
   type CoverageSource,
   type RepositoryDetailsPage,
@@ -86,14 +87,15 @@ export class Services {
       "DELETE",
     );
   }
-  async jobs(after = "", pds = "") {
-    const page = await this.call<{ jobs: Job[]; nextCursor?: string }>("jetstream", `/jobs?limit=50&after=${encodeURIComponent(after)}&pds=${encodeURIComponent(pds)}`);
-    return { ...page, jobs: page.jobs.map(normalizeJobDiagnostics) };
+  async jobs(after = "", pds = "", state: JobStateFilter | "" = "") {
+    const stateQuery = state ? `&state=${encodeURIComponent(state)}` : "";
+    const page = await this.call<{ jobs: Job[]; nextCursor?: string }>("jetstream", `/jobs?limit=50&after=${encodeURIComponent(after)}&pds=${encodeURIComponent(pds)}${stateQuery}`);
+    return { ...page, jobs: page.jobs.map(normalizeJob) };
   }
   async repositoryDetails(id: string, after = "", limit = 100) {
     const query = new URLSearchParams({ limit: String(limit) }); if (after) query.set("after", after);
     const page = await this.call<RepositoryDetailsPage>("jetstream", `/jobs/${encodeURIComponent(id)}/repositories?${query}`);
-    return { ...page, job: normalizeJobDiagnostics(page.job), repositories: page.repositories.map((repository) => ({ ...repository, failedAt: recordedTimestamp(repository.failedAt) })) };
+    return { ...page, job: normalizeJob(page.job), repositories: page.repositories.map((repository) => ({ ...repository, failedAt: recordedTimestamp(repository.failedAt) })) };
   }
   async coverage(after = "", pds = "") {
     const page = await this.call<CoveragePage>("jetstream", `/coverage?limit=50&after=${encodeURIComponent(after)}&pds=${encodeURIComponent(pds)}`);
@@ -351,6 +353,15 @@ function normalizeJobDiagnostics<T extends {
     lastProgressAt: recordedTimestamp(value.lastProgressAt),
     ...(failure ? { lastFailure: failure } : { lastFailure: undefined }),
   } as T;
+}
+
+// Jetstream serializes an unrecorded creation time as the zero timestamp; the
+// administration API omits it instead. Coverage items have no creation time.
+function normalizeJob(job: Job): Job {
+  return {
+    ...normalizeJobDiagnostics(job),
+    createdAt: recordedTimestamp(job.createdAt),
+  };
 }
 
 function normalizeCoverageDiagnostics<T extends CoverageSource & {
