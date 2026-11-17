@@ -395,13 +395,16 @@ test("an older collectiondir reply without hosts is reported as accepted", async
 });
 
 test("a reply with neither hosts nor the legacy acknowledgement is invalid", async (t) => {
-  for (const body of [{}, { message: "queued" }, { error: "busy" }]) {
-    const directory = await stubDirectory(t, () => ({ body }));
-    const client = new Collectiondir({ url: directory.url, token });
-    await assert.rejects(client.requestCrawl(["https://pds.example"]), {
-      code: "collectiondir_invalid_response",
-    });
-  }
+  // Each reply gets its own stub directory, so the cases are independent.
+  await Promise.all(
+    [{}, { message: "queued" }, { error: "busy" }].map(async (body) => {
+      const directory = await stubDirectory(t, () => ({ body }));
+      const client = new Collectiondir({ url: directory.url, token });
+      await assert.rejects(client.requestCrawl(["https://pds.example"]), {
+        code: "collectiondir_invalid_response",
+      });
+    }),
+  );
 });
 
 test("collectiondir status maps active and ended crawls and drops non-HTTPS hosts", async (t) => {
