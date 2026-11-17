@@ -26,7 +26,7 @@ func NewRelayClient(rawURL string) (*RelayClient, error) {
 		return nil, errors.New("reference relay URL must be an HTTPS origin")
 	}
 	return &RelayClient{
-		base: "https://" + u.Host,
+		base: httpsScheme + u.Host,
 		http: &http.Client{Timeout: 15 * time.Second},
 	}, nil
 }

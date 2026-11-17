@@ -179,7 +179,7 @@ func TestAdministrationDiscoverySecretIsOptional(t *testing.T) {
 	if err := prepare("administration"); err != nil {
 		t.Fatal(err)
 	}
-	if path := os.Getenv(administrationDiscoverySecret.output); path != "" {
+	if os.Getenv(administrationDiscoverySecret.output) != "" {
 		t.Fatalf("unexpected %s without a discovery credential", administrationDiscoverySecret.output)
 	}
 	if os.Getenv(administrationSecret.output) == "" {

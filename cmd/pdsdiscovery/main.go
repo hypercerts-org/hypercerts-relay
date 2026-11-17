@@ -29,6 +29,9 @@ import (
 	"github.com/urfave/cli/v3"
 )
 
+// pollIntervalFlag names the administration poll interval flag.
+const pollIntervalFlag = "poll-interval"
+
 func main() {
 	app := &cli.Command{
 		Name:    "pdsdiscovery",
@@ -39,7 +42,7 @@ func main() {
 			&cli.StringFlag{Name: "admin-token-file", Required: true, Usage: "file holding the administration machine token", Sources: cli.EnvVars("DISCOVERY_ADMIN_TOKEN_FILE")},
 			&cli.StringFlag{Name: "upstream", Value: "wss://jetstream2.us-east.bsky.network/subscribe", Usage: "Bluesky Jetstream subscribe URL", Sources: cli.EnvVars("DISCOVERY_UPSTREAM")},
 			&cli.StringFlag{Name: "reference-relay", Value: "https://relay1.us-east.bsky.network", Usage: "relay queried with com.atproto.sync.getHostStatus", Sources: cli.EnvVars("DISCOVERY_REFERENCE_RELAY")},
-			&cli.DurationFlag{Name: "poll-interval", Value: time.Minute, Usage: "administration state poll interval", Sources: cli.EnvVars("DISCOVERY_POLL_INTERVAL")},
+			&cli.DurationFlag{Name: pollIntervalFlag, Value: time.Minute, Usage: "administration state poll interval", Sources: cli.EnvVars("DISCOVERY_POLL_INTERVAL")},
 			&cli.StringFlag{Name: "deny-hosts", Usage: "comma-separated hostnames or *.suffix patterns never enabled", Sources: cli.EnvVars("DISCOVERY_DENY_HOSTS")},
 			&cli.BoolFlag{Name: "dry-run", Usage: "log candidates without requesting operations", Sources: cli.EnvVars("DISCOVERY_DRY_RUN")},
 			&cli.IntFlag{Name: "account-threshold", Value: 100, Usage: "reference account count above which the account limit is raised", Sources: cli.EnvVars("DISCOVERY_ACCOUNT_THRESHOLD")},
@@ -75,14 +78,15 @@ func run(ctx context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
-	if cmd.Duration("poll-interval") < 5*time.Second {
+	pollInterval := cmd.Duration(pollIntervalFlag)
+	if pollInterval < 5*time.Second {
 		return errors.New("poll interval must be at least 5s")
 	}
 	cfg := Config{
 		DenyHosts:        splitList(cmd.String("deny-hosts")),
 		DryRun:           cmd.Bool("dry-run"),
 		AccountThreshold: int64(cmd.Int("account-threshold")),
-		PendingQuotaTTL:  max(time.Hour, 10*cmd.Duration("poll-interval")),
+		PendingQuotaTTL:  max(time.Hour, 10*pollInterval),
 	}
 	d, err := NewDiscoverer(cfg, log, identity.DefaultDirectory(), admin, relay)
 	if err != nil {
@@ -109,58 +113,67 @@ func run(ctx context.Context, cmd *cli.Command) error {
 
 	var wg sync.WaitGroup
 	if addr := cmd.String("metrics-addr"); addr != "" {
-		mux := http.NewServeMux()
-		mux.Handle("GET /metrics", promhttp.Handler())
-		stale := 5 * cmd.Duration("poll-interval")
-		mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-			if time.Since(time.Unix(lastSuccess.Load(), 0)) > stale {
-				http.Error(w, "administration state is stale", http.StatusServiceUnavailable)
-				return
-			}
-			_, _ = w.Write([]byte("ok\n"))
-		})
-		srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
-		wg.Go(func() {
-			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				log.Error("metrics listener stopped", "err", err)
-			}
-		})
-		wg.Go(func() {
-			<-ctx.Done()
-			shutdown, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-			defer cancel()
-			_ = srv.Shutdown(shutdown)
-		})
+		startMetrics(ctx, &wg, log, addr, 5*pollInterval, &lastSuccess)
 	}
 	wg.Go(func() { up.Run(ctx) })
-	wg.Go(func() {
-		ticker := time.NewTicker(cmd.Duration("poll-interval"))
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-			}
-			state, err := admin.State(ctx)
-			if err != nil {
-				if ctx.Err() == nil {
-					pollFailures.Inc()
-					log.Warn("administration state poll failed; keeping last state", "err", err)
-				}
-				continue
-			}
-			if d.SetState(state) {
-				up.Reload()
-			}
-			lastSuccess.Store(time.Now().Unix())
-			lastPoll.SetToCurrentTime()
-			d.Reconcile(ctx)
-		}
-	})
+	wg.Go(func() { pollAdministration(ctx, log, admin, d, up, pollInterval, &lastSuccess) })
 	wg.Wait()
 	log.Info("pdsdiscovery stopped")
 	return nil
+}
+
+// startMetrics serves /metrics and /healthz until ctx ends. Health fails when
+// the last successful administration poll is older than stale.
+func startMetrics(ctx context.Context, wg *sync.WaitGroup, log *slog.Logger, addr string, stale time.Duration, lastSuccess *atomic.Int64) {
+	mux := http.NewServeMux()
+	mux.Handle("GET /metrics", promhttp.Handler())
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		if time.Since(time.Unix(lastSuccess.Load(), 0)) > stale {
+			http.Error(w, "administration state is stale", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = w.Write([]byte("ok\n"))
+	})
+	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	wg.Go(func() {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Error("metrics listener stopped", "err", err)
+		}
+	})
+	wg.Go(func() {
+		<-ctx.Done()
+		shutdown, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdown)
+	})
+}
+
+// pollAdministration refreshes the discovery state every interval, reconnects
+// the upstream when collections change and raises pending account limits.
+func pollAdministration(ctx context.Context, log *slog.Logger, admin *AdminClient, d *Discoverer, up *Upstream, interval time.Duration, lastSuccess *atomic.Int64) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		state, err := admin.State(ctx)
+		if err != nil {
+			if ctx.Err() == nil {
+				pollFailures.Inc()
+				log.Warn("administration state poll failed; keeping last state", "err", err)
+			}
+			continue
+		}
+		if d.SetState(state) {
+			up.Reload()
+		}
+		lastSuccess.Store(time.Now().Unix())
+		lastPoll.SetToCurrentTime()
+		d.Reconcile(ctx)
+	}
 }
 
 func splitList(raw string) []string {

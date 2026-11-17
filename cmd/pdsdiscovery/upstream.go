@@ -106,10 +106,54 @@ type jetstreamEvent struct {
 	} `json:"commit"`
 }
 
+// pongWait is how long a connection may stay silent, including pongs to our
+// pings, before the read deadline closes it.
+const pongWait = 90 * time.Second
+
 func (u *Upstream) consume(ctx context.Context, wanted []string) error {
-	target, err := url.Parse(u.base)
+	target, cursor, err := u.subscribeURL(wanted)
 	if err != nil {
 		return err
+	}
+	dialer := websocket.Dialer{HandshakeTimeout: 15 * time.Second, Proxy: http.ProxyFromEnvironment}
+	conn, resp, err := dialer.DialContext(ctx, target, http.Header{"User-Agent": {"hypercerts-pdsdiscovery/" + version.Version}})
+	if resp != nil && resp.Body != nil {
+		resp.Body.Close()
+	}
+	if err != nil {
+		return fmt.Errorf("dialing upstream: %w", err)
+	}
+	u.log.Info("connected to upstream", "collections", len(wanted), "cursor", cursor)
+	defer conn.Close()
+
+	conn.SetReadLimit(4 << 20)
+	_ = conn.SetReadDeadline(time.Now().Add(pongWait))
+	conn.SetPongHandler(func(string) error { return conn.SetReadDeadline(time.Now().Add(pongWait)) })
+
+	var reloaded atomic.Bool
+	done := make(chan struct{})
+	defer close(done)
+	go u.supervise(ctx, conn, done, &reloaded)
+
+	for {
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			if reloaded.Load() {
+				return errReload
+			}
+			return err
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(pongWait))
+		u.handleMessage(ctx, msg)
+	}
+}
+
+// subscribeURL returns the Jetstream subscribe URL for the wanted collections,
+// resuming from the in-memory cursor or, on a cold start, the lookback.
+func (u *Upstream) subscribeURL(wanted []string) (string, int64, error) {
+	target, err := url.Parse(u.base)
+	if err != nil {
+		return "", 0, err
 	}
 	q := target.Query()
 	q.Del("wantedCollections")
@@ -122,75 +166,54 @@ func (u *Upstream) consume(ctx context.Context, wanted []string) error {
 	}
 	q.Set("cursor", strconv.FormatInt(cursor, 10))
 	target.RawQuery = q.Encode()
+	return target.String(), cursor, nil
+}
 
-	dialer := websocket.Dialer{HandshakeTimeout: 15 * time.Second, Proxy: http.ProxyFromEnvironment}
-	conn, resp, err := dialer.DialContext(ctx, target.String(), http.Header{"User-Agent": {"hypercerts-pdsdiscovery/" + version.Version}})
-	if resp != nil && resp.Body != nil {
-		resp.Body.Close()
-	}
-	if err != nil {
-		return fmt.Errorf("dialing upstream: %w", err)
-	}
-	u.log.Info("connected to upstream", "collections", len(wanted), "cursor", cursor)
-
-	const pongWait = 90 * time.Second
-	conn.SetReadLimit(4 << 20)
-	_ = conn.SetReadDeadline(time.Now().Add(pongWait))
-	conn.SetPongHandler(func(string) error { return conn.SetReadDeadline(time.Now().Add(pongWait)) })
-
-	var reloaded atomic.Bool
-	done := make(chan struct{})
-	defer close(done)
-	go func() {
-		ping := time.NewTicker(30 * time.Second)
-		defer ping.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-ctx.Done():
-				conn.Close()
-				return
-			case <-u.reload:
-				reloaded.Store(true)
-				conn.Close()
-				return
-			case <-ping.C:
-				if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second)); err != nil {
-					conn.Close()
-					return
-				}
-			}
-		}
-	}()
-	defer conn.Close()
-
+// supervise pings the connection and closes it when ctx ends, when the
+// collection set changes (setting reloaded), or when a ping fails. It returns
+// when done is closed.
+func (u *Upstream) supervise(ctx context.Context, conn *websocket.Conn, done <-chan struct{}, reloaded *atomic.Bool) {
+	ping := time.NewTicker(30 * time.Second)
+	defer ping.Stop()
 	for {
-		_, msg, err := conn.ReadMessage()
-		if err != nil {
-			if reloaded.Load() {
-				return errReload
+		select {
+		case <-done:
+			return
+		case <-ctx.Done():
+			conn.Close()
+			return
+		case <-u.reload:
+			reloaded.Store(true)
+			conn.Close()
+			return
+		case <-ping.C:
+			if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second)); err != nil {
+				conn.Close()
+				return
 			}
-			return err
 		}
-		_ = conn.SetReadDeadline(time.Now().Add(pongWait))
-		var evt jetstreamEvent
-		if err := json.Unmarshal(msg, &evt); err != nil {
-			continue
-		}
-		if evt.TimeUS > u.cursor.Load() {
-			u.cursor.Store(evt.TimeUS)
-		}
-		if evt.Kind != "commit" || evt.Commit == nil {
-			continue
-		}
-		if evt.Commit.Operation != "create" && evt.Commit.Operation != "update" {
-			continue
-		}
-		obsCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		u.d.Observe(obsCtx, evt.DID, evt.Commit.Collection)
-		cancel()
 	}
+}
+
+// handleMessage advances the cursor and passes record creates and updates to
+// the Discoverer. Other events and undecodable messages are ignored.
+func (u *Upstream) handleMessage(ctx context.Context, msg []byte) {
+	var evt jetstreamEvent
+	if err := json.Unmarshal(msg, &evt); err != nil {
+		return
+	}
+	if evt.TimeUS > u.cursor.Load() {
+		u.cursor.Store(evt.TimeUS)
+	}
+	if evt.Kind != "commit" || evt.Commit == nil {
+		return
+	}
+	if evt.Commit.Operation != "create" && evt.Commit.Operation != "update" {
+		return
+	}
+	obsCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	u.d.Observe(obsCtx, evt.DID, evt.Commit.Collection)
 }
 
 // wantedCollections returns the Jetstream filter. Above the 100-value limit it

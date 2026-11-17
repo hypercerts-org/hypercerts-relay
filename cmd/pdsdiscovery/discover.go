@@ -39,6 +39,9 @@ type HostStatus struct {
 
 var ErrHostNotFound = errors.New("host not found on reference relay")
 
+// httpsScheme prefixes every PDS origin this service accepts.
+const httpsScheme = "https://"
+
 type Config struct {
 	// DenyHosts holds exact hostnames, or "*.suffix" patterns that match any
 	// subdomain of suffix.
@@ -370,15 +373,15 @@ func normalizeOrigin(endpoint string) (string, error) {
 		return "", fmt.Errorf("PDS endpoint hostname %q is not a public domain", host)
 	}
 	if port := u.Port(); port != "" && port != "443" {
-		return "https://" + host + ":" + port, nil
+		return httpsScheme + host + ":" + port, nil
 	}
-	return "https://" + host, nil
+	return httpsScheme + host, nil
 }
 
 // originKey normalises an administration source origin for comparison.
 func originKey(origin string) string {
 	key := strings.ToLower(strings.TrimSuffix(origin, "/"))
-	if strings.HasPrefix(key, "https://") {
+	if strings.HasPrefix(key, httpsScheme) {
 		key = strings.TrimSuffix(key, ":443")
 	}
 	return key

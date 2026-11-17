@@ -417,34 +417,47 @@ func TestIdempotencyKeyIsDeterministicUUIDv5(t *testing.T) {
 	}
 }
 
+// fakeAdminHandler records authorised requests and answers like the
+// administration discovery routes.
+type fakeAdminHandler struct {
+	token    string
+	mu       sync.Mutex
+	requests []string
+}
+
+func (f *fakeAdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("Authorization") != "Bearer "+f.token {
+		w.WriteHeader(401)
+		return
+	}
+	body, _ := io.ReadAll(r.Body)
+	f.mu.Lock()
+	f.requests = append(f.requests, r.Method+" "+r.URL.Path+" "+r.Header.Get("Idempotency-Key")+" "+string(body))
+	f.mu.Unlock()
+	switch r.URL.Path {
+	case "/api/v1/sources/discovery/state":
+		_ = json.NewEncoder(w).Encode(DiscoveryState{PolicyRevision: 3, Collections: []string{collection}, Sources: []DiscoverySource{{PDS: "https://a.example.com", State: "enabled", AccountLimit: count(100)}}})
+	case "/api/v1/sources/discovery/operations":
+		w.WriteHeader(fakeOperationStatus(string(body)))
+	}
+}
+
+// fakeOperationStatus rejects one fixture PDS and reports another as busy.
+func fakeOperationStatus(body string) int {
+	switch {
+	case strings.Contains(body, "forbidden.example.com"):
+		return 403
+	case strings.Contains(body, "busy.example.com"):
+		return 503
+	default:
+		return 202
+	}
+}
+
 func TestAdminClient(t *testing.T) {
 	token := strings.Repeat("t", 40)
-	var mu sync.Mutex
-	var requests []string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		defer mu.Unlock()
-		if r.Header.Get("Authorization") != "Bearer "+token {
-			w.WriteHeader(401)
-			return
-		}
-		body, _ := io.ReadAll(r.Body)
-		requests = append(requests, r.Method+" "+r.URL.Path+" "+r.Header.Get("Idempotency-Key")+" "+string(body))
-		switch r.URL.Path {
-		case "/api/v1/sources/discovery/state":
-			_ = json.NewEncoder(w).Encode(DiscoveryState{PolicyRevision: 3, Collections: []string{collection}, Sources: []DiscoverySource{{PDS: "https://a.example.com", State: "enabled", AccountLimit: count(100)}}})
-		case "/api/v1/sources/discovery/operations":
-			if strings.Contains(string(body), "forbidden.example.com") {
-				w.WriteHeader(403)
-				return
-			}
-			if strings.Contains(string(body), "busy.example.com") {
-				w.WriteHeader(503)
-				return
-			}
-			w.WriteHeader(202)
-		}
-	}))
+	handler := &fakeAdminHandler{token: token}
+	srv := httptest.NewServer(handler)
 	defer srv.Close()
 	c, err := NewAdminClient(srv.URL, token)
 	if err != nil {
@@ -474,8 +487,8 @@ func TestAdminClient(t *testing.T) {
 		"POST /api/v1/sources/discovery/operations " + idempotencyKey("account_quota:https://pds.example.com:100:2000") + ` {"accountLimit":2000,"expectedLimit":100,"kind":"account_quota","pds":"https://pds.example.com"}`,
 	}
 	for i, w := range want {
-		if requests[i] != w {
-			t.Errorf("request %d:\n got %s\nwant %s", i, requests[i], w)
+		if handler.requests[i] != w {
+			t.Errorf("request %d:\n got %s\nwant %s", i, handler.requests[i], w)
 		}
 	}
 }

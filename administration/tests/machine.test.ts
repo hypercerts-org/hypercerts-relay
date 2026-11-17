@@ -20,6 +20,9 @@ const oauth: OAuthProvider = {
   async revoke() {},
 };
 
+// query reads a request path's query string; no base URL is needed.
+const query = (url: string) => new URLSearchParams(url.split("?")[1] ?? "");
+
 // One fake control server answers Relay source pages and lookups, and the
 // Jetstream policy. `states` holds the Relay desired state of known sources.
 async function controlServer(t: TestContext) {
@@ -29,7 +32,7 @@ async function controlServer(t: TestContext) {
     calls.push(`${req.method} ${req.url} ${req.headers.authorization}`);
     res.setHeader("Content-Type", "application/json");
     if (req.method === "GET" && req.url?.startsWith("/hypercerts/v1/source?")) {
-      const pds = new URL(req.url, "http://x").searchParams.get("pds") ?? "";
+      const pds = query(req.url).get("pds") ?? "";
       const state = states.get(pds);
       if (!state) {
         res.statusCode = 404;
@@ -48,7 +51,7 @@ async function controlServer(t: TestContext) {
       return;
     }
     if (req.url?.startsWith("/hypercerts/v1/sources")) {
-      const after = new URL(req.url, "http://x").searchParams.get("after");
+      const after = query(req.url).get("after");
       res.end(
         JSON.stringify(
           after === ""
@@ -218,7 +221,7 @@ test("machine operations are limited to enabling sources and raising account lim
     const response = await request("/api/v1/sources/discovery/operations", forbidden);
     assert.equal(response.status, 403, JSON.stringify(forbidden));
   }
-  assert.equal((await request("/api/v1/sources/discovery/operations", { kind: "source", pds: "ftp://x", state: "enabled" })).status, 400);
+  assert.equal((await request("/api/v1/sources/discovery/operations", { kind: "source", pds: "wss://pds.example", state: "enabled" })).status, 400);
   assert.equal((await request("/api/v1/sources/discovery/operations", enable, { "Idempotency-Key": "not-a-uuid" })).status, 400);
   assert.equal(store.page("operations", "", 50).items.length, 0);
 });
