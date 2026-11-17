@@ -110,24 +110,31 @@ let stopping = false;
 async function run() {
   while (!stopping) {
     await worker.tick();
-    // Crawl outcome tracking is advisory; its failures never stop the worker.
-    await crawls.reconcile().catch(() => {
-      console.error("Collection directory crawl reconciliation failed.");
-    });
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
 }
-const running = run().catch(() => {
+// Crawl tracking runs in its own loop so a slow collection directory never
+// delays operations. Directory network errors are handled inside reconcile;
+// anything that escapes it is a persistence failure.
+async function reconcileCrawls() {
+  while (!stopping) {
+    await crawls.reconcile();
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+}
+function persistenceFailed() {
   console.error("Control-plane persistence failed; stopping.");
   stopping = true;
   server.close();
   process.exitCode = 1;
-});
+}
+const running = run().catch(persistenceFailed);
+const reconciling = reconcileCrawls().catch(persistenceFailed);
 async function shutdown() {
   if (stopping) return;
   stopping = true;
   server.close();
-  await running;
+  await Promise.all([running, reconciling]);
   store.close();
 }
 process.once("SIGINT", shutdown);

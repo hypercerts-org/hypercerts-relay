@@ -45,7 +45,11 @@
     authoritative inventory, and do not replace Jetstream backfill.
   </p>
 </div>
-{#if blocked}<p class="error" role="status" id="directory-blocked">
+{#if blocked}<p
+    class={directory ? "error" : "note"}
+    role="status"
+    id="directory-blocked"
+  >
     {blocked}
   </p>{/if}
 <div class="actions">

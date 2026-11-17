@@ -214,6 +214,12 @@ async function fixture(
   };
 }
 
+function manySources(count: number) {
+  return Array.from({ length: count }, (_, i) =>
+    sourceView(`pds${String(i).padStart(3, "0")}.example`),
+  );
+}
+
 interface AuditEntry {
   action: string;
   actor: string;
@@ -533,13 +539,15 @@ test("crawl requests require an administrator session, CSRF and Origin", async (
     "https://pds.example": sourceView("pds.example"),
   });
   const body = { kind: "collection_crawl", scope: "https://pds.example" };
-  for (const headers of [
-    { Cookie: "" },
-    { "X-CSRF-Token": "" },
-    { Origin: "https://evil.example" },
-  ] as Record<string, string>[])
-    assert.ok(
-      (await request("/api/v1/operations", body, headers)).status >= 400,
+  for (const [headers, status] of [
+    [{ Cookie: "" }, 401],
+    [{ "X-CSRF-Token": "" }, 403],
+    [{ Origin: "https://evil.example" }, 403],
+  ] as [Record<string, string>, number][])
+    assert.equal(
+      (await request("/api/v1/operations", body, headers)).status,
+      status,
+      JSON.stringify(headers),
     );
   for (const path of [
     "/api/v1/collection-directory/status",
@@ -1034,4 +1042,197 @@ test("the collection directory token never appears in responses or audit history
   assert.ok(
     directory.calls.every((call) => call.authorization === `Bearer ${token}`),
   );
+});
+
+test("crawl all records accepted chunks before a later chunk fails", async (t) => {
+  let posts = 0;
+  const seen = new Set<string>();
+  // The first chunk is accepted; the second fails until the directory
+  // recovers. Hosts already submitted then report an active crawl.
+  let failSecond = true;
+  const directory = await stubDirectory(t, (call) => {
+    if (call.path === "/admin/crawlStatus") return { body: emptyStatus() };
+    posts++;
+    if (failSecond && posts === 2) return { status: 503 };
+    const hosts = (JSON.parse(call.body) as { hosts: string[] }).hosts;
+    const reply = Object.fromEntries(
+      hosts.map((host) => [
+        host,
+        {
+          state: seen.has(host) ? "already_active" : "started",
+          start: crawlStart,
+        },
+      ]),
+    );
+    for (const host of hosts) seen.add(host);
+    return { body: { message: "ok", hosts: reply } };
+  });
+  const { crawl, rows, services, store, request, worker } = await fixture(
+    t,
+    directory.url,
+  );
+  services.sources = async () => ({
+    Sources: manySources(150),
+    NextAfterHostID: 0,
+  });
+  // Counted in SQL: the audit page holds at most 100 entries.
+  const accepted = () =>
+    (
+      store.db
+        .prepare(
+          "SELECT COUNT(*) AS n FROM audit WHERE action='collection_crawl_accepted' AND operation=?",
+        )
+        .get(op.id) as { n: number }
+    ).n;
+  const op = await crawl("all");
+  assert.equal(op.state, "incomplete");
+  assert.equal(op.error, "collectiondir_unavailable");
+  assert.equal(rows().length, 100);
+  assert.equal(accepted(), 100);
+  assert.ok(rows().every((row) => row.operation === op.id));
+
+  failSecond = false;
+  assert.equal(
+    (await request(`/api/v1/operations/${op.id}/retry`, {})).status,
+    200,
+  );
+  await worker.tick();
+  const retried = store.operation(op.id)!;
+  assert.equal(retried.state, "applied", retried.error ?? "");
+  assert.equal(rows().length, 150);
+  assert.equal(accepted(), 150);
+  assert.equal(
+    new Set(rows().map((row) => row.pds)).size,
+    150,
+    "no source recorded twice",
+  );
+  assert.ok(
+    rows()
+      .slice(0, 100)
+      .every((row) => row.submission === "started"),
+  );
+});
+
+test("accepted crawls close as unknown once the directory is no longer configured", async (t) => {
+  const directory = await stubDirectory(t, startingDirectory);
+  const { crawl, rows, store, services } = await fixture(t, directory.url, {
+    "https://pds.example": sourceView("pds.example"),
+  });
+  await crawl("https://pds.example");
+  assert.equal(rows()[0].state, "accepted");
+  const unconfigured = new CollectionCrawls(
+    store,
+    services,
+    new Collectiondir(null),
+  );
+  await unconfigured.reconcile();
+  assert.equal(rows()[0].state, "unknown");
+  assert.equal(rows()[0].errorCategory, "collectiondir_not_configured");
+  const audit = auditEntries(store).filter(
+    (entry) => entry.action === "collection_crawl_unknown",
+  );
+  assert.equal(audit.length, 1);
+  assert.equal(audit[0].actor, did);
+  assert.equal(audit[0].detail.errorCategory, "collectiondir_not_configured");
+  const calls = directory.calls.length;
+  const auditCount = auditEntries(store).length;
+  await unconfigured.reconcile(Date.now() + 10_000);
+  assert.equal(auditEntries(store).length, auditCount);
+  assert.equal(directory.calls.length, calls);
+});
+
+test("reconciliation sees every active crawl while the browser list is capped", async (t) => {
+  const origins = manySources(1001).map(
+    (source) => `https://${source.Hostname}`,
+  );
+  // The oldest crawl sorts last, beyond the browser's 1,000 entries.
+  const starts = origins.map((_, i) =>
+    new Date(Date.UTC(2026, 10, 17, 10, 0, 1001 - i)).toISOString(),
+  );
+  const target = origins[1000];
+  const directory = await stubDirectory(t, (call) =>
+    call.path === "/admin/crawlStatus"
+      ? {
+          body: emptyStatus({
+            host_starts: Object.fromEntries(
+              origins.map((pds, i) => [pds, { start: starts[i], seen: i }]),
+            ),
+          }),
+        }
+      : {
+          body: {
+            message: "ok",
+            hosts: {
+              [target]: { state: "already_active", start: starts[1000] },
+            },
+          },
+        },
+  );
+  const { crawl, crawls, rows, request } = await fixture(t, directory.url, {
+    [target]: sourceView(new URL(target).hostname),
+  });
+  await crawl(target);
+  await crawls.reconcile(Date.now() + 60_000);
+  assert.equal(rows()[0].state, "accepted");
+  assert.equal(rows()[0].reposDescribed, 1000);
+  const status = await (
+    await request("/api/v1/collection-directory/status")
+  ).json();
+  assert.equal(status.active.length, 1000);
+  assert.ok(
+    !status.active.some((entry: { pds: string }) => entry.pds === target),
+  );
+});
+
+test("status reads share a short cache and the overview probe is bounded", async (t) => {
+  const directory = await stubDirectory(t, () => ({ body: emptyStatus() }));
+  const { request } = await fixture(t, directory.url);
+  for (let i = 0; i < 3; i++)
+    assert.equal(
+      (await (await request("/api/v1/collection-directory/status")).json())
+        .available,
+      true,
+    );
+  assert.equal(
+    directory.calls.filter((call) => call.path === "/admin/crawlStatus").length,
+    1,
+  );
+
+  const slow = await stubDirectory(t, () => ({
+    body: emptyStatus(),
+    delayMs: 2500,
+  }));
+  const { request: slowRequest } = await fixture(t, slow.url);
+  const started = Date.now();
+  const overall = await (await slowRequest("/api/v1/status")).json();
+  assert.ok(Date.now() - started < 2000, "overview waited for the directory");
+  assert.equal(overall.collectiondir, "unavailable");
+});
+
+test("reconciliation surfaces database failures instead of swallowing them", async (t) => {
+  let statusBody: Record<string, unknown> = emptyStatus();
+  const directory = await stubDirectory(t, (call) =>
+    call.path === "/admin/crawlStatus"
+      ? { body: statusBody }
+      : startingDirectory(call),
+  );
+  const { crawl, crawls, store } = await fixture(t, directory.url, {
+    "https://pds.example": sourceView("pds.example"),
+  });
+  await crawl("https://pds.example");
+  statusBody = emptyStatus({
+    host_results: {
+      "https://pds.example": {
+        start: crawlStart,
+        end: "2026-11-17T10:05:00Z",
+        seen: 1,
+        describe_errors: 0,
+        state: "finished",
+      },
+    },
+  });
+  store.transaction = () => {
+    throw new Error("disk I/O error");
+  };
+  await assert.rejects(crawls.reconcile(Date.now()), /disk I\/O error/);
 });

@@ -12,6 +12,9 @@ import {
   type RepositoryDetailsPage,
 } from "./contracts.ts";
 
+// Commands applied by Relay or Jetstream. Collection directory crawls are
+// applied by CollectionCrawls instead.
+export type ServiceCommand = Exclude<Command, { kind: "collection_crawl" }>;
 export interface ServiceConfig {
   url: string;
   token: string;
@@ -129,7 +132,7 @@ export class Services {
     );
   }
   async apply(
-    command: Command,
+    command: ServiceCommand,
     id: string,
     progress: (value: unknown) => void = () => {},
   ): Promise<unknown> {
@@ -175,10 +178,6 @@ export class Services {
           scope: command.scope,
           eventsPerSecond: command.eventsPerSecond,
         });
-      case "collection_crawl":
-        // The Worker routes these to CollectionCrawls; Relay and Jetstream
-        // have no part in a collection directory crawl.
-        throw new ApiError(400, "collection_crawl_not_a_service_command");
     }
   }
   private async applyQuotaRecovery(

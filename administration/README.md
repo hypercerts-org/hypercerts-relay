@@ -228,6 +228,9 @@ collection directory, and records one crawl row per source with the actor and
 time, and an audit entry. A source that is disabled, unvalidated, unknown to
 Relay or plaintext fails the operation without contacting the directory. An
 unreachable directory leaves the operation `incomplete` for an explicit retry.
+When crawling all sources, each batch of 100 accepted sources is recorded as soon
+as the directory accepts it, so a later failed batch keeps the earlier records;
+the retry finds those crawls already running and records nothing twice.
 
 `applied` means the directory accepted the request, not that the crawl finished.
 If a crawl of that source was already running, the request is still applied, no
@@ -240,7 +243,7 @@ every five seconds while anything is running:
 | `accepted` | The directory took the request; the crawl is running or not yet observed.                         |
 | `finished` | The repository listing ended. Repositories that could not be described are counted separately.     |
 | `failed`   | The listing stopped early; a bounded category and HTTP status are shown, never raw response text. |
-| `unknown`  | The directory restarted or no longer reports the result, so the outcome cannot be known.          |
+| `unknown`  | The directory restarted, no longer reports the result, or is no longer configured, so the outcome cannot be known. |
 
 Crawl results are candidate DID/collection pairs for
 `com.atproto.sync.listReposByCollection`, not an authoritative inventory. A crawl

@@ -50,8 +50,8 @@ export interface CollectiondirStatus {
 
 // Relay normalizes source hostnames to lower case; only localhost carries a port.
 const crawlOrigin = /^https:\/\/[a-z0-9.-]+(?::\d{1,5})?$/;
-const submissionChunk = 100;
-const statusListLimit = 1000;
+// The most hosts sent in one requestCrawl call.
+export const crawlSubmissionChunk = 100;
 
 export function isCrawlOrigin(value: string) {
   return crawlOrigin.test(value);
@@ -145,8 +145,8 @@ export class Collectiondir {
       serverTime: body.server_time,
       processStartedAt: timestamp(body.process_start) ?? null,
       historySupported,
-      active: active.slice(0, statusListLimit),
-      recent: recent.slice(0, statusListLimit),
+      active,
+      recent,
     };
   }
 
@@ -159,8 +159,8 @@ export class Collectiondir {
     if (unique.some((origin) => !isCrawlOrigin(origin)))
       throw new ApiError(400, "invalid_crawl_origin");
     const submissions: CrawlSubmission[] = [];
-    for (let i = 0; i < unique.length; i += submissionChunk) {
-      const hosts = unique.slice(i, i + submissionChunk);
+    for (let i = 0; i < unique.length; i += crawlSubmissionChunk) {
+      const hosts = unique.slice(i, i + crawlSubmissionChunk);
       const body = await this.request(
         "/admin/pds/requestCrawl",
         "POST",

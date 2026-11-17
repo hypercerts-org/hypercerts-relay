@@ -12,6 +12,7 @@ import {
   crawlEligible,
   crawlNotice,
   crawlSummary,
+  crawlsInProgress,
   createDirectoryPoller,
   directoryMessage,
   directoryPollMs,
@@ -147,7 +148,11 @@ test.each([
   "an unusable directory disables only the crawl action",
   async (status, message) => {
     const submit = vi.fn();
-    render(Sources, { rows: [source("pds.example")], submit, directory: status });
+    render(Sources, {
+      rows: [source("pds.example")],
+      submit,
+      directory: status,
+    });
     const crawlAction = screen.getByRole("button", {
       name: crawlButton,
     }) as HTMLButtonElement;
@@ -224,7 +229,10 @@ test("accepted, finished, failed and unknown crawls read differently", () => {
       crawl(pds, { state: "failed", errorCategory: "http", httpStatus: 502 }),
     ),
     crawlSummary(
-      crawl(pds, { state: "unknown", errorCategory: "collectiondir_restarted" }),
+      crawl(pds, {
+        state: "unknown",
+        errorCategory: "collectiondir_restarted",
+      }),
     ),
   ];
   expect(summaries).toEqual([
@@ -417,4 +425,97 @@ test("the poller runs only while a crawl is active, pauses when hidden, and stop
   poller.stop();
   await vi.advanceTimersByTimeAsync(directoryPollMs * 4);
   expect(refresh).toHaveBeenCalledTimes(6);
+});
+
+test("the source detail loads its newest crawl even when it is not in the shared list", async () => {
+  const older = crawl("https://pds.example", {
+    id: "older-row",
+    state: "failed",
+    errorCategory: "http",
+    httpStatus: 502,
+    requestedAt: "2026-11-01T10:00:00.000Z",
+  });
+  const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.startsWith("/api/v1/collection-directory/crawls"))
+      return Response.json({ items: [older], next: null });
+    return Response.json({ error: "unavailable" }, { status: 503 });
+  });
+  vi.stubGlobal("fetch", fetcher);
+  render(Sources, {
+    rows: [source("pds.example")],
+    submit: vi.fn(),
+    directory: directory(),
+    // The shared list holds only other sources' newer requests.
+    crawls: [crawl("https://other.example")],
+  });
+  await fireEvent.click(screen.getByRole("button", { name: "pds.example" }));
+  const detail = screen.getByRole("region", {
+    name: "Collection directory crawl",
+  });
+  expect(await within(detail).findByText("Failed: http 502")).toBeTruthy();
+  expect(
+    fetcher.mock.calls.some(
+      ([input]) =>
+        String(input) ===
+        "/api/v1/collection-directory/crawls?pds=https%3A%2F%2Fpds.example&limit=1",
+    ),
+  ).toBe(true);
+});
+
+test("accepted rows do not keep polling once the directory is unconfigured", () => {
+  const accepted = [crawl("https://pds.example")];
+  expect(crawlsInProgress(directory(), accepted, null)).toBe(true);
+  expect(
+    crawlsInProgress(
+      directory({
+        configured: false,
+        available: false,
+        error: "collectiondir_not_configured",
+      }),
+      accepted,
+      null,
+    ),
+  ).toBe(false);
+  expect(
+    crawlsInProgress(
+      directory({ available: false, error: "collectiondir_unavailable" }),
+      accepted,
+      null,
+    ),
+  ).toBe(true);
+  expect(crawlsInProgress(directory(), [], null)).toBe(false);
+});
+
+test("the initial directory check is a status note, not an error", () => {
+  render(CollectionDirectory, { directory: null, crawls: [], submit: vi.fn() });
+  const message = screen.getByRole("status");
+  expect(message.textContent).toMatch(/Checking the collection directory/);
+  expect(message.classList.contains("error")).toBe(false);
+});
+
+test("adding a source works while the collection directory is unconfigured", async () => {
+  const submit = vi.fn();
+  render(Sources, {
+    rows: [],
+    submit,
+    directory: directory({
+      configured: false,
+      available: false,
+      error: "collectiondir_not_configured",
+    }),
+  });
+  await fireEvent.input(screen.getByLabelText("PDS origin"), {
+    target: { value: "new.example" },
+  });
+  const add = screen.getByRole("button", {
+    name: "Add source",
+  }) as HTMLButtonElement;
+  expect(add.disabled).toBe(false);
+  await fireEvent.click(add);
+  expect(submit).toHaveBeenCalledExactlyOnceWith({
+    kind: "source",
+    pds: "new.example",
+    state: "enabled",
+  });
 });

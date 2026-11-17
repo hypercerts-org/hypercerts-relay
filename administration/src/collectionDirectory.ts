@@ -130,6 +130,22 @@ export function crawlNotice(
   }`;
 }
 
+// Whether crawl status can still change and is worth polling. Accepted rows
+// are ignored without a configured directory: only the server can close them.
+export function crawlsInProgress(
+  directory: CollectionDirectoryStatus | null,
+  rows: CollectionCrawl[],
+  operation: Operation | null,
+): boolean {
+  return (
+    (directory?.active.length ?? 0) > 0 ||
+    (directory?.configured !== false &&
+      rows.some((row) => row.state === "accepted")) ||
+    (operation?.command.kind === "collection_crawl" &&
+      ["requested", "applying"].includes(operation.state))
+  );
+}
+
 export interface DirectoryPoller {
   // Re-evaluates whether polling is needed, for example after a load.
   update(): void;

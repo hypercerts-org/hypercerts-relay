@@ -11,7 +11,9 @@ import { Services } from "./services.ts";
 import {
   Collectiondir,
   CollectiondirError,
+  crawlSubmissionChunk,
   type CollectiondirStatus,
+  type CrawlSubmission,
 } from "./collectiondir.ts";
 
 // How often accepted crawls are compared with the collection directory.
@@ -19,6 +21,11 @@ const reconcileIntervalMs = 5000;
 // An accepted crawl absent from both active and retained results after this
 // long has an outcome the directory no longer reports.
 const resultGraceMs = 30000;
+// How long one directory observation answers browser status requests.
+const statusCacheMs = 2000;
+// The most active and recent crawls returned to the browser. Reconciliation
+// always uses the directory's complete lists.
+const browserListLimit = 1000;
 
 interface RelaySourceView {
   Hostname: string;
@@ -45,6 +52,13 @@ type CrawlRow = Omit<CollectionCrawl, "actorHandle">;
 export class CollectionCrawls {
   private lastReconcile = Number.NEGATIVE_INFINITY;
   private reconciling = false;
+  // The latest directory read, successful or not.
+  private observation: {
+    at: number;
+    status?: CollectiondirStatus;
+    error?: string;
+  } | null = null;
+  private observing: Promise<CollectiondirStatus> | null = null;
   constructor(
     private readonly store: Store,
     private readonly services: Services,
@@ -103,16 +117,38 @@ export class CollectionCrawls {
       targets.push(`https://${view.Hostname}`);
     }
     // Fail before submitting when the directory is unreachable or rejects
-    // the token, so a submission is either fully recorded or retried.
+    // the token.
     await this.collectiondir.status();
-    const submissions = await this.collectiondir.requestCrawl(targets);
+    // Each accepted chunk is recorded before the next is sent, so a later
+    // failure leaves the operation incomplete without losing accepted crawls.
+    // A retry finds those crawls running and records nothing twice.
+    const submissions: CrawlSubmission[] = [];
+    for (let i = 0; i < targets.length; i += crawlSubmissionChunk) {
+      const accepted = await this.collectiondir.requestCrawl(
+        targets.slice(i, i + crawlSubmissionChunk),
+      );
+      this.record(op, accepted);
+      submissions.push(...accepted);
+    }
+    return {
+      collectiondir: {
+        submitted: submissions.length,
+        started: submissions.filter((s) => s.outcome === "started").length,
+        alreadyActive: submissions.filter((s) => s.outcome === "already_active")
+          .length,
+        skipped,
+      },
+    };
+  }
+
+  private record(op: Operation, accepted: CrawlSubmission[]) {
     const acceptedAt = new Date().toISOString();
     const insert = this.store.db.prepare(
       `INSERT OR IGNORE INTO collection_crawls(id,operation,pds,actor,cause,submission,state,requestedAt,acceptedAt,crawlStartedAt)
        VALUES(?,?,?,?,'manual',?,'accepted',?,?,?)`,
     );
     this.store.transaction(() => {
-      for (const submission of submissions) {
+      for (const submission of accepted) {
         const inserted = insert.run(
           randomUUID(),
           op.id,
@@ -132,25 +168,13 @@ export class CollectionCrawls {
           );
       }
     });
-    return {
-      collectiondir: {
-        submitted: submissions.length,
-        started: submissions.filter((s) => s.outcome === "started").length,
-        alreadyActive: submissions.filter((s) => s.outcome === "already_active")
-          .length,
-        skipped,
-      },
-    };
   }
 
-  // Compares accepted crawls with the directory. Self-throttled; a failed
-  // status read leaves every row accepted for the next attempt.
+  // Compares accepted crawls with the directory. Self-throttled. A failed
+  // status read leaves every row accepted for the next attempt; database
+  // errors propagate to the caller.
   async reconcile(now = Date.now()): Promise<void> {
-    if (
-      !this.configured ||
-      this.reconciling ||
-      now - this.lastReconcile < reconcileIntervalMs
-    )
+    if (this.reconciling || now - this.lastReconcile < reconcileIntervalMs)
       return;
     const pending = this.store.db
       .prepare(
@@ -159,17 +183,74 @@ export class CollectionCrawls {
       .all() as unknown as CrawlRow[];
     if (!pending.length) return;
     this.lastReconcile = now;
+    // Without a directory nothing can report these crawls again.
+    if (!this.configured) {
+      const observedAt = new Date(now).toISOString();
+      for (const row of pending)
+        this.finish(
+          row,
+          "unknown",
+          observedAt,
+          null,
+          "collectiondir_not_configured",
+        );
+      return;
+    }
     this.reconciling = true;
     try {
       let status: CollectiondirStatus;
       try {
-        status = await this.collectiondir.status();
+        status = await this.observe();
       } catch {
         return;
       }
       this.applyObservation(pending, status, now);
     } finally {
       this.reconciling = false;
+    }
+  }
+
+  // One directory status read at a time; its outcome also answers browser
+  // status requests for statusCacheMs.
+  private observe(timeoutMs?: number): Promise<CollectiondirStatus> {
+    this.observing ??= this.collectiondir
+      .status(timeoutMs)
+      .then(
+        (status) => {
+          this.observation = { at: Date.now(), status };
+          return status;
+        },
+        (e: unknown) => {
+          this.observation = {
+            at: Date.now(),
+            error: e instanceof ApiError ? e.code : "collectiondir_unavailable",
+          };
+          throw e;
+        },
+      )
+      .finally(() => {
+        this.observing = null;
+      });
+    return this.observing;
+  }
+
+  // A caller with a shorter deadline than a read already in flight stops
+  // waiting at its own deadline.
+  private async observeWithin(timeoutMs?: number) {
+    if (timeoutMs === undefined) return this.observe();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        this.observe(timeoutMs),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new CollectiondirError("unavailable")),
+            timeoutMs,
+          );
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -270,8 +351,9 @@ export class CollectionCrawls {
     });
   }
 
-  // Never throws: an unconfigured or unreachable directory is a status.
-  async status(): Promise<CollectionDirectoryStatus> {
+  // Never throws: an unconfigured or unreachable directory is a status. A
+  // successful observation younger than statusCacheMs is reused.
+  async status(timeoutMs?: number): Promise<CollectionDirectoryStatus> {
     const empty = {
       observedAt: new Date().toISOString(),
       processStartedAt: null,
@@ -287,7 +369,12 @@ export class CollectionCrawls {
         ...empty,
       };
     try {
-      const status = await this.collectiondir.status();
+      const cached =
+        this.observation && Date.now() - this.observation.at < statusCacheMs
+          ? this.observation
+          : null;
+      if (cached?.error) throw new ApiError(503, cached.error);
+      const status = cached?.status ?? (await this.observeWithin(timeoutMs));
       return {
         configured: true,
         available: true,
@@ -295,8 +382,8 @@ export class CollectionCrawls {
         observedAt: status.observedAt,
         processStartedAt: status.processStartedAt,
         historySupported: status.historySupported,
-        active: status.active,
-        recent: status.recent,
+        active: status.active.slice(0, browserListLimit),
+        recent: status.recent.slice(0, browserListLimit),
       };
     } catch (e) {
       return {

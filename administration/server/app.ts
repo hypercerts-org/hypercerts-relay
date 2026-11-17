@@ -319,7 +319,8 @@ export function createApp(
   app.get("/api/v1/status", async (_req, res) => {
     const [checks, directory] = await Promise.all([
       Promise.allSettled([services.sources(), services.policy()]),
-      crawls.status(),
+      // A short probe: overview health must not wait on the directory.
+      crawls.status(1000),
     ]);
     res.json({
       relay: checks[0].status === "fulfilled" ? "available" : "unavailable",

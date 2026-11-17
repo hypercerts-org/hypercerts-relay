@@ -146,11 +146,15 @@ To let operators request collection directory crawls from Administration, also s
 | Administration | `HC_COLLECTIONDIR_CONTROL_SECRET` | Same value as the collection directory's `COLLECTIONS_ADMIN_TOKEN`, at least 32 bytes |
 
 Set both or neither; Administration fails startup if only the URL or only the
-token file is present. The collection directory must listen on `[::]:2510` so the
-private hostname reaches it, and its API port must have no public domain: the
-admin endpoints share that listener. Deploy the collection directory and
-Administration from the same release, because Administration reads the per-host
-crawl replies added alongside this setting.
+token file is present. The collection directory's API listener
+(`COLLECTIONS_API_LISTEN`, default `:2510`) already accepts connections on all
+interfaces; if you override it, keep the port in the URL above. Do not attach a
+public domain to that port: the admin crawl endpoints share the listener with
+the query API. Publish `com.atproto.sync.listReposByCollection` through Rainbow
+instead, by setting `RAINBOW_COLLECTIONDIR_HOST` on Rainbow to the collection
+directory's private origin; Rainbow proxies only that query. Deploy the
+collection directory and Administration from the same release, because
+Administration reads the per-host crawl replies added alongside this setting.
 
 `HC_RELAY_CONTROL_SECRET` must be identical on Relay, Jetstream and
 Administration. Bootstrap writes each service its own token file, so only the

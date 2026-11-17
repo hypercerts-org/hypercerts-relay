@@ -28,6 +28,9 @@
     search = "",
     selected: Source | null = null,
     error = "";
+  // The selected source's newest crawl request, fetched by origin so it is
+  // found even when it is older than the shared list. Undefined until fetched.
+  let latestCrawl: CollectionCrawl | null | undefined = undefined;
   let detailUnavailable = false,
     coverage: Coverage | null = null,
     coverageUnavailable = false,
@@ -43,8 +46,39 @@
     (directory?.active ?? []).map((crawl) => [crawl.pds, crawl]),
   );
   $: selectedCrawl = selected
-    ? (crawls.find((row) => row.pds === sourceOrigin(selected!)) ?? null)
+    ? newestCrawl(
+        crawls.find((row) => row.pds === sourceOrigin(selected!)) ?? null,
+        latestCrawl?.pds === sourceOrigin(selected) ? latestCrawl : null,
+      )
     : null;
+  function newestCrawl(
+    listed: CollectionCrawl | null,
+    fetched: CollectionCrawl | null,
+  ) {
+    if (!listed || !fetched) return listed ?? fetched;
+    return fetched.requestedAt > listed.requestedAt ? fetched : listed;
+  }
+  // Crawl details load only when the page supplies collection directory
+  // status, so screens without it make no crawl requests.
+  async function refreshCrawl(origin: string, request: number) {
+    if (directory === null) return;
+    try {
+      const page = await api<{ items: CollectionCrawl[] }>(
+        `/collection-directory/crawls?pds=${encodeURIComponent(origin)}&limit=1`,
+      );
+      if (
+        request === detailRequest &&
+        selected &&
+        sourceOrigin(selected) === origin
+      )
+        latestCrawl = page.items[0] ?? null;
+    } catch {
+      // The shared crawl list remains the fallback.
+    }
+  }
+  export async function refreshCrawlDetail() {
+    if (selected) await refreshCrawl(sourceOrigin(selected), detailRequest);
+  }
   $: displayedRows = filter
     ? rows.filter((source) => source.Hostname.toLowerCase().includes(filter))
     : rows;
@@ -71,6 +105,7 @@
     detailRequest++;
     coverage = null;
     coverageUnavailable = false;
+    latestCrawl = undefined;
   }
   async function refreshCoverage(origin: string, request: number) {
     try {
@@ -126,6 +161,7 @@
         }
       })(),
       refreshCoverage(origin, request),
+      refreshCrawl(origin, request),
     ]);
   }
   function select(source: Source) {
@@ -135,6 +171,7 @@
     detailUnavailable = false;
     resetCoverage();
     void refreshCoverage(sourceOrigin(source), detailRequest);
+    void refreshCrawl(sourceOrigin(source), detailRequest);
   }
   async function find() {
     const query = search,
@@ -149,7 +186,10 @@
       detailUnavailable = false;
       resetCoverage();
       const detail = ++detailRequest;
-      await refreshCoverage(sourceOrigin(found), detail);
+      await Promise.all([
+        refreshCoverage(sourceOrigin(found), detail),
+        refreshCrawl(sourceOrigin(found), detail),
+      ]);
     } catch (e) {
       if (request === lookupRequest) error = (e as Error).message;
     }

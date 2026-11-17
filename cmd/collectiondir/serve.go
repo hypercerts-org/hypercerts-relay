@@ -175,6 +175,7 @@ type activeCrawl struct {
 // hypercerts: bounded in-memory history of ended crawls; lost on restart.
 const maxCrawlResults = 256
 
+// hypercerts: how one ended crawl finished, kept in crawlResults.
 type crawlResult struct {
 	start          time.Time
 	end            time.Time

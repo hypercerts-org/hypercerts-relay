@@ -29,6 +29,7 @@
   import {
     createDirectoryPoller,
     crawlNotice,
+    crawlsInProgress,
     type DirectoryPoller,
   } from "./collectionDirectory";
   const navigation = [
@@ -79,7 +80,10 @@
     loadError = "",
     notice = "";
   let administrators: Administrator[] = [];
-  let sourcesComponent: { refreshDetails: () => Promise<void> } | null = null;
+  let sourcesComponent: {
+    refreshDetails: () => Promise<void>;
+    refreshCrawlDetail: () => Promise<void>;
+  } | null = null;
   let policyLoaded = false;
   let sources: Source[] = [],
     policy: Policy = { revision: 1, collections: [] },
@@ -197,25 +201,27 @@
     } finally {
       loading = false;
     }
-    if (directoryScreen) {
-      // Collection directory problems are shown on the page, never as a
-      // load failure: Relay source management must keep working without it.
-      try {
-        await refreshDirectory();
-      } catch {
-        directory = {
-          configured: true,
-          available: false,
-          error: "status_request_failed",
-          observedAt: new Date().toISOString(),
-          processStartedAt: null,
-          historySupported: false,
-          active: [],
-          recent: [],
-        };
-      }
-      poller?.update();
+    // Not awaited: actions and page loads never wait on the directory.
+    if (directoryScreen) void refreshDirectoryQuietly();
+  }
+  // Collection directory problems are shown on the page, never as a load
+  // failure: Relay source management must keep working without it.
+  async function refreshDirectoryQuietly() {
+    try {
+      await refreshDirectory();
+    } catch {
+      directory = {
+        configured: true,
+        available: false,
+        error: "status_request_failed",
+        observedAt: new Date().toISOString(),
+        processStartedAt: null,
+        historySupported: false,
+        active: [],
+        recent: [],
+      };
     }
+    poller?.update();
   }
   async function refreshDirectory() {
     const [directoryStatus, crawlPage] = await Promise.all([
@@ -258,13 +264,7 @@
     }
   }
   function crawlActive() {
-    return (
-      directoryScreen &&
-      ((directory?.active.length ?? 0) > 0 ||
-        crawls.some((row) => row.state === "accepted") ||
-        (operation?.command.kind === "collection_crawl" &&
-          ["requested", "applying"].includes(operation.state)))
-    );
+    return directoryScreen && crawlsInProgress(directory, crawls, operation);
   }
   $: crawlMessage = crawlNotice(operation, crawls);
   async function submit(command: Command) {
@@ -361,6 +361,7 @@
     let active = true;
     poller = createDirectoryPoller(async () => {
       await refreshDirectory();
+      await sourcesComponent?.refreshCrawlDetail();
       if (
         operation?.command.kind === "collection_crawl" &&
         ["requested", "applying"].includes(operation.state)
