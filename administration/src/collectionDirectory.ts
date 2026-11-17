@@ -93,8 +93,7 @@ export function crawlNotice(
   rows: CollectionCrawl[],
 ): string | null {
   if (
-    !operation ||
-    operation.command.kind !== "collection_crawl" ||
+    operation?.command.kind !== "collection_crawl" ||
     operation.state !== "applied"
   )
     return null;

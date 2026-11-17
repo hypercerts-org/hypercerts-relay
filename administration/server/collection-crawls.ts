@@ -77,59 +77,14 @@ export class CollectionCrawls {
       throw new ApiError(400, "invalid_command");
     if (!this.collectiondir.configured)
       throw new CollectiondirError("not_configured");
-    const skipped: Record<Ineligibility, number> = {
-      not_enabled: 0,
-      not_https: 0,
-    };
-    const targets: string[] = [];
-    if (command.scope === "all") {
-      let after = "";
-      for (;;) {
-        const page = (await this.services.sources(after)) as unknown as {
-          Sources: RelaySourceView[];
-          NextAfterHostID: number;
-        };
-        for (const source of page.Sources) {
-          const reason = ineligibility(source);
-          if (reason) skipped[reason]++;
-          else targets.push(`https://${source.Hostname}`);
-        }
-        if (!page.NextAfterHostID) break;
-        after = String(page.NextAfterHostID);
-      }
-      if (!targets.length) throw new ApiError(409, "no_enabled_sources");
-    } else {
-      let view: RelaySourceView;
-      try {
-        view = await this.services.call<RelaySourceView>(
-          "relay",
-          `/source?pds=${encodeURIComponent(command.scope)}`,
-        );
-      } catch (e) {
-        if (e instanceof ApiError && e.status === 404)
-          throw new ApiError(409, "source_not_approved");
-        throw e;
-      }
-      const reason = ineligibility(view);
-      if (reason === "not_enabled")
-        throw new ApiError(409, "source_not_enabled");
-      if (reason === "not_https") throw new ApiError(409, "source_not_https");
-      targets.push(`https://${view.Hostname}`);
-    }
-    // Fail before submitting when the directory is unreachable or rejects
-    // the token.
-    await this.collectiondir.status();
-    // Each accepted chunk is recorded before the next is sent, so a later
-    // failure leaves the operation incomplete without losing accepted crawls.
-    // A retry finds those crawls running and records nothing twice.
-    const submissions: CrawlSubmission[] = [];
-    for (let i = 0; i < targets.length; i += crawlSubmissionChunk) {
-      const accepted = await this.collectiondir.requestCrawl(
-        targets.slice(i, i + crawlSubmissionChunk),
-      );
-      this.record(op, accepted);
-      submissions.push(...accepted);
-    }
+    const { targets, skipped } =
+      command.scope === "all"
+        ? await this.enabledTargets()
+        : {
+            targets: [await this.sourceTarget(command.scope)],
+            skipped: { not_enabled: 0, not_https: 0 },
+          };
+    const submissions = await this.submit(op, targets);
     return {
       collectiondir: {
         submitted: submissions.length,
@@ -139,6 +94,73 @@ export class CollectionCrawls {
         skipped,
       },
     };
+  }
+
+  // Every eligible source across Relay's pages, counting the ineligible ones.
+  private async enabledTargets(): Promise<{
+    targets: string[];
+    skipped: Record<Ineligibility, number>;
+  }> {
+    const skipped: Record<Ineligibility, number> = {
+      not_enabled: 0,
+      not_https: 0,
+    };
+    const targets: string[] = [];
+    let after = "";
+    for (;;) {
+      const page = (await this.services.sources(after)) as unknown as {
+        Sources: RelaySourceView[];
+        NextAfterHostID: number;
+      };
+      for (const source of page.Sources) {
+        const reason = ineligibility(source);
+        if (reason) skipped[reason]++;
+        else targets.push(`https://${source.Hostname}`);
+      }
+      if (!page.NextAfterHostID) break;
+      after = String(page.NextAfterHostID);
+    }
+    if (!targets.length) throw new ApiError(409, "no_enabled_sources");
+    return { targets, skipped };
+  }
+
+  // The one requested source, which must be approved, enabled and HTTPS.
+  private async sourceTarget(scope: string): Promise<string> {
+    let view: RelaySourceView;
+    try {
+      view = await this.services.call<RelaySourceView>(
+        "relay",
+        `/source?pds=${encodeURIComponent(scope)}`,
+      );
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 404)
+        throw new ApiError(409, "source_not_approved");
+      throw e;
+    }
+    const reason = ineligibility(view);
+    if (reason === "not_enabled") throw new ApiError(409, "source_not_enabled");
+    if (reason === "not_https") throw new ApiError(409, "source_not_https");
+    return `https://${view.Hostname}`;
+  }
+
+  private async submit(
+    op: Operation,
+    targets: string[],
+  ): Promise<CrawlSubmission[]> {
+    // Fail before submitting when the directory is unreachable or rejects
+    // the token.
+    await this.collectiondir.status();
+    // Each accepted chunk is recorded before the next is sent, so a later
+    // failure leaves the operation incomplete without losing accepted crawls.
+    // A retry finds those crawls running and records nothing twice.
+    const submissions: CrawlSubmission[] = [];
+    for (let i = 0; i < targets.length; i += crawlSubmissionChunk) {
+      const chunk = targets.slice(i, i + crawlSubmissionChunk);
+      const accepted = await this.collectiondir.requestCrawl(chunk); // NOSONAR: sequential by design, see above
+      this.record(op, accepted);
+      submissions.push(...accepted);
+    }
+    return submissions;
   }
 
   private record(op: Operation, accepted: CrawlSubmission[]) {
@@ -284,7 +306,7 @@ export class CollectionCrawls {
         continue;
       }
       const ended = recent.get(row.pds);
-      if (ended && row.crawlStartedAt === ended.startedAt) {
+      if (row.crawlStartedAt === ended?.startedAt) {
         this.finish(row, ended.state, status.observedAt, ended);
         continue;
       }

@@ -31,6 +31,12 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+// The URL a stubbed fetch was called with.
+function requestUrl(input: RequestInfo | URL): string {
+  if (typeof input === "string") return input;
+  return input instanceof URL ? input.href : input.url;
+}
+
 let nextHostID = 1;
 function source(hostname: string, overrides: Partial<Source> = {}): Source {
   return {
@@ -178,8 +184,8 @@ test.each([
 );
 
 test("an active crawl replaces the action with its progress and start", async () => {
-  const fetcher = vi.fn(async () =>
-    Response.json({ error: "unavailable" }, { status: 503 }),
+  const fetcher = vi.fn(() =>
+    Promise.resolve(Response.json({ error: "unavailable" }, { status: 503 })),
   );
   vi.stubGlobal("fetch", fetcher);
   const active = {
@@ -435,12 +441,13 @@ test("the source detail loads its newest crawl even when it is not in the shared
     httpStatus: 502,
     requestedAt: "2026-11-01T10:00:00.000Z",
   });
-  const fetcher = vi.fn(async (input: RequestInfo | URL) => {
-    const url = String(input);
-    if (url.startsWith("/api/v1/collection-directory/crawls"))
-      return Response.json({ items: [older], next: null });
-    return Response.json({ error: "unavailable" }, { status: 503 });
-  });
+  const fetcher = vi.fn((input: RequestInfo | URL) =>
+    Promise.resolve(
+      requestUrl(input).startsWith("/api/v1/collection-directory/crawls")
+        ? Response.json({ items: [older], next: null })
+        : Response.json({ error: "unavailable" }, { status: 503 }),
+    ),
+  );
   vi.stubGlobal("fetch", fetcher);
   render(Sources, {
     rows: [source("pds.example")],
@@ -457,7 +464,7 @@ test("the source detail loads its newest crawl even when it is not in the shared
   expect(
     fetcher.mock.calls.some(
       ([input]) =>
-        String(input) ===
+        requestUrl(input) ===
         "/api/v1/collection-directory/crawls?pds=https%3A%2F%2Fpds.example&limit=1",
     ),
   ).toBe(true);

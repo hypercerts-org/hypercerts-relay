@@ -13,6 +13,7 @@ import {
   command,
   operationBodyLimit,
   origin,
+  type CollectionDirectoryStatus,
 } from "./contracts.ts";
 import { Store } from "./store.ts";
 import { Services } from "./services.ts";
@@ -325,11 +326,7 @@ export function createApp(
     res.json({
       relay: checks[0].status === "fulfilled" ? "available" : "unavailable",
       jetstream: checks[1].status === "fulfilled" ? "available" : "unavailable",
-      collectiondir: !directory.configured
-        ? "not_configured"
-        : directory.available
-          ? "available"
-          : "unavailable",
+      collectiondir: directoryHealth(directory),
       publicServiceOrigins: options.publicServiceOrigins ?? {},
       observedAt: new Date().toISOString(),
     });
@@ -365,4 +362,10 @@ export function createApp(
   };
   app.use(errors);
   return app;
+}
+
+// The overview's one-word collection directory health.
+function directoryHealth(directory: CollectionDirectoryStatus) {
+  if (!directory.configured) return "not_configured";
+  return directory.available ? "available" : "unavailable";
 }

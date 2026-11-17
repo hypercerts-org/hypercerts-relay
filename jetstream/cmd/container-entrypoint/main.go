@@ -84,28 +84,35 @@ func prepare(component string) error {
 			return fmt.Errorf("%s must contain at least 32 bytes", secret.input)
 		}
 	}
-	if len(secrets) > 0 {
-		dir, err := os.MkdirTemp("", "hypercerts-secrets-")
-		if err != nil {
-			return fmt.Errorf("create secret directory: %w", err)
-		}
-		complete := false
-		defer func() {
-			if !complete {
-				_ = os.RemoveAll(dir)
-			}
-		}()
-		for _, secret := range secrets {
-			path := filepath.Join(dir, secret.output)
-			if err := os.WriteFile(path, []byte(strings.TrimSpace(os.Getenv(secret.input))), 0600); err != nil {
-				return fmt.Errorf("write %s: %w", secret.output, err)
-			}
-			if err := os.Setenv(secret.output, path); err != nil {
-				return fmt.Errorf("configure %s: %w", secret.output, err)
-			}
-		}
-		complete = true
+	return writeSecretFiles(secrets)
+}
+
+// writeSecretFiles writes each secret to a private temporary file and points
+// its output variable at that file. A failure removes the directory.
+func writeSecretFiles(secrets []secretFile) error {
+	if len(secrets) == 0 {
+		return nil
 	}
+	dir, err := os.MkdirTemp("", "hypercerts-secrets-")
+	if err != nil {
+		return fmt.Errorf("create secret directory: %w", err)
+	}
+	complete := false
+	defer func() {
+		if !complete {
+			_ = os.RemoveAll(dir)
+		}
+	}()
+	for _, secret := range secrets {
+		path := filepath.Join(dir, secret.output)
+		if err := os.WriteFile(path, []byte(strings.TrimSpace(os.Getenv(secret.input))), 0600); err != nil {
+			return fmt.Errorf("write %s: %w", secret.output, err)
+		}
+		if err := os.Setenv(secret.output, path); err != nil {
+			return fmt.Errorf("configure %s: %w", secret.output, err)
+		}
+	}
+	complete = true
 	return nil
 }
 

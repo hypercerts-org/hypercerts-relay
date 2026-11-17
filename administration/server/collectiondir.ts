@@ -52,6 +52,7 @@ export interface CollectiondirStatus {
 const crawlOrigin = /^https:\/\/[a-z0-9.-]+(?::\d{1,5})?$/;
 // The most hosts sent in one requestCrawl call.
 export const crawlSubmissionChunk = 100;
+const crawlPath = "/admin/pds/requestCrawl";
 
 export function isCrawlOrigin(value: string) {
   return crawlOrigin.test(value);
@@ -159,33 +160,11 @@ export class Collectiondir {
     if (unique.some((origin) => !isCrawlOrigin(origin)))
       throw new ApiError(400, "invalid_crawl_origin");
     const submissions: CrawlSubmission[] = [];
+    // One chunk at a time: a failed chunk stops the rest from being sent.
     for (let i = 0; i < unique.length; i += crawlSubmissionChunk) {
       const hosts = unique.slice(i, i + crawlSubmissionChunk);
-      const body = await this.request(
-        "/admin/pds/requestCrawl",
-        "POST",
-        { hosts },
-        timeoutMs,
-      );
-      if (!isRecord(body)) throw new CollectiondirError("invalid_response");
-      if (body.hosts === undefined) {
-        for (const pds of hosts)
-          submissions.push({ pds, outcome: "accepted", startedAt: null });
-        continue;
-      }
-      if (!isRecord(body.hosts))
-        throw new CollectiondirError("invalid_response");
-      for (const pds of hosts) {
-        const entry = body.hosts[pds];
-        const startedAt = isRecord(entry) ? timestamp(entry.start) : undefined;
-        if (
-          !isRecord(entry) ||
-          (entry.state !== "started" && entry.state !== "already_active") ||
-          !startedAt
-        )
-          throw new CollectiondirError("invalid_response");
-        submissions.push({ pds, outcome: entry.state, startedAt });
-      }
+      const body = await this.request(crawlPath, "POST", { hosts }, timeoutMs); // NOSONAR: sequential by design, see above
+      submissions.push(...chunkSubmissions(hosts, body));
     }
     return submissions;
   }
@@ -287,12 +266,7 @@ function endedCrawl(pds: string, value: unknown): EndedCrawl {
     ...crawl,
     finishedAt,
     state: record.state,
-    errorCategory:
-      typeof category === "string" && /^[a-z_]{1,40}$/.test(category)
-        ? category
-        : record.state === "failed"
-          ? "unknown"
-          : null,
+    errorCategory: errorCategory(category, record.state),
     httpStatus:
       typeof httpStatus === "number" &&
       Number.isInteger(httpStatus) &&
@@ -301,6 +275,36 @@ function endedCrawl(pds: string, value: unknown): EndedCrawl {
         ? httpStatus
         : null,
   };
+}
+
+// A failed crawl without a well-formed category is reported as "unknown".
+function errorCategory(
+  category: unknown,
+  state: "finished" | "failed",
+): string | null {
+  if (typeof category === "string" && /^[a-z_]{1,40}$/.test(category))
+    return category;
+  return state === "failed" ? "unknown" : null;
+}
+
+// One requestCrawl response. An older directory reports no per-host outcome.
+function chunkSubmissions(hosts: string[], body: unknown): CrawlSubmission[] {
+  if (!isRecord(body)) throw new CollectiondirError("invalid_response");
+  if (body.hosts === undefined)
+    return hosts.map((pds) => ({ pds, outcome: "accepted", startedAt: null }));
+  const outcomes = body.hosts;
+  if (!isRecord(outcomes)) throw new CollectiondirError("invalid_response");
+  return hosts.map((pds) => {
+    const entry = outcomes[pds];
+    const startedAt = isRecord(entry) ? timestamp(entry.start) : undefined;
+    if (
+      !isRecord(entry) ||
+      (entry.state !== "started" && entry.state !== "already_active") ||
+      !startedAt
+    )
+      throw new CollectiondirError("invalid_response");
+    return { pds, outcome: entry.state, startedAt };
+  });
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

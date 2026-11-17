@@ -98,6 +98,8 @@ func newCrawlTestServer(t *testing.T, client *http.Client) (*collectionServer, *
 	go func() {
 		defer drained.Done()
 		for range cs.ingestCrawl {
+			// Discard crawled records: these tests observe crawl status, not
+			// ingestion, and draining keeps the producers from blocking.
 		}
 	}()
 	t.Cleanup(func() {

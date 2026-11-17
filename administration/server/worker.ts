@@ -1,6 +1,6 @@
 import { Store } from "./store.ts";
 import { Services } from "./services.ts";
-import { ApiError } from "./contracts.ts";
+import { ApiError, type Operation } from "./contracts.ts";
 import {
   discoveryActor,
   discoverySettings,
@@ -65,19 +65,7 @@ export class Worker {
           if (await machineEnableBlocked(this.services, op.command))
             throw new ApiError(409, "source_disabled_by_operator");
         }
-        const result =
-          op.command.kind === "collection_crawl"
-            ? await this.crawls.apply(op)
-            : await this.services.apply(op.command, op.id, (value) => {
-                this.store.transition(
-                  op.id,
-                  "applying",
-                  value,
-                  null,
-                  undefined,
-                  ["applying"],
-                );
-              });
+        const result = await this.execute(op);
         this.store.transition(op.id, "applied", result, null, undefined, [
           "applying",
         ]);
@@ -96,5 +84,15 @@ export class Worker {
     } finally {
       this.busy = false;
     }
+  }
+  // A collection directory crawl is applied here; every other command goes to
+  // Relay or Jetstream, which report progress while it applies.
+  private execute(op: Operation): Promise<unknown> {
+    if (op.command.kind === "collection_crawl") return this.crawls.apply(op);
+    return this.services.apply(op.command, op.id, (value) => {
+      this.store.transition(op.id, "applying", value, null, undefined, [
+        "applying",
+      ]);
+    });
   }
 }

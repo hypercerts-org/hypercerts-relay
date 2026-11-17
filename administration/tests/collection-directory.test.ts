@@ -355,7 +355,7 @@ test("collectiondir client classifies every failure without exposing the token",
   ];
   for (const [reply, failure, status] of cases) {
     directory.setHandler(() => reply);
-    await assert.rejects(client.status(100), rejectsWith(failure, status));
+    await assert.rejects(client.status(100), rejectsWith(failure, status)); // NOSONAR: each case replaces the shared stub reply
   }
   directory.setHandler(() => ({
     body: { message: "ok", hosts: { "https://pds.example": { state: "odd" } } },
@@ -369,17 +369,20 @@ test("collectiondir client classifies every failure without exposing the token",
 test("collectiondir client rejects non-HTTPS origins before any request", async (t) => {
   const directory = await stubDirectory(t, startingDirectory);
   const client = new Collectiondir({ url: directory.url, token });
-  for (const origin of [
-    "http://pds.example",
-    "https://pds.example/path",
-    "pds.example",
-    "https://user@pds.example",
-  ])
-    await assert.rejects(
-      client.requestCrawl([origin]),
-      (error: unknown) =>
-        error instanceof ApiError && error.code === "invalid_crawl_origin",
-    );
+  await Promise.all(
+    [
+      "http://pds.example",
+      "https://pds.example/path",
+      "pds.example",
+      "https://user@pds.example",
+    ].map((origin) =>
+      assert.rejects(
+        client.requestCrawl([origin]),
+        (error: unknown) =>
+          error instanceof ApiError && error.code === "invalid_crawl_origin",
+      ),
+    ),
+  );
   assert.equal(directory.calls.length, 0);
 });
 
@@ -543,21 +546,32 @@ test("crawl requests require an administrator session, CSRF and Origin", async (
     "https://pds.example": sourceView("pds.example"),
   });
   const body = { kind: "collection_crawl", scope: "https://pds.example" };
-  for (const [headers, status] of [
-    [{ Cookie: "" }, 401],
-    [{ "X-CSRF-Token": "" }, 403],
-    [{ Origin: "https://evil.example" }, 403],
-  ] as [Record<string, string>, number][])
-    assert.equal(
-      (await request("/api/v1/operations", body, headers)).status,
-      status,
-      JSON.stringify(headers),
-    );
-  for (const path of [
-    "/api/v1/collection-directory/status",
-    "/api/v1/collection-directory/crawls",
-  ])
-    assert.equal((await request(path, undefined, { Cookie: "" })).status, 401);
+  await Promise.all(
+    (
+      [
+        [{ Cookie: "" }, 401],
+        [{ "X-CSRF-Token": "" }, 403],
+        [{ Origin: "https://evil.example" }, 403],
+      ] as [Record<string, string>, number][]
+    ).map(async ([headers, status]) =>
+      assert.equal(
+        (await request("/api/v1/operations", body, headers)).status,
+        status,
+        JSON.stringify(headers),
+      ),
+    ),
+  );
+  await Promise.all(
+    [
+      "/api/v1/collection-directory/status",
+      "/api/v1/collection-directory/crawls",
+    ].map(async (path) =>
+      assert.equal(
+        (await request(path, undefined, { Cookie: "" })).status,
+        401,
+      ),
+    ),
+  );
   store.db.prepare("DELETE FROM administrators WHERE did=?").run(did);
   assert.equal((await request("/api/v1/operations", body)).status, 401);
   assert.equal(store.page("operations", "", 50).items.length, 0);
@@ -569,17 +583,19 @@ test("the PDS discovery machine API cannot request a crawl", async (t) => {
   const { request, store, relayLookups } = await fixture(t, directory.url, {
     "https://pds.example": sourceView("pds.example"),
   });
-  for (const scope of ["https://pds.example", "all"]) {
-    const response = await request(
-      "/api/v1/sources/discovery/operations",
-      { kind: "collection_crawl", scope },
-      { Cookie: "", Authorization: `Bearer ${machineToken}` },
-    );
-    assert.equal(response.status, 403);
-    assert.deepEqual(await response.json(), {
-      error: "machine_command_not_permitted",
-    });
-  }
+  await Promise.all(
+    ["https://pds.example", "all"].map(async (scope) => {
+      const response = await request(
+        "/api/v1/sources/discovery/operations",
+        { kind: "collection_crawl", scope },
+        { Cookie: "", Authorization: `Bearer ${machineToken}` },
+      );
+      assert.equal(response.status, 403);
+      assert.deepEqual(await response.json(), {
+        error: "machine_command_not_permitted",
+      });
+    }),
+  );
   assert.equal(store.page("operations", "", 50).items.length, 0);
   assert.deepEqual(relayLookups, []);
   assert.equal(directory.calls.length, 0);
@@ -642,7 +658,7 @@ test("unknown, disabled, unvalidated and plaintext sources fail without contacti
     ["https://unvalidated.example", "source_not_enabled"],
     ["https://plaintext.example", "source_not_https"],
   ]) {
-    const op = await crawl(scope);
+    const op = await crawl(scope); // NOSONAR: the worker applies one operation per tick
     assert.equal(op.state, "failed", scope);
     assert.equal(op.error, code, scope);
   }
@@ -853,7 +869,7 @@ test("reconciliation records progress, completion, failure and unknown outcomes"
     directory.url,
     sources,
   );
-  for (const origin of Object.keys(sources)) await crawl(origin);
+  for (const origin of Object.keys(sources)) await crawl(origin); // NOSONAR: the worker applies one operation per tick
   const byPDS = () =>
     Object.fromEntries(rows().map((row) => [row.pds as string, row]));
   let now = Date.now();
@@ -946,13 +962,13 @@ test("reconciliation records progress, completion, failure and unknown outcomes"
     "result_not_retained",
   );
 
-  const actions = auditEntries(store).map((entry) => entry.action);
+  const actions = new Set(auditEntries(store).map((entry) => entry.action));
   for (const action of [
     "collection_crawl_finished",
     "collection_crawl_failed",
     "collection_crawl_unknown",
   ])
-    assert.ok(actions.includes(action), action);
+    assert.ok(actions.has(action), action);
   const failedAudit = auditEntries(store).find(
     (entry) => entry.action === "collection_crawl_failed",
   );
@@ -1029,19 +1045,24 @@ test("the collection directory token never appears in responses or audit history
   });
   await crawl("https://pds.example");
   await crawls.reconcile();
-  const bodies = [];
-  for (const path of [
-    "/api/v1/collection-directory/status",
-    "/api/v1/collection-directory/crawls",
-    "/api/v1/status",
-    "/api/v1/operations",
-    "/api/v1/audit",
-  ])
-    bodies.push(await (await request(path)).text());
-  directory.setHandler(() => ({ status: 401 }));
-  bodies.push(
-    await (await request("/api/v1/collection-directory/status")).text(),
+  const bodies = await Promise.all(
+    [
+      "/api/v1/collection-directory/status",
+      "/api/v1/collection-directory/crawls",
+      "/api/v1/status",
+      "/api/v1/operations",
+      "/api/v1/audit",
+    ].map(async (path) => (await request(path)).text()),
   );
+  directory.setHandler(() => ({ status: 401 }));
+  // The status reads above filled the short status cache; a reconcile past
+  // its throttle reads the directory again and caches the 401 outcome.
+  await crawls.reconcile(Date.now() + 60_000);
+  const rejected = await (
+    await request("/api/v1/collection-directory/status")
+  ).text();
+  assert.equal(JSON.parse(rejected).error, "collectiondir_unauthorized");
+  bodies.push(rejected);
   for (const body of bodies) assert.doesNotMatch(body, new RegExp(token));
   assert.ok(
     directory.calls.every((call) => call.authorization === `Bearer ${token}`),
@@ -1191,12 +1212,10 @@ test("reconciliation sees every active crawl while the browser list is capped", 
 test("status reads share a short cache and the overview probe is bounded", async (t) => {
   const directory = await stubDirectory(t, () => ({ body: emptyStatus() }));
   const { request } = await fixture(t, directory.url);
-  for (let i = 0; i < 3; i++)
-    assert.equal(
-      (await (await request("/api/v1/collection-directory/status")).json())
-        .available,
-      true,
-    );
+  for (let i = 0; i < 3; i++) {
+    const response = await request("/api/v1/collection-directory/status"); // NOSONAR: sequential reads exercise the status cache
+    assert.equal((await response.json()).available, true); // NOSONAR: completes this read before the next
+  }
   assert.equal(
     directory.calls.filter((call) => call.path === "/admin/crawlStatus").length,
     1,

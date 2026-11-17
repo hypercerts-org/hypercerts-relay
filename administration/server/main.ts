@@ -118,8 +118,8 @@ async function run() {
 // anything that escapes it is a persistence failure.
 async function reconcileCrawls() {
   while (!stopping) {
-    await crawls.reconcile();
-    await new Promise((resolve) => setTimeout(resolve, 1000));
+    await crawls.reconcile(); // NOSONAR: a polling loop, one pass at a time
+    await new Promise((resolve) => setTimeout(resolve, 1000)); // NOSONAR: poll interval
   }
 }
 function persistenceFailed() {
