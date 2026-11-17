@@ -67,6 +67,44 @@ source is not complete, unavailable acquisition remains incomplete, and the
 administration API labels historical PDS attribution `unknown` rather than
 assigning old archive data to a currently observed host.
 
+## Automatic PDS discovery
+
+The optional `cmd/pdsdiscovery` service automates PDS admission through
+administration, so its changes go through the same journal and audit as an
+administrator's. This adds automatic PDS admission as a responsibility. It
+belongs to administration and is requested by the discovery service; it does
+not move into Relay or Jetstream.
+
+- Administration mounts the discovery `state` and `operations` routes under
+  `/api/v1/sources/discovery` only when `ADMIN_DISCOVERY_TOKEN_FILE` is
+  configured. Those two routes take a bearer machine token, not an OAuth
+  session; the token grants no access to any other `/api/v1` route, and a
+  browser session cannot use them. The `settings` route under the same prefix
+  is always available to administrators, with a session and CSRF.
+- `GET /api/v1/sources/discovery/state` returns the applied collection policy
+  and every Relay source with its desired state and account limit.
+- `POST /api/v1/sources/discovery/operations` accepts only two commands: a `source` with
+  state `enabled`, and an `account_quota` whose `accountLimit` is greater than
+  its `expectedLimit`. Every other command gets HTTP 403. Accepted operations
+  are recorded under the actor `service:pds-discovery`.
+- An operator's disable or remove always wins. The service skips any PDS that
+  is already a source in any state. Administration also refuses a machine
+  enable for a source that Relay reports as `disabled` or `removed`, both when
+  the request arrives and again before the worker applies it. It reports
+  `source_disabled_by_operator` (HTTP 409, or a failed operation).
+- There is no cap on the number of additions and no built-in denylist; an
+  optional denylist can exclude hosts. A host that the reference relay reports
+  as `banned` is not added.
+- An account limit is raised only for a PDS that this service added. The new
+  limit is the reference relay's account count rounded up to the next thousand,
+  and only when that count is above the threshold and the host is not
+  throttled there. The limit never exceeds the administrator-set maximum
+  (100,000 by default), which is changed in the Sources screen, audited as
+  `discovery_settings_changed`, and enforced by administration on every
+  discovery request.
+- Discovery is best effort. It is not evidence of complete source or
+  collection coverage.
+
 ## Acceptance mapping
 
 | Management operation | Owner and required evidence |

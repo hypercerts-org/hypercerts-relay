@@ -32,6 +32,7 @@ npm run server
 | `RELAY_PUBLIC_ORIGIN`          | Optional public Relay HTTPS origin displayed on the Overview page; never use the control URL.           |
 | `RAINBOW_PUBLIC_ORIGIN`        | Optional public Rainbow HTTPS origin displayed on the Overview page.                                    |
 | `JETSTREAM_PUBLIC_ORIGIN`      | Optional public Jetstream HTTPS origin displayed on the Overview page; never use the control URL.       |
+| `ADMIN_DISCOVERY_TOKEN_FILE`   | Optional machine token, at least 32 bytes, for `cmd/pdsdiscovery`. When unset, the discovery `state` and `operations` routes are not mounted. |
 
 The Relay independently uses `JETSTREAM_CONTROL_URL` and `JETSTREAM_CONTROL_TOKEN`
 for its durable source-lifecycle handoff to Jetstream. Configure both on the Relay
@@ -129,6 +130,7 @@ The browser-facing API is `/api/v1`; all endpoints below require authorization.
 | `GET /jobs`, `/coverage`                 | Jetstream job state, bounded execution diagnostics, last progress and inventory-failure details, and source/policy-scoped current-state coverage; optional exact `pds` filter. |
 | `GET /jobs/{id}/repositories`            | Lazy, cursor-paginated unresolved repository details from Jetstream's frozen inventory, including recorded failure times. |
 | `GET /limits`, `/status`, `/audit`       | Applied policies, bounded service health, durable actor-attributed history.                                |
+| `GET`, `POST /sources/discovery/settings` | Automatic PDS discovery settings: `{maxAccountLimit}`, a whole number of at least 1,000 (default 100,000). Changes are CSRF protected and audited as `discovery_settings_changed`. |
 
 Commands are discriminated by `kind`: `source` (`pds`, `state`), `collections`
 (`expectedRevision`, exact `collections`), `job` (`pds`, `reason`), `job_action`
@@ -176,6 +178,29 @@ work, resets eligible retries for incomplete jobs, and refreshes the inventory f
 failed jobs. The Backfill jobs table offers no Retry action for complete jobs.
 
 The administration UI presents the authoritative aggregate for all enabled sources under the current policy, independent of page and exact-source filters. It shows nullable initial inventory, verified scanned, matching, successful no-match, unresolved and attributable-record counts as job-wide evidence—not per-collection progress. Null remains Unknown while zero is a measured value. Failure category, last progress timestamp, attempts, affected repository DID and explicit retry action are shown only when supplied; throttling and incomplete work do not imply a retry countdown or ETA. History and live freshness remain independently unknown; completed acquisition does not establish either. Acquisition diagnostics show recorded repository retry and PDS cooldown deadlines and the current wait reason when supplied. Retry-waiting evidence without either deadline explicitly reports unknown timing; no countdown or ETA is inferred. Stopped work still requires the explicit job retry action when reported.
+
+### Machine API for PDS discovery
+
+When `ADMIN_DISCOVERY_TOKEN_FILE` is set, administration also serves the
+`state` and `operations` routes below under `/api/v1/sources/discovery`, which
+the optional [PDS discovery service](../cmd/pdsdiscovery/README.md) uses. These
+two routes require `Authorization: Bearer <token>`. They do not use OAuth
+sessions or CSRF. The token grants no access to any other `/api/v1` route, and
+a browser session cannot use these two routes. The discovery `settings` route
+under the same prefix is part of the browser API above and is always mounted.
+
+| Endpoint                | Contract                                                                                                     |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `GET /state`            | `{policyRevision, collections, sources: [{pds, state, accountLimit}], maxAccountLimit}`, covering every Relay source in any state. |
+| `POST /operations`      | Only a `source` command with state `enabled`, or an `account_quota` command that raises the limit. Requires a UUID `Idempotency-Key` and returns HTTP 202. Any other command returns HTTP 403. A source enable for a PDS that Relay reports as `disabled` or `removed` returns HTTP 409 `source_disabled_by_operator`. An account limit above the discovery maximum returns HTTP 403 `account_limit_above_discovery_maximum`. |
+
+Before applying a discovery operation, the worker checks again. An account
+limit above the current discovery maximum fails with
+`account_limit_above_discovery_maximum`. For a source enable, it checks Relay again. If an
+operator disabled or removed the source in the meantime, the operation fails
+with `source_disabled_by_operator` and nothing is changed. Machine operations use the normal journal and worker. They are recorded and
+audited under the actor `service:pds-discovery` and are shown on the Operations
+screen, where they can be retried or cancelled like any other operation.
 
 ## Rate policy
 

@@ -17,6 +17,13 @@ import {
 import { Store } from "./store.ts";
 import { Services } from "./services.ts";
 import type { AdministratorProfile } from "./profile.ts";
+import {
+  changeDiscoverySettings,
+  discoveryPrefix,
+  discoverySettings,
+  discoverySettingsInput,
+  machineRouter,
+} from "./machine.ts";
 
 export interface PublicServiceOrigins {
   relay?: string;
@@ -25,6 +32,9 @@ export interface PublicServiceOrigins {
 }
 export interface AppOptions extends ProxyOptions {
   publicServiceOrigins?: PublicServiceOrigins;
+  // Bearer token for the automatic PDS discovery service. When it is unset,
+  // the machine routes are not mounted.
+  machineToken?: string;
 }
 
 const page = z.object({
@@ -70,6 +80,8 @@ export function createApp(
   app.get("/oauth-client-metadata.json", (_req, res) => res.json(metadata));
   app.post("/auth/login", loginLimit(), (req, res) => auth.login(req, res));
   app.get("/auth/callback", (req, res) => auth.callback(req, res));
+  if (options.machineToken)
+    app.use(discoveryPrefix, machineRouter(store, services, options.machineToken));
   app.use("/api/v1", auth.require);
   app.get("/api/v1/session", (_req, res) => {
     const { did, csrf, expires } = res.locals.session as Session;
@@ -200,6 +212,15 @@ export function createApp(
       )
       .then((v) => res.json(v)),
   );
+  app.get(`${discoveryPrefix}/settings`, (_req, res) => {
+    res.json(discoverySettings(store));
+  });
+  app.post(`${discoveryPrefix}/settings`, (req, res) => {
+    const input = discoverySettingsInput.parse(req.body);
+    res.json(
+      changeDiscoverySettings(store, (res.locals.session as Session).did, input),
+    );
+  });
   app.get("/api/v1/policy", (_req, res) =>
     services.policy().then((v) => res.json(v)),
   );

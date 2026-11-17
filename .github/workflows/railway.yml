@@ -44,6 +44,10 @@ jobs:
             dockerfile: administration/Dockerfile
             context: .
             binary: /app/node_modules/.bin/tsx
+          - component: pdsdiscovery
+            dockerfile: cmd/pdsdiscovery/Dockerfile
+            context: .
+            binary: /pdsdiscovery
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       - name: Build canonical image without publishing
@@ -68,6 +72,7 @@ jobs:
             -e HC_RELAY_CONTROL_SECRET=deployment-fixture-credential-32-bytes \
             -e HC_JETSTREAM_CONTROL_SECRET=deployment-fixture-credential-32-bytes \
             -e HC_ADMIN_ENCRYPTION_SECRET=deployment-fixture-credential-32-bytes \
+            -e HC_DISCOVERY_SECRET=deployment-fixture-credential-32-bytes \
             "hypercerts-${COMPONENT}:check" "$@"
 
   required:
