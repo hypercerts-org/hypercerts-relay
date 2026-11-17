@@ -207,9 +207,15 @@ func validRepositoryCompletion(completion repositoryCompletion) bool {
 // applyCompletion records one repository completion on a job. It allocates
 // new evidence and timestamps instead of writing through shared pointers.
 func applyCompletion(job *Job, completion repositoryCompletion) {
+	_, alreadyCompleted := job.CompletedRepos[completion.DID]
 	job.CompletedRepos[completion.DID] = completion.CompletedRevision
 	job.Cursor = completion.Cursor
 	job.LastProgressAt = timePointer(completion.At)
+	// A newer journal revision may follow a completion folded by an older
+	// binary. The DID's evidence was already counted in that generation.
+	if alreadyCompleted {
+		return
+	}
 	if completion.Records == nil {
 		job.Evidence = nil
 		return

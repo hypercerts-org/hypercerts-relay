@@ -1018,7 +1018,13 @@ func inputFailure(ctx context.Context, code string) error {
 }
 
 func (p PDSProcessor) repository(ctx context.Context, client *atmossync.Client, job Job, entry atmossync.ListReposEntry) error {
-	snapshot, commit, err := p.acquireSnapshot(ctx, client, job, entry)
+	snapshot, commit, headers, err := p.acquireSnapshot(ctx, client, job, entry)
+	// Persist pacing outside the acquisition deadline: a sibling may hold the
+	// manager lock throughout reconciliation. Successful downloads still pace
+	// the origin even when verification or projection fails.
+	if paceErr := p.paceRateLimit(job, headers); paceErr != nil {
+		return paceErr
+	}
 	if err != nil {
 		return err
 	}
@@ -1045,41 +1051,38 @@ func (p PDSProcessor) repository(ctx context.Context, client *atmossync.Client, 
 
 // acquireSnapshot verifies the source, downloads and verifies the repository
 // and projects the selected records, all within repositoryAcquisitionTimeout.
-func (p PDSProcessor) acquireSnapshot(ctx context.Context, client *atmossync.Client, job Job, entry atmossync.ListReposEntry) (ingest.Snapshot, *repo.Commit, error) {
+func (p PDSProcessor) acquireSnapshot(ctx context.Context, client *atmossync.Client, job Job, entry atmossync.ListReposEntry) (ingest.Snapshot, *repo.Commit, http.Header, error) {
 	ctx, cancel := context.WithTimeout(ctx, repositoryAcquisitionTimeout)
 	defer cancel()
 	stageStartedAt := time.Now()
 	err := p.verifySource(ctx, entry.DID, job.PDS)
 	p.timings.record(repositoryStageIdentity, stageStartedAt)
 	if err != nil {
-		return ingest.Snapshot{}, nil, err
+		return ingest.Snapshot{}, nil, nil, err
 	}
 	// A sibling's 429 may have stopped the pass while this repository's
 	// identity was resolving; send no request after that.
 	if p.gate.isStopped() {
-		return ingest.Snapshot{}, nil, errRepositoryStartStopped
+		return ingest.Snapshot{}, nil, nil, errRepositoryStartStopped
 	}
 	stageStartedAt = time.Now()
 	capture := &pdsResponseCapture{}
 	r, commit, err := fetchRepository(context.WithValue(ctx, pdsResponseCaptureKey{}, capture), client, entry.DID)
 	p.timings.record(repositoryStageGetRepo, stageStartedAt)
 	if err != nil {
-		return ingest.Snapshot{}, nil, err
-	}
-	if err := p.paceRateLimit(job, capture.header); err != nil {
-		return ingest.Snapshot{}, nil, err
+		return ingest.Snapshot{}, nil, nil, err
 	}
 	stageStartedAt = time.Now()
 	err = p.verifySnapshot(ctx, job, entry, commit)
 	p.timings.record(repositoryStageIdentity, stageStartedAt)
 	if err != nil {
-		return ingest.Snapshot{}, nil, err
+		return ingest.Snapshot{}, nil, capture.header, err
 	}
 	snapshot, err := projectSnapshot(ctx, job, entry.DID, r, commit.Rev)
 	if err != nil {
-		return ingest.Snapshot{}, nil, err
+		return ingest.Snapshot{}, nil, capture.header, err
 	}
-	return snapshot, commit, nil
+	return snapshot, commit, capture.header, nil
 }
 
 // paceRateLimit cools the PDS origin down until just after its advertised

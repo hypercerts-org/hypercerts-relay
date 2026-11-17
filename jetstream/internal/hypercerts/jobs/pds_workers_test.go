@@ -711,3 +711,80 @@ func TestPDSProcessorReconcileQueueDoesNotExpireAcquisitionDeadline(t *testing.T
 		require.EqualValues(t, 1, fixture.getRepoByDID[index].Load(), "queue time must not fail or repeat an attempt")
 	}
 }
+
+func TestPDSProcessorPacingReconcileQueueDoesNotExpireAcquisitionDeadline(t *testing.T) {
+	const acquisitionTimeout = 300 * time.Millisecond
+	previous := repositoryAcquisitionTimeout
+	repositoryAcquisitionTimeout = acquisitionTimeout
+	t.Cleanup(func() { repositoryAcquisitionTimeout = previous })
+	const repos = 2
+	fixture := newLatencyFixture(t, repos, 0, 0, 0)
+	secondDownloadStarted := make(chan struct{})
+	reconcileStarted := make(chan struct{})
+	pacedResponseReady := make(chan struct{})
+	releaseReconcile := make(chan struct{})
+	var secondDownloadOnce, pacedResponseOnce, releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseReconcile) }) }
+	fixture.setGetRepoHook(func(request *http.Request, index int) *http.Response {
+		if index == 0 {
+			// Both attempts must start before the first reconciliation takes
+			// the manager lock, otherwise the second download cannot begin.
+			select {
+			case <-secondDownloadStarted:
+			case <-request.Context().Done():
+			}
+			return nil
+		}
+		secondDownloadOnce.Do(func() { close(secondDownloadStarted) })
+		select {
+		case <-reconcileStarted:
+		case <-request.Context().Done():
+			return nil
+		}
+		response := latencyFixtureResponse(request, http.StatusOK, "application/vnd.ipld.car", fixture.repos[index].car)
+		response.Header.Set("RateLimit-Remaining", "0")
+		response.Header.Set("RateLimit-Reset", strconv.FormatInt(time.Now().Add(3*time.Second).Unix(), 10))
+		pacedResponseOnce.Do(func() { close(pacedResponseReady) })
+		return response
+	})
+	fixture.setReconcileHook(func(ctx context.Context, snapshot ingest.Snapshot) error {
+		if snapshot.DID != fixture.repos[0].did {
+			return nil
+		}
+		close(reconcileStarted)
+		select {
+		case <-releaseReconcile:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+	m, db := openMemoryManager(t, vfs.NewMem())
+	defer db.Close()
+	job, err := m.AddSource(latencyFixturePDS)
+	require.NoError(t, err)
+	run := startManagerRun(m, fixture.processor(m, repos))
+	defer func() {
+		release()
+		run.stop(t)
+	}()
+	select {
+	case <-pacedResponseReady:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the pacing response did not arrive during the sibling reconciliation")
+	}
+	// Keep the manager lock held beyond the second acquisition's deadline.
+	// With pacing inside acquisition, its subsequent fresh identity lookup
+	// receives an expired context even though the download succeeded.
+	time.Sleep(2 * acquisitionTimeout)
+	release()
+	completed := requireJobState(t, m, job.ID, Complete, 15*time.Second)
+	requireCompleteEvidence(t, completed, repos)
+	for index := range fixture.repos {
+		require.EqualValues(t, 1, fixture.getRepoByDID[index].Load(), "pacing lock wait must not fail or repeat an attempt")
+	}
+	require.Nil(t, completed.LastFailure, "pacing lock wait must not record a failed attempt")
+	_, found, err := m.GetPDSCooldown(latencyFixturePDS)
+	require.NoError(t, err)
+	require.True(t, found, "the low-budget response still persists the pacing cooldown")
+}

@@ -175,6 +175,53 @@ func TestCompletionJournalReplayIsIdempotentAndIgnoresStaleGeneration(t *testing
 	require.Empty(t, journalKeys(t, db))
 }
 
+func TestCompletionJournalNewerRevisionDoesNotCountEvidenceAgain(t *testing.T) {
+	const newerRevision = "3l3qo2vutsw2c"
+	for name, records := range map[string]int{"matching": 2, "no_match": 0} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			m, db := newManager(t, dir)
+			job, err := m.AddSource("https://pds.example")
+			require.NoError(t, err)
+			worker, _ := startRepositoryWorker(t, m, job.ID, map[string]string{journalDIDA: journalRevision})
+			checkpointJournaled(t, m, job.ID, journalDIDA, records)
+			require.ErrorIs(t, worker.stop(), context.Canceled)
+			require.NoError(t, db.Close())
+
+			m, db = newManager(t, dir)
+			folded, err := m.Get(job.ID)
+			require.NoError(t, err)
+			require.Equal(t, journalRevision, persistedCompletedRepos(t, db, job.ID)[journalDIDA])
+			require.Equal(t, 1, folded.Evidence.Scanned)
+			// A downgrade can fold an older completion while leaving this
+			// newer revision from the same generation and listing unfolded.
+			row, err := json.Marshal(repositoryCompletion{
+				JobID: job.ID, DID: journalDIDA, ListedRevision: journalRevision,
+				CompletedRevision: newerRevision, Generation: folded.AcquisitionGeneration,
+				Records: &records, At: time.Now().UTC(),
+			})
+			require.NoError(t, err)
+			require.NoError(t, db.Set(repositoryCompletionKey(job.ID, journalDIDA), row, store.SyncWrites))
+			require.NoError(t, db.Close())
+
+			m, db = newManager(t, dir)
+			replayed, err := m.Get(job.ID)
+			require.NoError(t, err)
+			require.Equal(t, newerRevision, replayed.CompletedRepos[journalDIDA])
+			require.Equal(t, folded.Evidence, replayed.Evidence, "advancing a completed DID must not count its evidence again")
+			require.Empty(t, journalKeys(t, db))
+			require.NoError(t, db.Close())
+
+			m, db = newManager(t, dir)
+			defer db.Close()
+			again, err := m.Get(job.ID)
+			require.NoError(t, err)
+			require.Equal(t, replayed.CompletedRepos, again.CompletedRepos)
+			require.Equal(t, replayed.Evidence, again.Evidence)
+		})
+	}
+}
+
 func TestCompletionJournalCorruptRowFailsOpen(t *testing.T) {
 	for name, write := range map[string]func(*store.Store, string) error{
 		"undecodable": func(db *store.Store, jobID string) error {

@@ -12,3 +12,5 @@ resumes with fewer workers, and it pauses before the limit when the PDS reports
 its remaining request budget. Each worker can hold one repository of up to
 64 MiB in memory. A downgraded release downloads repositories checkpointed by
 this release since the job last saved its state again.
+Acquisition evidence counts each repository once after a downgrade and upgrade,
+and pacing waits do not use repository attempts.
