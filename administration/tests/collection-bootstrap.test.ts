@@ -177,7 +177,7 @@ async function fixture(t: TestContext, directoryURL: string | null) {
       const input = body as { pds: string; state: string };
       return relay.put(input.pds, input.state) as T;
     }
-    const pds = new URL(path, "http://relay").searchParams.get("pds")!;
+    const pds = new URLSearchParams(path.split("?")[1] ?? "").get("pds")!;
     const view = relay.sources.get(pds);
     if (!view) throw new ApiError(404, "relay_rejected_404");
     return structuredClone(view) as T;
@@ -772,7 +772,10 @@ test("the bootstraps route pages newest first", async (t) => {
   // Rows created in the same millisecond tie-break on operation ID, so only
   // the order of the keys and the complete, disjoint pages are asserted.
   const items = [...first.items, ...second.items];
-  assert.deepEqual(items.map((item) => item.pds).sort(), origins);
+  assert.deepEqual(
+    items.map((item) => item.pds).sort((a, b) => a.localeCompare(b)),
+    origins,
+  );
   const key = (item: CollectionBootstrapView) =>
     `${item.createdAt}|${item.sourceOperation}`;
   for (let i = 1; i < items.length; i++)
