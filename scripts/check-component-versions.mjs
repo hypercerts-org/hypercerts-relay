@@ -65,7 +65,7 @@ equal('administration/package-lock.json version', json('administration/package-l
 equal('administration/package-lock.json root package version', json('administration/package-lock.json').packages[''].version)
 match('Relay and Rainbow runtime version', 'hypercerts/version/version.go', /Version = "([^"]+)"/)
 match('Jetstream runtime version', 'jetstream/internal/version/version.go', /Version = "([^"]+)"/)
-for (const path of ['cmd/relay/Dockerfile', 'cmd/rainbow/Dockerfile', 'jetstream/Dockerfile', 'administration/Dockerfile']) {
+for (const path of ['cmd/relay/Dockerfile', 'cmd/rainbow/Dockerfile', 'jetstream/Dockerfile', 'administration/Dockerfile', 'cmd/pdsdiscovery/Dockerfile']) {
   matchAll(`${path} build version`, path, /ARG VERSION=([^\s]+)/g)
 }
 

@@ -1,6 +1,11 @@
 import { Store } from "./store.ts";
 import { Services } from "./services.ts";
 import { ApiError } from "./contracts.ts";
+import {
+  discoveryActor,
+  discoverySettings,
+  machineEnableBlocked,
+} from "./machine.ts";
 
 // One worker per database. Never infer archive completion from command acceptance.
 export class Worker {
@@ -41,6 +46,18 @@ export class Worker {
       )
         return;
       try {
+        // Discovery requests are re-checked at apply time, so an operator
+        // disable or a lowered maximum made after the request still wins.
+        if (op.actor === discoveryActor) {
+          if (
+            op.command.kind === "account_quota" &&
+            op.command.accountLimit >
+              discoverySettings(this.store).maxAccountLimit
+          )
+            throw new ApiError(403, "account_limit_above_discovery_maximum");
+          if (await machineEnableBlocked(this.services, op.command))
+            throw new ApiError(409, "source_disabled_by_operator");
+        }
         const result = await this.services.apply(op.command, op.id, (value) => {
           this.store.transition(op.id, "applying", value, null, undefined, [
             "applying",

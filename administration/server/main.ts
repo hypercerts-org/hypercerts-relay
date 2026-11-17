@@ -74,6 +74,9 @@ const server = createApp(
       (process.env.HC_RAILWAY_STARTUP === "1"
         ? ["loopback", "linklocal", "uniquelocal"]
         : undefined),
+    machineToken: process.env.ADMIN_DISCOVERY_TOKEN_FILE
+      ? secret("ADMIN_DISCOVERY_TOKEN_FILE")
+      : undefined,
     publicServiceOrigins: {
       relay: publicOrigin("RELAY_PUBLIC_ORIGIN"),
       rainbow: publicOrigin("RAINBOW_PUBLIC_ORIGIN"),

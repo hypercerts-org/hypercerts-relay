@@ -57,7 +57,7 @@ setLockfileRootVersion('administration/package-lock.json')
 // local image builds report the same release value before CI stamps metadata.
 replace('hypercerts/version/version.go', /Version = "[^"]+"/, `Version = "${version}"`)
 replace('jetstream/internal/version/version.go', /Version = "[^"]+"/, `Version = "${version}"`)
-for (const path of ['cmd/relay/Dockerfile', 'cmd/rainbow/Dockerfile', 'jetstream/Dockerfile', 'administration/Dockerfile']) {
+for (const path of ['cmd/relay/Dockerfile', 'cmd/rainbow/Dockerfile', 'jetstream/Dockerfile', 'administration/Dockerfile', 'cmd/pdsdiscovery/Dockerfile']) {
   const file = resolve(root, path)
   const source = readFileSync(file, 'utf8')
   if (!/ARG VERSION=[^\s]+/.test(source)) throw new Error(`expected version marker not found in ${path}`)

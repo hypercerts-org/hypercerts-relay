@@ -18,7 +18,7 @@ const fixtureSecret = "deployment-fixture-credential-32-bytes"
 // the Jetstream credential.
 const relayFixtureSecret = "relay-fixture-credential-differs-32-bytes"
 
-var allSecrets = []secretFile{relaySecret, jetstreamSecret, administrationSecret, jetstreamRelaySecret}
+var allSecrets = []secretFile{relaySecret, jetstreamSecret, administrationSecret, jetstreamRelaySecret, discoverySecret, administrationDiscoverySecret}
 
 func setup(t *testing.T) {
 	t.Helper()
@@ -36,7 +36,7 @@ func setup(t *testing.T) {
 }
 
 func TestSecretFiles(t *testing.T) {
-	for component, count := range map[string]int{"relay": 1, "jetstream": 2, "administration": 3, "rainbow": 0} {
+	for component, count := range map[string]int{"relay": 1, "jetstream": 2, "administration": 4, "pdsdiscovery": 1, "rainbow": 0} {
 		t.Run(component, func(t *testing.T) {
 			setup(t)
 			if err := prepare(component); err != nil {
@@ -166,5 +166,52 @@ func TestExecPassthrough(t *testing.T) {
 	}
 	if output.String() != strconv.Itoa(command.Process.Pid)+":argument preserved" {
 		t.Fatalf("PID or arguments changed across exec: %s", output.String())
+	}
+}
+
+// Administration mounts its discovery machine routes only when the shared
+// discovery credential is configured; it remains optional.
+func TestAdministrationDiscoverySecretIsOptional(t *testing.T) {
+	setup(t)
+	if err := os.Unsetenv(discoverySecret.input); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepare("administration"); err != nil {
+		t.Fatal(err)
+	}
+	if path := os.Getenv(administrationDiscoverySecret.output); path != "" {
+		t.Fatalf("unexpected %s without a discovery credential", administrationDiscoverySecret.output)
+	}
+	if os.Getenv(administrationSecret.output) == "" {
+		t.Fatal("administration lost its required credential")
+	}
+}
+
+func TestAdministrationRejectsShortDiscoverySecret(t *testing.T) {
+	setup(t)
+	t.Setenv(discoverySecret.input, "short")
+	if err := prepare("administration"); err == nil {
+		t.Fatal("expected a short discovery credential to fail")
+	}
+}
+
+// PDS discovery is stateless and must start without a Railway volume, but it
+// still requires its credential.
+func TestPDSDiscoveryNeedsNoVolume(t *testing.T) {
+	setup(t)
+	if err := os.Unsetenv("RAILWAY_VOLUME_MOUNT_PATH"); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepare("pdsdiscovery"); err != nil {
+		t.Fatal(err)
+	}
+	assertSecretFile(t, os.Getenv(discoverySecret.output), discoverySecret.output, fixtureSecret)
+
+	setup(t)
+	if err := os.Unsetenv(discoverySecret.input); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepare("pdsdiscovery"); err == nil {
+		t.Fatal("expected a missing discovery credential to fail")
 	}
 }

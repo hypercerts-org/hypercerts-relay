@@ -6,6 +6,7 @@
   import Operations from "./Operations.svelte";
   import Limits from "./Limits.svelte";
   import ArchiveKeys from "./ArchiveKeys.svelte";
+  import DiscoverySettings from "./DiscoverySettings.svelte";
   import State from "./State.svelte";
   import logo from "./brand/assets/logo/hypercerts.svg";
   import {
@@ -397,7 +398,7 @@
           rows={sources}
           {submit}
           {busy}
-        />
+        /><DiscoverySettings csrf={session.csrf} />
       {:else if screen === "collections"}{#if policyLoaded}<Collections
             {policy}
             {submit}

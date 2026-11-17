@@ -30,8 +30,13 @@ var administrationSecret = secretFile{"HC_ADMIN_ENCRYPTION_SECRET", "ADMIN_ENCRY
 // the same input as relaySecret because both services must hold the same value.
 var jetstreamRelaySecret = secretFile{"HC_RELAY_CONTROL_SECRET", "JETSTREAM_RELAY_CONTROL_TOKEN_FILE"}
 
+// The PDS discovery service and administration share one machine credential.
+// Administration mounts its machine routes only when the credential is present.
+var discoverySecret = secretFile{"HC_DISCOVERY_SECRET", "DISCOVERY_ADMIN_TOKEN_FILE"}
+var administrationDiscoverySecret = secretFile{"HC_DISCOVERY_SECRET", "ADMIN_DISCOVERY_TOKEN_FILE"}
+
 func clearRawSecrets() {
-	for _, secret := range []secretFile{relaySecret, jetstreamSecret, administrationSecret} {
+	for _, secret := range []secretFile{relaySecret, jetstreamSecret, administrationSecret, discoverySecret} {
 		_ = os.Unsetenv(secret.input)
 	}
 }
@@ -39,6 +44,7 @@ func clearRawSecrets() {
 func prepare(component string) error {
 	defer clearRawSecrets()
 	var secrets []secretFile
+	needsVolume := true
 	switch component {
 	case "relay":
 		secrets = []secretFile{relaySecret}
@@ -46,6 +52,13 @@ func prepare(component string) error {
 		secrets = []secretFile{jetstreamSecret, jetstreamRelaySecret}
 	case "administration":
 		secrets = []secretFile{relaySecret, jetstreamSecret, administrationSecret}
+		if os.Getenv(administrationDiscoverySecret.input) != "" {
+			secrets = append(secrets, administrationDiscoverySecret)
+		}
+	case "pdsdiscovery":
+		// Stateless: discovery keeps no local data, so it needs no volume.
+		secrets = []secretFile{discoverySecret}
+		needsVolume = false
 	case "rainbow":
 	default:
 		return errors.New("unknown service name")
@@ -54,7 +67,7 @@ func prepare(component string) error {
 	if os.Getenv("HC_RAILWAY_STARTUP") != "1" {
 		return nil
 	}
-	if os.Getenv("RAILWAY_VOLUME_MOUNT_PATH") != "/data" {
+	if needsVolume && os.Getenv("RAILWAY_VOLUME_MOUNT_PATH") != "/data" {
 		return errors.New("a persistent Railway volume mounted at /data is required")
 	}
 	for _, secret := range secrets {

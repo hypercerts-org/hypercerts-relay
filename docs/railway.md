@@ -97,6 +97,11 @@ Setting `HC_RAILWAY_STARTUP=1` enables the following runtime contract:
   source, the change commits without consulting it.
 - Administration consumes both service credentials and `HC_ADMIN_ENCRYPTION_SECRET`,
   setting the two service file paths and `ADMIN_ENCRYPTION_KEY_FILE`.
+- Administration also consumes the optional `HC_DISCOVERY_SECRET` and sets
+  `ADMIN_DISCOVERY_TOKEN_FILE`. Without it, the PDS discovery machine API stays
+  unmounted.
+- PDS discovery consumes `HC_DISCOVERY_SECRET` and sets
+  `DISCOVERY_ADMIN_TOKEN_FILE`. It is stateless and needs no volume.
 - Rainbow needs no credential conversion.
 
 ### Required variables per environment
@@ -123,6 +128,10 @@ listener and returns 404, which Jetstream reports as `policy_mirror_unavailable`
 | Administration | `HC_ADMIN_ENCRYPTION_SECRET` | At least 32 bytes |
 | Administration | `RELAY_CONTROL_URL` | `http://relay.railway.internal:2472` |
 | Administration | `JETSTREAM_CONTROL_URL` | `http://jetstream.railway.internal:6060` |
+| Administration | `HC_DISCOVERY_SECRET` | Optional; at least 32 bytes, and only with PDS discovery |
+| PDS discovery | `HC_RAILWAY_STARTUP` | `1` |
+| PDS discovery | `HC_DISCOVERY_SECRET` | Same value as the administration service |
+| PDS discovery | `DISCOVERY_ADMIN_URL` | Administration's private origin |
 
 `HC_RELAY_CONTROL_SECRET` must be identical on Relay, Jetstream and
 Administration. Bootstrap writes each service its own token file, so only the
@@ -136,7 +145,7 @@ after deploying.
 
 Credential values must contain at least 32 bytes after trimming whitespace. The
 helper creates a mode-0700 temporary directory and mode-0600 files, removes the
-three raw credential variables from the child environment, then executes the
+raw credential variables from the child environment, then executes the
 service. Keep values in the platform's secret store, never in source, Docker build
 arguments, image layers, command history or CI logs. Keep the OAuth encryption key
 stable with its database; coordinate service-token rotation with client restarts.
