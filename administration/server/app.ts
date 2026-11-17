@@ -24,6 +24,8 @@ import {
   discoverySettingsInput,
   machineRouter,
 } from "./machine.ts";
+import { CollectionCrawls } from "./collection-crawls.ts";
+import { Collectiondir } from "./collectiondir.ts";
 
 export interface PublicServiceOrigins {
   relay?: string;
@@ -35,6 +37,8 @@ export interface AppOptions extends ProxyOptions {
   // Bearer token for the automatic PDS discovery service. When it is unset,
   // the machine routes are not mounted.
   machineToken?: string;
+  // Absent means the collection directory is not configured.
+  collectionCrawls?: CollectionCrawls;
 }
 
 const page = z.object({
@@ -49,6 +53,9 @@ export function createApp(
   staticDir?: string,
   options: AppOptions = {},
 ) {
+  const crawls =
+    options.collectionCrawls ??
+    new CollectionCrawls(store, services, new Collectiondir(null));
   const app = express();
   app.disable("x-powered-by");
   app.set("trust proxy", options.trustProxy ?? false);
@@ -131,6 +138,8 @@ export function createApp(
   app.post("/api/v1/operations", operationBody, (req, res) => {
     const input = command.parse(req.body),
       key = z.uuid().parse(req.get("Idempotency-Key"));
+    if (input.kind === "collection_crawl" && !crawls.configured)
+      throw new ApiError(409, "collectiondir_not_configured");
     res
       .status(202)
       .json(store.request((res.locals.session as Session).did, input, key));
@@ -286,6 +295,19 @@ export function createApp(
       next: coverage.nextCursor ?? null,
     });
   });
+  app.get("/api/v1/collection-directory/status", async (_req, res) => {
+    res.json(await crawls.status());
+  });
+  app.get("/api/v1/collection-directory/crawls", (req, res) => {
+    const p = page.parse(req.query);
+    res.json(
+      crawls.page(
+        p.after,
+        p.limit,
+        req.query.pds ? origin.parse(req.query.pds) : undefined,
+      ),
+    );
+  });
   app.get("/api/v1/limits", (req, res) =>
     services
       .call(
@@ -295,13 +317,18 @@ export function createApp(
       .then((v) => res.json(v)),
   );
   app.get("/api/v1/status", async (_req, res) => {
-    const checks = await Promise.allSettled([
-      services.sources(),
-      services.policy(),
+    const [checks, directory] = await Promise.all([
+      Promise.allSettled([services.sources(), services.policy()]),
+      crawls.status(),
     ]);
     res.json({
       relay: checks[0].status === "fulfilled" ? "available" : "unavailable",
       jetstream: checks[1].status === "fulfilled" ? "available" : "unavailable",
+      collectiondir: !directory.configured
+        ? "not_configured"
+        : directory.available
+          ? "available"
+          : "unavailable",
       publicServiceOrigins: options.publicServiceOrigins ?? {},
       observedAt: new Date().toISOString(),
     });

@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import Administrators from "./Administrators.svelte";
   import Sources from "./Sources.svelte";
+  import CollectionDirectory from "./CollectionDirectory.svelte";
   import Collections from "./Collections.svelte";
   import Operations from "./Operations.svelte";
   import Limits from "./Limits.svelte";
@@ -22,7 +23,14 @@
     type Audit,
     type Limit,
     type Administrator,
+    type CollectionCrawl,
+    type CollectionDirectoryStatus,
   } from "./api";
+  import {
+    createDirectoryPoller,
+    crawlNotice,
+    type DirectoryPoller,
+  } from "./collectionDirectory";
   const navigation = [
     { label: "", items: [["overview", "Overview"]] },
     {
@@ -40,6 +48,10 @@
         ["coverage", "Coverage"],
         ["archive-keys", "Consumer API keys"],
       ],
+    },
+    {
+      label: "Discovery",
+      items: [["collection-directory", "Collection directory"]],
     },
     {
       label: "Administration",
@@ -79,9 +91,16 @@
     globalLimits: Limit[] = [];
   let nextOperationAudit: string | null = null,
     nextHistoryAudit: string | null = null;
+  let directory: CollectionDirectoryStatus | null = null,
+    crawls: CollectionCrawl[] = [],
+    nextCrawls: string | null = null,
+    olderCrawlsLoaded = false,
+    poller: DirectoryPoller | null = null;
+  const directoryScreen = ["sources", "collection-directory"].includes(screen);
   let status: {
       relay: string;
       jetstream: string;
+      collectiondir?: string;
       publicServiceOrigins: {
         relay?: string;
         rainbow?: string;
@@ -151,6 +170,9 @@
           next = limitPage.next;
           break;
         }
+        case "collection-directory":
+          next = null;
+          break;
         case "audit": {
           const [operationPage, auditPage] = await Promise.all([
             api<{ items: Operation[]; next: string | null }>("/operations"),
@@ -175,7 +197,76 @@
     } finally {
       loading = false;
     }
+    if (directoryScreen) {
+      // Collection directory problems are shown on the page, never as a
+      // load failure: Relay source management must keep working without it.
+      try {
+        await refreshDirectory();
+      } catch {
+        directory = {
+          configured: true,
+          available: false,
+          error: "status_request_failed",
+          observedAt: new Date().toISOString(),
+          processStartedAt: null,
+          historySupported: false,
+          active: [],
+          recent: [],
+        };
+      }
+      poller?.update();
+    }
   }
+  async function refreshDirectory() {
+    const [directoryStatus, crawlPage] = await Promise.all([
+      api<CollectionDirectoryStatus>("/collection-directory/status"),
+      api<{ items: CollectionCrawl[]; next: string | null }>(
+        "/collection-directory/crawls?limit=100",
+      ),
+    ]);
+    directory = directoryStatus;
+    if (olderCrawlsLoaded) {
+      // Keep older pages the operator loaded; refresh only the newest rows.
+      const fresh = new Set(crawlPage.items.map((row) => row.id));
+      crawls = [
+        ...crawlPage.items,
+        ...crawls.filter((row) => !fresh.has(row.id)),
+      ];
+    } else {
+      crawls = crawlPage.items;
+      nextCrawls = crawlPage.next;
+    }
+  }
+  async function moreCrawls() {
+    if (!nextCrawls) return;
+    try {
+      const olderPage = await api<{
+        items: CollectionCrawl[];
+        next: string | null;
+      }>(
+        `/collection-directory/crawls?limit=100&after=${encodeURIComponent(nextCrawls)}`,
+      );
+      const known = new Set(crawls.map((row) => row.id));
+      crawls = [
+        ...crawls,
+        ...olderPage.items.filter((row) => !known.has(row.id)),
+      ];
+      nextCrawls = olderPage.next;
+      olderCrawlsLoaded = true;
+    } catch (e) {
+      error = (e as Error).message;
+    }
+  }
+  function crawlActive() {
+    return (
+      directoryScreen &&
+      ((directory?.active.length ?? 0) > 0 ||
+        crawls.some((row) => row.state === "accepted") ||
+        (operation?.command.kind === "collection_crawl" &&
+          ["requested", "applying"].includes(operation.state)))
+    );
+  }
+  $: crawlMessage = crawlNotice(operation, crawls);
   async function submit(command: Command) {
     busy = true;
     error = "";
@@ -268,6 +359,14 @@
   }
   onMount(() => {
     let active = true;
+    poller = createDirectoryPoller(async () => {
+      await refreshDirectory();
+      if (
+        operation?.command.kind === "collection_crawl" &&
+        ["requested", "applying"].includes(operation.state)
+      )
+        operation = await api<Operation>(`/operations/${operation.id}`);
+    }, crawlActive);
     void api<typeof session>("/session")
       .then(async (value) => {
         if (active) {
@@ -281,6 +380,7 @@
       });
     return () => {
       active = false;
+      poller?.stop();
     };
   });
 </script>
@@ -385,7 +485,7 @@
                 "_",
                 " ",
               ) ?? ""} <a href="/audit">View audit log</a>
-            </div>{/if}
+            </div>{#if crawlMessage}<p>{crawlMessage}</p>{/if}{/if}
         </div>{/if}
       {#if screen === "manage-adminis"}<Administrators
           rows={administrators}
@@ -398,7 +498,17 @@
           rows={sources}
           {submit}
           {busy}
+          {directory}
+          {crawls}
         /><DiscoverySettings csrf={session.csrf} />
+      {:else if screen === "collection-directory"}<CollectionDirectory
+          {directory}
+          {crawls}
+          hasMore={!!nextCrawls}
+          more={moreCrawls}
+          {submit}
+          {busy}
+        />
       {:else if screen === "collections"}{#if policyLoaded}<Collections
             {policy}
             {submit}
@@ -444,6 +554,10 @@
             <div>
               <dt>Jetstream</dt>
               <dd><State value={status?.jetstream ?? "unknown"} /></dd>
+            </div>
+            <div>
+              <dt>Collection directory</dt>
+              <dd><State value={status?.collectiondir ?? "unknown"} /></dd>
             </div>
             <div>
               <dt>Relay public endpoint</dt>
@@ -501,7 +615,7 @@
           >
         </section>
       {/if}
-      {#if !["overview", "collections", "archive-keys", "audit"].includes(screen)}<nav
+      {#if !["overview", "collections", "archive-keys", "audit", "collection-directory"].includes(screen)}<nav
           class="pagination"
           aria-label="Result pages"
         >

@@ -102,6 +102,9 @@ Setting `HC_RAILWAY_STARTUP=1` enables the following runtime contract:
   unmounted.
 - PDS discovery consumes `HC_DISCOVERY_SECRET` and sets
   `DISCOVERY_ADMIN_TOKEN_FILE`. It is stateless and needs no volume.
+- Administration also consumes the optional `HC_COLLECTIONDIR_CONTROL_SECRET`
+  and sets `COLLECTIONDIR_CONTROL_TOKEN_FILE`. When the variable is unset or
+  empty, no file is written and collection directory crawls stay disabled.
 - Rainbow needs no credential conversion.
 
 ### Required variables per environment
@@ -132,6 +135,22 @@ listener and returns 404, which Jetstream reports as `policy_mirror_unavailable`
 | PDS discovery | `HC_RAILWAY_STARTUP` | `1` |
 | PDS discovery | `HC_DISCOVERY_SECRET` | Same value as the administration service |
 | PDS discovery | `DISCOVERY_ADMIN_URL` | Administration's private origin |
+
+### Optional: collection directory crawls
+
+To let operators request collection directory crawls from Administration, also set:
+
+| Service | Variable | Value |
+| --- | --- | --- |
+| Administration | `COLLECTIONDIR_CONTROL_URL` | `http://collectiondir.railway.internal:2510` |
+| Administration | `HC_COLLECTIONDIR_CONTROL_SECRET` | Same value as the collection directory's `COLLECTIONS_ADMIN_TOKEN`, at least 32 bytes |
+
+Set both or neither; Administration fails startup if only the URL or only the
+token file is present. The collection directory must listen on `[::]:2510` so the
+private hostname reaches it, and its API port must have no public domain: the
+admin endpoints share that listener. Deploy the collection directory and
+Administration from the same release, because Administration reads the per-host
+crawl replies added alongside this setting.
 
 `HC_RELAY_CONTROL_SECRET` must be identical on Relay, Jetstream and
 Administration. Bootstrap writes each service its own token file, so only the

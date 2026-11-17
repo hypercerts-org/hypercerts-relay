@@ -11,10 +11,19 @@
     type CoveragePage,
     type JetstreamSummary,
     type Command,
+    type CollectionCrawl,
+    type CollectionDirectoryStatus,
   } from "./api";
+  import {
+    crawlEligible,
+    crawlSummary,
+    directoryMessage,
+  } from "./collectionDirectory";
   export let rows: Source[] = [];
   export let submit: (command: Command) => Promise<void>;
   export let busy = false;
+  export let directory: CollectionDirectoryStatus | null = null;
+  export let crawls: CollectionCrawl[] = [];
   let pds = "",
     search = "",
     selected: Source | null = null,
@@ -29,6 +38,13 @@
     .toLowerCase()
     .replace(/^https?:\/\//, "");
   $: jetstreamStats = coverage ?? selected?.JetstreamCoverage ?? null;
+  $: crawlBlocked = directoryMessage(directory);
+  $: activeCrawls = new Map(
+    (directory?.active ?? []).map((crawl) => [crawl.pds, crawl]),
+  );
+  $: selectedCrawl = selected
+    ? (crawls.find((row) => row.pds === sourceOrigin(selected!)) ?? null)
+    : null;
   $: displayedRows = filter
     ? rows.filter((source) => source.Hostname.toLowerCase().includes(filter))
     : rows;
@@ -209,6 +225,9 @@
   <button>Filter</button>
 </form>
 {#if error}<p role="alert" class="error">{error}</p>{/if}
+{#if crawlBlocked}<p class="note" role="status" id="crawl-blocked">
+    {crawlBlocked}
+  </p>{/if}
 {#if selected}
   <section class="detail" aria-label="Source detail">
     {#if detailUnavailable}<p class="error" role="status">
@@ -423,6 +442,56 @@
         {/if}
       </dl>
     </section>
+    <section class="detail" aria-label="Collection directory crawl">
+      <h3>Collection directory</h3>
+      <dl>
+        <div>
+          <dt>Latest crawl</dt>
+          <dd>
+            {crawlSummary(
+              selectedCrawl,
+              activeCrawls.get(sourceOrigin(selected)),
+            )}
+          </dd>
+        </div>
+        {#if selectedCrawl}
+          <div>
+            <dt>Requested</dt>
+            <dd>
+              {recordedTime(selectedCrawl.acceptedAt)}<small
+                >by {selectedCrawl.actorHandle
+                  ? `@${selectedCrawl.actorHandle}`
+                  : selectedCrawl.actor}</small
+              >
+            </dd>
+          </div>
+          <div>
+            <dt>Crawl started</dt>
+            <dd>{recordedTime(selectedCrawl.crawlStartedAt ?? undefined)}</dd>
+          </div>
+          <div>
+            <dt>Repositories described</dt>
+            <dd>
+              {activeCrawls.get(selectedCrawl.pds)?.reposDescribed ??
+                selectedCrawl.reposDescribed ??
+                "Not reported"}
+            </dd>
+          </div>
+          <div>
+            <dt>Could not be described</dt>
+            <dd>
+              {activeCrawls.get(selectedCrawl.pds)?.describeErrors ??
+                selectedCrawl.describeErrors ??
+                "Not reported"}
+            </dd>
+          </div>
+        {/if}
+      </dl>
+      <p class="note">
+        Results are candidate DID/collection pairs, not an authoritative
+        inventory.
+      </p>
+    </section>
     {#key sourceOrigin(selected)}
       <AccountQuota
         source={selected}
@@ -528,7 +597,21 @@
                     pds: sourceOrigin(source),
                     state: "removed",
                   })}>Remove</button
-              >
+              >{#if crawlEligible(source)}{#if activeCrawls.has(sourceOrigin(source))}<button
+                    disabled
+                    >Crawling… {activeCrawls.get(sourceOrigin(source))
+                      ?.reposDescribed} repositories described</button
+                  >{:else}<button
+                    disabled={busy || !!crawlBlocked}
+                    aria-describedby={crawlBlocked
+                      ? "crawl-blocked"
+                      : undefined}
+                    onclick={() =>
+                      submit({
+                        kind: "collection_crawl",
+                        scope: sourceOrigin(source),
+                      })}>Crawl collection directory</button
+                  >{/if}{/if}
             </div></td
           ></tr
         >

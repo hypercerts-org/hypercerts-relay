@@ -6,6 +6,8 @@ import {
   discoverySettings,
   machineEnableBlocked,
 } from "./machine.ts";
+import { CollectionCrawls } from "./collection-crawls.ts";
+import { Collectiondir } from "./collectiondir.ts";
 
 // One worker per database. Never infer archive completion from command acceptance.
 export class Worker {
@@ -13,6 +15,11 @@ export class Worker {
   constructor(
     private readonly store: Store,
     private readonly services: Services,
+    private readonly crawls: CollectionCrawls = new CollectionCrawls(
+      store,
+      services,
+      new Collectiondir(null),
+    ),
   ) {}
   recover() {
     const pending = this.store.db
@@ -58,11 +65,19 @@ export class Worker {
           if (await machineEnableBlocked(this.services, op.command))
             throw new ApiError(409, "source_disabled_by_operator");
         }
-        const result = await this.services.apply(op.command, op.id, (value) => {
-          this.store.transition(op.id, "applying", value, null, undefined, [
-            "applying",
-          ]);
-        });
+        const result =
+          op.command.kind === "collection_crawl"
+            ? await this.crawls.apply(op)
+            : await this.services.apply(op.command, op.id, (value) => {
+                this.store.transition(
+                  op.id,
+                  "applying",
+                  value,
+                  null,
+                  undefined,
+                  ["applying"],
+                );
+              });
         this.store.transition(op.id, "applied", result, null, undefined, [
           "applying",
         ]);

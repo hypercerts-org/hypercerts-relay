@@ -35,15 +35,21 @@ var jetstreamRelaySecret = secretFile{"HC_RELAY_CONTROL_SECRET", "JETSTREAM_RELA
 var discoverySecret = secretFile{"HC_DISCOVERY_SECRET", "DISCOVERY_ADMIN_TOKEN_FILE"}
 var administrationDiscoverySecret = secretFile{"HC_DISCOVERY_SECRET", "ADMIN_DISCOVERY_TOKEN_FILE"}
 
+// collectiondirSecret is optional: Administration enables its collection
+// directory crawl action only when this credential is supplied.
+var collectiondirSecret = secretFile{"HC_COLLECTIONDIR_CONTROL_SECRET", "COLLECTIONDIR_CONTROL_TOKEN_FILE"}
+
 func clearRawSecrets() {
-	for _, secret := range []secretFile{relaySecret, jetstreamSecret, administrationSecret, discoverySecret} {
+	for _, secret := range []secretFile{relaySecret, jetstreamSecret, administrationSecret, discoverySecret, collectiondirSecret} {
 		_ = os.Unsetenv(secret.input)
 	}
 }
 
 func prepare(component string) error {
 	defer clearRawSecrets()
-	var secrets []secretFile
+	// optional secrets are converted only when their input is set; once set,
+	// they must meet the same length rule as required secrets.
+	var secrets, optional []secretFile
 	needsVolume := true
 	switch component {
 	case "relay":
@@ -52,9 +58,7 @@ func prepare(component string) error {
 		secrets = []secretFile{jetstreamSecret, jetstreamRelaySecret}
 	case "administration":
 		secrets = []secretFile{relaySecret, jetstreamSecret, administrationSecret}
-		if os.Getenv(administrationDiscoverySecret.input) != "" {
-			secrets = append(secrets, administrationDiscoverySecret)
-		}
+		optional = []secretFile{administrationDiscoverySecret, collectiondirSecret}
 	case "pdsdiscovery":
 		// Stateless: discovery keeps no local data, so it needs no volume.
 		secrets = []secretFile{discoverySecret}
@@ -69,6 +73,11 @@ func prepare(component string) error {
 	}
 	if needsVolume && os.Getenv("RAILWAY_VOLUME_MOUNT_PATH") != "/data" {
 		return errors.New("a persistent Railway volume mounted at /data is required")
+	}
+	for _, secret := range optional {
+		if os.Getenv(secret.input) != "" {
+			secrets = append(secrets, secret)
+		}
 	}
 	for _, secret := range secrets {
 		if len(strings.TrimSpace(os.Getenv(secret.input))) < 32 {

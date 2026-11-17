@@ -175,6 +175,10 @@ export class Services {
           scope: command.scope,
           eventsPerSecond: command.eventsPerSecond,
         });
+      case "collection_crawl":
+        // The Worker routes these to CollectionCrawls; Relay and Jetstream
+        // have no part in a collection directory crawl.
+        throw new ApiError(400, "collection_crawl_not_a_service_command");
     }
   }
   private async applyQuotaRecovery(
@@ -263,7 +267,7 @@ async function controlError(
   );
 }
 
-async function readControlBody<T>(response: Response): Promise<T> {
+export async function readControlBody<T>(response: Response): Promise<T> {
   const reader = response.body!.getReader();
   const chunks: Uint8Array[] = [];
   let size = 0;
@@ -430,7 +434,10 @@ async function remoteArchiveError(response: Response): Promise<string | null> {
     : null;
 }
 
-function allowedControlTransport(url: URL, railwayPrivateNetwork: boolean) {
+export function allowedControlTransport(
+  url: URL,
+  railwayPrivateNetwork: boolean,
+) {
   if (url.protocol === "https:") return true;
   if (url.protocol !== "http:") return false;
   if (["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)) return true;

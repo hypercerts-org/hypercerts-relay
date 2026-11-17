@@ -24,7 +24,10 @@ export class Store {
       CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, did TEXT NOT NULL, csrf TEXT NOT NULL, expires INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS administrators (did TEXT PRIMARY KEY);
       CREATE INDEX IF NOT EXISTS operations_state ON operations(state,createdAt,id);
-      CREATE INDEX IF NOT EXISTS operations_created ON operations(createdAt,id);`);
+      CREATE INDEX IF NOT EXISTS operations_created ON operations(createdAt,id);
+      CREATE TABLE IF NOT EXISTS collection_crawls (id TEXT PRIMARY KEY, operation TEXT NOT NULL, pds TEXT NOT NULL, actor TEXT NOT NULL, cause TEXT NOT NULL DEFAULT 'manual', submission TEXT NOT NULL, state TEXT NOT NULL, requestedAt TEXT NOT NULL, acceptedAt TEXT NOT NULL, crawlStartedAt TEXT, finishedAt TEXT, reposDescribed INTEGER, describeErrors INTEGER, errorCategory TEXT, httpStatus INTEGER, observedAt TEXT, UNIQUE(operation,pds));
+      CREATE INDEX IF NOT EXISTS collection_crawls_state ON collection_crawls(state,requestedAt);
+      CREATE INDEX IF NOT EXISTS collection_crawls_recent ON collection_crawls(requestedAt,id);`);
     const auditColumns = this.db.prepare("PRAGMA table_info(audit)").all() as {
       name: string;
     }[];

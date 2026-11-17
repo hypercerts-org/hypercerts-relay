@@ -33,6 +33,8 @@ npm run server
 | `RAINBOW_PUBLIC_ORIGIN`        | Optional public Rainbow HTTPS origin displayed on the Overview page.                                    |
 | `JETSTREAM_PUBLIC_ORIGIN`      | Optional public Jetstream HTTPS origin displayed on the Overview page; never use the control URL.       |
 | `ADMIN_DISCOVERY_TOKEN_FILE`   | Optional machine token, at least 32 bytes, for `cmd/pdsdiscovery`. When unset, the discovery `state` and `operations` routes are not mounted. |
+| `COLLECTIONDIR_CONTROL_URL`        | Optional private collection directory origin, such as `http://collectiondir.railway.internal:2510`. Unset disables crawls. |
+| `COLLECTIONDIR_CONTROL_TOKEN_FILE` | File containing the collection directory's `COLLECTIONS_ADMIN_TOKEN`, at least 32 bytes. Required with the URL. |
 
 The Relay independently uses `JETSTREAM_CONTROL_URL` and `JETSTREAM_CONTROL_TOKEN`
 for its durable source-lifecycle handoff to Jetstream. Configure both on the Relay
@@ -58,6 +60,13 @@ Control URLs reject plaintext HTTP except loopback and single-service
 `*_PUBLIC_ORIGIN` values accept only HTTPS origins (or loopback HTTP for local
 development) and are display-only; they must not expose private management/debug
 listeners. No component is deployed by this change.
+
+`COLLECTIONDIR_CONTROL_URL` and `COLLECTIONDIR_CONTROL_TOKEN_FILE` are optional
+and must be set together; if exactly one is set, startup fails. The URL follows
+the same transport rules as the other control URLs and must not equal the Relay
+or Jetstream control origin or any `*_PUBLIC_ORIGIN`. The collection directory
+itself accepts any nonempty token, but Administration requires at least 32 bytes,
+so set a `COLLECTIONS_ADMIN_TOKEN` of that length before enabling crawls.
 
 `/oauth-client-metadata.json` must be reachable by authorization servers at the
 public origin. OAuth uses the maintained AT Protocol Node client for discovery,
@@ -129,13 +138,16 @@ The browser-facing API is `/api/v1`; all endpoints below require authorization.
 | `GET /policy`                            | Jetstream's applied collection-policy revision.                                                            |
 | `GET /jobs`, `/coverage`                 | Jetstream job state, bounded execution diagnostics, last progress and inventory-failure details, and source/policy-scoped current-state coverage; optional exact `pds` filter. |
 | `GET /jobs/{id}/repositories`            | Lazy, cursor-paginated unresolved repository details from Jetstream's frozen inventory, including recorded failure times. |
-| `GET /limits`, `/status`, `/audit`       | Applied policies, bounded service health, durable actor-attributed history.                                |
+| `GET /limits`, `/status`, `/audit`       | Applied policies, bounded service health, durable actor-attributed history. `/status` includes `collectiondir`: `available`, `unavailable` or `not_configured`. |
 | `GET`, `POST /sources/discovery/settings` | Automatic PDS discovery settings: `{maxAccountLimit}`, a whole number of at least 1,000 (default 100,000). Changes are CSRF protected and audited as `discovery_settings_changed`. |
+| `GET /collection-directory/status`       | Always HTTP 200: `configured`, `available`, bounded `error` code, active crawls and recent crawl results.   |
+| `GET /collection-directory/crawls`       | Newest-first crawl requests with actor, times, submission, state and result; optional exact `pds` filter.  |
 
 Commands are discriminated by `kind`: `source` (`pds`, `state`), `collections`
 (`expectedRevision`, exact `collections`), `job` (`pds`, `reason`), `job_action`
-(`id`, `action`), `account_quota` (`pds`, `expectedLimit`, `accountLimit`), and
-`limit` (`scope`, `eventsPerSecond`). Bodies are limited to
+(`id`, `action`), `account_quota` (`pds`, `expectedLimit`, `accountLimit`),
+`limit` (`scope`, `eventsPerSecond`), and `collection_crawl` (`scope`: `all` or a
+PDS origin). Bodies are limited to
 64 KiB. Lists use bounded pages and opaque `after` cursors; restart pagination to
 include newly added items that sort before the current cursor. Collection lists
 are limited to 1,000 exact NSIDs per request.
@@ -201,6 +213,41 @@ operator disabled or removed the source in the meantime, the operation fails
 with `source_disabled_by_operator` and nothing is changed. Machine operations use the normal journal and worker. They are recorded and
 audited under the actor `service:pds-discovery` and are shown on the Operations
 screen, where they can be retried or cancelled like any other operation.
+
+## Collection directory crawls
+
+When the collection directory is configured, **PDS sources** offers **Crawl
+collection directory** for each enabled, validation-passed HTTPS source, and
+**Collection directory** offers **Crawl all enabled sources** after a
+confirmation. Without configuration, or while the directory is unreachable, the
+actions are disabled with an explanation; source management keeps working.
+
+Each request is a `collection_crawl` journal operation. When it is applied, the
+service checks each source against Relay, sends `https://<Relay hostname>` to the
+collection directory, and records one crawl row per source with the actor and
+time, and an audit entry. A source that is disabled, unvalidated, unknown to
+Relay or plaintext fails the operation without contacting the directory. An
+unreachable directory leaves the operation `incomplete` for an explicit retry.
+
+`applied` means the directory accepted the request, not that the crawl finished.
+If a crawl of that source was already running, the request is still applied, no
+second crawl starts, and the page explains this. The service then polls the
+directory every five seconds while crawls are open, and the browser refreshes
+every five seconds while anything is running:
+
+| State      | Meaning                                                                                           |
+| ---------- | ------------------------------------------------------------------------------------------------- |
+| `accepted` | The directory took the request; the crawl is running or not yet observed.                         |
+| `finished` | The repository listing ended. Repositories that could not be described are counted separately.     |
+| `failed`   | The listing stopped early; a bounded category and HTTP status are shown, never raw response text. |
+| `unknown`  | The directory restarted or no longer reports the result, so the outcome cannot be known.          |
+
+Crawl results are candidate DID/collection pairs for
+`com.atproto.sync.listReposByCollection`, not an authoritative inventory. A crawl
+does not admit a source to Relay and is not a Jetstream backfill. See
+[the collection directory guide](../cmd/collectiondir/README.md). The PDS
+discovery machine API cannot request crawls; it rejects `collection_crawl` with
+HTTP 403.
 
 ## Rate policy
 

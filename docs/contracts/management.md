@@ -105,6 +105,19 @@ not move into Relay or Jetstream.
 - Discovery is best effort. It is not evidence of complete source or
   collection coverage.
 
+## Collection directory crawls
+
+Administration may ask the optional collection directory to crawl enabled,
+validation-passed HTTPS sources through a `collection_crawl` operation. It checks
+each source against Relay when the operation is applied, sends only
+`https://<Relay hostname>` to the directory's bearer-authenticated
+`/admin/pds/requestCrawl`, and records one actor-attributed crawl row and audit
+entry per accepted source. `applied` means the directory accepted the request.
+Administration then follows `/admin/crawlStatus` and records whether the crawl
+finished, failed with a bounded category, or has an unknown outcome after a
+directory restart. A crawl adds candidate DID/collection pairs only: it is not
+Relay admission, not Jetstream backfill and not proof of current records.
+
 ## Acceptance mapping
 
 | Management operation | Owner and required evidence |
@@ -114,6 +127,7 @@ not move into Relay or Jetstream.
 | Job submission, retry and cancellation | Jetstream; [TECH-596](https://linear.app/hypercerts/issue/TECH-596/backfill-record-collections-for-a-pds) |
 | Global or PDS raw-frame rate policy | Relay; [TECH-602](https://linear.app/hypercerts/issue/TECH-602/manage-global-and-pds-specific-relay-rate-limits) |
 | Administrator membership, session revocation and CSRF-protected mutation | Administration; [TECH-599](https://linear.app/hypercerts/issue/TECH-599/secure-the-relay-administration-api-with-at-protocol-oauth) |
+| Manual collection directory crawl of one or all enabled sources | Administration and collection directory; [TECH-900](https://linear.app/hypercerts/issue/TECH-900/add-a-manual-collectiondir-crawl-action-to-the-administration-interface) |
 
 Neither the rate-limit nor administration work has production OAuth qualification
 or a deployment claim.

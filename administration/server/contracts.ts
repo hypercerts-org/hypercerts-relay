@@ -122,6 +122,14 @@ export const command = z.discriminatedUnion("kind", [
       eventsPerSecond: rate,
     })
     .strict(),
+  // Asks the collection directory to crawl one enabled source, or every
+  // enabled source. Applied means the directory accepted the request.
+  z
+    .object({
+      kind: z.literal("collection_crawl"),
+      scope: z.union([z.literal("all"), origin]),
+    })
+    .strict(),
 ]);
 export type Command = z.infer<typeof command>;
 export type OperationState =
@@ -136,6 +144,52 @@ export interface Operation {
   updatedAt: string;
   result: unknown;
   error: string | null;
+}
+// A crawl the collection directory reports as running. describeErrors is null
+// when the directory does not report it.
+export interface ActiveCrawl {
+  pds: string;
+  startedAt: string;
+  reposDescribed: number;
+  describeErrors: number | null;
+}
+// The latest ended crawl the collection directory retains for a source.
+export interface EndedCrawl extends ActiveCrawl {
+  finishedAt: string;
+  state: "finished" | "failed";
+  errorCategory: string | null;
+  httpStatus: number | null;
+}
+export interface CollectionDirectoryStatus {
+  configured: boolean;
+  available: boolean;
+  error: string | null;
+  observedAt: string;
+  processStartedAt: string | null;
+  historySupported: boolean;
+  active: ActiveCrawl[];
+  recent: EndedCrawl[];
+}
+// One source accepted by the collection directory for one crawl request.
+// Acceptance fields are fixed at submission; completion fields are observed.
+export interface CollectionCrawl {
+  id: string;
+  operation: string;
+  pds: string;
+  actor: string;
+  actorHandle: string | null;
+  cause: string;
+  submission: "started" | "already_active" | "accepted";
+  state: "accepted" | "finished" | "failed" | "unknown";
+  requestedAt: string;
+  acceptedAt: string;
+  crawlStartedAt: string | null;
+  finishedAt: string | null;
+  reposDescribed: number | null;
+  describeErrors: number | null;
+  errorCategory: string | null;
+  httpStatus: number | null;
+  observedAt: string | null;
 }
 export interface Policy {
   revision: number;

@@ -20,6 +20,9 @@ const relayFixtureSecret = "relay-fixture-credential-differs-32-bytes"
 
 var allSecrets = []secretFile{relaySecret, jetstreamSecret, administrationSecret, jetstreamRelaySecret, discoverySecret, administrationDiscoverySecret}
 
+// optionalSecrets are materialized only when their input is supplied.
+var optionalSecrets = []secretFile{collectiondirSecret}
+
 func setup(t *testing.T) {
 	t.Helper()
 	t.Setenv("TMPDIR", t.TempDir())
@@ -28,8 +31,14 @@ func setup(t *testing.T) {
 	for _, secret := range allSecrets {
 		t.Setenv(secret.input, fixtureSecret)
 	}
-	for _, secret := range allSecrets {
+	for _, secret := range append(allSecrets, optionalSecrets...) {
 		if err := os.Unsetenv(secret.output); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, secret := range optionalSecrets {
+		t.Setenv(secret.input, "")
+		if err := os.Unsetenv(secret.input); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -59,6 +68,67 @@ func TestSecretFiles(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestOptionalCollectiondirSecret(t *testing.T) {
+	t.Run("absent", func(t *testing.T) {
+		setup(t)
+		if err := prepare("administration"); err != nil {
+			t.Fatal(err)
+		}
+		if _, present := os.LookupEnv(collectiondirSecret.output); present {
+			t.Fatal("administration received a collection directory token file without input")
+		}
+	})
+	t.Run("supplied", func(t *testing.T) {
+		setup(t)
+		t.Setenv(collectiondirSecret.input, relayFixtureSecret)
+		if err := prepare("administration"); err != nil {
+			t.Fatal(err)
+		}
+		if _, present := os.LookupEnv(collectiondirSecret.input); present {
+			t.Fatalf("raw %s remains in environment", collectiondirSecret.input)
+		}
+		found := 0
+		for _, secret := range append(allSecrets, optionalSecrets...) {
+			if os.Getenv(secret.output) != "" {
+				found++
+			}
+		}
+		// Three required administration files, the discovery file that setup
+		// supplies, and the collection directory file.
+		if found != 5 {
+			t.Fatalf("got %d files, want 5", found)
+		}
+		assertSecretFile(t, os.Getenv(collectiondirSecret.output), collectiondirSecret.output, relayFixtureSecret)
+	})
+	t.Run("other components ignore it", func(t *testing.T) {
+		setup(t)
+		t.Setenv(collectiondirSecret.input, relayFixtureSecret)
+		if err := prepare("relay"); err != nil {
+			t.Fatal(err)
+		}
+		if _, present := os.LookupEnv(collectiondirSecret.output); present {
+			t.Fatal("relay received the collection directory token file")
+		}
+		if _, present := os.LookupEnv(collectiondirSecret.input); present {
+			t.Fatalf("raw %s remains in environment", collectiondirSecret.input)
+		}
+	})
+	t.Run("short", func(t *testing.T) {
+		setup(t)
+		t.Setenv(collectiondirSecret.input, "short-credential")
+		err := prepare("administration")
+		if err == nil || !strings.Contains(err.Error(), "at least 32 bytes") {
+			t.Fatal("short collection directory secret accepted")
+		}
+		if strings.Contains(err.Error(), "short-credential") {
+			t.Fatal("secret included in diagnostic")
+		}
+		if _, present := os.LookupEnv(collectiondirSecret.input); present {
+			t.Fatalf("raw %s remains in environment", collectiondirSecret.input)
+		}
+	})
 }
 
 // Jetstream authenticates to the Relay's private control listener for recovery

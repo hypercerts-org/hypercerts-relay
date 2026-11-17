@@ -12,6 +12,18 @@ Build with `go build -o collectiondir ./cmd/collectiondir`. Set `COLLECTIONS_ADM
 
 Use your actual Relay address; do not embed credentials in URLs. Supply a nonempty token even when no crawl is planned. The service does not automatically discover or bootstrap PDSes. Once the stream is running, submit each approved public PDS to `POST /admin/pds/requestCrawl` with `Authorization: Bearer <token>` and JSON `{"hosts":["https://your-pds"]}`. Protect the token and transport; use a secure authenticated proxy for remote access. Check `GET /admin/crawlStatus` with the same bearer authorization and review logs for progress and errors; a successful submission is not proof of complete coverage. Choose `--crawl-qps` appropriate for each PDS. The service-side crawl transport blocks private addresses; offline crawls have different network protections and should only target trusted hosts.
 
+### Crawl request and status replies
+
+`POST /admin/pds/requestCrawl` replies `{"message":"ok","hosts":{...}}`. Each `hosts` key is the normalized host URL; its value has `state` (`started`, or `already_active` when a crawl of that host is running and no second crawl was started) and `start`, the RFC 3339 start time of the crawl that is running. Submit the exact `https://` origin you want to match later, because duplicate detection compares normalized strings.
+
+`GET /admin/crawlStatus` returns:
+
+- `host_starts`: running crawls, each with `start`, `seen` (repositories described so far) and `describe_errors` (repositories whose `describeRepo` failed and were skipped).
+- `host_results`: the latest ended crawl per host, with `start`, `end`, `seen`, `describe_errors`, `state`, and for a failed crawl `error_category` (`canceled`, `timeout`, `http`, `blocked_address`, `transport` or `unknown`) and, for `http`, `http_status`. Raw upstream error text is logged, never returned.
+- `server_time` and `process_start`, the time this process started.
+
+A host and its `start` identify one crawl. `finished` means the repository listing ended without error; it does not mean every repository was described (see `describe_errors`). `failed` means the listing stopped early. Results are kept in memory for at most 256 hosts, oldest first out, and are lost on restart; a `process_start` later than a crawl's start means its outcome is unknown.
+
 Query `GET /xrpc/com.atproto.sync.listReposByCollection?collection=<nsid>&limit=100` and follow the returned cursor. `/v1/listCollections` provides approximate, cached counts; its default threshold excludes collections with fewer than five DIDs. Do not treat counts or candidates as verified records.
 
 ## Exposure and limitations

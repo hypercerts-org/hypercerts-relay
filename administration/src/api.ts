@@ -11,6 +11,10 @@ export type {
   JobLastFailure,
   RepositoryDetail,
   RepositoryDetailsPage,
+  ActiveCrawl,
+  EndedCrawl,
+  CollectionCrawl,
+  CollectionDirectoryStatus,
 } from "../server/contracts";
 export interface Administrator {
   did: string;
@@ -114,6 +118,8 @@ export function target(command: Command) {
       return `${command.action} job ${command.id.slice(0, 8)}`;
     case "limit":
       return `${command.scope} · ${command.eventsPerSecond} events/second`;
+    case "collection_crawl":
+      return `crawl collection directory · ${command.scope === "all" ? "all enabled sources" : command.scope}`;
   }
 }
 export function sourceOrigin(source: Source) {

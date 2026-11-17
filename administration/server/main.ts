@@ -6,6 +6,8 @@ import { Auth, oauthProvider } from "./auth.ts";
 import { createApp } from "./app.ts";
 import { Services } from "./services.ts";
 import { Worker } from "./worker.ts";
+import { Collectiondir, collectiondirConfig } from "./collectiondir.ts";
+import { CollectionCrawls } from "./collection-crawls.ts";
 
 function required(name: string) {
   const value = process.env[name];
@@ -58,8 +60,28 @@ const services = new Services(
   },
   { railwayPrivateNetwork: process.env.HC_RAILWAY_STARTUP === "1" },
 );
+const publicServiceOrigins = {
+  relay: publicOrigin("RELAY_PUBLIC_ORIGIN"),
+  rainbow: publicOrigin("RAINBOW_PUBLIC_ORIGIN"),
+  jetstream: publicOrigin("JETSTREAM_PUBLIC_ORIGIN"),
+};
+// Optional: without both settings the crawl action is disabled.
+const collectiondir = new Collectiondir(
+  collectiondirConfig(process.env, secret),
+  {
+    railwayPrivateNetwork: process.env.HC_RAILWAY_STARTUP === "1",
+    forbiddenOrigins: [
+      required("RELAY_CONTROL_URL"),
+      required("JETSTREAM_CONTROL_URL"),
+      ...Object.values(publicServiceOrigins).filter(
+        (value): value is string => value !== undefined,
+      ),
+    ],
+  },
+);
+const crawls = new CollectionCrawls(store, services, collectiondir);
 store.seedAdministrator(process.env.ADMIN_SEED_DID);
-const worker = new Worker(store, services);
+const worker = new Worker(store, services, crawls);
 worker.recover();
 const server = createApp(
   store,
@@ -77,11 +99,8 @@ const server = createApp(
     machineToken: process.env.ADMIN_DISCOVERY_TOKEN_FILE
       ? secret("ADMIN_DISCOVERY_TOKEN_FILE")
       : undefined,
-    publicServiceOrigins: {
-      relay: publicOrigin("RELAY_PUBLIC_ORIGIN"),
-      rainbow: publicOrigin("RAINBOW_PUBLIC_ORIGIN"),
-      jetstream: publicOrigin("JETSTREAM_PUBLIC_ORIGIN"),
-    },
+    publicServiceOrigins,
+    collectionCrawls: crawls,
   },
 ).listen(
   Number(process.env.PORT ?? 3000),
@@ -91,6 +110,10 @@ let stopping = false;
 async function run() {
   while (!stopping) {
     await worker.tick();
+    // Crawl outcome tracking is advisory; its failures never stop the worker.
+    await crawls.reconcile().catch(() => {
+      console.error("Collection directory crawl reconciliation failed.");
+    });
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
 }

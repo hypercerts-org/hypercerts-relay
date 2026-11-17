@@ -1,0 +1,377 @@
+import { randomUUID } from "node:crypto";
+import {
+  ApiError,
+  type CollectionCrawl,
+  type CollectionDirectoryStatus,
+  type EndedCrawl,
+  type Operation,
+} from "./contracts.ts";
+import { Store } from "./store.ts";
+import { Services } from "./services.ts";
+import {
+  Collectiondir,
+  CollectiondirError,
+  type CollectiondirStatus,
+} from "./collectiondir.ts";
+
+// How often accepted crawls are compared with the collection directory.
+const reconcileIntervalMs = 5000;
+// An accepted crawl absent from both active and retained results after this
+// long has an outcome the directory no longer reports.
+const resultGraceMs = 30000;
+
+interface RelaySourceView {
+  Hostname: string;
+  NoSSL: boolean;
+  DesiredState: string;
+  Validation?: { Status: string };
+}
+type Ineligibility = "not_enabled" | "not_https";
+
+function ineligibility(source: RelaySourceView): Ineligibility | null {
+  if (
+    source.DesiredState !== "enabled" ||
+    source.Validation?.Status !== "passed"
+  )
+    return "not_enabled";
+  if (source.NoSSL) return "not_https";
+  return null;
+}
+
+type CrawlRow = Omit<CollectionCrawl, "actorHandle">;
+
+// Records manual collection directory crawl requests and follows each accepted
+// source until the directory reports how its crawl ended.
+export class CollectionCrawls {
+  private lastReconcile = Number.NEGATIVE_INFINITY;
+  private reconciling = false;
+  constructor(
+    private readonly store: Store,
+    private readonly services: Services,
+    private readonly collectiondir: Collectiondir,
+  ) {}
+
+  get configured() {
+    return this.collectiondir.configured;
+  }
+
+  // Called by the Worker. Eligibility is checked against Relay at apply time,
+  // and the crawl target is always rebuilt from Relay's stored hostname.
+  async apply(op: Operation): Promise<unknown> {
+    const command = op.command;
+    if (command.kind !== "collection_crawl")
+      throw new ApiError(400, "invalid_command");
+    if (!this.collectiondir.configured)
+      throw new CollectiondirError("not_configured");
+    const skipped: Record<Ineligibility, number> = {
+      not_enabled: 0,
+      not_https: 0,
+    };
+    const targets: string[] = [];
+    if (command.scope === "all") {
+      let after = "";
+      for (;;) {
+        const page = (await this.services.sources(after)) as unknown as {
+          Sources: RelaySourceView[];
+          NextAfterHostID: number;
+        };
+        for (const source of page.Sources) {
+          const reason = ineligibility(source);
+          if (reason) skipped[reason]++;
+          else targets.push(`https://${source.Hostname}`);
+        }
+        if (!page.NextAfterHostID) break;
+        after = String(page.NextAfterHostID);
+      }
+      if (!targets.length) throw new ApiError(409, "no_enabled_sources");
+    } else {
+      let view: RelaySourceView;
+      try {
+        view = await this.services.call<RelaySourceView>(
+          "relay",
+          `/source?pds=${encodeURIComponent(command.scope)}`,
+        );
+      } catch (e) {
+        if (e instanceof ApiError && e.status === 404)
+          throw new ApiError(409, "source_not_approved");
+        throw e;
+      }
+      const reason = ineligibility(view);
+      if (reason === "not_enabled")
+        throw new ApiError(409, "source_not_enabled");
+      if (reason === "not_https") throw new ApiError(409, "source_not_https");
+      targets.push(`https://${view.Hostname}`);
+    }
+    // Fail before submitting when the directory is unreachable or rejects
+    // the token, so a submission is either fully recorded or retried.
+    await this.collectiondir.status();
+    const submissions = await this.collectiondir.requestCrawl(targets);
+    const acceptedAt = new Date().toISOString();
+    const insert = this.store.db.prepare(
+      `INSERT OR IGNORE INTO collection_crawls(id,operation,pds,actor,cause,submission,state,requestedAt,acceptedAt,crawlStartedAt)
+       VALUES(?,?,?,?,'manual',?,'accepted',?,?,?)`,
+    );
+    this.store.transaction(() => {
+      for (const submission of submissions) {
+        const inserted = insert.run(
+          randomUUID(),
+          op.id,
+          submission.pds,
+          op.actor,
+          submission.outcome,
+          op.createdAt,
+          acceptedAt,
+          submission.startedAt,
+        );
+        if (inserted.changes)
+          this.store.audit(
+            op.actor,
+            "collection_crawl_accepted",
+            { pds: submission.pds, submission: submission.outcome },
+            op.id,
+          );
+      }
+    });
+    return {
+      collectiondir: {
+        submitted: submissions.length,
+        started: submissions.filter((s) => s.outcome === "started").length,
+        alreadyActive: submissions.filter((s) => s.outcome === "already_active")
+          .length,
+        skipped,
+      },
+    };
+  }
+
+  // Compares accepted crawls with the directory. Self-throttled; a failed
+  // status read leaves every row accepted for the next attempt.
+  async reconcile(now = Date.now()): Promise<void> {
+    if (
+      !this.configured ||
+      this.reconciling ||
+      now - this.lastReconcile < reconcileIntervalMs
+    )
+      return;
+    const pending = this.store.db
+      .prepare(
+        "SELECT * FROM collection_crawls WHERE state='accepted' ORDER BY requestedAt,id",
+      )
+      .all() as unknown as CrawlRow[];
+    if (!pending.length) return;
+    this.lastReconcile = now;
+    this.reconciling = true;
+    try {
+      let status: CollectiondirStatus;
+      try {
+        status = await this.collectiondir.status();
+      } catch {
+        return;
+      }
+      this.applyObservation(pending, status, now);
+    } finally {
+      this.reconciling = false;
+    }
+  }
+
+  private applyObservation(
+    pending: CrawlRow[],
+    status: CollectiondirStatus,
+    now: number,
+  ) {
+    const active = new Map(status.active.map((crawl) => [crawl.pds, crawl]));
+    const recent = new Map(status.recent.map((crawl) => [crawl.pds, crawl]));
+    const processStarted = status.processStartedAt
+      ? Date.parse(status.processStartedAt)
+      : Number.NaN;
+    const progress = this.store.db.prepare(
+      "UPDATE collection_crawls SET crawlStartedAt=?,reposDescribed=?,describeErrors=?,observedAt=? WHERE id=? AND state='accepted'",
+    );
+    for (const row of pending) {
+      const running = active.get(row.pds);
+      if (
+        running &&
+        (row.crawlStartedAt === null ||
+          row.crawlStartedAt === running.startedAt)
+      ) {
+        progress.run(
+          running.startedAt,
+          running.reposDescribed,
+          running.describeErrors,
+          status.observedAt,
+          row.id,
+        );
+        continue;
+      }
+      const ended = recent.get(row.pds);
+      if (ended && row.crawlStartedAt === ended.startedAt) {
+        this.finish(row, ended.state, status.observedAt, ended);
+        continue;
+      }
+      const reference = Date.parse(row.crawlStartedAt ?? row.acceptedAt);
+      if (processStarted > reference) {
+        this.finish(
+          row,
+          "unknown",
+          status.observedAt,
+          null,
+          "collectiondir_restarted",
+        );
+        continue;
+      }
+      if (now - Date.parse(row.acceptedAt) > resultGraceMs)
+        this.finish(
+          row,
+          "unknown",
+          status.observedAt,
+          null,
+          status.historySupported
+            ? "result_not_retained"
+            : "status_history_unsupported",
+        );
+    }
+  }
+
+  private finish(
+    row: CrawlRow,
+    state: "finished" | "failed" | "unknown",
+    observedAt: string,
+    ended: EndedCrawl | null,
+    reason: string | null = null,
+  ) {
+    const outcome = {
+      finishedAt: ended?.finishedAt ?? null,
+      reposDescribed: ended?.reposDescribed ?? row.reposDescribed,
+      describeErrors: ended?.describeErrors ?? row.describeErrors,
+      errorCategory: ended ? ended.errorCategory : reason,
+      httpStatus: ended?.httpStatus ?? null,
+    };
+    this.store.transaction(() => {
+      const updated = this.store.db
+        .prepare(
+          "UPDATE collection_crawls SET state=?,finishedAt=?,reposDescribed=?,describeErrors=?,errorCategory=?,httpStatus=?,observedAt=? WHERE id=? AND state='accepted'",
+        )
+        .run(
+          state,
+          outcome.finishedAt,
+          outcome.reposDescribed,
+          outcome.describeErrors,
+          outcome.errorCategory,
+          outcome.httpStatus,
+          observedAt,
+          row.id,
+        );
+      if (updated.changes)
+        this.store.audit(
+          row.actor,
+          `collection_crawl_${state}`,
+          { pds: row.pds, crawlStartedAt: row.crawlStartedAt, ...outcome },
+          row.operation,
+        );
+    });
+  }
+
+  // Never throws: an unconfigured or unreachable directory is a status.
+  async status(): Promise<CollectionDirectoryStatus> {
+    const empty = {
+      observedAt: new Date().toISOString(),
+      processStartedAt: null,
+      historySupported: false,
+      active: [],
+      recent: [],
+    };
+    if (!this.configured)
+      return {
+        configured: false,
+        available: false,
+        error: "collectiondir_not_configured",
+        ...empty,
+      };
+    try {
+      const status = await this.collectiondir.status();
+      return {
+        configured: true,
+        available: true,
+        error: null,
+        observedAt: status.observedAt,
+        processStartedAt: status.processStartedAt,
+        historySupported: status.historySupported,
+        active: status.active,
+        recent: status.recent,
+      };
+    } catch (e) {
+      return {
+        configured: true,
+        available: false,
+        error: e instanceof ApiError ? e.code : "collectiondir_unavailable",
+        ...empty,
+      };
+    }
+  }
+
+  // Newest requests first. The cursor is the last row's requestedAt|id.
+  page(
+    after: string,
+    limit: number,
+    pds?: string,
+  ): { items: CollectionCrawl[]; next: string | null } {
+    const [requestedAt, id] = crawlCursor(after);
+    const rows = this.store.db
+      .prepare(
+        `SELECT * FROM collection_crawls
+         WHERE (?='' OR (requestedAt,id)<(?,?)) AND (?='' OR pds=?)
+         ORDER BY requestedAt DESC,id DESC LIMIT ?`,
+      )
+      .all(
+        requestedAt,
+        requestedAt,
+        id,
+        pds ?? "",
+        pds ?? "",
+        limit + 1,
+      ) as unknown as CrawlRow[];
+    const items = rows.slice(0, limit).map((row) => ({
+      ...row,
+      actorHandle: this.actorHandle(row),
+    }));
+    return {
+      items,
+      next:
+        rows.length > limit
+          ? `${rows[limit - 1].requestedAt}|${rows[limit - 1].id}`
+          : null,
+    };
+  }
+
+  private actorHandle(row: CrawlRow): string | null {
+    return (
+      this.store.get<{ handle?: string | null }>(
+        "administrator-profile",
+        row.actor,
+      )?.handle ??
+      (
+        this.store.db
+          .prepare(
+            "SELECT actorHandle FROM audit WHERE operation=? AND actor=? AND actorHandle IS NOT NULL ORDER BY seq LIMIT 1",
+          )
+          .get(row.operation, row.actor) as
+          { actorHandle?: string | null } | undefined
+      )?.actorHandle ??
+      null
+    );
+  }
+}
+
+function crawlCursor(after: string): [string, string] {
+  if (!after) return ["", ""];
+  const parts = after.split("|");
+  if (
+    parts.length !== 2 ||
+    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(parts[0]) ||
+    !Number.isFinite(Date.parse(parts[0])) ||
+    !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(
+      parts[1],
+    )
+  )
+    throw new ApiError(400, "invalid_cursor");
+  return [parts[0], parts[1]];
+}
