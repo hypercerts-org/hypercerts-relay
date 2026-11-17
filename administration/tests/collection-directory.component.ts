@@ -815,13 +815,15 @@ test("the source detail offers Retry only once automatic retries have stopped", 
   });
   vi.stubGlobal(
     "fetch",
-    vi.fn(async (input: RequestInfo | URL) => {
-      const url = String(input);
+    vi.fn((input: RequestInfo | URL) => {
+      const url = requestUrl(input);
       if (url.startsWith("/api/v1/collection-directory/bootstraps"))
-        return Response.json({ items: [current], next: null });
+        return Promise.resolve(Response.json({ items: [current], next: null }));
       if (url.startsWith("/api/v1/collection-directory/crawls"))
-        return Response.json({ items: [], next: null });
-      return Response.json({ error: "unavailable" }, { status: 503 });
+        return Promise.resolve(Response.json({ items: [], next: null }));
+      return Promise.resolve(
+        Response.json({ error: "unavailable" }, { status: 503 }),
+      );
     }),
   );
   render(Sources, {

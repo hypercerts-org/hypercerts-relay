@@ -428,7 +428,7 @@ test("failed admission and disable or remove queue nothing", async (t) => {
   await worker.tick();
 
   for (const state of ["disabled", "removed"]) {
-    const op = await source("https://pds.example", state);
+    const op = await source("https://pds.example", state); // NOSONAR: disable, then remove, one worker tick each
     assert.equal(op.state, "applied");
     assert.equal(bootstrapResult(op), undefined);
   }
@@ -732,15 +732,17 @@ test("the bootstraps route requires a session and the command schema is unchange
   await source("https://pds.example");
   await worker.tick();
   // The directory token never reaches responses or audit history.
-  for (const path of [
-    "/api/v1/collection-directory/bootstraps",
-    "/api/v1/collection-directory/crawls",
-    "/api/v1/operations",
-    "/api/v1/audit",
-  ]) {
-    const text = await (await request(path)).text();
-    assert.ok(!text.includes(token), path);
-  }
+  await Promise.all(
+    [
+      "/api/v1/collection-directory/bootstraps",
+      "/api/v1/collection-directory/crawls",
+      "/api/v1/operations",
+      "/api/v1/audit",
+    ].map(async (path) => {
+      const text = await (await request(path)).text();
+      assert.ok(!text.includes(token), path);
+    }),
+  );
   assert.ok(
     !JSON.stringify(store.db.prepare("SELECT * FROM audit").all()).includes(
       token,
@@ -755,7 +757,7 @@ test("the bootstraps route pages newest first", async (t) => {
     "https://b.example",
     "https://c.example",
   ];
-  for (const origin of origins) await source(origin);
+  for (const origin of origins) await source(origin); // NOSONAR: request order defines newest first
   type Page = { items: CollectionBootstrapView[]; next: string | null };
   const first = (await (
     await request("/api/v1/collection-directory/bootstraps?limit=2")

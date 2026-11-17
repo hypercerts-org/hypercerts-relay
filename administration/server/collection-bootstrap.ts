@@ -53,7 +53,7 @@ export function bootstrapOperationId(sourceOperationId: string): string {
   const hex = createHash("sha256")
     .update(`collection-bootstrap:${sourceOperationId}`)
     .digest("hex");
-  const variant = ((parseInt(hex[16], 16) & 0x3) | 0x8).toString(16);
+  const variant = ((Number.parseInt(hex[16], 16) & 0x3) | 0x8).toString(16);
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-8${hex.slice(13, 16)}-${variant}${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
 }
 
@@ -89,8 +89,7 @@ export class CollectionBootstrap {
     if (command.kind !== "source" || command.state !== "enabled") return null;
     const relay = (result as { relay?: RelaySourceView } | null)?.relay;
     if (
-      !relay ||
-      relay.DesiredState !== "enabled" ||
+      relay?.DesiredState !== "enabled" ||
       relay.Validation?.Status !== "passed" ||
       typeof relay.Hostname !== "string" ||
       !relay.Hostname

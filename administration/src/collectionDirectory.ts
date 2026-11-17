@@ -140,7 +140,7 @@ export function crawlNotice(
 }
 
 // Initial crawl phases that the server can still move forward on its own.
-const openBootstrapPhases = ["waiting", "retrying", "accepted"];
+const openBootstrapPhases = new Set(["waiting", "retrying", "accepted"]);
 
 // Whether crawl status can still change and is worth polling. Accepted rows
 // are ignored without a configured directory: only the server can close them.
@@ -160,9 +160,7 @@ export function crawlsInProgress(
         (operation.command.kind === "source" &&
           operation.command.state === "enabled")) &&
       ["requested", "applying"].includes(operation.state)) ||
-    bootstraps.some((bootstrap) =>
-      openBootstrapPhases.includes(bootstrap.phase),
-    )
+    bootstraps.some((bootstrap) => openBootstrapPhases.has(bootstrap.phase))
   );
 }
 
@@ -172,11 +170,7 @@ export function bootstrapNotice(operation: Operation | null): {
   text: string;
   queued: boolean;
 } | null {
-  if (
-    !operation ||
-    operation.command.kind !== "source" ||
-    operation.state !== "applied"
-  )
+  if (operation?.command.kind !== "source" || operation.state !== "applied")
     return null;
   const bootstrap = (
     operation.result as {
