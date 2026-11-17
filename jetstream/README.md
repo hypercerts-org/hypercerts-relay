@@ -401,9 +401,11 @@ stays serial: workers overlap downloads and identity checks, not archive
 writes. When reconciliation dominates, as described above, more workers add
 little.
 
-After an HTTP 429, the job sends no further `getRepo` request, lets
-downloads already under way finish, and waits for the PDS cooldown. A
-repository stopped before its request keeps its attempt budget. It then resumes with half as many
+After an HTTP 429 is recorded, the job starts no further `getRepo` request,
+lets downloads already under way finish, and waits for the PDS cooldown. A
+worker that was about to send its request while the 429 was being recorded
+can still send it. A repository stopped before its request keeps its attempt
+budget. It then resumes with half as many
 workers (at least one). It adds one worker back after every 64 repositories
 completed since the last 429, up to the configured value. This reduction is
 held in memory and resets when Jetstream restarts. When a successful `getRepo`
