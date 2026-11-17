@@ -612,7 +612,14 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 	rt.orchestrator = orch
 	// hypercerts: Snapshots use the same identity directory and direct-PDS HTTP client.
 	if rt.BackfillJobs != nil {
-		rt.jobProcessor = jobs.PDSProcessor{Manager: rt.BackfillJobs, HTTPClient: xrpcClient.HTTPClient.Val(), Directory: directory, Reconcile: orch.ReconcileSnapshot}.Run
+		rt.jobProcessor = jobs.PDSProcessor{
+			Manager:     rt.BackfillJobs,
+			HTTPClient:  xrpcClient.HTTPClient.Val(),
+			Directory:   directory,
+			Reconcile:   orch.ReconcileSnapshot,
+			RepoWorkers: opts.effectivePDSJobRepoWorkers(), // hypercerts: per-job repository concurrency (TECH-901).
+			Limits:      jobs.NewPDSWorkerLimits(),         // hypercerts: in-memory per-PDS 429 backoff.
+		}.Run
 		if opts.RelayControlURL != "" {
 			receiver := jobs.RelayReceiptSender{URL: opts.RelayControlURL, Token: opts.RelayControlToken, Client: xrpcClient.HTTPClient.Val()}
 			rt.BackfillJobs.SetReceiptSender(receiver.Send)

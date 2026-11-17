@@ -216,6 +216,8 @@ func serveCommand() *cli.Command {
 			&cli.StringFlag{Name: "relay-control-url", Usage: "Private Relay control base URL used only for completed recovery receipts", Sources: cli.EnvVars("JETSTREAM_RELAY_CONTROL_URL")},
 			&cli.StringFlag{Name: "relay-control-token-file", Usage: "Mounted Relay private-control credential for recovery receipts", Sources: cli.EnvVars("JETSTREAM_RELAY_CONTROL_TOKEN_FILE")},
 			&cli.StringSliceFlag{Name: "pds-sources", Usage: "Initial admitted direct-PDS HTTPS origins to backfill; comma-separated", Sources: cli.EnvVars("JETSTREAM_PDS_SOURCES")},
+			// hypercerts: Repositories one direct-PDS backfill job acquires at once (TECH-901).
+			&cli.IntFlag{Name: "pds-job-repo-workers", Usage: fmt.Sprintf("Repositories one direct-PDS backfill job downloads at once (1-%d); each can hold up to 64 MiB", jetstreamd.MaxPDSJobRepoWorkers), Sources: cli.EnvVars("JETSTREAM_PDS_JOB_REPO_WORKERS"), Value: jetstreamd.DefaultPDSJobRepoWorkers},
 			// hypercerts: Seed new archives with bundled record NSIDs unless explicitly overridden.
 			&cli.StringSliceFlag{Name: "collections", Usage: "Initial exact collection NSIDs, overriding the bundled seed; empty stores no records. Existing persisted policy wins.", Sources: cli.EnvVars("JETSTREAM_COLLECTIONS")},
 			&cli.BoolFlag{Name: "disable-collection-seed", Usage: "Disable bundled Hypercerts/Certified collection seeding for a new data directory; explicit collections still apply", Sources: cli.EnvVars("JETSTREAM_DISABLE_COLLECTION_SEED")},
@@ -491,6 +493,12 @@ func serveOptionsFromCommand(cmd *cli.Command) (jetstreamd.Options, error) {
 		return jetstreamd.Options{}, fmt.Errorf("serve: --backfill-repos cannot be combined with --max-backfill-repos")
 	}
 
+	// hypercerts: Bound per-job PDS concurrency before any job can start.
+	pdsJobRepoWorkers := cmd.Int("pds-job-repo-workers")
+	if pdsJobRepoWorkers < 1 || pdsJobRepoWorkers > jetstreamd.MaxPDSJobRepoWorkers {
+		return jetstreamd.Options{}, fmt.Errorf("serve: --pds-job-repo-workers must be between 1 and %d", jetstreamd.MaxPDSJobRepoWorkers)
+	}
+
 	skipMergeDiscovery := cmd.Bool("skip-merge-discovery")
 	if maxBackfillRepos > 0 || len(backfillRepos) > 0 {
 		skipMergeDiscovery = true
@@ -515,6 +523,7 @@ func serveOptionsFromCommand(cmd *cli.Command) (jetstreamd.Options, error) {
 		CollectionSelection:            true,
 		RequirePolicyAdoption:          true,
 		InitialPDSSources:              cmd.StringSlice("pds-sources"),
+		PDSJobRepoWorkers:              pdsJobRepoWorkers, // hypercerts: validated per-job direct-PDS repository concurrency.
 		InitialCollections:             initialCollections,
 		RelayURL:                       cmd.String("relay-url"),
 		RelayControlURL:                cmd.String("relay-control-url"),

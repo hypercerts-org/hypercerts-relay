@@ -20,6 +20,9 @@ import (
 const (
 	repositoryRetryPrefix = "hypercerts/backfill-repo-retry/"
 	pdsCooldownPrefix     = "hypercerts/backfill-pds-cooldown/"
+	// repositoryCompletionPrefix holds the completion journal: one row per
+	// repository checkpointed since the last full job-state write.
+	repositoryCompletionPrefix = "hypercerts/backfill-repo-done/"
 
 	maxRepositoryAttempts    = 3
 	repositoryRetryBaseDelay = time.Second
@@ -167,6 +170,114 @@ func repositoryRetryKey(jobID, did string) []byte {
 	return []byte(string(repositoryRetryJobPrefix(jobID)) + base64.RawURLEncoding.EncodeToString([]byte(did)))
 }
 
+func repositoryCompletionKey(jobID, did string) []byte {
+	return []byte(repositoryCompletionPrefix + jobID + "/" + base64.RawURLEncoding.EncodeToString([]byte(did)))
+}
+
+// repositoryCompletion is one journaled repository checkpoint. The job-state
+// document plus the journal is the durable job state: every full state write
+// already contains the journaled completions and deletes the journal in the
+// same batch. Records is nil for the legacy unattributed checkpoint.
+type repositoryCompletion struct {
+	JobID             string    `json:"jobId"`
+	DID               string    `json:"did"`
+	ListedRevision    string    `json:"listedRevision"`
+	CompletedRevision string    `json:"completedRevision"`
+	Generation        uint64    `json:"generation"`
+	Records           *int      `json:"records"`
+	Cursor            string    `json:"cursor"`
+	At                time.Time `json:"at"`
+}
+
+func validRepositoryCompletion(completion repositoryCompletion) bool {
+	if completion.JobID == "" || completion.At.IsZero() || completion.Records != nil && *completion.Records < 0 {
+		return false
+	}
+	if _, err := atmos.ParseDID(completion.DID); err != nil {
+		return false
+	}
+	listed, err := atmos.ParseTID(completion.ListedRevision)
+	if err != nil {
+		return false
+	}
+	completed, err := atmos.ParseTID(completion.CompletedRevision)
+	return err == nil && completed.Integer() >= listed.Integer()
+}
+
+// applyCompletion records one repository completion on a job. It allocates
+// new evidence and timestamps instead of writing through shared pointers.
+func applyCompletion(job *Job, completion repositoryCompletion) {
+	job.CompletedRepos[completion.DID] = completion.CompletedRevision
+	job.Cursor = completion.Cursor
+	job.LastProgressAt = timePointer(completion.At)
+	if completion.Records == nil {
+		job.Evidence = nil
+		return
+	}
+	if job.Evidence == nil {
+		return
+	}
+	evidence := *job.Evidence
+	evidence.Scanned++
+	if *completion.Records == 0 {
+		evidence.NoMatch++
+	} else {
+		evidence.Matching++
+	}
+	evidence.AttributableRecords += *completion.Records
+	evidence.LastProgressAt = completion.At.UTC()
+	job.Evidence = &evidence
+}
+
+// replayCompletionJournal folds journaled completions into restored job state
+// and returns the number of journal rows found. Rows are applied in checkpoint
+// order, so progress timestamps and cursors match the state before restart. A
+// row for a missing job, another acquisition generation, a listed revision
+// that is no longer the job's inventory revision, or an already-recorded
+// revision is skipped, so replay is idempotent. A malformed row fails the open.
+func (m *Manager) replayCompletionJournal(restored *data) (int, error) {
+	prefix := []byte(repositoryCompletionPrefix)
+	iter, err := m.db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: store.PrefixUpperBound(prefix)})
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = iter.Close() }()
+	var completions []repositoryCompletion
+	for iter.First(); iter.Valid(); iter.Next() {
+		var completion repositoryCompletion
+		if err := json.Unmarshal(iter.Value(), &completion); err != nil || !validRepositoryCompletion(completion) || string(iter.Key()) != string(repositoryCompletionKey(completion.JobID, completion.DID)) {
+			return 0, errors.New("invalid persisted repository completion")
+		}
+		completions = append(completions, completion)
+	}
+	if err := iter.Error(); err != nil {
+		return 0, err
+	}
+	slices.SortStableFunc(completions, func(a, b repositoryCompletion) int { return a.At.Compare(b.At) })
+	inventories := map[string]map[string]string{}
+	for _, completion := range completions {
+		job, ok := restored.Jobs[completion.JobID]
+		if !ok || job.AcquisitionGeneration != completion.Generation || completedRevisionAtLeast(job.CompletedRepos[completion.DID], completion.CompletedRevision) {
+			continue
+		}
+		entries, loaded := inventories[completion.JobID]
+		if !loaded {
+			inv, err := m.readInventory(completion.JobID)
+			if err != nil {
+				return 0, err
+			}
+			entries = inv.Entries
+			inventories[completion.JobID] = entries
+		}
+		if entries[completion.DID] != completion.ListedRevision {
+			continue
+		}
+		applyCompletion(&job, completion)
+		restored.Jobs[completion.JobID] = job
+	}
+	return len(completions), nil
+}
+
 func pdsCooldownKey(pds string) []byte {
 	return []byte(pdsCooldownPrefix + base64.RawURLEncoding.EncodeToString([]byte(pds)))
 }
@@ -197,11 +308,11 @@ func (m *Manager) ListRepositoryRetries(jobID string) ([]RepositoryRetry, error)
 	if !job.TotalReposKnown {
 		return nil, ErrConflict
 	}
-	inv, err := m.readInventory(jobID)
+	entries, err := m.frozenInventoryLocked(jobID)
 	if err != nil {
 		return nil, err
 	}
-	out, err := m.listFrozenRepositoryRetryRowsLocked(jobID, job, inv.Entries)
+	out, err := m.listFrozenRepositoryRetryRowsLocked(jobID, job, entries)
 	if err != nil {
 		return nil, err
 	}
@@ -862,6 +973,35 @@ func (m *Manager) BeginRepositoryAttempt(jobID, did string) (RepositoryRetry, er
 	return current, nil
 }
 
+// abandonRepositoryAttempt returns an attempt that began but sent no request,
+// restoring the repository's retry state from before BeginRepositoryAttempt so
+// the attempt budget is unchanged.
+func (m *Manager) abandonRepositoryAttempt(jobID, did string, begun, previous RepositoryRetry) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	job, listedRevision, err := m.repositoryCoordinateLocked(jobID, did)
+	if err != nil {
+		return err
+	}
+	if !m.active(jobID) {
+		return ErrConflict
+	}
+	current, err := m.repositoryRetryLocked(job, did, listedRevision)
+	if err != nil {
+		return err
+	}
+	if current.State != RepositoryRetryInFlight || current.Attempts != begun.Attempts || previous.Attempts != begun.Attempts-1 {
+		return ErrConflict
+	}
+	if previous.Attempts == 0 {
+		return m.commitRepositoryRetryBatch(m.data, false, nil, [][]byte{repositoryRetryKey(jobID, did)}, nil)
+	}
+	if previous.JobID != jobID || previous.DID != did || previous.ListedRevision != listedRevision || !validPersistedRepositoryRetry(previous) {
+		return ErrConflict
+	}
+	return m.commitRepositoryRetryBatch(m.data, false, &previous, nil, nil)
+}
+
 // RecordRepositoryFailure atomically records a sanitized failure and, when
 // supplied, extends the PDS-wide cooldown. A nil retryAt marks the repository
 // unresolved; otherwise it enters retry_wait until that deadline.
@@ -912,7 +1052,10 @@ func (m *Manager) repositoryFailureCooldownLocked(pds string, pdsCooldownUntil *
 	}
 	until := pdsCooldownUntil.UTC()
 	if !until.After(time.Now().UTC()) {
-		return nil, ErrInvalidInput
+		// The deadline can pass while the caller waits for mu, for example
+		// behind a sibling's reconciliation. An elapsed cooldown extends
+		// nothing; it must not fail the repository or stop the runtime.
+		return nil, nil
 	}
 	existing, found, err := m.readPDSCooldownLocked(pds)
 	if err != nil {
@@ -971,36 +1114,53 @@ func (m *Manager) checkpointRepository(jobID, did, listedRevision, completedRevi
 	if current.State != RepositoryRetryInFlight {
 		return ErrConflict
 	}
-	next := clone(m.data)
-	job = next.Jobs[jobID]
-	job.CompletedRepos[did] = completedRevision
-	job.Cursor = cursor
-	now := time.Now().UTC()
-	job.LastProgressAt = &now
-	if records == nil {
-		job.Evidence = nil
-	} else if job.Evidence != nil {
-		job.Evidence.Scanned++
-		if *records == 0 {
-			job.Evidence.NoMatch++
-		} else {
-			job.Evidence.Matching++
-		}
-		job.Evidence.AttributableRecords += *records
-		job.Evidence.LastProgressAt = now
+	completion := repositoryCompletion{
+		JobID:             jobID,
+		DID:               did,
+		ListedRevision:    frozenRevision,
+		CompletedRevision: completedRevision,
+		Generation:        job.AcquisitionGeneration,
+		Cursor:            cursor,
+		At:                time.Now().UTC(),
 	}
-	next.Jobs[jobID] = job
-	return m.commitRepositoryRetryBatch(next, true, nil, [][]byte{repositoryRetryKey(jobID, did)}, nil)
+	if records != nil {
+		count := *records
+		completion.Records = &count
+	}
+	encoded, err := json.Marshal(completion)
+	if err != nil {
+		return err
+	}
+	// A constant-size journal row replaces the full job-state rewrite; the
+	// row and the retry-row deletion still commit in one synced batch.
+	batch := m.db.NewBatch()
+	defer func() { _ = batch.Close() }()
+	if err := batch.Set(repositoryCompletionKey(jobID, did), encoded, nil); err != nil {
+		return err
+	}
+	if err := batch.Delete(repositoryRetryKey(jobID, did), nil); err != nil {
+		return err
+	}
+	// Count the row before committing: a commit that reports failure may
+	// still have written it, and over-counting costs only a range delete.
+	m.completionJournalRows++
+	if err := m.db.Commit(batch, store.SyncWrites); err != nil {
+		return err
+	}
+	applyCompletion(&job, completion)
+	m.data.Jobs[jobID] = job
+	m.signalScheduler()
+	return nil
 }
 
 func (m *Manager) repositoryRetryDeleteKeysLocked(jobID string, unresolvedOnly bool) ([][]byte, error) {
 	prefix := repositoryRetryJobPrefix(jobID)
-	var inv inventory
+	var entries map[string]string
 	var err error
 	var job Job
 	if unresolvedOnly {
 		job = m.data.Jobs[jobID]
-		inv, err = m.readInventory(jobID)
+		entries, err = m.frozenInventoryLocked(jobID)
 		if err != nil {
 			return nil, err
 		}
@@ -1022,7 +1182,7 @@ func (m *Manager) repositoryRetryDeleteKeysLocked(jobID string, unresolvedOnly b
 			return nil, errors.New("invalid persisted repository retry state")
 		}
 		if unresolvedOnly {
-			listedRevision, exists := inv.Entries[retry.DID]
+			listedRevision, exists := entries[retry.DID]
 			if !exists || listedRevision != retry.ListedRevision || retry.State != RepositoryRetryUnresolved {
 				continue
 			}
@@ -1069,7 +1229,7 @@ func (m *Manager) ResetUnresolvedRepositoryRetries(jobID string) (int, error) {
 // through the retry-state batch so all jobs for that origin observe it.
 func (m *Manager) RecordPDSCooldown(jobID string, until time.Time) error {
 	until = until.UTC()
-	if jobID == "" || !validRetryDeadline(until) || !until.After(time.Now().UTC()) {
+	if jobID == "" || !validRetryDeadline(until) {
 		return ErrInvalidInput
 	}
 	m.mu.Lock()
@@ -1080,6 +1240,11 @@ func (m *Manager) RecordPDSCooldown(jobID string, until time.Time) error {
 	}
 	if !m.active(jobID) {
 		return ErrConflict
+	}
+	if !until.After(time.Now().UTC()) {
+		// An already elapsed deadline, possibly passed while waiting for mu,
+		// extends nothing.
+		return nil
 	}
 	canonical, err := normalizeSource(job.PDS)
 	if err != nil || canonical != job.PDS {
@@ -1122,11 +1287,11 @@ func (m *Manager) repositoryCoordinateLocked(jobID, did string) (Job, string, er
 	if !job.TotalReposKnown && job.Reason != ReasonRepositoryRecovery {
 		return Job{}, "", ErrConflict
 	}
-	inv, err := m.readInventory(jobID)
+	entries, err := m.frozenInventoryLocked(jobID)
 	if err != nil {
 		return Job{}, "", err
 	}
-	listedRevision, ok := inv.Entries[did]
+	listedRevision, ok := entries[did]
 	if !ok {
 		return Job{}, "", ErrConflict
 	}
@@ -1202,11 +1367,11 @@ func (m *Manager) pendingJobDueLocked(job Job, now time.Time) (time.Time, bool, 
 	if !job.TotalReposKnown && (job.Reason != ReasonRepositoryRecovery || job.EnumeratedRepos+len(job.RecoveryDiscoveryFailures) < len(job.RecoveryDIDs)) {
 		return applyPDSCooldown(now, cooldown, coolingDown), true, nil
 	}
-	inv, err := m.readInventory(job.ID)
+	entries, err := m.peekInventoryLocked(job.ID)
 	if err != nil {
 		return time.Time{}, false, err
 	}
-	retries, err := m.pendingRepositoryRetryRowsLocked(job, inv.Entries)
+	retries, err := m.pendingRepositoryRetryRowsLocked(job, entries)
 	if err != nil {
 		return time.Time{}, false, err
 	}
@@ -1214,7 +1379,7 @@ func (m *Manager) pendingJobDueLocked(job Job, now time.Time) (time.Time, bool, 
 	if err != nil {
 		return time.Time{}, false, err
 	}
-	if dueNow || pendingInventoryHasImplicitReady(job, inv.Entries, retries) {
+	if dueNow || pendingInventoryHasImplicitReady(job, entries, retries) {
 		return applyPDSCooldown(now, cooldown, coolingDown), true, nil
 	}
 	if earliest.IsZero() {
@@ -1370,11 +1535,7 @@ func (m *Manager) commitRepositoryRetryBatch(next data, persistJob bool, retry *
 	batch := m.db.NewBatch()
 	defer func() { _ = batch.Close() }()
 	if persistJob {
-		encoded, err := json.Marshal(next)
-		if err != nil {
-			return err
-		}
-		if err := batch.Set([]byte(stateKey), encoded, nil); err != nil {
+		if err := m.stageJobState(batch, next); err != nil {
 			return err
 		}
 	}
@@ -1401,7 +1562,7 @@ func (m *Manager) commitRepositoryRetryBatch(next data, persistJob bool, retry *
 			return err
 		}
 	}
-	if err := m.db.Commit(batch, store.SyncWrites); err != nil {
+	if err := m.commitBatch(batch, persistJob); err != nil {
 		return err
 	}
 	if persistJob {

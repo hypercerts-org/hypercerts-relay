@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"math/rand"
 	"net"
 	"net/http"
@@ -12,6 +13,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bluesky-social/jetstream/internal/ingest"
@@ -30,6 +33,122 @@ type PDSProcessor struct {
 	HTTPClient *http.Client
 	Directory  *identity.Directory
 	Reconcile  func(context.Context, ingest.Snapshot) error
+	// RepoWorkers bounds how many repositories of one job are acquired at
+	// once. Zero or negative acquires one repository at a time.
+	RepoWorkers int
+	// Limits, when set, lowers a PDS origin's concurrency after an HTTP 429
+	// and restores it gradually. Nil keeps RepoWorkers as a fixed ceiling.
+	Limits *PDSWorkerLimits
+
+	// timings and gate are set only on the pass-local copy used by
+	// processFrozenInventory.
+	timings *repositoryStageTimings
+	gate    *repoGate
+}
+
+func (p PDSProcessor) repoWorkers() int {
+	return max(p.RepoWorkers, 1)
+}
+
+// pdsWorkerRecoverySuccesses is how many repositories must complete since the
+// last HTTP 429 before a lowered per-PDS ceiling rises by one worker.
+const pdsWorkerRecoverySuccesses = 64
+
+// PDSWorkerLimits adapts each PDS origin's repository concurrency without
+// exceeding the configured worker count: an HTTP 429 halves the origin's
+// ceiling (minimum one), and every 64 repositories completed since the last
+// 429 raise it by one. State is in memory only and resets on restart.
+type PDSWorkerLimits struct {
+	mu      sync.Mutex
+	origins map[string]*pdsWorkerLimit
+}
+
+type pdsWorkerLimit struct {
+	ceiling   int
+	successes int
+}
+
+func NewPDSWorkerLimits() *PDSWorkerLimits {
+	return &PDSWorkerLimits{origins: map[string]*pdsWorkerLimit{}}
+}
+
+func (l *PDSWorkerLimits) originLocked(pds string, configured int) *pdsWorkerLimit {
+	origin, ok := l.origins[pds]
+	if !ok {
+		origin = &pdsWorkerLimit{ceiling: configured}
+		l.origins[pds] = origin
+	}
+	origin.ceiling = min(origin.ceiling, configured)
+	return origin
+}
+
+// Ceiling returns the origin's current repository concurrency.
+func (l *PDSWorkerLimits) Ceiling(pds string, configured int) int {
+	if l == nil {
+		return configured
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.originLocked(pds, configured).ceiling
+}
+
+func (l *PDSWorkerLimits) recordSuccess(pds string, configured int) int {
+	if l == nil {
+		return configured
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	origin := l.originLocked(pds, configured)
+	origin.successes++
+	if origin.successes >= pdsWorkerRecoverySuccesses {
+		origin.successes = 0
+		origin.ceiling = min(origin.ceiling+1, configured)
+	}
+	return origin.ceiling
+}
+
+func (l *PDSWorkerLimits) recordRateLimited(pds string, configured int) int {
+	if l == nil {
+		return configured
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	origin := l.originLocked(pds, configured)
+	origin.successes = 0
+	origin.ceiling = max(origin.ceiling/2, 1)
+	return origin.ceiling
+}
+
+// Stages of one direct repository acquisition, summed per job pass for the
+// debug-level pass log.
+const (
+	repositoryStageIdentity = iota
+	repositoryStageGetRepo
+	repositoryStageReconcile
+	repositoryStageCheckpoint
+	repositoryStageCount
+)
+
+type repositoryStageTimings struct {
+	durations [repositoryStageCount]atomic.Int64
+	completed atomic.Int64
+}
+
+func (t *repositoryStageTimings) record(stage int, startedAt time.Time) {
+	if t == nil {
+		return
+	}
+	t.durations[stage].Add(int64(time.Since(startedAt)))
+}
+
+func (t *repositoryStageTimings) recordCompletion() {
+	if t != nil {
+		t.completed.Add(1)
+	}
+}
+
+func (t *repositoryStageTimings) duration(stage int) time.Duration {
+	return time.Duration(t.durations[stage].Load())
 }
 
 const (
@@ -46,7 +165,21 @@ const (
 	pdsCauseUnknown   = "unknown"
 
 	maxPDSServerRetryWait = 30 * time.Minute
+
+	// paceRateLimitHeadroom extends a pacing cooldown past the advertised
+	// RateLimit-Reset, which has one-second resolution and is subject to
+	// clock skew, so the first request after the pause lands in a new window.
+	paceRateLimitHeadroom = time.Second
 )
+
+// repositoryAcquisitionTimeout bounds one repository's identity checks,
+// download, verification and projection. Waiting for and performing the
+// serial archive reconciliation is not included. Tests may shorten it.
+var repositoryAcquisitionTimeout = 2 * time.Minute
+
+// errRepositoryStartStopped reports that the pass stopped, for example after a
+// sibling's 429, between this repository's attempt start and its download.
+var errRepositoryStartStopped = errors.New("repository pass stopped before download")
 
 type pdsResponseCaptureKey struct{}
 
@@ -317,6 +450,7 @@ func newListReposAttemptFailure(ctx context.Context, cause error, capture *pdsRe
 }
 
 type frozenRepositoryOutcome struct {
+	completed       bool
 	retryPending    bool
 	stop            bool
 	unavailable     bool
@@ -325,28 +459,176 @@ type frozenRepositoryOutcome struct {
 	attemptFailure  *pdsAttemptFailure
 }
 
+// repoGate hands out a job's frozen inventory to repository workers in
+// inventory order. It never lets more than ceiling repositories run at once
+// and starts none after a worker stops the pass. Workers pull work, so one
+// worker reproduces the serial order and outcomes exactly.
+type repoGate struct {
+	mu        sync.Mutex
+	cond      *sync.Cond
+	ctx       context.Context
+	pds       string
+	workers   int
+	limits    *PDSWorkerLimits
+	entries   []ListedRepository
+	completed map[string]string
+	outcomes  []frozenRepositoryOutcome
+	cursor    int
+	active    int
+	ceiling   int
+	stopped   bool
+	err       error
+	cancel    context.CancelFunc
+}
+
+func newRepoGate(ctx context.Context, p PDSProcessor, job Job, entries []ListedRepository, cancel context.CancelFunc) *repoGate {
+	workers := p.repoWorkers()
+	gate := &repoGate{
+		ctx:       ctx,
+		pds:       job.PDS,
+		workers:   workers,
+		limits:    p.Limits,
+		entries:   entries,
+		completed: job.CompletedRepos,
+		outcomes:  make([]frozenRepositoryOutcome, len(entries)),
+		ceiling:   p.Limits.Ceiling(job.PDS, workers),
+		cancel:    cancel,
+	}
+	gate.cond = sync.NewCond(&gate.mu)
+	return gate
+}
+
+// next returns the next unfinished inventory index once a worker slot is free,
+// or false when the pass is stopped or the inventory is exhausted.
+func (g *repoGate) next() (int, bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for {
+		if g.stopped || g.ctx.Err() != nil {
+			return 0, false
+		}
+		for g.cursor < len(g.entries) && completedRevisionAtLeast(g.completed[g.entries[g.cursor].DID], g.entries[g.cursor].Revision) {
+			g.cursor++
+		}
+		if g.cursor == len(g.entries) {
+			return 0, false
+		}
+		if g.active < g.ceiling {
+			index := g.cursor
+			g.cursor++
+			g.active++
+			return index, true
+		}
+		g.cond.Wait()
+	}
+}
+
+// finish records one repository's outcome. A local error cancels the other
+// workers; a stopping outcome, such as a PDS cooldown, lets in-flight
+// repositories finish but starts no more.
+func (g *repoGate) finish(index int, outcome frozenRepositoryOutcome, err error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.active--
+	g.outcomes[index] = outcome
+	switch {
+	case err != nil:
+		if g.err == nil {
+			g.err = err
+		}
+		g.stopped = true
+		g.cancel()
+	case outcome.stop:
+		g.stopped = true
+	}
+	if outcome.attemptFailure != nil && outcome.attemptFailure.httpStatus == http.StatusTooManyRequests {
+		g.ceiling = g.limits.recordRateLimited(g.pds, g.workers)
+	} else if outcome.completed {
+		g.ceiling = g.limits.recordSuccess(g.pds, g.workers)
+	}
+	g.cond.Broadcast()
+}
+
+// isStopped reports whether the pass stopped starting repositories.
+func (g *repoGate) isStopped() bool {
+	if g == nil {
+		return false
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.stopped
+}
+
+func (g *repoGate) currentCeiling() int {
+	if g == nil {
+		return 1
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.ceiling
+}
+
 func (p PDSProcessor) processFrozenInventory(ctx context.Context, client *atmossync.Client, job Job) error {
 	entries, err := p.Manager.Inventory(job.ID)
 	if err != nil {
 		return err
 	}
+	startedAt := time.Now()
+	poolCtx, cancelPool := context.WithCancel(ctx)
+	defer cancelPool()
+	p.timings = &repositoryStageTimings{}
+	p.gate = newRepoGate(poolCtx, p, job, entries, cancelPool)
+	defer func() {
+		elapsed := time.Since(startedAt)
+		completed := p.timings.completed.Load()
+		slog.Default().Info("direct PDS backfill pass finished",
+			"job_id", job.ID,
+			"repos_completed", completed,
+			"elapsed", elapsed,
+			"repos_per_second", float64(completed)/max(elapsed.Seconds(), 1e-9),
+			"workers", p.repoWorkers(),
+			"worker_ceiling", p.gate.currentCeiling(),
+		)
+		slog.Default().Debug("direct PDS backfill pass stages",
+			"job_id", job.ID,
+			"repos_completed", completed,
+			"elapsed", elapsed,
+			"identity", p.timings.duration(repositoryStageIdentity),
+			"get_repo", p.timings.duration(repositoryStageGetRepo),
+			"reconcile", p.timings.duration(repositoryStageReconcile),
+			"checkpoint", p.timings.duration(repositoryStageCheckpoint),
+		)
+	}()
 	var outcome frozenRepositoryOutcome
 	if job.Reason == ReasonRepositoryRecovery && !job.TotalReposKnown {
 		outcome.unavailable = true
 		outcome.unavailableCode = "recovery_revision_unavailable"
 	}
-	for _, frozen := range entries {
-		if completedRevisionAtLeast(job.CompletedRepos[frozen.DID], frozen.Revision) {
-			continue
+	var workers sync.WaitGroup
+	for worker := range min(p.repoWorkers(), len(entries)) {
+		// Each worker has its own client; all share the configured transport.
+		workerClient := client
+		if worker > 0 {
+			workerClient = p.client(job)
 		}
-		current, err := p.processFrozenRepository(ctx, client, job, frozen)
-		if err != nil {
-			return err
-		}
+		workers.Go(func() {
+			for {
+				index, ok := p.gate.next()
+				if !ok {
+					return
+				}
+				current, err := p.processFrozenRepository(poolCtx, workerClient, job, entries[index])
+				p.gate.finish(index, current, err)
+			}
+		})
+	}
+	workers.Wait()
+	if p.gate.err != nil {
+		return p.gate.err
+	}
+	// Merge in inventory order so the job outcome does not depend on timing.
+	for _, current := range p.gate.outcomes {
 		outcome = mergeFrozenRepositoryOutcome(outcome, current)
-		if current.stop {
-			break
-		}
 	}
 	if outcome.retryPending {
 		return errJobYield
@@ -399,7 +681,7 @@ func (p PDSProcessor) processFrozenRepository(ctx context.Context, client *atmos
 	if found && cooldown.Until.After(time.Now()) {
 		return frozenRepositoryOutcome{retryPending: true, stop: true}, nil
 	}
-	return p.processReadyRepository(ctx, client, job, entry)
+	return p.processReadyRepository(ctx, client, job, entry, retry)
 }
 
 func (p PDSProcessor) persistedRetryOutcome(job Job, entry atmossync.ListReposEntry, retry RepositoryRetry) (frozenRepositoryOutcome, bool, error) {
@@ -447,7 +729,9 @@ func unresolvedRepositoryOutcome(p PDSProcessor, job Job, entry atmossync.ListRe
 	return outcome
 }
 
-func (p PDSProcessor) processReadyRepository(ctx context.Context, client *atmossync.Client, job Job, entry atmossync.ListReposEntry) (frozenRepositoryOutcome, error) {
+// processReadyRepository acquires one repository. previous is its retry state
+// before this attempt, restored if the pass stops before the download.
+func (p PDSProcessor) processReadyRepository(ctx context.Context, client *atmossync.Client, job Job, entry atmossync.ListReposEntry, previous RepositoryRetry) (frozenRepositoryOutcome, error) {
 	if err := p.validateListedSnapshot(&job, entry); err != nil {
 		var input *InputError
 		if errors.As(err, &input) && !input.Unavailable {
@@ -462,17 +746,36 @@ func (p PDSProcessor) processReadyRepository(ctx context.Context, client *atmoss
 	if err != nil {
 		return frozenRepositoryOutcome{}, err
 	}
-	if err := p.repository(ctx, client, job, entry); err == nil {
-		return frozenRepositoryOutcome{}, nil
-	} else if ctx.Err() != nil {
+	err = p.repository(ctx, client, job, entry)
+	switch {
+	case err == nil:
+		return frozenRepositoryOutcome{completed: true}, nil
+	case ctx.Err() != nil:
 		return frozenRepositoryOutcome{}, ctx.Err()
-	} else {
-		var input *InputError
-		if !errors.As(err, &input) {
+	case errors.Is(err, errRepositoryStartStopped):
+		// No request was sent, so the attempt is returned unused.
+		if err := p.Manager.abandonRepositoryAttempt(job.ID, string(entry.DID), attempt, previous); err != nil {
 			return frozenRepositoryOutcome{}, err
 		}
-		return p.recordRepositoryAttemptFailure(job, entry, attempt, err, input)
+		return frozenRepositoryOutcome{retryPending: true, stop: true}, nil
 	}
+	err = classifyRepositoryDeadline(err, entry.DID)
+	var input *InputError
+	if !errors.As(err, &input) {
+		return frozenRepositoryOutcome{}, err
+	}
+	return p.recordRepositoryAttemptFailure(job, entry, attempt, err, input)
+}
+
+// classifyRepositoryDeadline turns an expired per-repository deadline that
+// escaped classification into a retryable timeout. While the pass itself is
+// live, a slow repository must schedule a retry, never stop the runtime.
+func classifyRepositoryDeadline(err error, did atmos.DID) error {
+	var input *InputError
+	if !errors.Is(err, context.DeadlineExceeded) || errors.As(err, &input) {
+		return err
+	}
+	return newPDSAttemptFailure(&InputError{Code: "repository_unavailable", Unavailable: true}, err, pdsStageGetRepoRequest, string(did), false, nil)
 }
 
 func (p PDSProcessor) recordRepositoryAttemptFailure(job Job, entry atmossync.ListReposEntry, attempt RepositoryRetry, err error, input *InputError) (frozenRepositoryOutcome, error) {
@@ -715,29 +1018,93 @@ func inputFailure(ctx context.Context, code string) error {
 }
 
 func (p PDSProcessor) repository(ctx context.Context, client *atmossync.Client, job Job, entry atmossync.ListReposEntry) error {
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer cancel()
-	if err := p.verifySource(ctx, entry.DID, job.PDS); err != nil {
-		return err
-	}
-	r, commit, err := fetchRepository(ctx, client, entry.DID)
+	snapshot, commit, err := p.acquireSnapshot(ctx, client, job, entry)
 	if err != nil {
 		return err
 	}
-	if err := p.verifySnapshot(ctx, job, entry, commit); err != nil {
-		return err
-	}
-	snapshot, err := projectSnapshot(ctx, job, entry.DID, r, commit.Rev)
+	// Reconciliation is serial across workers. It runs under the pass context,
+	// so time queued behind another repository's reconciliation never expires
+	// this repository's acquisition deadline.
+	stageStartedAt := time.Now()
+	err = p.Manager.ApplyContext(ctx, job.ID, func(admittedCtx context.Context) error { return p.Reconcile(admittedCtx, snapshot) })
+	p.timings.record(repositoryStageReconcile, stageStartedAt)
 	if err != nil {
-		return err
-	}
-	if err := p.Manager.ApplyContext(ctx, job.ID, func(admittedCtx context.Context) error { return p.Reconcile(admittedCtx, snapshot) }); err != nil {
 		if errors.Is(err, ingest.ErrAccountUnavailable) {
 			return &InputError{Code: "account_unavailable", Unavailable: true}
 		}
 		return err
 	}
-	return p.Manager.CheckpointRepositoryAcquisition(job.ID, string(entry.DID), entry.Rev, commit.Rev, job.Cursor, len(snapshot.Records))
+	stageStartedAt = time.Now()
+	err = p.Manager.CheckpointRepositoryAcquisition(job.ID, string(entry.DID), entry.Rev, commit.Rev, job.Cursor, len(snapshot.Records))
+	p.timings.record(repositoryStageCheckpoint, stageStartedAt)
+	if err == nil {
+		p.timings.recordCompletion()
+	}
+	return err
+}
+
+// acquireSnapshot verifies the source, downloads and verifies the repository
+// and projects the selected records, all within repositoryAcquisitionTimeout.
+func (p PDSProcessor) acquireSnapshot(ctx context.Context, client *atmossync.Client, job Job, entry atmossync.ListReposEntry) (ingest.Snapshot, *repo.Commit, error) {
+	ctx, cancel := context.WithTimeout(ctx, repositoryAcquisitionTimeout)
+	defer cancel()
+	stageStartedAt := time.Now()
+	err := p.verifySource(ctx, entry.DID, job.PDS)
+	p.timings.record(repositoryStageIdentity, stageStartedAt)
+	if err != nil {
+		return ingest.Snapshot{}, nil, err
+	}
+	// A sibling's 429 may have stopped the pass while this repository's
+	// identity was resolving; send no request after that.
+	if p.gate.isStopped() {
+		return ingest.Snapshot{}, nil, errRepositoryStartStopped
+	}
+	stageStartedAt = time.Now()
+	capture := &pdsResponseCapture{}
+	r, commit, err := fetchRepository(context.WithValue(ctx, pdsResponseCaptureKey{}, capture), client, entry.DID)
+	p.timings.record(repositoryStageGetRepo, stageStartedAt)
+	if err != nil {
+		return ingest.Snapshot{}, nil, err
+	}
+	if err := p.paceRateLimit(job, capture.header); err != nil {
+		return ingest.Snapshot{}, nil, err
+	}
+	stageStartedAt = time.Now()
+	err = p.verifySnapshot(ctx, job, entry, commit)
+	p.timings.record(repositoryStageIdentity, stageStartedAt)
+	if err != nil {
+		return ingest.Snapshot{}, nil, err
+	}
+	snapshot, err := projectSnapshot(ctx, job, entry.DID, r, commit.Rev)
+	if err != nil {
+		return ingest.Snapshot{}, nil, err
+	}
+	return snapshot, commit, nil
+}
+
+// paceRateLimit cools the PDS origin down until just after its advertised
+// reset before the request budget runs out. When a successful getRepo
+// response reports fewer remaining requests than twice the current worker
+// ceiling, no new repository starts until one second after RateLimit-Reset,
+// and in-flight repositories finish.
+// Unlike a 429, this consumes no repository attempt. Missing or invalid
+// headers leave pacing to the server's 429 handling.
+func (p PDSProcessor) paceRateLimit(job Job, headers http.Header) error {
+	remaining, err := strconv.ParseInt(strings.TrimSpace(headers.Get("RateLimit-Remaining")), 10, 64)
+	if err != nil || remaining < 0 || remaining >= int64(2*p.gate.currentCeiling()) {
+		return nil
+	}
+	now := time.Now()
+	ceiling := now.Add(maxPDSServerRetryWait)
+	reset := pdsRateLimitResetDeadline(strings.TrimSpace(headers.Get("RateLimit-Reset")), now, ceiling)
+	if reset.IsZero() {
+		return nil
+	}
+	deadline := reset.Add(paceRateLimitHeadroom)
+	if deadline.After(ceiling) {
+		deadline = ceiling
+	}
+	return p.Manager.RecordPDSCooldown(job.ID, deadline)
 }
 
 // repositoryReadErrors records a non-EOF getRepo body failure so it cannot
@@ -791,8 +1158,11 @@ func verifySourceIdentity(ident *identity.Identity, pds string) error {
 }
 
 func fetchRepository(ctx context.Context, client *atmossync.Client, did atmos.DID) (*repo.Repo, *repo.Commit, error) {
-	capture := &pdsResponseCapture{}
-	ctx = context.WithValue(ctx, pdsResponseCaptureKey{}, capture)
+	capture, ok := ctx.Value(pdsResponseCaptureKey{}).(*pdsResponseCapture)
+	if !ok {
+		capture = &pdsResponseCapture{}
+		ctx = context.WithValue(ctx, pdsResponseCaptureKey{}, capture)
+	}
 	body, err := client.GetRepoStream(ctx, did, "")
 	if err != nil {
 		if errors.Is(ctx.Err(), context.Canceled) {
