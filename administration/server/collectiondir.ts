@@ -287,11 +287,14 @@ function errorCategory(
   return state === "failed" ? "unknown" : null;
 }
 
-// One requestCrawl response. An older directory reports no per-host outcome.
+// One requestCrawl response. An older directory reports no per-host outcome
+// and only acknowledges with {"message":"ok"}; anything else is unexpected.
 function chunkSubmissions(hosts: string[], body: unknown): CrawlSubmission[] {
   if (!isRecord(body)) throw new CollectiondirError("invalid_response");
-  if (body.hosts === undefined)
+  if (body.hosts === undefined) {
+    if (body.message !== "ok") throw new CollectiondirError("invalid_response");
     return hosts.map((pds) => ({ pds, outcome: "accepted", startedAt: null }));
+  }
   const outcomes = body.hosts;
   if (!isRecord(outcomes)) throw new CollectiondirError("invalid_response");
   return hosts.map((pds) => {

@@ -498,7 +498,7 @@
           <div>
             <dt>Requested</dt>
             <dd>
-              {recordedTime(selectedCrawl.acceptedAt)}<small
+              {recordedTime(selectedCrawl.requestedAt)}<small
                 >by {selectedCrawl.actorHandle
                   ? `@${selectedCrawl.actorHandle}`
                   : selectedCrawl.actor}</small

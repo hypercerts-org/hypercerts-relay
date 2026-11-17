@@ -191,6 +191,19 @@ func waitForResult(t *testing.T, e *echo.Echo, host string) (statusReply, HostCr
 	return statusReply{}, HostCrawlResult{}
 }
 
+func TestDefaultCrawlClientBoundsResponseHeaders(t *testing.T) {
+	transport, ok := defaultCrawlHTTPClient().Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("default crawl client has no *http.Transport")
+	}
+	if transport.ResponseHeaderTimeout != crawlResponseHeaderTimeout {
+		t.Fatalf("response header timeout = %v, want %v", transport.ResponseHeaderTimeout, crawlResponseHeaderTimeout)
+	}
+	if transport.DialContext == nil {
+		t.Fatal("default crawl client lost the public-only dialer")
+	}
+}
+
 func TestCrawlFinishedMovesToResults(t *testing.T) {
 	pds := newFakePDS(t, &fakePDS{dids: []string{"did:plc:one", "did:plc:two"}})
 	_, e := newCrawlTestServer(t, pds.server.Client())

@@ -948,13 +948,23 @@ func (cs *collectionServer) startCrawl(hostIn string) (host string, started bool
 	return host, true, start
 }
 
+// hypercerts: bounds the wait for each crawl response's headers, so a PDS that
+// accepts a connection but never answers cannot hold its crawl active forever.
+// It does not limit body reads or the length of the whole crawl.
+const crawlResponseHeaderTimeout = 30 * time.Second
+
+// hypercerts: the public-only crawl client, with crawlResponseHeaderTimeout.
+func defaultCrawlHTTPClient() *http.Client {
+	transport := ssrf.PublicOnlyTransport()
+	transport.ResponseHeaderTimeout = crawlResponseHeaderTimeout
+	return &http.Client{Transport: transport}
+}
+
 // hypercerts: the crawl is registered by startCrawl before this runs.
 func (cs *collectionServer) crawlThread(host string, start time.Time, crawlStats *CrawlStats) {
 	httpClient := cs.crawlHTTPClient
 	if httpClient == nil {
-		httpClient = &http.Client{
-			Transport: ssrf.PublicOnlyTransport(),
-		}
+		httpClient = defaultCrawlHTTPClient()
 	}
 	rpcClient := xrpc.Client{
 		Host:   host,

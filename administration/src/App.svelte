@@ -223,13 +223,26 @@
     }
     poller?.update();
   }
+  // Page loads and the poller can refresh concurrently; only the newest
+  // refresh may change state, so a slower, older response (or failure) is
+  // dropped instead of overwriting it.
+  let directoryRequest = 0;
   async function refreshDirectory() {
-    const [directoryStatus, crawlPage] = await Promise.all([
-      api<CollectionDirectoryStatus>("/collection-directory/status"),
-      api<{ items: CollectionCrawl[]; next: string | null }>(
-        "/collection-directory/crawls?limit=100",
-      ),
-    ]);
+    const request = ++directoryRequest;
+    let directoryStatus: CollectionDirectoryStatus;
+    let crawlPage: { items: CollectionCrawl[]; next: string | null };
+    try {
+      [directoryStatus, crawlPage] = await Promise.all([
+        api<CollectionDirectoryStatus>("/collection-directory/status"),
+        api<{ items: CollectionCrawl[]; next: string | null }>(
+          "/collection-directory/crawls?limit=100",
+        ),
+      ]);
+    } catch (error) {
+      if (request === directoryRequest) throw error;
+      return;
+    }
+    if (request !== directoryRequest) return;
     directory = directoryStatus;
     if (olderCrawlsLoaded) {
       // Keep older pages the operator loaded; refresh only the newest rows.
@@ -360,13 +373,19 @@
   onMount(() => {
     let active = true;
     poller = createDirectoryPoller(async () => {
+      // Follow a pending crawl request first, so a request that finishes
+      // during this poll is reflected in the directory snapshot read below.
+      const watched = operation;
+      if (
+        watched?.command.kind === "collection_crawl" &&
+        ["requested", "applying"].includes(watched.state)
+      ) {
+        const latest = await api<Operation>(`/operations/${watched.id}`);
+        // Keep an operation the operator submitted while this was in flight.
+        if (operation?.id === watched.id) operation = latest;
+      }
       await refreshDirectory();
       await sourcesComponent?.refreshCrawlDetail();
-      if (
-        operation?.command.kind === "collection_crawl" &&
-        ["requested", "applying"].includes(operation.state)
-      )
-        operation = await api<Operation>(`/operations/${operation.id}`);
     }, crawlActive);
     void api<typeof session>("/session")
       .then(async (value) => {
