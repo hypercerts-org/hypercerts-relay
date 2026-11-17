@@ -50,20 +50,36 @@ const server = createApp(
   {},
   resolve("dist"),
 ).listen(3188, "127.0.0.1");
-let stopping = false;
+let stopping: Promise<void> | undefined;
 function closeServer() {
   return new Promise<void>((resolve, reject) => {
     server.close((error) => (error ? reject(error) : resolve()));
   });
 }
-async function shutdown() {
-  if (stopping) return;
-  stopping = true;
-  clearInterval(timer);
-  await Promise.allSettled(ticks);
-  await closeServer();
-  store.close();
-  await fixtures.close();
+// Every caller waits for the same shutdown, so a repeated signal neither
+// starts a second one nor exits before the first has finished.
+function shutdown() {
+  stopping ??= (async () => {
+    clearInterval(timer);
+    await Promise.allSettled(ticks);
+    await closeServer();
+    store.close();
+    await fixtures.close();
+  })();
+  return stopping;
 }
-process.once("SIGINT", () => void shutdown());
-process.once("SIGTERM", () => void shutdown());
+// Playwright stops this server with SIGTERM to its whole process group
+// (gracefulShutdown in playwright.config.ts). Handle every signal, since an
+// unhandled repeat would kill the process while it removes the fixtures'
+// temporary directory, and exit once that is done.
+function stop() {
+  shutdown().then(
+    () => process.exit(0),
+    (error: unknown) => {
+      console.error(error);
+      process.exit(1);
+    },
+  );
+}
+process.on("SIGINT", stop);
+process.on("SIGTERM", stop);

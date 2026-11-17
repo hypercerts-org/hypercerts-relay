@@ -4,6 +4,7 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -53,7 +54,14 @@ export async function startControlFixtures(): Promise<ControlFixtures> {
       "CONTROL_GO_BINARY must identify an absolute Go executable path",
     );
   const dir = mkdtempSync(join(tmpdir(), "admin-control-fixture-"));
-  const env = { ...process.env, GOCACHE: join(dir, "go-cache") };
+  // Keep Go's build work and each fixture's t.TempDir inside dir, so removing
+  // dir also cleans up after a fixture that was killed instead of stopped.
+  mkdirSync(join(dir, "tmp"));
+  const env = {
+    ...process.env,
+    GOCACHE: join(dir, "go-cache"),
+    TMPDIR: join(dir, "tmp"),
+  };
   const compile = promisify(execFile);
   const specs = [
     { name: "relay", cwd: resolve(".."), pkg: "./cmd/relay" },

@@ -1,7 +1,7 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID, createHash } from "node:crypto";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:http";
@@ -854,8 +854,10 @@ test("repository recovery operations accept a full DID scope only after authenti
     413,
   );
 });
-test("durable operations recover after restart and retain actor and failure states", async () => {
-  const path = join(mkdtempSync(join(tmpdir(), "control-test-")), "state.db");
+test("durable operations recover after restart and retain actor and failure states", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "control-test-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, "state.db");
   let store = new Store(path);
   const cmd = command.parse({
     kind: "collections",
