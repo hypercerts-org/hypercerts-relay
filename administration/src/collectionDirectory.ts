@@ -1,5 +1,6 @@
 import type {
   ActiveCrawl,
+  CollectionBootstrapView,
   CollectionCrawl,
   CollectionDirectoryStatus,
   Operation,
@@ -138,19 +139,122 @@ export function crawlNotice(
   }`;
 }
 
+// Initial crawl phases that the server can still move forward on its own.
+const openBootstrapPhases = ["waiting", "retrying", "accepted"];
+
 // Whether crawl status can still change and is worth polling. Accepted rows
 // are ignored without a configured directory: only the server can close them.
+// A source enable is followed because applying it may queue an initial crawl.
 export function crawlsInProgress(
   directory: CollectionDirectoryStatus | null,
   rows: CollectionCrawl[],
   operation: Operation | null,
+  bootstraps: CollectionBootstrapView[] = [],
 ): boolean {
   return (
     (directory?.active.length ?? 0) > 0 ||
     (directory?.configured !== false &&
       rows.some((row) => row.state === "accepted")) ||
-    (operation?.command.kind === "collection_crawl" &&
-      ["requested", "applying"].includes(operation.state))
+    (operation !== null &&
+      (operation.command.kind === "collection_crawl" ||
+        (operation.command.kind === "source" &&
+          operation.command.state === "enabled")) &&
+      ["requested", "applying"].includes(operation.state)) ||
+    bootstraps.some((bootstrap) =>
+      openBootstrapPhases.includes(bootstrap.phase),
+    )
+  );
+}
+
+// What happened to the initial crawl when a source enable was applied. The
+// source itself was added in every case.
+export function bootstrapNotice(operation: Operation | null): {
+  text: string;
+  queued: boolean;
+} | null {
+  if (
+    !operation ||
+    operation.command.kind !== "source" ||
+    operation.state !== "applied"
+  )
+    return null;
+  const bootstrap = (
+    operation.result as {
+      collectionDirectory?: { bootstrap: string };
+    } | null
+  )?.collectionDirectory?.bootstrap;
+  switch (bootstrap) {
+    case "queued":
+      return {
+        text: "Initial collection directory crawl queued.",
+        queued: true,
+      };
+    case "not_configured":
+      return {
+        text: "Collection directory is not configured, so no initial crawl was requested. The source was added.",
+        queued: false,
+      };
+    case "not_https":
+      return {
+        text: "No initial crawl: the collection directory only crawls HTTPS sources. The source was added.",
+        queued: false,
+      };
+    default:
+      return null;
+  }
+}
+
+function errorText(code: string | null) {
+  return (code ?? "unknown error").replaceAll("_", " ");
+}
+
+// One line describing an initial crawl. Once the directory accepts it, the
+// wording matches crawlSummary.
+export function bootstrapSummary(
+  bootstrap: CollectionBootstrapView,
+  active?: ActiveCrawl,
+): string {
+  const request = bootstrap.request;
+  switch (bootstrap.phase) {
+    case "skipped_not_configured":
+      return "Skipped: collection directory not configured. Once it is configured, use Crawl collection directory.";
+    case "skipped_not_https":
+      return "Skipped: the collection directory only crawls HTTPS sources.";
+    case "waiting":
+      return "Waiting to be submitted";
+    case "retrying": {
+      const reason =
+        request?.error === "collectiondir_unavailable"
+          ? "Collection directory unavailable"
+          : `Not submitted: ${errorText(request?.error ?? null)}`;
+      return `${reason}; retrying automatically (attempt ${
+        (request?.attempts ?? 0) + 1
+      }${
+        request?.nextAttemptAt ? `, next at ${time(request.nextAttemptAt)}` : ""
+      })`;
+    }
+    case "needs_attention":
+      return `Could not be submitted: ${errorText(request?.error ?? null)}. Automatic retries have stopped.`;
+    case "not_requested":
+      if (request?.state === "canceled") return "Not requested: canceled";
+      if (request?.error === "source_not_enabled")
+        return "Not requested: source was no longer enabled";
+      return `Not requested: ${errorText(request?.error ?? null)}`;
+    case "accepted":
+    case "finished":
+    case "failed":
+    case "unknown":
+      return bootstrap.crawl
+        ? crawlSummary(bootstrap.crawl, active)
+        : "Outcome unknown: not reported";
+  }
+}
+
+// Initial crawls the collection directory has not yet accepted.
+export function awaitingBootstraps(bootstraps: CollectionBootstrapView[]) {
+  return bootstraps.filter(
+    (bootstrap) =>
+      !["accepted", "finished", "failed", "unknown"].includes(bootstrap.phase),
   );
 }
 

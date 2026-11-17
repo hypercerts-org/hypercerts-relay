@@ -27,7 +27,9 @@ export class Store {
       CREATE INDEX IF NOT EXISTS operations_created ON operations(createdAt,id);
       CREATE TABLE IF NOT EXISTS collection_crawls (id TEXT PRIMARY KEY, operation TEXT NOT NULL, pds TEXT NOT NULL, actor TEXT NOT NULL, cause TEXT NOT NULL DEFAULT 'manual', submission TEXT NOT NULL, state TEXT NOT NULL, requestedAt TEXT NOT NULL, acceptedAt TEXT NOT NULL, crawlStartedAt TEXT, finishedAt TEXT, reposDescribed INTEGER, describeErrors INTEGER, errorCategory TEXT, httpStatus INTEGER, observedAt TEXT, UNIQUE(operation,pds));
       CREATE INDEX IF NOT EXISTS collection_crawls_state ON collection_crawls(state,requestedAt);
-      CREATE INDEX IF NOT EXISTS collection_crawls_recent ON collection_crawls(requestedAt,id);`);
+      CREATE INDEX IF NOT EXISTS collection_crawls_recent ON collection_crawls(requestedAt,id);
+      CREATE TABLE IF NOT EXISTS collection_bootstraps (sourceOperation TEXT PRIMARY KEY, pds TEXT NOT NULL, hostId INTEGER NOT NULL, sourceRevision INTEGER NOT NULL, actor TEXT NOT NULL, outcome TEXT NOT NULL, crawlOperation TEXT UNIQUE, attempts INTEGER NOT NULL DEFAULT 0, nextAttemptAt TEXT, gaveUpAt TEXT, createdAt TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS collection_bootstraps_pds ON collection_bootstraps(pds,createdAt);`);
     const auditColumns = this.db.prepare("PRAGMA table_info(audit)").all() as {
       name: string;
     }[];
@@ -159,23 +161,25 @@ export class Store {
       .run(namespace, key);
   }
   request(actor: string, body: Command, id: string = randomUUID()): Operation {
-    return this.transaction(() => {
-      const previous = this.operation(id);
-      if (previous) {
-        if (
-          previous.actor !== actor ||
-          JSON.stringify(previous.command) !== JSON.stringify(body)
-        )
-          throw new ApiError(409, "idempotency_conflict");
-        return previous;
-      }
-      const time = new Date().toISOString();
-      this.db
-        .prepare("INSERT INTO operations VALUES(?,?,?,?,?,?,NULL,NULL)")
-        .run(id, actor, JSON.stringify(body), "requested", time, time);
-      this.audit(actor, "requested", body, id);
-      return this.operation(id)!;
-    });
+    return this.transaction(() => this.enqueue(actor, body, id));
+  }
+  // Records a requested operation; the caller provides the transaction.
+  enqueue(actor: string, body: Command, id: string): Operation {
+    const previous = this.operation(id);
+    if (previous) {
+      if (
+        previous.actor !== actor ||
+        JSON.stringify(previous.command) !== JSON.stringify(body)
+      )
+        throw new ApiError(409, "idempotency_conflict");
+      return previous;
+    }
+    const time = new Date().toISOString();
+    this.db
+      .prepare("INSERT INTO operations VALUES(?,?,?,?,?,?,NULL,NULL)")
+      .run(id, actor, JSON.stringify(body), "requested", time, time);
+    this.audit(actor, "requested", body, id);
+    return this.operation(id)!;
   }
   operation(id: string): Operation | undefined {
     const r = this.db.prepare("SELECT * FROM operations WHERE id=?").get(id);
@@ -205,6 +209,8 @@ export class Store {
     error: string | null = null,
     actor?: string,
     expected?: readonly OperationState[],
+    // Runs in the same transaction, only when the transition happens.
+    within?: () => void,
   ): boolean {
     return this.transaction(() => {
       const op = this.operation(id);
@@ -222,6 +228,7 @@ export class Store {
           id,
         );
       this.audit(actor ?? op.actor, state, { result, error }, id);
+      within?.();
       return true;
     });
   }

@@ -8,6 +8,7 @@ import { Services } from "./services.ts";
 import { Worker } from "./worker.ts";
 import { Collectiondir, collectiondirConfig } from "./collectiondir.ts";
 import { CollectionCrawls } from "./collection-crawls.ts";
+import { CollectionBootstrap } from "./collection-bootstrap.ts";
 
 function required(name: string) {
   const value = process.env[name];
@@ -80,8 +81,9 @@ const collectiondir = new Collectiondir(
   },
 );
 const crawls = new CollectionCrawls(store, services, collectiondir);
+const bootstrap = new CollectionBootstrap(store, collectiondir.configured);
 store.seedAdministrator(process.env.ADMIN_SEED_DID);
-const worker = new Worker(store, services, crawls);
+const worker = new Worker(store, services, crawls, bootstrap);
 worker.recover();
 const server = createApp(
   store,
@@ -101,6 +103,7 @@ const server = createApp(
       : undefined,
     publicServiceOrigins,
     collectionCrawls: crawls,
+    collectionBootstrap: bootstrap,
   },
 ).listen(
   Number(process.env.PORT ?? 3000),
@@ -110,6 +113,8 @@ let stopping = false;
 async function run() {
   while (!stopping) {
     await worker.tick();
+    // SQLite only; a failure here is a persistence failure.
+    bootstrap.retryDue();
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
 }

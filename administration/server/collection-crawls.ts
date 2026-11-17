@@ -45,7 +45,7 @@ function ineligibility(source: RelaySourceView): Ineligibility | null {
   return null;
 }
 
-type CrawlRow = Omit<CollectionCrawl, "actorHandle">;
+type CrawlRow = Omit<CollectionCrawl, "actorHandle" | "sourceOperation">;
 
 // Records manual collection directory crawl requests and follows each accepted
 // source until the directory reports how its crawl ended.
@@ -178,9 +178,16 @@ export class CollectionCrawls {
 
   private record(op: Operation, accepted: CrawlSubmission[]) {
     const acceptedAt = new Date().toISOString();
+    // Derived server-side: an operation queued by CollectionBootstrap is an
+    // automatic initial crawl.
+    const cause = this.store.db
+      .prepare("SELECT 1 FROM collection_bootstraps WHERE crawlOperation=?")
+      .get(op.id)
+      ? "source_added"
+      : "manual";
     const insert = this.store.db.prepare(
       `INSERT OR IGNORE INTO collection_crawls(id,operation,pds,actor,cause,submission,state,requestedAt,acceptedAt,crawlStartedAt)
-       VALUES(?,?,?,?,'manual',?,'accepted',?,?,?)`,
+       VALUES(?,?,?,?,?,?,'accepted',?,?,?)`,
     );
     this.store.transaction(() => {
       for (const submission of accepted) {
@@ -189,6 +196,7 @@ export class CollectionCrawls {
           op.id,
           submission.pds,
           op.actor,
+          cause,
           submission.outcome,
           op.createdAt,
           acceptedAt,
@@ -440,10 +448,11 @@ export class CollectionCrawls {
     const [requestedAt, id] = crawlCursor(after);
     const rows = this.store.db
       .prepare(
-        `SELECT * FROM collection_crawls
-         WHERE (?='' OR (requestedAt,id)<(?,?)) AND (?='' OR pds=?)
-         ${ids ? `AND id IN (${ids.map(() => "?").join(",")})` : ""}
-         ORDER BY requestedAt DESC,id DESC LIMIT ?`,
+        `SELECT c.*, b.sourceOperation FROM collection_crawls c
+         LEFT JOIN collection_bootstraps b ON b.crawlOperation=c.operation
+         WHERE (?='' OR (c.requestedAt,c.id)<(?,?)) AND (?='' OR c.pds=?)
+         ${ids ? `AND c.id IN (${ids.map(() => "?").join(",")})` : ""}
+         ORDER BY c.requestedAt DESC,c.id DESC LIMIT ?`,
       )
       .all(
         requestedAt,
@@ -453,7 +462,7 @@ export class CollectionCrawls {
         pds ?? "",
         ...(ids ?? []),
         limit + 1,
-      ) as unknown as CrawlRow[];
+      ) as unknown as (CrawlRow & { sourceOperation: string | null })[];
     const items = rows.slice(0, limit).map((row) => ({
       ...row,
       actorHandle: this.actorHandle(row),
@@ -486,7 +495,7 @@ export class CollectionCrawls {
   }
 }
 
-function crawlCursor(after: string): [string, string] {
+export function crawlCursor(after: string): [string, string] {
   if (!after) return ["", ""];
   const parts = after.split("|");
   if (

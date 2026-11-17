@@ -1,0 +1,5 @@
+---
+'hypercerts-relay': minor
+---
+
+Enabling a PDS source in Administration now automatically requests an initial collection directory crawl of it, whether an operator or PDS discovery added the source. The source is added whatever happens to the crawl. Progress and outcome are shown as "Initial crawl" in the source's detail panel and on the Collection directory page, where crawl requests now show whether they were manual or triggered by a source being added. If the collection directory is unavailable, the request is retried automatically for 24 hours and then waits for a manual retry. Re-enabling a source crawls it again; enabling a source that is already enabled does not. Nothing is requested when the collection directory is not configured or the source is plaintext HTTP, and sources enabled before this release are not crawled automatically; use "Crawl all enabled sources" once. A retried crawl request now sends only the sources it has not already recorded, so a finished crawl is not started a second time. The collection directory's `--crawl-qps` can now also be set with `COLLECTIONS_CRAWL_QPS`.

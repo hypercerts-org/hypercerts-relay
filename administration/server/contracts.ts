@@ -178,7 +178,10 @@ export interface CollectionCrawl {
   pds: string;
   actor: string;
   actorHandle: string | null;
+  // "source_added" when the request was an automatic initial crawl.
   cause: string;
+  // The source operation that queued an automatic initial crawl, else null.
+  sourceOperation: string | null;
   submission: "started" | "already_active" | "accepted";
   state: "accepted" | "finished" | "failed" | "unknown";
   requestedAt: string;
@@ -190,6 +193,38 @@ export interface CollectionCrawl {
   errorCategory: string | null;
   httpStatus: number | null;
   observedAt: string | null;
+}
+// How an automatic initial crawl of a newly enabled source is progressing.
+export type CollectionBootstrapPhase =
+  | "skipped_not_configured"
+  | "skipped_not_https"
+  | "waiting"
+  | "retrying"
+  | "needs_attention"
+  | "not_requested"
+  | "accepted"
+  | "finished"
+  | "failed"
+  | "unknown";
+// One automatic initial crawl, recorded when a source enable was applied.
+export interface CollectionBootstrapView {
+  sourceOperation: string;
+  pds: string;
+  actor: string;
+  actorHandle: string | null;
+  createdAt: string;
+  outcome: "queued" | "not_configured" | "not_https";
+  crawlOperation: string | null;
+  phase: CollectionBootstrapPhase;
+  // The follow-up crawl operation; null when no crawl was queued.
+  request: {
+    state: OperationState;
+    error: string | null;
+    attempts: number;
+    nextAttemptAt: string | null;
+    updatedAt: string;
+  } | null;
+  crawl: CollectionCrawl | null;
 }
 export interface Policy {
   revision: number;

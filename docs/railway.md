@@ -144,6 +144,7 @@ To let operators request collection directory crawls from Administration, also s
 | --- | --- | --- |
 | Administration | `COLLECTIONDIR_CONTROL_URL` | `http://collectiondir.railway.internal:2510` |
 | Administration | `HC_COLLECTIONDIR_CONTROL_SECRET` | Same value as the collection directory's `COLLECTIONS_ADMIN_TOKEN`, at least 32 bytes |
+| Collection directory | `COLLECTIONS_CRAWL_QPS` | Optional; requests per second to each crawled PDS, default `100` |
 
 Set both or neither; Administration fails startup if only the URL or only the
 token file is present. The collection directory's API listener
@@ -155,6 +156,8 @@ instead, by setting `RAINBOW_COLLECTIONDIR_HOST` on Rainbow to the collection
 directory's private origin; Rainbow proxies only that query. Deploy the
 collection directory and Administration from the same release, because
 Administration reads the per-host crawl replies added alongside this setting.
+With both settings, enabling a source also requests an initial crawl of it, so
+choose `COLLECTIONS_CRAWL_QPS` for the PDSes you expect to add.
 
 `HC_RELAY_CONTROL_SECRET` must be identical on Relay, Jetstream and
 Administration. Bootstrap writes each service its own token file, so only the

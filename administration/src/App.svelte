@@ -25,8 +25,10 @@
     type Administrator,
     type CollectionCrawl,
     type CollectionDirectoryStatus,
+    type CollectionBootstrapView,
   } from "./api";
   import {
+    bootstrapNotice,
     createDirectoryPoller,
     crawlNotice,
     crawlsInProgress,
@@ -99,6 +101,7 @@
     nextHistoryAudit: string | null = null;
   let directory: CollectionDirectoryStatus | null = null,
     crawls: CollectionCrawl[] = [],
+    bootstraps: CollectionBootstrapView[] = [],
     nextCrawls: string | null = null,
     olderCrawlsLoaded = false,
     poller: DirectoryPoller | null = null;
@@ -223,10 +226,14 @@
     const keepOlder = olderCrawlsLoaded;
     let directoryStatus: CollectionDirectoryStatus;
     let crawlPage: CrawlPage;
+    let bootstrapPage: { items: CollectionBootstrapView[]; next: string | null };
     try {
-      [directoryStatus, crawlPage] = await Promise.all([
+      [directoryStatus, crawlPage, bootstrapPage] = await Promise.all([
         api<CollectionDirectoryStatus>("/collection-directory/status"),
         refreshCrawls(crawls, keepOlder, (path) => api<CrawlPage>(path)),
+        api<{ items: CollectionBootstrapView[]; next: string | null }>(
+          "/collection-directory/bootstraps?limit=100",
+        ),
       ]);
     } catch (error) {
       if (request !== directoryRequest) return;
@@ -245,6 +252,7 @@
     }
     if (request !== directoryRequest) return;
     directory = directoryStatus;
+    bootstraps = bootstrapPage.items;
     crawls = crawlPage.items;
     if (!keepOlder) nextCrawls = crawlPage.next;
   }
@@ -272,9 +280,13 @@
     }
   }
   function crawlActive() {
-    return directoryScreen && crawlsInProgress(directory, crawls, operation);
+    return (
+      directoryScreen &&
+      crawlsInProgress(directory, crawls, operation, bootstraps)
+    );
   }
   $: crawlMessage = crawlNotice(operation, crawls);
+  $: bootstrapMessage = bootstrapNotice(operation);
   async function submit(command: Command) {
     busy = true;
     error = "";
@@ -368,11 +380,13 @@
   onMount(() => {
     let active = true;
     poller = createDirectoryPoller(async () => {
-      // Follow a pending crawl request first, so a request that finishes
-      // during this poll is reflected in the directory snapshot read below.
+      // Follow a pending crawl request or source enable first, so one that
+      // finishes during this poll is reflected in the directory snapshot read
+      // below (a source enable queues the initial crawl).
       const watched = operation;
       if (
-        watched?.command.kind === "collection_crawl" &&
+        (watched?.command.kind === "collection_crawl" ||
+          watched?.command.kind === "source") &&
         ["requested", "applying"].includes(watched.state)
       ) {
         const latest = await api<Operation>(`/operations/${watched.id}`);
@@ -500,7 +514,11 @@
                 "_",
                 " ",
               ) ?? ""} <a href="/audit">View audit log</a>
-            </div>{#if crawlMessage}<p>{crawlMessage}</p>{/if}{/if}
+            </div>{#if crawlMessage}<p>{crawlMessage}</p>{/if}{#if bootstrapMessage}<p
+                >{bootstrapMessage.text}{#if bootstrapMessage.queued}
+                  <a href="/collection-directory">View collection directory</a
+                  >{/if}
+              </p>{/if}{/if}
         </div>{/if}
       {#if screen === "manage-adminis"}<Administrators
           rows={administrators}
@@ -515,10 +533,12 @@
           {busy}
           {directory}
           {crawls}
+          {action}
         /><DiscoverySettings csrf={session.csrf} />
       {:else if screen === "collection-directory"}<CollectionDirectory
           {directory}
           {crawls}
+          {bootstraps}
           hasMore={!!nextCrawls}
           more={moreCrawls}
           {submit}

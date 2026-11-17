@@ -27,6 +27,7 @@ import {
 } from "./machine.ts";
 import { CollectionCrawls } from "./collection-crawls.ts";
 import { Collectiondir } from "./collectiondir.ts";
+import { CollectionBootstrap } from "./collection-bootstrap.ts";
 
 export interface PublicServiceOrigins {
   relay?: string;
@@ -40,6 +41,8 @@ export interface AppOptions extends ProxyOptions {
   machineToken?: string;
   // Absent means the collection directory is not configured.
   collectionCrawls?: CollectionCrawls;
+  // Automatic initial crawls; absent means none are recorded.
+  collectionBootstrap?: CollectionBootstrap;
 }
 
 const page = z.object({
@@ -57,6 +60,9 @@ export function createApp(
   const crawls =
     options.collectionCrawls ??
     new CollectionCrawls(store, services, new Collectiondir(null));
+  const bootstraps =
+    options.collectionBootstrap ??
+    new CollectionBootstrap(store, crawls.configured);
   const app = express();
   app.disable("x-powered-by");
   app.set("trust proxy", options.trustProxy ?? false);
@@ -316,6 +322,14 @@ export function createApp(
         ids,
       ),
     );
+  });
+  // Plaintext sources are recorded too, so the filter is an exact origin
+  // rather than the HTTPS-only PDS origin schema.
+  app.get("/api/v1/collection-directory/bootstraps", (req, res) => {
+    const p = page
+      .extend({ pds: z.string().max(300).optional() })
+      .parse(req.query);
+    res.json(bootstraps.page(p.after, p.limit, p.pds));
   });
   app.get("/api/v1/limits", (req, res) =>
     services

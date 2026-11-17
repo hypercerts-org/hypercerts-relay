@@ -15,6 +15,8 @@ export type {
   EndedCrawl,
   CollectionCrawl,
   CollectionDirectoryStatus,
+  CollectionBootstrapPhase,
+  CollectionBootstrapView,
 } from "../server/contracts";
 export interface Administrator {
   did: string;

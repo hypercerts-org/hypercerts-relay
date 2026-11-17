@@ -1,14 +1,21 @@
 <script lang="ts">
   import { tick } from "svelte";
   import State from "./State.svelte";
-  import { directoryMessage, crawlSummary } from "./collectionDirectory";
+  import {
+    awaitingBootstraps,
+    bootstrapSummary,
+    directoryMessage,
+    crawlSummary,
+  } from "./collectionDirectory";
   import type {
     Command,
+    CollectionBootstrapView,
     CollectionCrawl,
     CollectionDirectoryStatus,
   } from "./api";
   export let directory: CollectionDirectoryStatus | null = null;
   export let crawls: CollectionCrawl[] = [];
+  export let bootstraps: CollectionBootstrapView[] = [];
   export let hasMore = false;
   export let more: () => Promise<void> = async () => {};
   export let submit: (command: Command) => Promise<void>;
@@ -17,6 +24,7 @@
   let confirmButton: HTMLButtonElement;
   let startButton: HTMLButtonElement;
   $: blocked = directoryMessage(directory);
+  $: awaiting = awaitingBootstraps(bootstraps);
   $: activeByPDS = new Map(
     (directory?.active ?? []).map((crawl) => [crawl.pds, crawl]),
   );
@@ -126,15 +134,17 @@
   <table>
     <caption>Crawl requests</caption><thead
       ><tr
-        ><th>Source</th><th>Requested by</th><th>Requested at</th><th
-          >Submission</th
-        ><th>State</th><th>Result</th></tr
+        ><th>Source</th><th>Trigger</th><th>Requested by</th><th
+          >Requested at</th
+        ><th>Submission</th><th>State</th><th>Result</th></tr
       ></thead
     ><tbody>
       {#each crawls as row (row.id)}<tr
           ><td>{row.pds}</td><td
-            >{row.actorHandle ? `@${row.actorHandle}` : row.actor}</td
-          ><td>{time(row.requestedAt)}</td><td
+            >{row.cause === "source_added" ? "Source added" : "Manual"}</td
+          ><td>{row.actorHandle ? `@${row.actorHandle}` : row.actor}</td><td
+            >{time(row.requestedAt)}</td
+          ><td
             >{row.submission === "already_active"
               ? "Already running"
               : row.submission === "started"
@@ -147,7 +157,7 @@
           ></tr
         >
       {:else}<tr
-          ><td colspan="6" class="empty">No crawl requests recorded.</td></tr
+          ><td colspan="7" class="empty">No crawl requests recorded.</td></tr
         >{/each}
     </tbody>
   </table>
@@ -155,11 +165,43 @@
 {#if hasMore}<div class="actions">
     <button onclick={() => void more()}>Load more crawl requests</button>
   </div>{/if}
+<h2>Initial crawls awaiting submission</h2>
+<!-- svelte-ignore a11y_no_noninteractive_tabindex (Scrollable tables need keyboard access; verified with axe and Chromium.) -->
+<div
+  class="table-wrap"
+  role="region"
+  aria-label="Scrollable initial crawls awaiting submission"
+  tabindex="0"
+>
+  <table>
+    <caption>Initial crawls awaiting submission</caption><thead
+      ><tr
+        ><th>Source</th><th>Source enabled by</th><th>Enabled at</th><th
+          >Status</th
+        ></tr
+      ></thead
+    ><tbody>
+      {#each awaiting as row (row.sourceOperation)}<tr
+          ><td>{row.pds}</td><td
+            >{row.actorHandle ? `@${row.actorHandle}` : row.actor}</td
+          ><td>{time(row.createdAt)}</td><td>{bootstrapSummary(row)}</td></tr
+        >
+      {:else}<tr
+          ><td colspan="4" class="empty"
+            >No initial crawls are waiting. Accepted initial crawls appear under
+            Crawl requests.</td
+          ></tr
+        >{/each}
+    </tbody>
+  </table>
+</div>
 <p class="note">
   Accepted means the collection directory took the request; it is not
   completion. Finished means the repository listing ended; repositories that
   could not be described are counted separately. Outcomes are lost if the
-  collection directory restarts.
+  collection directory restarts. Enabling a source requests an initial crawl
+  automatically; while the collection directory is unavailable it is retried
+  for 24 hours, then waits for a manual retry.
 </p>
 
 <style>
