@@ -121,14 +121,16 @@ Relay admission, not Jetstream backfill and not proof of current records.
 When a `source` enable from any actor, including PDS discovery, is applied and
 Relay reports the source enabled and validated, Administration queues one
 follow-up `collection_crawl` operation for that source in the same transaction.
-It has a deterministic ID and is owned by the same actor. An enable that leaves
-Relay's source revision unchanged queues nothing. The crawl is recorded with
+It has a deterministic version 8 UUID, a version that client idempotency keys
+may not use, and is owned by the same actor. An enable that leaves the source
+unchanged does not request a crawl if one was already queued at that source
+revision. The crawl is recorded with
 the server-derived cause `source_added`; the command schema is unchanged. If
 the directory is unavailable, Administration retries the follow-up for 24 hours
 under `system:collection-bootstrap`, then leaves it for a manual retry. The
 source operation stays applied whatever happens to the crawl. Without a
-configured directory, or for a plaintext source, the skip is recorded and
-nothing is requested. Sources enabled before this behavior are not crawled
+configured directory, for a plaintext source, or if another operation already
+holds the follow-up ID, the skip is recorded and nothing is requested. Sources enabled before this behavior are not crawled
 automatically.
 
 ## Acceptance mapping

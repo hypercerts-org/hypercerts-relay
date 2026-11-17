@@ -1,10 +1,13 @@
 import { createHash } from "node:crypto";
-import type {
-  CollectionBootstrapPhase,
-  CollectionBootstrapView,
-  CollectionCrawl,
-  Operation,
-  OperationState,
+import { z } from "zod";
+import {
+  ApiError,
+  type CollectionBootstrapPhase,
+  type CollectionBootstrapView,
+  type CollectionCrawl,
+  type Command,
+  type Operation,
+  type OperationState,
 } from "./contracts.ts";
 import { Store } from "./store.ts";
 import { crawlCursor } from "./collection-crawls.ts";
@@ -18,7 +21,7 @@ const retryMaxMs = 10 * 60_000;
 const retryWindowMs = 24 * 60 * 60_000;
 
 export type BootstrapOutcome =
-  "queued" | "not_configured" | "not_https" | "unchanged";
+  "queued" | "not_configured" | "not_https" | "conflict" | "unchanged";
 
 interface RelaySourceView {
   HostID: number;
@@ -35,7 +38,7 @@ interface BootstrapRow {
   hostId: number;
   sourceRevision: number;
   actor: string;
-  outcome: "queued" | "not_configured" | "not_https";
+  outcome: CollectionBootstrapView["outcome"];
   crawlOperation: string | null;
   attempts: number;
   nextAttemptAt: string | null;
@@ -52,6 +55,15 @@ export function bootstrapOperationId(sourceOperationId: string): string {
     .digest("hex");
   const variant = ((parseInt(hex[16], 16) & 0x3) | 0x8).toString(16);
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-8${hex.slice(13, 16)}-${variant}${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+}
+
+// Parses a client Idempotency-Key. Version 8 UUIDs are reserved for IDs the
+// server derives, such as bootstrapOperationId, so a client cannot claim a
+// follow-up operation's ID before the server queues it.
+export function clientIdempotencyKey(value: unknown): string {
+  const key = z.uuid().parse(value);
+  if (key[14] === "8") throw new ApiError(400, "reserved_idempotency_key");
+  return key;
 }
 
 function retryDelayMs(attempts: number) {
@@ -86,6 +98,8 @@ export class CollectionBootstrap {
       return null;
     const pds = `${relay.NoSSL ? "http" : "https"}://${relay.Hostname}`;
     const crawlOperation = bootstrapOperationId(op.id);
+    const followUp: Command = { kind: "collection_crawl", scope: pds };
+    const existing = this.store.operation(crawlOperation);
     let outcome: BootstrapOutcome;
     if (relay.NoSSL) outcome = "not_https";
     else if (!this.configured) outcome = "not_configured";
@@ -99,6 +113,14 @@ export class CollectionBootstrap {
         .get(pds, relay.HostID, relay.Revision, op.id)
     )
       outcome = "unchanged";
+    // Another request already holds the follow-up ID. The source is still
+    // applied; the crawl is skipped and recorded instead.
+    else if (
+      existing &&
+      (existing.actor !== op.actor ||
+        JSON.stringify(existing.command) !== JSON.stringify(followUp))
+    )
+      outcome = "conflict";
     else outcome = "queued";
     const queued = outcome === "queued";
     return {
@@ -111,7 +133,20 @@ export class CollectionBootstrap {
         },
       },
       commit: () => {
-        if (outcome !== "unchanged") {
+        let recorded = outcome;
+        if (recorded === "queued") {
+          // plan() already detects a conflicting ID. This guards the
+          // transaction: a conflict must never roll back the source change.
+          try {
+            this.store.enqueue(op.actor, followUp, crawlOperation);
+          } catch (e) {
+            if (!(e instanceof ApiError && e.code === "idempotency_conflict"))
+              throw e;
+            recorded = "conflict";
+          }
+        }
+        const recordedQueued = recorded === "queued";
+        if (recorded !== "unchanged") {
           const inserted = this.store.db
             .prepare(
               "INSERT OR IGNORE INTO collection_bootstraps(sourceOperation,pds,hostId,sourceRevision,actor,outcome,crawlOperation,createdAt) VALUES(?,?,?,?,?,?,?,?)",
@@ -122,22 +157,17 @@ export class CollectionBootstrap {
               relay.HostID,
               relay.Revision,
               op.actor,
-              outcome,
-              queued ? crawlOperation : null,
+              recorded,
+              recordedQueued ? crawlOperation : null,
               new Date().toISOString(),
             );
+          // Already committed for this operation.
           if (!inserted.changes) return;
-          if (queued)
-            this.store.enqueue(
-              op.actor,
-              { kind: "collection_crawl", scope: pds },
-              crawlOperation,
-            );
         }
         this.store.audit(
           op.actor,
-          `collection_bootstrap_${outcome}`,
-          { pds, crawlOperation: queued ? crawlOperation : null },
+          `collection_bootstrap_${recorded}`,
+          { pds, crawlOperation: recordedQueued ? crawlOperation : null },
           op.id,
         );
       },
@@ -286,6 +316,7 @@ function phase(
 ): CollectionBootstrapPhase {
   if (row.outcome === "not_configured") return "skipped_not_configured";
   if (row.outcome === "not_https") return "skipped_not_https";
+  if (row.outcome === "conflict") return "skipped_conflict";
   switch (state) {
     case "requested":
     case "applying":

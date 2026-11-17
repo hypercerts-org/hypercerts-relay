@@ -506,7 +506,11 @@ test("the source stays unapplied when the bootstrap cannot be recorded", async (
     throw new Error("disk I/O error");
   };
   await worker.tick();
-  assert.notEqual(store.operation(id)!.state, "applied");
+  // The rolled-back applied transition leaves the worker's failure path,
+  // which records the unexpected error without a follow-up.
+  const op = store.operation(id)!;
+  assert.equal(op.state, "failed");
+  assert.equal(op.error, "application_failed");
   assert.equal(operations("collection_crawl").length, 0);
   assert.equal(bootstrapRows().length, 0);
   assert.equal(
@@ -746,26 +750,33 @@ test("the bootstraps route requires a session and the command schema is unchange
 
 test("the bootstraps route pages newest first", async (t) => {
   const { source, request } = await fixture(t, null);
-  for (const host of ["a.example", "b.example", "c.example"])
-    await source(`https://${host}`);
+  const origins = [
+    "https://a.example",
+    "https://b.example",
+    "https://c.example",
+  ];
+  for (const origin of origins) await source(origin);
+  type Page = { items: CollectionBootstrapView[]; next: string | null };
   const first = (await (
     await request("/api/v1/collection-directory/bootstraps?limit=2")
-  ).json()) as { items: CollectionBootstrapView[]; next: string | null };
-  assert.deepEqual(
-    first.items.map((item) => item.pds),
-    ["https://c.example", "https://b.example"],
-  );
+  ).json()) as Page;
+  assert.equal(first.items.length, 2);
   assert.ok(first.next);
   const second = (await (
     await request(
       `/api/v1/collection-directory/bootstraps?limit=2&after=${encodeURIComponent(first.next!)}`,
     )
-  ).json()) as { items: CollectionBootstrapView[]; next: string | null };
-  assert.deepEqual(
-    second.items.map((item) => item.pds),
-    ["https://a.example"],
-  );
+  ).json()) as Page;
+  assert.equal(second.items.length, 1);
   assert.equal(second.next, null);
+  // Rows created in the same millisecond tie-break on operation ID, so only
+  // the order of the keys and the complete, disjoint pages are asserted.
+  const items = [...first.items, ...second.items];
+  assert.deepEqual(items.map((item) => item.pds).sort(), origins);
+  const key = (item: CollectionBootstrapView) =>
+    `${item.createdAt}|${item.sourceOperation}`;
+  for (let i = 1; i < items.length; i++)
+    assert.ok(key(items[i - 1]) > key(items[i]), "newest first");
 });
 
 test("a source enabled by PDS discovery queues a crawl owned by the discovery actor", async (t) => {
@@ -853,4 +864,129 @@ test("automatic retries surface database failures instead of swallowing them", a
     throw new Error("disk I/O error");
   };
   assert.throws(() => bootstrap.retryDue(failedAt + 30_000), /disk I\/O error/);
+});
+
+test("server-derived version 8 keys are refused on both operation routes", async (t) => {
+  const directory = await stubDirectory(t, startingDirectory());
+  const { request, operations } = await fixture(t, directory.url);
+  const reserved = bootstrapOperationId(randomUUID());
+  const enable = {
+    kind: "source",
+    pds: "https://pds.example",
+    state: "enabled",
+  };
+  const browser = await request("/api/v1/operations", enable, {
+    "Idempotency-Key": reserved,
+  });
+  assert.equal(browser.status, 400);
+  assert.deepEqual(await browser.json(), {
+    error: "reserved_idempotency_key",
+  });
+  const machine = await request(
+    "/api/v1/sources/discovery/operations",
+    enable,
+    {
+      Cookie: "",
+      Authorization: `Bearer ${machineToken}`,
+      "Idempotency-Key": reserved,
+    },
+  );
+  assert.equal(machine.status, 400);
+  assert.deepEqual(await machine.json(), {
+    error: "reserved_idempotency_key",
+  });
+  assert.equal(operations().length, 0);
+  // Ordinary random and name-based keys are still accepted.
+  assert.equal(
+    (
+      await request("/api/v1/operations", enable, {
+        "Idempotency-Key": randomUUID(),
+      })
+    ).status,
+    202,
+  );
+});
+
+test("a follow-up ID already in use skips the crawl and the source still applies", async (t) => {
+  const directory = await stubDirectory(t, startingDirectory());
+  const { store, requestSource, worker, operations, bootstraps, audit } =
+    await fixture(t, directory.url);
+  const id = await requestSource("https://pds.example");
+  // Pre-create an unrelated operation at the derived ID, as a client key
+  // could have before version 8 keys were reserved.
+  const squatter = store.request(
+    discoveryActor,
+    { kind: "source", pds: "https://pds.example", state: "enabled" },
+    bootstrapOperationId(id),
+  );
+  await worker.tick();
+  const op = store.operation(id)!;
+  assert.equal(op.state, "applied", op.error ?? "");
+  assert.deepEqual(bootstrapResult(op), {
+    bootstrap: "conflict",
+    pds: "https://pds.example",
+  });
+  assert.equal(operations("collection_crawl").length, 0);
+  assert.deepEqual(store.operation(squatter.id)!.command, squatter.command);
+  const conflicts = audit("collection_bootstrap_conflict");
+  assert.equal(conflicts.length, 1);
+  assert.equal(conflicts[0].operation, id);
+  const [view] = await bootstraps();
+  assert.equal(view.outcome, "conflict");
+  assert.equal(view.phase, "skipped_conflict");
+  assert.equal(view.crawlOperation, null);
+  assert.equal(view.request, null);
+  assert.equal(directory.posts().length, 0);
+});
+
+test("a conflict that appears at commit is recorded instead of rolling back", async (t) => {
+  const directory = await stubDirectory(t, startingDirectory());
+  const { store, relay, bootstrap, requestSource, bootstrapRows, audit } =
+    await fixture(t, directory.url);
+  const id = await requestSource("https://pds.example");
+  const view = relay.put("https://pds.example", "enabled");
+  const follow = bootstrap.plan(store.operation(id)!, {
+    relay: view,
+    jetstream: { pending: false, enabled: true },
+  })!;
+  assert.equal(
+    (follow.result as CollectionDirectoryResult).collectionDirectory?.bootstrap,
+    "queued",
+  );
+  store.request(
+    discoveryActor,
+    { kind: "source", pds: "https://pds.example", state: "enabled" },
+    bootstrapOperationId(id),
+  );
+  assert.doesNotThrow(() => store.transaction(follow.commit));
+  const [row] = bootstrapRows();
+  assert.equal(row.outcome, "conflict");
+  assert.equal(row.crawlOperation, null);
+  assert.equal(audit("collection_bootstrap_conflict").length, 1);
+  assert.equal(audit("collection_bootstrap_queued").length, 0);
+});
+
+test("an enable interrupted while applying is re-applied with exactly one bootstrap", async (t) => {
+  const directory = await stubDirectory(t, startingDirectory());
+  const { store, relay, requestSource, worker, bootstrapRows, audit } =
+    await fixture(t, directory.url);
+  const id = await requestSource("https://pds.example");
+  // Relay applied the enable, then the process stopped before the applied
+  // transaction committed.
+  assert.ok(
+    store.transition(id, "applying", null, null, undefined, ["requested"]),
+  );
+  relay.put("https://pds.example", "enabled");
+  worker.recover();
+  assert.equal(store.operation(id)!.state, "requested");
+  await worker.tick();
+  const op = store.operation(id)!;
+  assert.equal(op.state, "applied", op.error ?? "");
+  assert.equal(bootstrapResult(op)?.bootstrap, "queued");
+  const rows = bootstrapRows();
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].sourceOperation, id);
+  assert.equal(rows[0].outcome, "queued");
+  assert.equal(audit("collection_bootstrap_queued").length, 1);
+  assert.equal(audit("collection_bootstrap_unchanged").length, 0);
 });

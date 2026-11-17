@@ -131,7 +131,7 @@ The browser-facing API is `/api/v1`; all endpoints below require authorization.
 | `POST /administrators`                   | `{did, action}` with `grant` or `remove`; actor audited, CSRF protected; cannot remove oneself.            |
 | `GET /session`                           | Current DID, CSRF token, expiry.                                                                           |
 | `POST /signout`, `/revoke-sessions`      | Revoke the current or all local sessions.                                                                  |
-| `POST /operations`                       | Validated command plus UUID `Idempotency-Key`; returns durable operation and HTTP 202.                     |
+| `POST /operations`                       | Validated command plus UUID `Idempotency-Key` (version 8 is reserved for server-derived IDs and returns HTTP 400 `reserved_idempotency_key`); returns durable operation and HTTP 202. |
 | `GET /operations`, `/operations/{id}`    | Requested command, actor, state, observed result and bounded failure code.                                 |
 | `POST /operations/{id}/retry`, `/cancel` | Retry failed/incomplete work or cancel work not yet applying; actor audited.                               |
 | `GET /sources`, `/source?pds=…`          | Relay's desired, validation, connection, admission-quota, Relay-observed-account and durable-cursor state. |
@@ -205,7 +205,7 @@ under the same prefix is part of the browser API above and is always mounted.
 | Endpoint                | Contract                                                                                                     |
 | ----------------------- | ------------------------------------------------------------------------------------------------------------ |
 | `GET /state`            | `{policyRevision, collections, sources: [{pds, state, accountLimit}], maxAccountLimit}`, covering every Relay source in any state. |
-| `POST /operations`      | Only a `source` command with state `enabled`, or an `account_quota` command that raises the limit. Requires a UUID `Idempotency-Key` and returns HTTP 202. Any other command returns HTTP 403. A source enable for a PDS that Relay reports as `disabled` or `removed` returns HTTP 409 `source_disabled_by_operator`. An account limit above the discovery maximum returns HTTP 403 `account_limit_above_discovery_maximum`. |
+| `POST /operations`      | Only a `source` command with state `enabled`, or an `account_quota` command that raises the limit. Requires a UUID `Idempotency-Key` that is not version 8 (HTTP 400 `reserved_idempotency_key`) and returns HTTP 202. Any other command returns HTTP 403. A source enable for a PDS that Relay reports as `disabled` or `removed` returns HTTP 409 `source_disabled_by_operator`. An account limit above the discovery maximum returns HTTP 403 `account_limit_above_discovery_maximum`. |
 
 Before applying a discovery operation, the worker checks again. An account
 limit above the current discovery maximum fails with
@@ -276,14 +276,20 @@ above.
 
 - **What triggers it.** Only an applied enable that Relay reports as enabled
   and validated. A source operation that fails or is left incomplete, and any
-  disable or remove, requests nothing. An enable of a source that was already
-  enabled does not crawl it again; disabling and then re-enabling does.
+  disable or remove, requests nothing. An enable that leaves the source
+  unchanged does not request a crawl if one was already queued at that source
+  revision; disabling and then re-enabling does request one.
 - **How it is recorded.** In the same transaction that marks the source
   operation applied, administration queues a follow-up `collection_crawl`
   operation for `https://<Relay hostname>`, owned by the same actor. The
   source operation's result gains `collectionDirectory.bootstrap`: `queued`,
-  `not_configured`, `not_https` or `unchanged`. The crawl appears under
-  **Crawl requests** with the trigger **Source added**.
+  `not_configured`, `not_https`, `conflict` or `unchanged`. The crawl appears
+  under **Crawl requests** with the trigger **Source added**. The follow-up
+  ID is a version 8 UUID; both operation routes refuse client
+  `Idempotency-Key` values of that version with HTTP 400
+  `reserved_idempotency_key`. If an operation nevertheless already holds the
+  ID, the crawl is skipped as `conflict`, audited as
+  `collection_bootstrap_conflict`, and the source still applies.
 - **The source is added whatever happens to the crawl.** The source operation
   stays applied. The crawl's progress is shown as **Initial crawl** in the
   source's detail panel. Crawls not yet accepted by the directory are listed
@@ -299,7 +305,8 @@ above.
   retried automatically.
 - **Not configured or plaintext.** Without a collection directory, or for an
   `http://` source, nothing is requested and the skip is recorded and shown.
-  Configuring the directory later does not crawl those sources.
+  Configuring the directory later does not automatically crawl those
+  sources.
 - **Sources enabled before this feature** are not crawled automatically. Use
   **Crawl all enabled sources** once.
 
@@ -314,6 +321,7 @@ The `phase` reported by `GET /collection-directory/bootstraps`:
 | `accepted`, `finished`, `failed`, `unknown` | The crawl row's state, as for manual crawls.            |
 | `skipped_not_configured` | No collection directory was configured when the source was enabled.        |
 | `skipped_not_https`      | The source is plaintext; the directory only crawls HTTPS sources.          |
+| `skipped_conflict`       | Another operation already held the follow-up ID; nothing was requested.    |
 
 Each crawl is limited by the collection directory's per-PDS rate,
 `--crawl-qps` or `COLLECTIONS_CRAWL_QPS` (default 100 requests per second).

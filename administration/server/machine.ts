@@ -4,6 +4,7 @@ import { z } from "zod";
 import { ApiError, command, type Command } from "./contracts.ts";
 import type { Services } from "./services.ts";
 import type { Store } from "./store.ts";
+import { clientIdempotencyKey } from "./collection-bootstrap.ts";
 
 // The automatic PDS discovery service is the only machine caller. Its
 // operations are journaled and audited under this fixed, non-DID actor.
@@ -152,7 +153,7 @@ export function machineRouter(
   });
   router.post("/operations", machineAuth, async (req, res) => {
     const input = command.parse(req.body),
-      key = z.uuid().parse(req.get("Idempotency-Key"));
+      key = clientIdempotencyKey(req.get("Idempotency-Key"));
     if (!permitted(input))
       throw new ApiError(403, "machine_command_not_permitted");
     // A replayed key returns its recorded operation without new checks.

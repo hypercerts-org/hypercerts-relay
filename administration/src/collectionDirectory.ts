@@ -199,6 +199,11 @@ export function bootstrapNotice(operation: Operation | null): {
         text: "No initial crawl: the collection directory only crawls HTTPS sources. The source was added.",
         queued: false,
       };
+    case "conflict":
+      return {
+        text: "No initial crawl was requested because its request ID was already in use. The source was added.",
+        queued: false,
+      };
     default:
       return null;
   }
@@ -220,6 +225,8 @@ export function bootstrapSummary(
       return "Skipped: collection directory not configured. Once it is configured, use Crawl collection directory.";
     case "skipped_not_https":
       return "Skipped: the collection directory only crawls HTTPS sources.";
+    case "skipped_conflict":
+      return "Skipped: another request already used this initial crawl's ID. Use Crawl collection directory.";
     case "waiting":
       return "Waiting to be submitted";
     case "retrying": {

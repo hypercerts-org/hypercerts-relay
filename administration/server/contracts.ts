@@ -198,6 +198,7 @@ export interface CollectionCrawl {
 export type CollectionBootstrapPhase =
   | "skipped_not_configured"
   | "skipped_not_https"
+  | "skipped_conflict"
   | "waiting"
   | "retrying"
   | "needs_attention"
@@ -213,7 +214,7 @@ export interface CollectionBootstrapView {
   actor: string;
   actorHandle: string | null;
   createdAt: string;
-  outcome: "queued" | "not_configured" | "not_https";
+  outcome: "queued" | "not_configured" | "not_https" | "conflict";
   crawlOperation: string | null;
   phase: CollectionBootstrapPhase;
   // The follow-up crawl operation; null when no crawl was queued.

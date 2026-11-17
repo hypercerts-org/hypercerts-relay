@@ -636,18 +636,20 @@ function bootstrap(
   overrides: Partial<CollectionBootstrapView> = {},
 ): CollectionBootstrapView {
   const skipped = phase.startsWith("skipped_");
+  const outcomes: Partial<
+    Record<CollectionBootstrapView["phase"], CollectionBootstrapView["outcome"]>
+  > = {
+    skipped_not_https: "not_https",
+    skipped_not_configured: "not_configured",
+    skipped_conflict: "conflict",
+  };
   return {
     sourceOperation,
     pds: "https://pds.example",
     actor: "service:pds-discovery",
     actorHandle: null,
     createdAt: "2026-11-17T10:00:00.000Z",
-    outcome:
-      phase === "skipped_not_https"
-        ? "not_https"
-        : phase === "skipped_not_configured"
-          ? "not_configured"
-          : "queued",
+    outcome: outcomes[phase] ?? "queued",
     crawlOperation: skipped ? null : bootstrapOperation,
     phase,
     request: skipped
@@ -695,6 +697,9 @@ test("the source notice explains each initial crawl outcome", () => {
   );
   expect(notice("not_https")?.text).toMatch(
     /^No initial crawl: the collection directory only crawls HTTPS sources\./,
+  );
+  expect(notice("conflict")?.text).toBe(
+    "No initial crawl was requested because its request ID was already in use. The source was added.",
   );
   expect(notice("unchanged")).toBeNull();
   expect(
@@ -759,6 +764,9 @@ test("initial crawl phases read differently; accepted is not finished", () => {
   );
   expect(bootstrapSummary(bootstrap("skipped_not_https"))).toMatch(
     /^Skipped: the collection directory only crawls HTTPS sources/,
+  );
+  expect(bootstrapSummary(bootstrap("skipped_conflict"))).toMatch(
+    /^Skipped: another request already used this initial crawl's ID/,
   );
   const accepted = bootstrapSummary(
     bootstrap("accepted", {
@@ -904,6 +912,7 @@ test("polling continues for open initial crawls and pending source enables only"
     "unknown",
     "skipped_not_configured",
     "skipped_not_https",
+    "skipped_conflict",
   ] as const)
     expect(crawlsInProgress(idle, [], null, [bootstrap(phase)])).toBe(false);
   expect(crawlsInProgress(idle, [], enableOperation("requested", null))).toBe(

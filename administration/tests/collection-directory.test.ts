@@ -614,7 +614,8 @@ test("the PDS discovery machine API cannot request a crawl", async (t) => {
   assert.equal(store.page("operations", "", 50).items.length, 0);
   // An automatic initial crawl queued for a discovery-enabled source is owned
   // by the discovery actor, but replaying its ID through the machine API is
-  // still refused rather than returning the recorded operation.
+  // refused, because server-derived (version 8) IDs are reserved, rather than
+  // returning the recorded operation.
   const body: Command = {
     kind: "collection_crawl",
     scope: "https://pds.example",
@@ -629,9 +630,9 @@ test("the PDS discovery machine API cannot request a crawl", async (t) => {
     Authorization: `Bearer ${machineToken}`,
     "Idempotency-Key": queued.id,
   });
-  assert.equal(replay.status, 403);
+  assert.equal(replay.status, 400);
   assert.deepEqual(await replay.json(), {
-    error: "machine_command_not_permitted",
+    error: "reserved_idempotency_key",
   });
   assert.equal(store.page("operations", "", 50).items.length, 1);
   assert.deepEqual(relayLookups, []);

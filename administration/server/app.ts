@@ -27,7 +27,10 @@ import {
 } from "./machine.ts";
 import { CollectionCrawls } from "./collection-crawls.ts";
 import { Collectiondir } from "./collectiondir.ts";
-import { CollectionBootstrap } from "./collection-bootstrap.ts";
+import {
+  CollectionBootstrap,
+  clientIdempotencyKey,
+} from "./collection-bootstrap.ts";
 
 export interface PublicServiceOrigins {
   relay?: string;
@@ -144,7 +147,7 @@ export function createApp(
   });
   app.post("/api/v1/operations", operationBody, (req, res) => {
     const input = command.parse(req.body),
-      key = z.uuid().parse(req.get("Idempotency-Key"));
+      key = clientIdempotencyKey(req.get("Idempotency-Key"));
     if (input.kind === "collection_crawl" && !crawls.configured)
       throw new ApiError(409, "collectiondir_not_configured");
     res
