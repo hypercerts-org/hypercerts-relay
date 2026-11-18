@@ -422,6 +422,33 @@ test("coverage read pages preserve global aggregate, diagnostics, and exact PDS 
   expect(readPaths).toContain(
     "/api/v1/jobs?after=&pds=https%3A%2F%2Ffailed.example",
   );
+  await expect(
+    page.locator("small", { hasText: /^Created: / }).first(),
+  ).toBeVisible();
+  // A status link reloads the jobs screen at the first page, keeping the PDS
+  // filter, and Jetstream receives the status filter.
+  await page
+    .getByRole("navigation", { name: "Filter jobs by status" })
+    .getByRole("link", { name: "Canceled", exact: true })
+    .click();
+  await expect(page).toHaveURL(
+    /\/jobs\?state=canceled&pds=https%3A%2F%2Ffailed\.example$/,
+  );
+  await expect(
+    page
+      .getByRole("navigation", { name: "Filter jobs by status" })
+      .getByRole("link", { name: "Canceled", exact: true }),
+  ).toHaveAttribute("aria-current", "true");
+  await expect(
+    page
+      .getByRole("navigation", { name: "Result pages" })
+      .getByText("Page 1", { exact: true }),
+  ).toBeVisible();
+  await expect
+    .poll(() => readPaths)
+    .toContain(
+      "/api/v1/jobs?after=&pds=https%3A%2F%2Ffailed.example&state=canceled",
+    );
   releaseSecondPage();
   await page.goto("/coverage");
   await page

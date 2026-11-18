@@ -237,6 +237,10 @@ test(
     );
     assert.ok(jobs.jobs.every((j) => j.coverage === "current_state"));
     assert.ok(jobs.jobs.some((j) => j.state === "incomplete"));
+    // Jetstream applies the status filter; the known incomplete job is listed.
+    const incomplete = await services.jobs("", "", "incomplete");
+    assert.ok(incomplete.jobs.some((j) => j.id === jobID));
+    assert.ok(incomplete.jobs.every((j) => j.state === "incomplete"));
     await services.call("relay", "/source", "PUT", {
       pds: "https://relay-only.example",
       state: "enabled",

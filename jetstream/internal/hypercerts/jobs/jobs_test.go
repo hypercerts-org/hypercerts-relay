@@ -928,3 +928,52 @@ func TestReceiptNamespacesAndLegacyMigration(t *testing.T) {
 	require.Equal(t, Pending, m.data.Jobs[job.ID].State, "old cancellation receipts must not cancel a later retry")
 	require.ErrorIs(t, m.TransitionOnce(job.ID, Pending, "legacy"), ErrConflict)
 }
+
+func TestListForDiagnosticsOrdersNewestFirst(t *testing.T) {
+	m, db := newManager(t, t.TempDir())
+	defer db.Close()
+	for _, pds := range []string{"https://a.example", "https://b.example", "https://c.example", "https://d.example"} {
+		_, err := m.AddSource(pds)
+		require.NoError(t, err)
+	}
+	byID := m.List()
+	require.Len(t, byID, 4)
+	ids := make([]string, 0, len(byID))
+	for _, job := range byID {
+		ids = append(ids, job.ID)
+	}
+
+	// Assign creation times so that recency disagrees with job-ID order: the
+	// third ID is newest, the first two share a timestamp, and the largest ID
+	// has no recorded creation time.
+	base := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	createdAt := map[string]time.Time{
+		ids[0]: base.Add(time.Hour),
+		ids[1]: base.Add(time.Hour),
+		ids[2]: base.Add(2 * time.Hour),
+		ids[3]: {},
+	}
+	m.mu.Lock()
+	for id, at := range createdAt {
+		job := m.data.Jobs[id]
+		job.CreatedAt = at
+		job.CompletedRepos["did:plc:diagnostics"] = "rev"
+		m.data.Jobs[id] = job
+	}
+	m.mu.Unlock()
+
+	listed := m.ListForDiagnostics()
+	listedIDs := make([]string, 0, len(listed))
+	for _, job := range listed {
+		listedIDs = append(listedIDs, job.ID)
+		require.Nil(t, job.CompletedRepos, "diagnostic listings omit completed repository sets")
+	}
+	require.Equal(t, []string{ids[2], ids[0], ids[1], ids[3]}, listedIDs, "newest first, ties by ascending ID, zero creation time last")
+
+	unchanged := m.List()
+	unchangedIDs := make([]string, 0, len(unchanged))
+	for _, job := range unchanged {
+		unchangedIDs = append(unchangedIDs, job.ID)
+	}
+	require.Equal(t, ids, unchangedIDs, "List keeps job-ID order")
+}

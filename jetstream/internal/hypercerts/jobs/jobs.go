@@ -1816,6 +1816,10 @@ func (m *Manager) canTransition(j Job, state State, hasReceipt bool) bool {
 	return j.State == Pending || j.State == Running || (hasReceipt && j.State == Canceled)
 }
 
+// ListForDiagnostics returns job snapshots without completed repository sets,
+// newest created first. Job ID breaks ties, and a zero CreatedAt sorts last.
+// Retry, cancellation and progress do not change CreatedAt, so they do not
+// move a job and an existing job ID remains a stable page cursor.
 func (m *Manager) ListForDiagnostics() []Job {
 	m.mu.Lock()
 	out := make([]Job, 0, len(m.data.Jobs))
@@ -1824,7 +1828,12 @@ func (m *Manager) ListForDiagnostics() []Job {
 		out = append(out, clone(job))
 	}
 	m.mu.Unlock()
-	slices.SortFunc(out, func(a, b Job) int { return strings.Compare(a.ID, b.ID) })
+	slices.SortFunc(out, func(a, b Job) int {
+		if byRecency := b.CreatedAt.Compare(a.CreatedAt); byRecency != 0 {
+			return byRecency
+		}
+		return strings.Compare(a.ID, b.ID)
+	})
 	return out
 }
 
