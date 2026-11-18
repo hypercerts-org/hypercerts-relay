@@ -39,7 +39,10 @@ directly.
    account-limit rule below, using the account count from step 4.
 
 There is no cap on how many PDSes are added; the Relay and Jetstream are sized
-for the additions.
+for the additions. When administration is connected to the collection
+directory, each added PDS also starts one collection directory crawl, and the
+directory has no limit on concurrent crawls, so a burst of additions is also a
+burst of crawls, each limited by `COLLECTIONS_CRAWL_QPS`.
 
 ### Account limit rule
 

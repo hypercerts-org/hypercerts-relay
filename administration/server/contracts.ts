@@ -122,6 +122,14 @@ export const command = z.discriminatedUnion("kind", [
       eventsPerSecond: rate,
     })
     .strict(),
+  // Asks the collection directory to crawl one enabled source, or every
+  // enabled source. Applied means the directory accepted the request.
+  z
+    .object({
+      kind: z.literal("collection_crawl"),
+      scope: z.union([z.literal("all"), origin]),
+    })
+    .strict(),
 ]);
 export type Command = z.infer<typeof command>;
 export type OperationState =
@@ -136,6 +144,88 @@ export interface Operation {
   updatedAt: string;
   result: unknown;
   error: string | null;
+}
+// A crawl the collection directory reports as running. describeErrors is null
+// when the directory does not report it.
+export interface ActiveCrawl {
+  pds: string;
+  startedAt: string;
+  reposDescribed: number;
+  describeErrors: number | null;
+}
+// The latest ended crawl the collection directory retains for a source.
+export interface EndedCrawl extends ActiveCrawl {
+  finishedAt: string;
+  state: "finished" | "failed";
+  errorCategory: string | null;
+  httpStatus: number | null;
+}
+export interface CollectionDirectoryStatus {
+  configured: boolean;
+  available: boolean;
+  error: string | null;
+  observedAt: string;
+  processStartedAt: string | null;
+  historySupported: boolean;
+  active: ActiveCrawl[];
+  recent: EndedCrawl[];
+}
+// One source accepted by the collection directory for one crawl request.
+// Acceptance fields are fixed at submission; completion fields are observed.
+export interface CollectionCrawl {
+  id: string;
+  operation: string;
+  pds: string;
+  actor: string;
+  actorHandle: string | null;
+  // "source_added" when the request was an automatic initial crawl.
+  cause: string;
+  // The source operation that queued an automatic initial crawl, else null.
+  sourceOperation: string | null;
+  submission: "started" | "already_active" | "accepted";
+  state: "accepted" | "finished" | "failed" | "unknown";
+  requestedAt: string;
+  acceptedAt: string;
+  crawlStartedAt: string | null;
+  finishedAt: string | null;
+  reposDescribed: number | null;
+  describeErrors: number | null;
+  errorCategory: string | null;
+  httpStatus: number | null;
+  observedAt: string | null;
+}
+// How an automatic initial crawl of a newly enabled source is progressing.
+export type CollectionBootstrapPhase =
+  | "skipped_not_configured"
+  | "skipped_not_https"
+  | "skipped_conflict"
+  | "waiting"
+  | "retrying"
+  | "needs_attention"
+  | "not_requested"
+  | "accepted"
+  | "finished"
+  | "failed"
+  | "unknown";
+// One automatic initial crawl, recorded when a source enable was applied.
+export interface CollectionBootstrapView {
+  sourceOperation: string;
+  pds: string;
+  actor: string;
+  actorHandle: string | null;
+  createdAt: string;
+  outcome: "queued" | "not_configured" | "not_https" | "conflict";
+  crawlOperation: string | null;
+  phase: CollectionBootstrapPhase;
+  // The follow-up crawl operation; null when no crawl was queued.
+  request: {
+    state: OperationState;
+    error: string | null;
+    attempts: number;
+    nextAttemptAt: string | null;
+    updatedAt: string;
+  } | null;
+  crawl: CollectionCrawl | null;
 }
 export interface Policy {
   revision: number;

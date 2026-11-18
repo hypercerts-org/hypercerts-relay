@@ -13,7 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import { resolve, join, isAbsolute } from "node:path";
 import { Store } from "../server/store.ts";
-import { Services } from "../server/services.ts";
+import { Services, type ServiceCommand } from "../server/services.ts";
 import { Worker } from "../server/worker.ts";
 import { command } from "../server/contracts.ts";
 
@@ -289,7 +289,7 @@ test(
     });
     const jobID = (job.result as { id: string }).id;
 
-    const again = await services.apply(job.command, job.id);
+    const again = await services.apply(job.command as ServiceCommand, job.id);
     assert.equal((again as { id: string }).id, jobID);
     let jobs = await services.jobs();
     const deadline = Date.now() + 10_000;

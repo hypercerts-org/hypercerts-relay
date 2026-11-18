@@ -15,6 +15,12 @@ export type {
   JobLastFailure,
   RepositoryDetail,
   RepositoryDetailsPage,
+  ActiveCrawl,
+  EndedCrawl,
+  CollectionCrawl,
+  CollectionDirectoryStatus,
+  CollectionBootstrapPhase,
+  CollectionBootstrapView,
   JobStateFilter,
 } from "../server/contracts";
 // Display labels for the job status filters, in link order. The record type
@@ -132,6 +138,8 @@ export function target(command: Command) {
       return `${command.action} job ${command.id.slice(0, 8)}`;
     case "limit":
       return `${command.scope} · ${command.eventsPerSecond} events/second`;
+    case "collection_crawl":
+      return `crawl collection directory · ${command.scope === "all" ? "all enabled sources" : command.scope}`;
   }
 }
 export function sourceOrigin(source: Source) {

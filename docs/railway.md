@@ -102,6 +102,9 @@ Setting `HC_RAILWAY_STARTUP=1` enables the following runtime contract:
   unmounted.
 - PDS discovery consumes `HC_DISCOVERY_SECRET` and sets
   `DISCOVERY_ADMIN_TOKEN_FILE`. It is stateless and needs no volume.
+- Administration also consumes the optional `HC_COLLECTIONDIR_CONTROL_SECRET`
+  and sets `COLLECTIONDIR_CONTROL_TOKEN_FILE`. When the variable is unset or
+  empty, no file is written and collection directory crawls stay disabled.
 - Rainbow needs no credential conversion.
 
 ### Required variables per environment
@@ -132,6 +135,29 @@ listener and returns 404, which Jetstream reports as `policy_mirror_unavailable`
 | PDS discovery | `HC_RAILWAY_STARTUP` | `1` |
 | PDS discovery | `HC_DISCOVERY_SECRET` | Same value as the administration service |
 | PDS discovery | `DISCOVERY_ADMIN_URL` | Administration's private origin |
+
+### Optional: collection directory crawls
+
+To let operators request collection directory crawls from Administration, also set:
+
+| Service | Variable | Value |
+| --- | --- | --- |
+| Administration | `COLLECTIONDIR_CONTROL_URL` | `http://collectiondir.railway.internal:2510` |
+| Administration | `HC_COLLECTIONDIR_CONTROL_SECRET` | Same value as the collection directory's `COLLECTIONS_ADMIN_TOKEN`, at least 32 bytes |
+| Collection directory | `COLLECTIONS_CRAWL_QPS` | Optional; requests per second to each crawled PDS, default `100` |
+
+Set both or neither; Administration fails startup if only the URL or only the
+token file is present. The collection directory's API listener
+(`COLLECTIONS_API_LISTEN`, default `:2510`) already accepts connections on all
+interfaces; if you override it, keep the port in the URL above. Do not attach a
+public domain to that port: the admin crawl endpoints share the listener with
+the query API. Publish `com.atproto.sync.listReposByCollection` through Rainbow
+instead, by setting `RAINBOW_COLLECTIONDIR_HOST` on Rainbow to the collection
+directory's private origin; Rainbow proxies only that query. Deploy the
+collection directory and Administration from the same release, because
+Administration reads the per-host crawl replies added alongside this setting.
+With both settings, enabling a source also requests an initial crawl of it, so
+choose `COLLECTIONS_CRAWL_QPS` for the PDSes you expect to add.
 
 `HC_RELAY_CONTROL_SECRET` must be identical on Relay, Jetstream and
 Administration. Bootstrap writes each service its own token file, so only the

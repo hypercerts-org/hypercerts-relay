@@ -6,6 +6,9 @@ import { Auth, oauthProvider } from "./auth.ts";
 import { createApp } from "./app.ts";
 import { Services } from "./services.ts";
 import { Worker } from "./worker.ts";
+import { Collectiondir, collectiondirConfig } from "./collectiondir.ts";
+import { CollectionCrawls } from "./collection-crawls.ts";
+import { CollectionBootstrap } from "./collection-bootstrap.ts";
 
 function required(name: string) {
   const value = process.env[name];
@@ -58,8 +61,29 @@ const services = new Services(
   },
   { railwayPrivateNetwork: process.env.HC_RAILWAY_STARTUP === "1" },
 );
+const publicServiceOrigins = {
+  relay: publicOrigin("RELAY_PUBLIC_ORIGIN"),
+  rainbow: publicOrigin("RAINBOW_PUBLIC_ORIGIN"),
+  jetstream: publicOrigin("JETSTREAM_PUBLIC_ORIGIN"),
+};
+// Optional: without both settings the crawl action is disabled.
+const collectiondir = new Collectiondir(
+  collectiondirConfig(process.env, secret),
+  {
+    railwayPrivateNetwork: process.env.HC_RAILWAY_STARTUP === "1",
+    forbiddenOrigins: [
+      required("RELAY_CONTROL_URL"),
+      required("JETSTREAM_CONTROL_URL"),
+      ...Object.values(publicServiceOrigins).filter(
+        (value): value is string => value !== undefined,
+      ),
+    ],
+  },
+);
+const crawls = new CollectionCrawls(store, services, collectiondir);
+const bootstrap = new CollectionBootstrap(store, collectiondir.configured);
 store.seedAdministrator(process.env.ADMIN_SEED_DID);
-const worker = new Worker(store, services);
+const worker = new Worker(store, services, crawls, bootstrap);
 worker.recover();
 const server = createApp(
   store,
@@ -77,11 +101,9 @@ const server = createApp(
     machineToken: process.env.ADMIN_DISCOVERY_TOKEN_FILE
       ? secret("ADMIN_DISCOVERY_TOKEN_FILE")
       : undefined,
-    publicServiceOrigins: {
-      relay: publicOrigin("RELAY_PUBLIC_ORIGIN"),
-      rainbow: publicOrigin("RAINBOW_PUBLIC_ORIGIN"),
-      jetstream: publicOrigin("JETSTREAM_PUBLIC_ORIGIN"),
-    },
+    publicServiceOrigins,
+    collectionCrawls: crawls,
+    collectionBootstrap: bootstrap,
   },
 ).listen(
   Number(process.env.PORT ?? 3000),
@@ -91,20 +113,33 @@ let stopping = false;
 async function run() {
   while (!stopping) {
     await worker.tick();
+    // SQLite only; a failure here is a persistence failure.
+    bootstrap.retryDue();
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
 }
-const running = run().catch(() => {
+// Crawl tracking runs in its own loop so a slow collection directory never
+// delays operations. Directory network errors are handled inside reconcile;
+// anything that escapes it is a persistence failure.
+async function reconcileCrawls() {
+  while (!stopping) {
+    await crawls.reconcile(); // NOSONAR: a polling loop, one pass at a time
+    await new Promise((resolve) => setTimeout(resolve, 1000)); // NOSONAR: poll interval
+  }
+}
+function persistenceFailed() {
   console.error("Control-plane persistence failed; stopping.");
   stopping = true;
   server.close();
   process.exitCode = 1;
-});
+}
+const running = run().catch(persistenceFailed);
+const reconciling = reconcileCrawls().catch(persistenceFailed);
 async function shutdown() {
   if (stopping) return;
   stopping = true;
   server.close();
-  await running;
+  await Promise.all([running, reconciling]);
   store.close();
 }
 process.once("SIGINT", shutdown);

@@ -13,6 +13,9 @@ import {
   type RepositoryDetailsPage,
 } from "./contracts.ts";
 
+// Commands applied by Relay or Jetstream. Collection directory crawls are
+// applied by CollectionCrawls instead.
+export type ServiceCommand = Exclude<Command, { kind: "collection_crawl" }>;
 export interface ServiceConfig {
   url: string;
   token: string;
@@ -131,7 +134,7 @@ export class Services {
     );
   }
   async apply(
-    command: Command,
+    command: ServiceCommand,
     id: string,
     progress: (value: unknown) => void = () => {},
   ): Promise<unknown> {
@@ -265,7 +268,7 @@ async function controlError(
   );
 }
 
-async function readControlBody<T>(response: Response): Promise<T> {
+export async function readControlBody<T>(response: Response): Promise<T> {
   const reader = response.body!.getReader();
   const chunks: Uint8Array[] = [];
   let size = 0;
@@ -441,7 +444,10 @@ async function remoteArchiveError(response: Response): Promise<string | null> {
     : null;
 }
 
-function allowedControlTransport(url: URL, railwayPrivateNetwork: boolean) {
+export function allowedControlTransport(
+  url: URL,
+  railwayPrivateNetwork: boolean,
+) {
   if (url.protocol === "https:") return true;
   if (url.protocol !== "http:") return false;
   if (["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)) return true;

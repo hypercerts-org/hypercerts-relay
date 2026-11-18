@@ -121,6 +121,7 @@ type Crawler struct {
 
 type CrawlStats struct {
 	ReposDescribed atomic.Uint32
+	DescribeErrors atomic.Uint32 // hypercerts: describeRepo failures that were skipped.
 }
 
 // CrawlPDSRepoCollections
@@ -152,6 +153,10 @@ func (cr *Crawler) CrawlPDSRepoCollections() error {
 					slog.Info("repo unavail", "host", cr.RpcClient.Host, "did", xr.Did, "err", err)
 				} else {
 					slog.Warn("repo desc", "host", cr.RpcClient.Host, "did", xr.Did, "err", err)
+				}
+				// hypercerts: count skipped repositories for crawl status.
+				if cr.Stats != nil {
+					cr.Stats.DescribeErrors.Add(1)
 				}
 				continue
 			}
