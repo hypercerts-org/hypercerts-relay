@@ -16,12 +16,17 @@ import { setTimeout as delay } from "node:timers/promises";
 import { test, type TestContext } from "node:test";
 import { startControlFixtures } from "./control-fixtures.ts";
 
-async function waitFor(predicate: () => boolean) {
-  const deadline = Date.now() + 3000;
+// Spawned harness children load tsx and the whole server before they compile.
+// When other test files compile Go concurrently, that start alone can exceed
+// the in-process lifecycle bound, so their first marker gets a startup bound.
+const childStartup = 30000;
+
+async function waitFor(predicate: () => boolean, milliseconds = 3000) {
+  const deadline = Date.now() + milliseconds;
   while (!predicate()) {
     assert.ok(
       Date.now() < deadline,
-      "lifecycle event arrived within 3 seconds",
+      `lifecycle event arrived within ${milliseconds} ms`,
     );
     await delay(10);
   }
@@ -147,11 +152,19 @@ ${fixture}`)}, { mode: 0o700 });
   });
   return {
     marker,
-    async compiling() {
+    // A spawned child gets the startup bound, and fails at once with its
+    // output if it exits before both compilers have started.
+    async compiling(child?: { child: ChildProcess; output(): string }) {
       await waitFor(
-        () =>
-          existsSync(marker("relay.compiling")) &&
-          existsSync(marker("jetstream.compiling")),
+        () => {
+          if (child && child.child.exitCode !== null)
+            assert.fail(`child exited before compiling:\n${child.output()}`);
+          return (
+            existsSync(marker("relay.compiling")) &&
+            existsSync(marker("jetstream.compiling"))
+          );
+        },
+        child ? childStartup : undefined,
       );
     },
     assertRemoved() {
@@ -240,7 +253,7 @@ test("control fixture compilation failure waits for its sibling writer", async (
 test("management compilation failure waits for its sibling writer", async (t) => {
   const h = harness(t, "fail-compile");
   const child = h.spawn("tests/management.test.ts");
-  assert.equal(await bounded(child.done), 1, child.output());
+  assert.equal(await bounded(child.done, childStartup), 1, child.output());
   assert.match(child.output(), /intentional compilation failure/);
   assert.equal(
     readFileSync(h.marker("jetstream.directory-present"), "utf8"),
@@ -253,7 +266,7 @@ test("management compilation failure waits for its sibling writer", async (t) =>
 test("browser server SIGTERM during compilation waits for startup cleanup", async (t) => {
   const h = harness(t, "block-compile");
   const child = h.spawn("tests/browser-server.ts");
-  await h.compiling();
+  await h.compiling(child);
   child.child.kill("SIGTERM");
   assert.equal(await bounded(child.done), 0, child.output());
   h.assertCompilersReaped();
@@ -277,7 +290,7 @@ await test("cancel management during compilation", { signal: abort.signal }, asy
 `,
   );
   const child = h.spawn(runner);
-  await h.compiling();
+  await h.compiling(child);
   await waitFor(
     () =>
       existsSync(h.marker("relay.aborted")) &&
@@ -320,7 +333,7 @@ test("browser server listen failure reaps fixtures and removes their directory",
   }
   const h = harness(t, "success");
   const child = h.spawn("tests/browser-server.ts");
-  assert.equal(await bounded(child.done, 15000), 1, child.output());
+  assert.equal(await bounded(child.done, childStartup), 1, child.output());
   assert.match(child.output(), /EADDRINUSE/);
   h.assertCompilersReaped();
   for (const name of ["relay", "jetstream"])
