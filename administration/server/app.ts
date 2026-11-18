@@ -27,6 +27,10 @@ import {
 } from "./machine.ts";
 import { CollectionCrawls } from "./collection-crawls.ts";
 import { Collectiondir } from "./collectiondir.ts";
+import {
+  CollectionBootstrap,
+  clientIdempotencyKey,
+} from "./collection-bootstrap.ts";
 
 export interface PublicServiceOrigins {
   relay?: string;
@@ -40,6 +44,8 @@ export interface AppOptions extends ProxyOptions {
   machineToken?: string;
   // Absent means the collection directory is not configured.
   collectionCrawls?: CollectionCrawls;
+  // Automatic initial crawls; absent means none are recorded.
+  collectionBootstrap?: CollectionBootstrap;
 }
 
 const page = z.object({
@@ -57,6 +63,9 @@ export function createApp(
   const crawls =
     options.collectionCrawls ??
     new CollectionCrawls(store, services, new Collectiondir(null));
+  const bootstraps =
+    options.collectionBootstrap ??
+    new CollectionBootstrap(store, crawls.configured);
   const app = express();
   app.disable("x-powered-by");
   app.set("trust proxy", options.trustProxy ?? false);
@@ -138,7 +147,7 @@ export function createApp(
   });
   app.post("/api/v1/operations", operationBody, (req, res) => {
     const input = command.parse(req.body),
-      key = z.uuid().parse(req.get("Idempotency-Key"));
+      key = clientIdempotencyKey(req.get("Idempotency-Key"));
     if (input.kind === "collection_crawl" && !crawls.configured)
       throw new ApiError(409, "collectiondir_not_configured");
     res
@@ -316,6 +325,17 @@ export function createApp(
         ids,
       ),
     );
+  });
+  // Plaintext sources are recorded too, so the filter is an exact origin
+  // rather than the HTTPS-only PDS origin schema.
+  app.get("/api/v1/collection-directory/bootstraps", (req, res) => {
+    const p = page
+      .extend({
+        pds: z.string().max(300).optional(),
+        phase: z.literal("open").optional(),
+      })
+      .parse(req.query);
+    res.json(bootstraps.page(p.after, p.limit, p.pds, p.phase));
   });
   app.get("/api/v1/limits", (req, res) =>
     services

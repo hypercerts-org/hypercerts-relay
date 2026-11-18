@@ -8,6 +8,7 @@ import {
 } from "./machine.ts";
 import { CollectionCrawls } from "./collection-crawls.ts";
 import { Collectiondir } from "./collectiondir.ts";
+import { CollectionBootstrap } from "./collection-bootstrap.ts";
 
 // One worker per database. Never infer archive completion from command acceptance.
 export class Worker {
@@ -19,6 +20,10 @@ export class Worker {
       store,
       services,
       new Collectiondir(null),
+    ),
+    private readonly bootstrap: CollectionBootstrap = new CollectionBootstrap(
+      store,
+      false,
     ),
   ) {}
   recover() {
@@ -66,9 +71,18 @@ export class Worker {
             throw new ApiError(409, "source_disabled_by_operator");
         }
         const result = await this.execute(op);
-        this.store.transition(op.id, "applied", result, null, undefined, [
-          "applying",
-        ]);
+        // An applied source enable queues its initial collection directory
+        // crawl in the same transaction.
+        const follow = this.bootstrap.plan(op, result);
+        this.store.transition(
+          op.id,
+          "applied",
+          follow?.result ?? result,
+          null,
+          undefined,
+          ["applying"],
+          follow?.commit,
+        );
       } catch (e) {
         this.store.transition(
           op.id,

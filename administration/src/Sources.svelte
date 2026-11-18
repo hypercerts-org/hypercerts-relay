@@ -13,8 +13,10 @@
     type Command,
     type CollectionCrawl,
     type CollectionDirectoryStatus,
+    type CollectionBootstrapView,
   } from "./api";
   import {
+    bootstrapSummary,
     crawlEligible,
     crawlSummary,
     directoryMessage,
@@ -24,6 +26,8 @@
   export let busy = false;
   export let directory: CollectionDirectoryStatus | null = null;
   export let crawls: CollectionCrawl[] = [];
+  export let action: (id: string, kind: "retry" | "cancel") => Promise<void> =
+    async () => {};
   let pds = "",
     search = "",
     selected: Source | null = null,
@@ -31,6 +35,8 @@
   // The selected source's newest crawl request, fetched by origin so it is
   // found even when it is older than the shared list. Undefined until fetched.
   let latestCrawl: CollectionCrawl | null | undefined = undefined;
+  // The selected source's newest automatic initial crawl, if any.
+  let latestBootstrap: CollectionBootstrapView | null = null;
   let detailUnavailable = false,
     coverage: Coverage | null = null,
     coverageUnavailable = false,
@@ -62,6 +68,27 @@
   // status, so screens without it make no crawl requests.
   async function refreshCrawl(origin: string, request: number) {
     if (directory === null) return;
+    await Promise.all([
+      refreshLatestCrawl(origin, request),
+      refreshBootstrap(origin, request),
+    ]);
+  }
+  async function refreshBootstrap(origin: string, request: number) {
+    try {
+      const page = await api<{ items: CollectionBootstrapView[] }>(
+        `/collection-directory/bootstraps?pds=${encodeURIComponent(origin)}&limit=1`,
+      );
+      if (
+        request === detailRequest &&
+        selected &&
+        sourceOrigin(selected) === origin
+      )
+        latestBootstrap = page.items[0] ?? null;
+    } catch {
+      // The initial crawl row stays hidden; other details are unaffected.
+    }
+  }
+  async function refreshLatestCrawl(origin: string, request: number) {
     try {
       const page = await api<{ items: CollectionCrawl[] }>(
         `/collection-directory/crawls?pds=${encodeURIComponent(origin)}&limit=1`,
@@ -106,6 +133,7 @@
     coverage = null;
     coverageUnavailable = false;
     latestCrawl = undefined;
+    latestBootstrap = null;
   }
   async function refreshCoverage(origin: string, request: number) {
     try {
@@ -485,6 +513,29 @@
     <section class="detail" aria-label="Collection directory crawl">
       <h3>Collection directory</h3>
       <dl>
+        {#if latestBootstrap && latestBootstrap.pds === sourceOrigin(selected)}
+          <div>
+            <dt>Initial crawl</dt>
+            <dd>
+              {bootstrapSummary(
+                latestBootstrap,
+                activeCrawls.get(latestBootstrap.pds),
+              )}{#if latestBootstrap.phase === "needs_attention" && latestBootstrap.crawlOperation}
+                <button
+                  disabled={busy}
+                  onclick={() =>
+                    action(latestBootstrap!.crawlOperation!, "retry")}
+                  >Retry initial crawl</button
+                >{/if}<small
+                >Requested automatically when the source was enabled
+                {recordedTime(latestBootstrap.createdAt)} by {latestBootstrap.actorHandle
+                  ? `@${latestBootstrap.actorHandle}`
+                  : latestBootstrap.actor}. The source was added whatever
+                happens to this crawl.</small
+              >
+            </dd>
+          </div>
+        {/if}
         <div>
           <dt>Latest crawl</dt>
           <dd>

@@ -74,6 +74,9 @@ var serveCmd = &cli.Command{
 			Name:  "crawl-qps",
 			Usage: "per-PDS crawl queries-per-second limit",
 			Value: 100,
+
+			// hypercerts: let container deployments set the crawl rate.
+			Sources: cli.EnvVars("COLLECTIONS_CRAWL_QPS"),
 		},
 		&cli.Uint64Flag{
 			Name:    "clist-min-dids",

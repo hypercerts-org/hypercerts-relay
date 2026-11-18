@@ -131,7 +131,7 @@ The browser-facing API is `/api/v1`; all endpoints below require authorization.
 | `POST /administrators`                   | `{did, action}` with `grant` or `remove`; actor audited, CSRF protected; cannot remove oneself.            |
 | `GET /session`                           | Current DID, CSRF token, expiry.                                                                           |
 | `POST /signout`, `/revoke-sessions`      | Revoke the current or all local sessions.                                                                  |
-| `POST /operations`                       | Validated command plus UUID `Idempotency-Key`; returns durable operation and HTTP 202.                     |
+| `POST /operations`                       | Validated command plus UUID `Idempotency-Key` (version 8 is reserved for server-derived IDs and returns HTTP 400 `reserved_idempotency_key`); returns durable operation and HTTP 202. |
 | `GET /operations`, `/operations/{id}`    | Requested command, actor, state, observed result and bounded failure code.                                 |
 | `POST /operations/{id}/retry`, `/cancel` | Retry failed/incomplete work or cancel work not yet applying; actor audited.                               |
 | `GET /sources`, `/source?pds=…`          | Relay's desired, validation, connection, admission-quota, Relay-observed-account and durable-cursor state. |
@@ -141,7 +141,8 @@ The browser-facing API is `/api/v1`; all endpoints below require authorization.
 | `GET /limits`, `/status`, `/audit`       | Applied policies, bounded service health, durable actor-attributed history. `/status` includes `collectiondir`: `available`, `unavailable` or `not_configured`. |
 | `GET`, `POST /sources/discovery/settings` | Automatic PDS discovery settings: `{maxAccountLimit}`, a whole number of at least 1,000 (default 100,000). Changes are CSRF protected and audited as `discovery_settings_changed`. |
 | `GET /collection-directory/status`       | Always HTTP 200: `configured`, `available`, bounded `error` code, active crawls and recent crawl results.   |
-| `GET /collection-directory/crawls`       | Newest-first crawl requests with actor, times, submission, state and result; optional exact `pds` and crawl-row `ids` filters.  |
+| `GET /collection-directory/crawls`       | Newest-first crawl requests with actor, times, trigger (`cause`: `manual` or `source_added`), the enabling `sourceOperation`, submission, state and result; optional exact `pds` and crawl-row `ids` filters. |
+| `GET /collection-directory/bootstraps`   | Newest-first automatic initial crawls with the enabling operation and actor, outcome, `phase`, follow-up request state, attempts and next retry time, and the crawl row once accepted; optional exact `pds` filter, which also matches `http://` sources. Optional `phase=open` selects only `waiting`, `retrying`, `needs_attention` and `accepted` before the same `after`/`limit` cursor paging; any other filter value is rejected, and omitting it returns all phases. |
 
 Commands are discriminated by `kind`: `source` (`pds`, `state`), `collections`
 (`expectedRevision`, exact `collections`), `job` (`pds`, `reason`), `job_action`
@@ -204,7 +205,7 @@ under the same prefix is part of the browser API above and is always mounted.
 | Endpoint                | Contract                                                                                                     |
 | ----------------------- | ------------------------------------------------------------------------------------------------------------ |
 | `GET /state`            | `{policyRevision, collections, sources: [{pds, state, accountLimit}], maxAccountLimit}`, covering every Relay source in any state. |
-| `POST /operations`      | Only a `source` command with state `enabled`, or an `account_quota` command that raises the limit. Requires a UUID `Idempotency-Key` and returns HTTP 202. Any other command returns HTTP 403. A source enable for a PDS that Relay reports as `disabled` or `removed` returns HTTP 409 `source_disabled_by_operator`. An account limit above the discovery maximum returns HTTP 403 `account_limit_above_discovery_maximum`. |
+| `POST /operations`      | Only a `source` command with state `enabled`, or an `account_quota` command that raises the limit. Requires a UUID `Idempotency-Key` that is not version 8 (HTTP 400 `reserved_idempotency_key`) and returns HTTP 202. Any other command returns HTTP 403. A source enable for a PDS that Relay reports as `disabled` or `removed` returns HTTP 409 `source_disabled_by_operator`. An account limit above the discovery maximum returns HTTP 403 `account_limit_above_discovery_maximum`. |
 
 Before applying a discovery operation, the worker checks again. An account
 limit above the current discovery maximum fails with
@@ -264,6 +265,68 @@ does not admit a source to Relay and is not a Jetstream backfill. See
 [the collection directory guide](../cmd/collectiondir/README.md). The PDS
 discovery machine API cannot request crawls; it rejects `collection_crawl` with
 HTTP 403.
+
+### Automatic initial crawl
+
+When a `source` operation with state `enabled` is applied, administration also
+asks the collection directory to crawl that source. This applies to sources
+added or re-enabled by an operator and to sources enabled by PDS discovery. It
+needs no extra configuration beyond the two collection directory settings
+above.
+
+- **What triggers it.** Only an applied enable that Relay reports as enabled
+  and validated. A source operation that fails or is left incomplete, and any
+  disable or remove, requests nothing. An enable that leaves the source
+  unchanged does not request a crawl if one was already queued at that source
+  revision; disabling and then re-enabling does request one.
+- **How it is recorded.** In the same transaction that marks the source
+  operation applied, administration queues a follow-up `collection_crawl`
+  operation for `https://<Relay hostname>`, owned by the same actor. The
+  source operation's result gains `collectionDirectory.bootstrap`: `queued`,
+  `not_configured`, `not_https`, `conflict` or `unchanged`. The crawl appears
+  under **Crawl requests** with the trigger **Source added**. The follow-up
+  ID is a version 8 UUID; both operation routes refuse client
+  `Idempotency-Key` values of that version with HTTP 400
+  `reserved_idempotency_key`. If an operation nevertheless already holds the
+  ID, the crawl is skipped as `conflict`, audited as
+  `collection_bootstrap_conflict`, and the source still applies.
+- **The source is added whatever happens to the crawl.** The source operation
+  stays applied. The crawl's progress is shown as **Initial crawl** in the
+  source's detail panel. Crawls not yet accepted by the directory are listed
+  under **Initial crawls awaiting submission** on the Collection directory
+  page.
+- **Retries.** If the directory is unavailable or refuses the request, the
+  follow-up operation is left `incomplete` and retried automatically after
+  30 seconds, doubling up to every 10 minutes, for 24 hours after the source
+  was enabled. Retries are audited under `system:collection-bootstrap`. After
+  24 hours the source detail shows **Retry initial crawl**, and the operation
+  can also be retried from the Operations screen. A follow-up that `failed`,
+  for example because the source was disabled before it ran, is never
+  retried automatically.
+- **Not configured or plaintext.** Without a collection directory, or for an
+  `http://` source, nothing is requested and the skip is recorded and shown.
+  Configuring the directory later does not automatically crawl those
+  sources.
+- **Sources enabled before this feature** are not crawled automatically. Use
+  **Crawl all enabled sources** once.
+
+The `phase` reported by `GET /collection-directory/bootstraps`:
+
+| Phase                    | Meaning                                                                    |
+| ------------------------ | -------------------------------------------------------------------------- |
+| `waiting`                | The crawl request is queued and has not yet been sent.                     |
+| `retrying`               | The directory was unavailable or refused; an automatic retry is scheduled. |
+| `needs_attention`        | Automatic retries stopped after 24 hours; retry manually.                  |
+| `not_requested`          | The request failed or was canceled, for example `source_not_enabled`.      |
+| `accepted`, `finished`, `failed`, `unknown` | The crawl row's state, as for manual crawls.            |
+| `skipped_not_configured` | No collection directory was configured when the source was enabled.        |
+| `skipped_not_https`      | The source is plaintext; the directory only crawls HTTPS sources.          |
+| `skipped_conflict`       | Another operation already held the follow-up ID; nothing was requested.    |
+
+Each crawl is limited by the collection directory's per-PDS rate,
+`--crawl-qps` or `COLLECTIONS_CRAWL_QPS` (default 100 requests per second).
+The directory does not limit how many crawls run at once, so enabling many
+sources at once starts that many crawls.
 
 ## Rate policy
 

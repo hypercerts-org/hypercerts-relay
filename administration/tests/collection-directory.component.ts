@@ -5,10 +5,14 @@ import {
   fireEvent,
   cleanup,
   within,
+  waitFor,
 } from "@testing-library/svelte";
+import App from "../src/App.svelte";
 import Sources from "../src/Sources.svelte";
 import CollectionDirectory from "../src/CollectionDirectory.svelte";
 import {
+  bootstrapNotice,
+  bootstrapSummary,
   crawlEligible,
   crawlNotice,
   crawlSummary,
@@ -20,6 +24,7 @@ import {
   refreshCrawls,
 } from "../src/collectionDirectory";
 import type {
+  CollectionBootstrapView,
   CollectionCrawl,
   CollectionDirectoryStatus,
   Operation,
@@ -30,6 +35,7 @@ afterEach(() => {
   cleanup();
   vi.useRealTimers();
   vi.unstubAllGlobals();
+  history.replaceState(null, "", "/");
 });
 
 // The URL a stubbed fetch was called with.
@@ -82,6 +88,7 @@ function crawl(
     actor: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
     actorHandle: "operator.example",
     cause: "manual",
+    sourceOperation: null,
     submission: "started",
     state: "accepted",
     requestedAt: "2026-11-17T10:00:01.000Z",
@@ -623,4 +630,494 @@ test("refreshing loaded history checks every older open row in bounded chunks", 
     items: [],
     next: "newest-page-cursor",
   });
+});
+
+const sourceOperation = "00000000-0000-4000-8000-0000000000a1";
+const bootstrapOperation = "00000000-0000-8000-8000-0000000000b2";
+function bootstrap(
+  phase: CollectionBootstrapView["phase"],
+  overrides: Partial<CollectionBootstrapView> = {},
+): CollectionBootstrapView {
+  const skipped = phase.startsWith("skipped_");
+  const outcomes: Partial<
+    Record<CollectionBootstrapView["phase"], CollectionBootstrapView["outcome"]>
+  > = {
+    skipped_not_https: "not_https",
+    skipped_not_configured: "not_configured",
+    skipped_conflict: "conflict",
+  };
+  return {
+    sourceOperation,
+    pds: "https://pds.example",
+    actor: "service:pds-discovery",
+    actorHandle: null,
+    createdAt: "2026-11-17T10:00:00.000Z",
+    outcome: outcomes[phase] ?? "queued",
+    crawlOperation: skipped ? null : bootstrapOperation,
+    phase,
+    request: skipped
+      ? null
+      : {
+          state: "requested",
+          error: null,
+          attempts: 0,
+          nextAttemptAt: null,
+          updatedAt: "2026-11-17T10:00:01.000Z",
+        },
+    crawl: null,
+    ...overrides,
+  };
+}
+function enableOperation(
+  state: Operation["state"],
+  result: unknown,
+): Operation {
+  return {
+    id: sourceOperation,
+    actor: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+    command: { kind: "source", pds: "https://pds.example", state: "enabled" },
+    state,
+    createdAt: "2026-11-17T10:00:00.000Z",
+    updatedAt: "2026-11-17T10:00:00.000Z",
+    result,
+    error: null,
+  };
+}
+
+test("the source notice explains each initial crawl outcome", () => {
+  const notice = (bootstrap: string) =>
+    bootstrapNotice(
+      enableOperation("applied", {
+        collectionDirectory: { bootstrap, pds: "https://pds.example" },
+      }),
+    );
+  expect(notice("queued")).toEqual({
+    text: "Initial collection directory crawl queued.",
+    queued: true,
+  });
+  expect(notice("not_configured")?.text).toBe(
+    "Collection directory is not configured, so no initial crawl was requested. The source was added.",
+  );
+  expect(notice("not_https")?.text).toMatch(
+    /^No initial crawl: the collection directory only crawls HTTPS sources\./,
+  );
+  expect(notice("conflict")?.text).toBe(
+    "No initial crawl was requested because its request ID was already in use. The source was added.",
+  );
+  expect(notice("unchanged")).toBeNull();
+  expect(
+    bootstrapNotice(
+      enableOperation("requested", {
+        collectionDirectory: { bootstrap: "queued" },
+      }),
+    ),
+  ).toBeNull();
+  expect(bootstrapNotice(enableOperation("applied", { relay: {} }))).toBeNull();
+});
+
+test("initial crawl phases read differently; accepted is not finished", () => {
+  expect(bootstrapSummary(bootstrap("waiting"))).toBe(
+    "Waiting to be submitted",
+  );
+  expect(
+    bootstrapSummary(
+      bootstrap("retrying", {
+        request: {
+          state: "incomplete",
+          error: "collectiondir_unavailable",
+          attempts: 1,
+          nextAttemptAt: "2026-11-17T10:01:00.000Z",
+          updatedAt: "2026-11-17T10:00:30.000Z",
+        },
+      }),
+    ),
+  ).toMatch(
+    /^Collection directory unavailable; retrying automatically \(attempt 2, next at .+\)$/,
+  );
+  expect(
+    bootstrapSummary(
+      bootstrap("needs_attention", {
+        request: {
+          state: "incomplete",
+          error: "collectiondir_unauthorized",
+          attempts: 9,
+          nextAttemptAt: null,
+          updatedAt: "2026-11-18T10:00:00.000Z",
+        },
+      }),
+    ),
+  ).toBe(
+    "Could not be submitted: collectiondir unauthorized. Automatic retries have stopped.",
+  );
+  expect(
+    bootstrapSummary(
+      bootstrap("not_requested", {
+        request: {
+          state: "failed",
+          error: "source_not_enabled",
+          attempts: 0,
+          nextAttemptAt: null,
+          updatedAt: "2026-11-17T10:00:01.000Z",
+        },
+      }),
+    ),
+  ).toBe("Not requested: source was no longer enabled");
+  expect(bootstrapSummary(bootstrap("skipped_not_configured"))).toMatch(
+    /^Skipped: collection directory not configured/,
+  );
+  expect(bootstrapSummary(bootstrap("skipped_not_https"))).toMatch(
+    /^Skipped: the collection directory only crawls HTTPS sources/,
+  );
+  expect(bootstrapSummary(bootstrap("skipped_conflict"))).toMatch(
+    /^Skipped: another request already used this initial crawl's ID/,
+  );
+  const accepted = bootstrapSummary(
+    bootstrap("accepted", {
+      crawl: crawl("https://pds.example", { cause: "source_added" }),
+    }),
+    {
+      pds: "https://pds.example",
+      startedAt: "2026-11-17T10:00:00.05Z",
+      reposDescribed: 4,
+      describeErrors: 0,
+    },
+  );
+  const finished = bootstrapSummary(
+    bootstrap("finished", {
+      crawl: crawl("https://pds.example", {
+        state: "finished",
+        reposDescribed: 4,
+      }),
+    }),
+  );
+  expect(accepted).toBe("Accepted, crawl running · 4 repositories described");
+  expect(finished).toBe("Finished · 4 repositories described");
+  expect(
+    bootstrapSummary(
+      bootstrap("failed", {
+        crawl: crawl("https://pds.example", {
+          state: "failed",
+          errorCategory: "http",
+          httpStatus: 502,
+        }),
+      }),
+    ),
+  ).toBe("Failed: http 502");
+});
+
+test("the source detail offers Retry only once automatic retries have stopped", async () => {
+  const action = vi.fn(async () => {});
+  let current = bootstrap("retrying", {
+    request: {
+      state: "incomplete",
+      error: "collectiondir_unavailable",
+      attempts: 0,
+      nextAttemptAt: "2026-11-17T10:01:00.000Z",
+      updatedAt: "2026-11-17T10:00:30.000Z",
+    },
+  });
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((input: RequestInfo | URL) => {
+      const url = requestUrl(input);
+      if (url.startsWith("/api/v1/collection-directory/bootstraps"))
+        return Promise.resolve(Response.json({ items: [current], next: null }));
+      if (url.startsWith("/api/v1/collection-directory/crawls"))
+        return Promise.resolve(Response.json({ items: [], next: null }));
+      return Promise.resolve(
+        Response.json({ error: "unavailable" }, { status: 503 }),
+      );
+    }),
+  );
+  render(Sources, {
+    rows: [source("pds.example")],
+    submit: vi.fn(),
+    action,
+    directory: directory(),
+  });
+  await fireEvent.click(screen.getByRole("button", { name: "pds.example" }));
+  const detail = screen.getByRole("region", {
+    name: "Collection directory crawl",
+  });
+  expect(
+    await within(detail).findByText(/retrying automatically/),
+  ).toBeTruthy();
+  expect(within(detail).getByText(/by service:pds-discovery/)).toBeTruthy();
+  expect(within(detail).getByText(/The source was added/)).toBeTruthy();
+  expect(
+    within(detail).queryByRole("button", { name: "Retry initial crawl" }),
+  ).toBeNull();
+
+  current = bootstrap("needs_attention", {
+    request: {
+      state: "incomplete",
+      error: "collectiondir_unavailable",
+      attempts: 9,
+      nextAttemptAt: null,
+      updatedAt: "2026-11-18T10:00:00.000Z",
+    },
+  });
+  await fireEvent.click(screen.getByRole("button", { name: "Close" }));
+  await fireEvent.click(screen.getByRole("button", { name: "pds.example" }));
+  const retry = await within(
+    screen.getByRole("region", { name: "Collection directory crawl" }),
+  ).findByRole("button", { name: "Retry initial crawl" });
+  await fireEvent.click(retry);
+  expect(action).toHaveBeenCalledExactlyOnceWith(bootstrapOperation, "retry");
+});
+
+test("crawl requests show their trigger and initial crawls awaiting submission are listed", () => {
+  render(CollectionDirectory, {
+    directory: directory(),
+    crawls: [
+      crawl("https://manual.example"),
+      crawl("https://added.example", {
+        cause: "source_added",
+        actor: "service:pds-discovery",
+        actorHandle: null,
+        sourceOperation,
+      }),
+    ],
+    bootstraps: [
+      bootstrap("retrying", { pds: "https://waiting.example" }),
+      bootstrap("accepted", {
+        pds: "https://accepted.example",
+        sourceOperation: "00000000-0000-4000-8000-0000000000c3",
+      }),
+      ...(
+        [
+          "not_requested",
+          "skipped_not_configured",
+          "skipped_not_https",
+          "skipped_conflict",
+        ] as const
+      ).map((phase) =>
+        bootstrap(phase, {
+          pds: `https://${phase}.example`,
+          sourceOperation: phase,
+        }),
+      ),
+    ],
+    submit: vi.fn(),
+  });
+  const requests = screen.getByRole("table", { name: "Crawl requests" });
+  const added = within(requests)
+    .getByText("https://added.example")
+    .closest("tr")!;
+  expect(within(added).getByText("Source added")).toBeTruthy();
+  expect(within(added).getByText("service:pds-discovery")).toBeTruthy();
+  const manual = within(requests)
+    .getByText("https://manual.example")
+    .closest("tr")!;
+  expect(within(manual).getByText("Manual")).toBeTruthy();
+  expect(within(manual).getByText("@operator.example")).toBeTruthy();
+  const awaiting = screen.getByRole("table", {
+    name: "Initial crawls awaiting submission",
+  });
+  expect(within(awaiting).getByText("https://waiting.example")).toBeTruthy();
+  expect(within(awaiting).queryByText("https://accepted.example")).toBeNull();
+  expect(within(awaiting).getAllByRole("row")).toHaveLength(2);
+});
+
+test("the directory loads all open bootstrap pages before declaring its queue complete", async () => {
+  history.replaceState(null, "", "/collection-directory");
+  const newerTerminal = Array.from({ length: 101 }, (_, index) =>
+    bootstrap("skipped_not_configured", {
+      sourceOperation: `terminal-${index}`,
+      pds: `https://terminal-${index}.example`,
+    }),
+  );
+  const newerOpen = Array.from({ length: 100 }, (_, index) =>
+    bootstrap("waiting", {
+      sourceOperation: `open-${index}`,
+      pds: `https://open-${index}.example`,
+    }),
+  );
+  const olderOpen = (["needs_attention", "retrying", "accepted"] as const).map(
+    (phase) =>
+      bootstrap(phase, {
+        sourceOperation: `old-${phase}`,
+        pds: `https://old-${phase}.example`,
+        createdAt: "2026-11-01T10:00:00.000Z",
+      }),
+  );
+  let finish!: (response: Response) => void;
+  const lastPage = new Promise<Response>((resolve) => {
+    finish = resolve;
+  });
+  const fetcher = vi.fn((input: RequestInfo | URL) => {
+    const url = new URL(requestUrl(input), location.origin);
+    if (url.pathname === "/api/v1/session")
+      return Promise.resolve(
+        Response.json({ did: "did:plc:operator", csrf: "test" }),
+      );
+    if (url.pathname.endsWith("/status"))
+      return Promise.resolve(Response.json(directory()));
+    if (url.pathname.endsWith("/bootstraps")) {
+      if (url.searchParams.get("phase") !== "open")
+        return Promise.resolve(
+          Response.json({
+            items: newerTerminal.slice(0, 100),
+            next: "terminal-page",
+          }),
+        );
+      if (url.searchParams.has("after")) return lastPage;
+      return Promise.resolve(
+        Response.json({ items: newerOpen, next: "older/open+cursor" }),
+      );
+    }
+    return Promise.resolve(Response.json({ items: [], next: null }));
+  });
+  vi.stubGlobal("fetch", fetcher);
+  render(App);
+  const awaiting = await screen.findByRole("table", {
+    name: "Initial crawls awaiting submission",
+  });
+  await waitFor(() =>
+    expect(
+      fetcher.mock.calls.some(
+        ([input]) =>
+          requestUrl(input) ===
+          "/api/v1/collection-directory/bootstraps?phase=open&limit=100&after=older%2Fopen%2Bcursor",
+      ),
+    ).toBe(true),
+  );
+  expect(
+    within(awaiting).queryByText(/No initial crawls are waiting/),
+  ).toBeNull();
+  expect(within(awaiting).queryByText("https://open-0.example")).toBeNull();
+  finish(Response.json({ items: olderOpen, next: null }));
+  expect(
+    await within(awaiting).findByText("https://old-needs_attention.example"),
+  ).toBeTruthy();
+  expect(
+    within(awaiting).getByText("https://old-retrying.example"),
+  ).toBeTruthy();
+  expect(
+    within(awaiting).queryByText("https://old-accepted.example"),
+  ).toBeNull();
+  expect(within(awaiting).queryByText("https://terminal-0.example")).toBeNull();
+  for (const row of olderOpen)
+    expect(crawlsInProgress(directory(), [], null, [row])).toBe(
+      row.phase !== "needs_attention",
+    );
+});
+
+test.each([false, true])(
+  "a superseded bootstrap page cannot overwrite a newer refresh (failure: %s)",
+  async (fail) => {
+    history.replaceState(null, "", "/collection-directory");
+    let finish!: (response: Response) => void;
+    let reject!: (error: Error) => void;
+    const stalePage = new Promise<Response>((resolve, rejectPromise) => {
+      finish = resolve;
+      reject = rejectPromise;
+    });
+    let refresh = 0;
+    const freshBootstrap = bootstrap("retrying", {
+      pds: "https://fresh.example",
+    });
+    const fetcher = vi.fn((input: RequestInfo | URL) => {
+      const url = new URL(requestUrl(input), location.origin);
+      if (url.pathname === "/api/v1/session")
+        return Promise.resolve(
+          Response.json({ did: "did:plc:operator", csrf: "test" }),
+        );
+      if (url.pathname.endsWith("/status")) {
+        refresh++;
+        return Promise.resolve(
+          Response.json(directory({ available: refresh > 1 })),
+        );
+      }
+      if (url.pathname.endsWith("/bootstraps")) {
+        if (url.searchParams.has("after")) return stalePage;
+        return Promise.resolve(
+          Response.json(
+            refresh === 1
+              ? { items: [], next: "older" }
+              : { items: [freshBootstrap], next: null },
+          ),
+        );
+      }
+      return Promise.resolve(
+        Response.json({
+          items: [
+            crawl(
+              refresh === 1 ? "https://stale.example" : "https://fresh.example",
+            ),
+          ],
+          next: null,
+        }),
+      );
+    });
+    vi.stubGlobal("fetch", fetcher);
+    render(App);
+    await waitFor(() =>
+      expect(
+        fetcher.mock.calls.some(([input]) =>
+          requestUrl(input).includes("after=older"),
+        ),
+      ).toBe(true),
+    );
+    await fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    const awaiting = screen.getByRole("table", {
+      name: "Initial crawls awaiting submission",
+    });
+    expect(
+      await within(awaiting).findByText("https://fresh.example"),
+    ).toBeTruthy();
+    if (fail) reject(new Error("stale page failed"));
+    else
+      finish(
+        Response.json({
+          items: [bootstrap("waiting", { pds: "https://stale.example" })],
+          next: null,
+        }),
+      );
+    await stalePage.catch(() => {});
+    await waitFor(() => {
+      expect(within(awaiting).getByText("https://fresh.example")).toBeTruthy();
+      expect(screen.queryByText("https://stale.example")).toBeNull();
+      expect(
+        (
+          screen.getByRole("button", {
+            name: "Crawl all enabled sources",
+          }) as HTMLButtonElement
+        ).disabled,
+      ).toBe(false);
+    });
+  },
+);
+
+test("an unloaded bootstrap queue does not claim that no initial crawls are waiting", async () => {
+  const { rerender } = render(CollectionDirectory, {
+    directory: directory(),
+    submit: vi.fn(),
+  });
+  expect(screen.queryByText(/No initial crawls are waiting/)).toBeNull();
+  await rerender({ bootstrapsLoaded: true });
+  expect(screen.getByText(/No initial crawls are waiting/)).toBeTruthy();
+});
+
+test("polling continues for open initial crawls and pending source enables only", () => {
+  const idle = directory();
+  for (const phase of ["waiting", "retrying", "accepted"] as const)
+    expect(crawlsInProgress(idle, [], null, [bootstrap(phase)])).toBe(true);
+  for (const phase of [
+    "needs_attention",
+    "not_requested",
+    "finished",
+    "failed",
+    "unknown",
+    "skipped_not_configured",
+    "skipped_not_https",
+    "skipped_conflict",
+  ] as const)
+    expect(crawlsInProgress(idle, [], null, [bootstrap(phase)])).toBe(false);
+  expect(crawlsInProgress(idle, [], enableOperation("requested", null))).toBe(
+    true,
+  );
+  expect(crawlsInProgress(idle, [], enableOperation("applied", null))).toBe(
+    false,
+  );
 });

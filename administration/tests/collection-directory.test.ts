@@ -7,13 +7,15 @@ import { Worker } from "../server/worker.ts";
 import { Services } from "../server/services.ts";
 import { Auth, type OAuthProvider } from "../server/auth.ts";
 import { createApp } from "../server/app.ts";
-import { ApiError } from "../server/contracts.ts";
+import { ApiError, type Command } from "../server/contracts.ts";
 import {
   Collectiondir,
   CollectiondirError,
   collectiondirConfig,
 } from "../server/collectiondir.ts";
 import { CollectionCrawls } from "../server/collection-crawls.ts";
+import { discoveryActor } from "../server/machine.ts";
+import { bootstrapOperationId } from "../server/collection-bootstrap.ts";
 
 const did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
 const token = "collectiondir-test-token-must-stay-private-0123456789";
@@ -610,6 +612,29 @@ test("the PDS discovery machine API cannot request a crawl", async (t) => {
     }),
   );
   assert.equal(store.page("operations", "", 50).items.length, 0);
+  // An automatic initial crawl queued for a discovery-enabled source is owned
+  // by the discovery actor, but replaying its ID through the machine API is
+  // refused, because server-derived (version 8) IDs are reserved, rather than
+  // returning the recorded operation.
+  const body: Command = {
+    kind: "collection_crawl",
+    scope: "https://pds.example",
+  };
+  const queued = store.request(
+    discoveryActor,
+    body,
+    bootstrapOperationId(randomUUID()),
+  );
+  const replay = await request("/api/v1/sources/discovery/operations", body, {
+    Cookie: "",
+    Authorization: `Bearer ${machineToken}`,
+    "Idempotency-Key": queued.id,
+  });
+  assert.equal(replay.status, 400);
+  assert.deepEqual(await replay.json(), {
+    error: "reserved_idempotency_key",
+  });
+  assert.equal(store.page("operations", "", 50).items.length, 1);
   assert.deepEqual(relayLookups, []);
   assert.equal(directory.calls.length, 0);
 });
@@ -799,8 +824,8 @@ test("an unavailable directory leaves the request incomplete and retryable", asy
   await worker.tick();
   assert.equal(store.operation(op.id)!.state, "applied");
   assert.equal(rows().length, 1);
-  // Re-applying the same operation (for example after a restart between
-  // submission and recording) finds the crawl running and adds no rows.
+  // Re-applying the same operation finds its recorded row and sends nothing,
+  // so a crawl that already finished is not started again.
   directory.setHandler((call) =>
     call.path === "/admin/crawlStatus"
       ? { body: emptyStatus() }
@@ -816,7 +841,13 @@ test("an unavailable directory leaves the request incomplete and retryable", asy
           },
         },
   );
-  await crawls.apply(store.operation(op.id)!);
+  const postsBefore = postedHosts(directory.calls).length;
+  const reapplied = (await crawls.apply(store.operation(op.id)!)) as {
+    collectiondir: { submitted: number; alreadySubmitted: number };
+  };
+  assert.equal(postedHosts(directory.calls).length, postsBefore);
+  assert.equal(reapplied.collectiondir.submitted, 0);
+  assert.equal(reapplied.collectiondir.alreadySubmitted, 1);
   assert.equal(rows().length, 1);
   assert.equal(rows()[0].submission, "started");
   assert.equal(
@@ -1158,7 +1189,7 @@ test("the collection directory token never appears in responses or audit history
   );
 });
 
-test("crawl all records accepted chunks before a later chunk fails", async (t) => {
+test("crawl all records accepted chunks and a retry sends only unrecorded sources", async (t) => {
   let posts = 0;
   const seen = new Set<string>();
   // The first chunk is accepted; the second fails until the directory

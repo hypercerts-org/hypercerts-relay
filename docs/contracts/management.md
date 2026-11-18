@@ -118,6 +118,21 @@ finished, failed with a bounded category, or has an unknown outcome after a
 directory restart. A crawl adds candidate DID/collection pairs only: it is not
 Relay admission, not Jetstream backfill and not proof of current records.
 
+When a `source` enable from any actor, including PDS discovery, is applied and
+Relay reports the source enabled and validated, Administration queues one
+follow-up `collection_crawl` operation for that source in the same transaction.
+It has a deterministic version 8 UUID, a version that client idempotency keys
+may not use, and is owned by the same actor. An enable that leaves the source
+unchanged does not request a crawl if one was already queued at that source
+revision. The crawl is recorded with
+the server-derived cause `source_added`; the command schema is unchanged. If
+the directory is unavailable, Administration retries the follow-up for 24 hours
+under `system:collection-bootstrap`, then leaves it for a manual retry. The
+source operation stays applied whatever happens to the crawl. Without a
+configured directory, for a plaintext source, or if another operation already
+holds the follow-up ID, the skip is recorded and nothing is requested. Sources enabled before this behavior are not crawled
+automatically.
+
 ## Acceptance mapping
 
 | Management operation | Owner and required evidence |
@@ -128,6 +143,7 @@ Relay admission, not Jetstream backfill and not proof of current records.
 | Global or PDS raw-frame rate policy | Relay; [TECH-602](https://linear.app/hypercerts/issue/TECH-602/manage-global-and-pds-specific-relay-rate-limits) |
 | Administrator membership, session revocation and CSRF-protected mutation | Administration; [TECH-599](https://linear.app/hypercerts/issue/TECH-599/secure-the-relay-administration-api-with-at-protocol-oauth) |
 | Manual collection directory crawl of one or all enabled sources | Administration and collection directory; [TECH-900](https://linear.app/hypercerts/issue/TECH-900/add-a-manual-collectiondir-crawl-action-to-the-administration-interface) |
+| Automatic collection directory crawl on source enable | Administration and collection directory; [TECH-850](https://linear.app/hypercerts/issue/TECH-850/automatically-bootstrap-collection-discovery-when-a-pds-is-added) |
 
 Neither the rate-limit nor administration work has production OAuth qualification
 or a deployment claim.
