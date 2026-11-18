@@ -78,6 +78,14 @@ test(
         const closed = new Promise<void>((resolve) =>
           pending.child.once("close", () => resolve()),
         );
+        // execFile's timeout only sends SIGTERM and then waits for close, so a
+        // compiler ignoring it would hold pending open. Escalate at the
+        // deadline whether or not pending has settled.
+        const deadline = setTimeout(
+          () => pending.child.kill("SIGKILL"),
+          305000,
+        );
+        void closed.then(() => clearTimeout(deadline));
         // Cancellation can start after-hooks while this body is still pending.
         // Register the drain before awaiting compilation so teardown also owns
         // the close barrier and its SIGKILL fallback.
