@@ -2,7 +2,14 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdtempSync, readFileSync, existsSync, writeFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  readFileSync,
+  existsSync,
+  mkdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve, join, isAbsolute } from "node:path";
 import { Store } from "../server/store.ts";
@@ -20,8 +27,31 @@ test(
         "CONTROL_GO_BINARY must identify an absolute Go executable path",
       );
     const temp = mkdtempSync(join(tmpdir(), "management-acceptance-"));
+    // node:test runs after-hooks in registration order, so the fixture and
+    // store teardown steps run from this one hook, in the order they were
+    // added, before the directory holding their binaries, Go cache, ready
+    // files and database is removed. Every step runs even if one fails.
+    const teardown: Array<() => unknown> = [];
+    t.after(async () => {
+      const errors: unknown[] = [];
+      for (const step of teardown) {
+        try {
+          await step();
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+      rmSync(temp, { recursive: true, force: true });
+      if (errors.length) throw errors[0];
+    });
     const compile = promisify(execFile);
-    const goEnv = { ...process.env, GOCACHE: join(temp, "go-cache") };
+    // Go's build work and each fixture's t.TempDir stay inside temp too.
+    mkdirSync(join(temp, "tmp"));
+    const goEnv = {
+      ...process.env,
+      GOCACHE: join(temp, "go-cache"),
+      TMPDIR: join(temp, "tmp"),
+    };
     const fixtures = [
       { name: "relay", cwd: resolve(".."), pkg: "./cmd/relay" },
       {
@@ -32,9 +62,9 @@ test(
     ];
     // Finish cold dependency downloads and compilation before starting either
     // bounded fixture server. Compilation is not part of its startup deadline.
-    await Promise.all(
-      fixtures.map(({ name, cwd, pkg }) =>
-        compile(
+    const compiled = await Promise.allSettled(
+      fixtures.map(async ({ name, cwd, pkg }) => {
+        const pending = compile(
           goBinary,
           ["test", "-c", "-o", join(temp, name + ".test"), pkg],
           {
@@ -44,9 +74,39 @@ test(
             signal: t.signal,
             maxBuffer: 2 * 1024 * 1024,
           },
-        ),
-      ),
+        );
+        const closed = new Promise<void>((resolve) =>
+          pending.child.once("close", () => resolve()),
+        );
+        // execFile's timeout only sends SIGTERM and then waits for close, so a
+        // compiler ignoring it would hold pending open. Escalate at the
+        // deadline whether or not pending has settled.
+        const deadline = setTimeout(
+          () => pending.child.kill("SIGKILL"),
+          305000,
+        );
+        void closed.then(() => clearTimeout(deadline));
+        // Cancellation can start after-hooks while this body is still pending.
+        // Register the drain before awaiting compilation so teardown also owns
+        // the close barrier and its SIGKILL fallback.
+        const reap = async () => {
+          const timeout = setTimeout(() => pending.child.kill("SIGKILL"), 5000);
+          try {
+            await closed;
+          } finally {
+            clearTimeout(timeout);
+          }
+        };
+        teardown.push(reap);
+        try {
+          await pending;
+        } finally {
+          await reap();
+        }
+      }),
     );
+    const failed = compiled.find((result) => result.status === "rejected");
+    if (failed?.status === "rejected") throw failed.reason;
     async function fixture(
       name: string,
       cwd: string,
@@ -78,11 +138,20 @@ test(
           child.on("exit", (code) => resolve({ code }));
         },
       );
-      t.after(async () => {
-        writeFileSync(ready + ".stop", "");
+      teardown.push(async () => {
+        // If the graceful stop marker cannot be written (for example ENOSPC),
+        // signal the fixture instead and still reap it before reporting.
+        let stopError: unknown;
+        try {
+          writeFileSync(ready + ".stop", "");
+        } catch (error) {
+          stopError = error;
+          child.kill("SIGTERM");
+        }
         const deadline = setTimeout(() => child.kill("SIGKILL"), 5000);
         try {
           const result = await done;
+          if (stopError) throw stopError;
           assert.ifError(result.error);
           assert.equal(result.code, 0, output);
         } finally {
@@ -116,7 +185,7 @@ test(
       { url: jetstream, token },
     );
     const store = new Store(join(temp, "control.db"));
-    t.after(() => store.close());
+    teardown.push(() => store.close());
     const worker = new Worker(store, services);
     async function apply(input: unknown) {
       const op = store.request("did:plc:operator", command.parse(input));
