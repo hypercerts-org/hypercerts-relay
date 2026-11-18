@@ -177,6 +177,16 @@ type Manager struct {
 	receiptRunning            map[string]bool
 	receiptCancel             context.CancelFunc
 	receiptDone               chan struct{}
+
+	// frozenInventories caches decoded inventories of running jobs whose
+	// listing is complete, keyed by job ID. Entries are shared and never
+	// modified; every inventory write and job outcome drops the job's entry.
+	// Guarded by mu.
+	frozenInventories map[string]map[string]string
+	// completionJournalRows counts completion journal rows written since the
+	// last full job-state write. While nonzero, the next state write deletes
+	// the journal in the same batch. Guarded by mu.
+	completionJournalRows int
 }
 
 // ReceiptSender submits a completed job's bounded recovery coordinate to the
@@ -198,12 +208,25 @@ func Open(db *store.Store, policy *selection.Manager) (*Manager, error) {
 	}
 	if !found {
 		m.data = emptyData()
+		// Rows without a state document belong to no job; the first state
+		// write deletes them.
+		rows, err := m.replayCompletionJournal(&m.data)
+		if err != nil {
+			return nil, err
+		}
+		m.completionJournalRows = rows
 		return m, nil
 	}
 	if err := restorePersistedData(&persisted); err != nil {
 		return nil, err
 	}
+	rows, err := m.replayCompletionJournal(&persisted)
+	if err != nil {
+		return nil, err
+	}
 	m.data = persisted
+	m.completionJournalRows = rows
+	// This write folds any replayed completions and empties the journal.
 	if err := m.save(m.data); err != nil {
 		return nil, err
 	}
@@ -316,11 +339,52 @@ func ensureSourceRevisions(next *data) {
 	}
 }
 func (m *Manager) save(next data) error {
-	b, err := json.Marshal(next)
+	if m.completionJournalRows == 0 {
+		b, err := json.Marshal(next)
+		if err != nil {
+			return err
+		}
+		return m.db.Set([]byte(stateKey), b, store.SyncWrites)
+	}
+	batch := m.db.NewBatch()
+	defer func() { _ = batch.Close() }()
+	if err := m.stageJobState(batch, next); err != nil {
+		return err
+	}
+	return m.commitBatch(batch, true)
+}
+
+// commitBatch synchronously commits a metadata batch. stagedJobState reports
+// whether the batch holds a stageJobState write, whose commit empties the
+// completion journal.
+func (m *Manager) commitBatch(batch *pebble.Batch, stagedJobState bool) error {
+	if err := m.db.Commit(batch, store.SyncWrites); err != nil {
+		return err
+	}
+	if stagedJobState {
+		m.completionJournalRows = 0
+	}
+	return nil
+}
+
+// stageJobState stages a full job-state document. next is derived from
+// m.data, so it already contains every journaled completion; when the journal
+// is not empty the same batch deletes it. Commit the batch with commitBatch,
+// or, when another component commits it, reset completionJournalRows after
+// that commit succeeds.
+func (m *Manager) stageJobState(batch *pebble.Batch, next data) error {
+	encoded, err := json.Marshal(next)
 	if err != nil {
 		return err
 	}
-	return m.db.Set([]byte(stateKey), b, store.SyncWrites)
+	if err := batch.Set([]byte(stateKey), encoded, nil); err != nil {
+		return err
+	}
+	if m.completionJournalRows == 0 {
+		return nil
+	}
+	prefix := []byte(repositoryCompletionPrefix)
+	return batch.DeleteRange(prefix, store.PrefixUpperBound(prefix), nil)
 }
 func (m *Manager) commit(next data) error {
 	if err := m.save(next); err != nil {
@@ -347,6 +411,42 @@ func (m *Manager) readInventory(id string) (inventory, error) {
 		return inventory{}, errors.New("invalid persisted job inventory")
 	}
 	return out, nil
+}
+
+// frozenInventoryLocked returns a job's inventory entries. While a job with a
+// complete listing (TotalReposKnown) runs, the decoded entries are cached until
+// the next inventory write or job outcome, so per-repository calls do not
+// re-read and re-decode the whole inventory. Callers must not modify the
+// returned map.
+func (m *Manager) frozenInventoryLocked(id string) (map[string]string, error) {
+	if entries, ok := m.frozenInventories[id]; ok {
+		return entries, nil
+	}
+	inv, err := m.readInventory(id)
+	if err != nil {
+		return nil, err
+	}
+	if job, ok := m.data.Jobs[id]; ok && job.TotalReposKnown && job.State == Running {
+		if m.frozenInventories == nil {
+			m.frozenInventories = map[string]map[string]string{}
+		}
+		m.frozenInventories[id] = inv.Entries
+	}
+	return inv.Entries, nil
+}
+
+// peekInventoryLocked uses a cached frozen inventory when present but never
+// populates the cache, so scheduler scans of idle jobs do not retain memory.
+// Callers must not modify the returned map.
+func (m *Manager) peekInventoryLocked(id string) (map[string]string, error) {
+	if entries, ok := m.frozenInventories[id]; ok {
+		return entries, nil
+	}
+	inv, err := m.readInventory(id)
+	if err != nil {
+		return nil, err
+	}
+	return inv.Entries, nil
 }
 
 func (m *Manager) commitInventory(next data, id string, inv inventory) error {
@@ -567,7 +667,7 @@ func (m *Manager) setPolicyLocked(ctx context.Context, expected uint64, collecti
 	update := func(stagePolicy func(*pebble.Batch) error) error {
 		var updateErr error
 		policy, updateErr = m.policy.Update(expected, collections, func(candidate selection.Policy, b *pebble.Batch) error {
-			return stagePolicyJobs(next, candidate, expected+1, stagePolicy, b)
+			return m.stagePolicyJobs(next, candidate, expected+1, stagePolicy, b)
 		})
 		return updateErr
 	}
@@ -580,6 +680,8 @@ func (m *Manager) setPolicyLocked(ctx context.Context, expected uint64, collecti
 		return selection.Policy{}, err
 	}
 	m.data = next
+	// The selection manager committed the staged job state and journal delete.
+	m.completionJournalRows = 0
 	m.signalScheduler()
 	if m.cancel != nil && m.data.Jobs[m.runningID].Policy.Revision != policy.Revision {
 		m.cancel()
@@ -628,7 +730,7 @@ func schedulePolicyJobs(next data, policy selection.Policy) error {
 	return nil
 }
 
-func stagePolicyJobs(next data, candidate selection.Policy, revision uint64, stagePolicy func(*pebble.Batch) error, batch *pebble.Batch) error {
+func (m *Manager) stagePolicyJobs(next data, candidate selection.Policy, revision uint64, stagePolicy func(*pebble.Batch) error, batch *pebble.Batch) error {
 	if stagePolicy != nil {
 		if candidate.Revision != revision {
 			return selection.ErrRevision
@@ -641,11 +743,7 @@ func stagePolicyJobs(next data, candidate selection.Policy, revision uint64, sta
 	if err := schedulePolicyJobs(next, candidate); err != nil {
 		return err
 	}
-	encoded, err := json.Marshal(next)
-	if err != nil {
-		return err
-	}
-	return batch.Set([]byte(stateKey), encoded, nil)
+	return m.stageJobState(batch, next)
 }
 
 func (m *Manager) Request(raw, reason string) (Job, error) { return m.RequestOnce(raw, reason, "") }
@@ -1313,12 +1411,12 @@ func (m *Manager) Inventory(id string) ([]ListedRepository, error) {
 	if !job.TotalReposKnown && job.Reason != ReasonRepositoryRecovery {
 		return nil, ErrConflict
 	}
-	inv, err := m.readInventory(id)
+	entries, err := m.frozenInventoryLocked(id)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]ListedRepository, 0, len(inv.Entries))
-	for did, rev := range inv.Entries {
+	out := make([]ListedRepository, 0, len(entries))
+	for did, rev := range entries {
 		out = append(out, ListedRepository{DID: did, Revision: rev})
 	}
 	slices.SortFunc(out, func(a, b ListedRepository) int { return strings.Compare(a.DID, b.DID) })
@@ -1456,8 +1554,11 @@ func (m *Manager) runNext(ctx context.Context, process Processor) (bool, error) 
 	jobCtx, cancel := context.WithCancel(ctx)
 	m.cancel = cancel
 	m.runningID = job.ID
+	// Repository checkpoints update CompletedRepos in place under mu, so the
+	// processor's copy must be taken before the lock is released.
+	claimed := clone(job)
 	m.mu.Unlock()
-	processErr := process(jobCtx, clone(job))
+	processErr := process(jobCtx, claimed)
 	cancel()
 	return true, m.finishJob(ctx, job.ID, processErr)
 }
@@ -1527,6 +1628,8 @@ func (m *Manager) persistJobOutcome(ctx context.Context, id string, processErr e
 	defer m.mu.Unlock()
 	m.cancel = nil
 	m.runningID = ""
+	// The next pass re-reads the inventory once; idle jobs hold no cache.
+	delete(m.frozenInventories, id)
 	if err := ctx.Err(); err != nil {
 		return nil, "", err
 	} // Persisted Running resumes on Open.
@@ -1869,17 +1972,16 @@ func (m *Manager) recordJobFailure(id string, failure JobFailure) error {
 }
 
 func (m *Manager) commitJobInventoryRetryBatch(next data, id string, inv inventory, deleteRetries [][]byte) error {
-	encodedState, err := json.Marshal(next)
-	if err != nil {
-		return err
-	}
 	encodedInventory, err := json.Marshal(inv)
 	if err != nil {
 		return err
 	}
+	// This is the only inventory writer; drop the decoded copy before the
+	// durable listing can change.
+	delete(m.frozenInventories, id)
 	batch := m.db.NewBatch()
 	defer batch.Close()
-	if err := batch.Set([]byte(stateKey), encodedState, nil); err != nil {
+	if err := m.stageJobState(batch, next); err != nil {
 		return err
 	}
 	if err := batch.Set(jobInventoryKey(id), encodedInventory, nil); err != nil {
@@ -1890,7 +1992,7 @@ func (m *Manager) commitJobInventoryRetryBatch(next data, id string, inv invento
 			return err
 		}
 	}
-	if err := m.db.Commit(batch, store.SyncWrites); err != nil {
+	if err := m.commitBatch(batch, true); err != nil {
 		return err
 	}
 	m.data = next
