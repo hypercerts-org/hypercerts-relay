@@ -53,18 +53,25 @@ async function start() {
     void pending.finally(() => ticks.delete(pending)).catch(console.error);
   }
   timer = setInterval(tick, 50);
-  server = createApp(
-    store,
-    services,
-    new Auth(store, base, oauth),
-    {},
-    resolve("dist"),
-  ).listen(3188, "127.0.0.1");
+  await new Promise<void>((resolveListening, reject) => {
+    server = createApp(
+      store,
+      services,
+      new Auth(store, base, oauth),
+      {},
+      resolve("dist"),
+    ).listen(3188, "127.0.0.1");
+    server.once("error", reject);
+    server.once("listening", () => {
+      server!.off("error", reject);
+      resolveListening();
+    });
+  });
 }
 let stopping: Promise<void> | undefined;
 function closeServer() {
   return new Promise<void>((resolve, reject) => {
-    if (!server) return resolve();
+    if (!server?.listening) return resolve();
     server.close((error) => (error ? reject(error) : resolve()));
   });
 }

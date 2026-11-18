@@ -8,8 +8,10 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { test, type TestContext } from "node:test";
 import { startControlFixtures } from "./control-fixtures.ts";
@@ -25,7 +27,10 @@ async function waitFor(predicate: () => boolean) {
   }
 }
 
-async function bounded<T>(pending: Promise<T>): Promise<T> {
+async function bounded<T>(
+  pending: Promise<T>,
+  milliseconds = 3000,
+): Promise<T> {
   let timeout: NodeJS.Timeout;
   try {
     return await Promise.race([
@@ -33,7 +38,7 @@ async function bounded<T>(pending: Promise<T>): Promise<T> {
       new Promise<never>((_, reject) => {
         timeout = setTimeout(
           () => reject(new Error("cleanup timed out")),
-          3000,
+          milliseconds,
         );
       }),
     ]);
@@ -91,6 +96,13 @@ if (mode === "block-compile") {
     process.exit(0);
   }, 150));
   setInterval(() => {}, 1000);
+} else if (mode === "stubborn-compile") {
+  process.on("SIGTERM", () => writeFileSync(join(root, name + ".aborted"), ""));
+  setInterval(() => {
+    if (!existsSync(dirname(output))) writeFileSync(join(root, name + ".directory-missing"), "");
+    mkdirSync(dirname(output), { recursive: true });
+    writeFileSync(output, "compiler still writing");
+  }, 10);
 } else if (mode === "fail-compile") {
   if (name === "relay") {
     while (!existsSync(join(root, "jetstream.compiling"))) await delay(10);
@@ -237,5 +249,76 @@ test("browser server SIGTERM during compilation waits for startup cleanup", asyn
   child.child.kill("SIGTERM");
   assert.equal(await bounded(child.done), 0, child.output());
   h.assertCompilersReaped();
+  h.assertRemoved();
+});
+
+test("management cancellation keeps its directory until stubborn compilers are reaped", async (t) => {
+  const h = harness(t, "stubborn-compile");
+  const runner = h.marker("cancel-management.mjs");
+  writeFileSync(
+    runner,
+    `import { test } from "node:test";
+import { existsSync } from "node:fs";
+import { setTimeout as delay } from "node:timers/promises";
+const abort = new AbortController();
+await test("cancel management during compilation", { signal: abort.signal }, async () => {
+  await import(${JSON.stringify(pathToFileURL(resolve("tests/management.test.ts")).href)});
+  while (!existsSync(${JSON.stringify(h.marker("relay.compiling"))}) || !existsSync(${JSON.stringify(h.marker("jetstream.compiling"))})) await delay(10);
+  abort.abort();
+});
+`,
+  );
+  const child = h.spawn(runner);
+  await h.compiling();
+  await waitFor(
+    () =>
+      existsSync(h.marker("relay.aborted")) &&
+      existsSync(h.marker("jetstream.aborted")),
+  );
+  // Both compilers ignore SIGTERM and keep writing. Cleanup must retain their
+  // directory through the five-second SIGKILL fallback, not just abort execFile.
+  await delay(250);
+  assert.equal(child.child.exitCode, null, child.output());
+  for (const name of ["relay", "jetstream"]) {
+    assert.ok(alive(Number(readFileSync(h.marker(name + ".pid"), "utf8"))));
+    assert.ok(existsSync(readFileSync(h.marker(name + ".dir"), "utf8")));
+  }
+  assert.equal(await bounded(child.done, 12000), 1, child.output());
+  assert.match(child.output(), /cancelled/);
+  for (const name of ["relay", "jetstream"])
+    assert.equal(existsSync(h.marker(name + ".directory-missing")), false);
+  h.assertCompilersReaped();
+  h.assertRemoved();
+});
+
+test("browser server listen failure reaps fixtures and removes their directory", async (t) => {
+  const listener = createServer();
+  t.after(
+    () => new Promise<void>((resolve) => listener.close(() => resolve())),
+  );
+  try {
+    await new Promise<void>((resolve, reject) => {
+      listener.once("error", reject);
+      listener.listen(3188, "127.0.0.1", resolve);
+    });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EADDRINUSE") {
+      t.skip(
+        "127.0.0.1:3188 is already in use; cannot own the conflict listener",
+      );
+      return;
+    }
+    throw error;
+  }
+  const h = harness(t, "success");
+  const child = h.spawn("tests/browser-server.ts");
+  assert.equal(await bounded(child.done, 15000), 1, child.output());
+  assert.match(child.output(), /EADDRINUSE/);
+  h.assertCompilersReaped();
+  for (const name of ["relay", "jetstream"])
+    assert.equal(
+      alive(Number(readFileSync(h.marker("fixture-" + name + ".pid"), "utf8"))),
+      false,
+    );
   h.assertRemoved();
 });

@@ -78,17 +78,22 @@ test(
         const closed = new Promise<void>((resolve) =>
           pending.child.once("close", () => resolve()),
         );
-        try {
-          await pending;
-        } finally {
-          // An aborted execFile rejects before its child is reaped. Keep the
-          // shared directory until every compiler has actually closed.
+        // Cancellation can start after-hooks while this body is still pending.
+        // Register the drain before awaiting compilation so teardown also owns
+        // the close barrier and its SIGKILL fallback.
+        const reap = async () => {
           const timeout = setTimeout(() => pending.child.kill("SIGKILL"), 5000);
           try {
             await closed;
           } finally {
             clearTimeout(timeout);
           }
+        };
+        teardown.push(reap);
+        try {
+          await pending;
+        } finally {
+          await reap();
         }
       }),
     );
