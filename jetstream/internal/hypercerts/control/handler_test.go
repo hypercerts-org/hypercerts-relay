@@ -12,6 +12,9 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"slices"
+	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1652,4 +1655,292 @@ func TestRepositoryRecoveryJobRequestAcceptsFullScope(t *testing.T) {
 	w = request(h, "POST", "/jobs", long, testToken)
 	require.Equal(t, 400, w.Code)
 	require.NotContains(t, w.Body.String(), "invalid_json")
+}
+
+type jobListPage struct {
+	Jobs       []jobView `json:"jobs"`
+	NextCursor string    `json:"nextCursor"`
+}
+
+// newestFirstJobIDs computes the expected job-list order independently of the
+// handler: creation time descending, then ascending job ID.
+func newestFirstJobIDs(manager *jobs.Manager, keep func(jobs.Job) bool) []string {
+	all := manager.List()
+	sort.SliceStable(all, func(i, j int) bool {
+		if !all[i].CreatedAt.Equal(all[j].CreatedAt) {
+			return all[i].CreatedAt.After(all[j].CreatedAt)
+		}
+		return all[i].ID < all[j].ID
+	})
+	ids := []string{}
+	for _, job := range all {
+		if keep == nil || keep(job) {
+			ids = append(ids, job.ID)
+		}
+	}
+	return ids
+}
+
+func fetchJobPage(t *testing.T, h http.Handler, query url.Values) jobListPage {
+	t.Helper()
+	w := request(h, "GET", "/jobs?"+query.Encode(), "", testToken)
+	require.Equal(t, 200, w.Code, w.Body.String())
+	var page jobListPage
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &page))
+	return page
+}
+
+// walkJobPages follows nextCursor from the first page and returns every listed
+// job ID in order.
+func walkJobPages(t *testing.T, h http.Handler, filters url.Values, limit int) []string {
+	t.Helper()
+	ids := []string{}
+	after := ""
+	for range 20 {
+		query := url.Values{"limit": {strconv.Itoa(limit)}}
+		for name, values := range filters {
+			query[name] = values
+		}
+		if after != "" {
+			query.Set("after", after)
+		}
+		page := fetchJobPage(t, h, query)
+		for _, job := range page.Jobs {
+			ids = append(ids, job.ID)
+		}
+		if page.NextCursor == "" {
+			return ids
+		}
+		require.Equal(t, page.Jobs[len(page.Jobs)-1].ID, page.NextCursor)
+		after = page.NextCursor
+	}
+	t.Fatal("job pagination did not terminate")
+	return nil
+}
+
+// openWithJobCreationTimes rewrites the persisted creation times of the named
+// jobs and reopens the manager over the same store, so ordering tests do not
+// depend on wall-clock resolution or hashed job IDs.
+func openWithJobCreationTimes(t *testing.T, dir string, createdAt map[string]time.Time) (*Handler, *jobs.Manager) {
+	t.Helper()
+	const jobStateKey = "hypercerts/backfill-jobs"
+	db, err := store.Open(dir, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	encoded, closer, err := db.Get([]byte(jobStateKey))
+	require.NoError(t, err)
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.UseNumber()
+	var state map[string]any
+	require.NoError(t, decoder.Decode(&state))
+	require.NoError(t, closer.Close())
+	persistedJobs := state["jobs"].(map[string]any)
+	for id, at := range createdAt {
+		persistedJobs[id].(map[string]any)["createdAt"] = at.Format(time.RFC3339Nano)
+	}
+	rewritten, err := json.Marshal(state)
+	require.NoError(t, err)
+	require.NoError(t, db.Set([]byte(jobStateKey), rewritten, store.SyncWrites))
+	policy, err := selection.Open(db, []string{"app.bsky.feed.post"})
+	require.NoError(t, err)
+	manager, err := jobs.Open(db, policy)
+	require.NoError(t, err)
+	handler, err := New(testToken, manager, policy)
+	require.NoError(t, err)
+	return handler, manager
+}
+
+func TestPrivateJobListPagesNewestFirst(t *testing.T) {
+	const first, second = "https://first.example", "https://second.example"
+	dir := t.TempDir()
+	db, err := store.Open(dir, nil)
+	require.NoError(t, err)
+	policy, err := selection.Open(db, []string{"app.bsky.feed.post"})
+	require.NoError(t, err)
+	created, err := jobs.Open(db, policy)
+	require.NoError(t, err)
+	for _, pds := range []string{first, second} {
+		_, err := created.AddSource(pds)
+		require.NoError(t, err)
+	}
+	_, err = created.Request(first, "backfill")
+	require.NoError(t, err)
+	_, err = created.Request(second, "quota_recovery")
+	require.NoError(t, err)
+	byID := created.List()
+	require.Len(t, byID, 4)
+	require.NoError(t, db.Close())
+
+	// Creation times disagree with both ascending and descending job-ID order,
+	// and two jobs tie so the ID tie-breaker is exercised.
+	base := time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)
+	h, manager := openWithJobCreationTimes(t, dir, map[string]time.Time{
+		byID[0].ID: base.Add(time.Hour),
+		byID[1].ID: base.Add(time.Hour),
+		byID[2].ID: base.Add(2 * time.Hour),
+		byID[3].ID: base,
+	})
+	expected := []string{byID[2].ID, byID[0].ID, byID[1].ID, byID[3].ID}
+	require.Equal(t, expected, newestFirstJobIDs(manager, nil))
+	for _, limit := range []int{1, 2, 3, 4, 100} {
+		require.Equal(t, expected, walkJobPages(t, h, nil, limit), "limit %d", limit)
+	}
+	pdsByID := map[string]string{}
+	for _, job := range byID {
+		pdsByID[job.ID] = job.PDS
+	}
+	for _, pds := range []string{first, second} {
+		filtered := []string{}
+		for _, id := range expected {
+			if pdsByID[id] == pds {
+				filtered = append(filtered, id)
+			}
+		}
+		require.Len(t, filtered, 2)
+		require.Equal(t, filtered, walkJobPages(t, h, url.Values{"pds": {pds}}, 1), pds)
+	}
+
+	// Cancellation and retry change state, not creation time, so the job
+	// keeps its position.
+	require.Equal(t, 200, request(h, "POST", "/jobs/"+expected[1]+"/cancel", "", testToken).Code)
+	require.Equal(t, expected, walkJobPages(t, h, nil, 1))
+	require.Equal(t, 200, request(h, "POST", "/jobs/"+expected[1]+"/retry", "", testToken).Code)
+	require.Equal(t, expected, walkJobPages(t, h, nil, 1))
+
+	unknown := request(h, "GET", "/jobs?after=ffffffffffffffffffffffffffffffff", "", testToken)
+	require.Equal(t, 400, unknown.Code)
+	require.JSONEq(t, `{"error":"invalid_cursor"}`, unknown.Body.String())
+
+	// A job created mid-pagination is newer than every listed job, so it
+	// neither shifts later pages nor repeats an earlier job.
+	pageOne := fetchJobPage(t, h, url.Values{"limit": {"2"}})
+	require.Equal(t, expected[:2], []string{pageOne.Jobs[0].ID, pageOne.Jobs[1].ID})
+	added, err := manager.AddSource("https://third.example")
+	require.NoError(t, err)
+	pageTwo := fetchJobPage(t, h, url.Values{"limit": {"2"}, "after": {pageOne.NextCursor}})
+	require.Equal(t, expected[2:], []string{pageTwo.Jobs[0].ID, pageTwo.Jobs[1].ID})
+	require.Empty(t, pageTwo.NextCursor)
+	fresh := fetchJobPage(t, h, url.Values{"limit": {"1"}})
+	require.Equal(t, added.ID, fresh.Jobs[0].ID, "a new job is listed first on a fresh listing")
+	require.Equal(t, append([]string{added.ID}, expected...), newestFirstJobIDs(manager, nil))
+}
+
+func TestPrivateJobListFiltersByState(t *testing.T) {
+	h, manager := setup(t)
+	origins := []string{"https://a.example", "https://b.example", "https://c.example", "https://d.example"}
+	sourceJobs := map[string]jobs.Job{}
+	for _, pds := range origins {
+		job, err := manager.AddSource(pds)
+		require.NoError(t, err)
+		sourceJobs[pds] = job
+	}
+	require.NoError(t, manager.Cancel(sourceJobs[origins[2]].ID))
+	require.NoError(t, manager.Cancel(sourceJobs[origins[3]].ID))
+
+	// The runner processes one job at a time; blocking it holds exactly one
+	// of the two pending jobs in the running state.
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	started := make(chan struct{})
+	go func() {
+		done <- manager.Run(ctx, func(ctx context.Context, j jobs.Job) error {
+			close(started)
+			<-ctx.Done()
+			return ctx.Err()
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	<-started
+
+	inState := func(states ...jobs.State) []string {
+		return newestFirstJobIDs(manager, func(j jobs.Job) bool { return slices.Contains(states, j.State) })
+	}
+	require.Len(t, inState(jobs.Running), 1)
+	require.Len(t, inState(jobs.Pending), 1)
+	require.Len(t, inState(jobs.Canceled), 2)
+
+	for _, state := range []jobs.State{jobs.Pending, jobs.Running, jobs.Canceled} {
+		require.Equal(t, inState(state), walkJobPages(t, h, url.Values{"state": {string(state)}}, 100), state)
+	}
+	active := inState(jobs.Pending, jobs.Running)
+	require.Len(t, active, 2)
+	require.Equal(t, active, walkJobPages(t, h, url.Values{"state": {"active"}}, 100))
+	require.Equal(t, active, walkJobPages(t, h, url.Values{"state": {"active"}}, 1))
+
+	// A filtered page follows the same newest-first cursor, visiting each match once.
+	require.Equal(t, inState(jobs.Canceled), walkJobPages(t, h, url.Values{"state": {"canceled"}}, 1))
+
+	// A cursor taken from another listing, including a job the filter does not
+	// select, resolves by position: the page holds exactly the matching jobs
+	// after it.
+	all := newestFirstJobIDs(manager, nil)
+	canceled := inState(jobs.Canceled)
+	unfiltered := fetchJobPage(t, h, url.Values{"limit": {"1"}})
+	require.Equal(t, all[0], unfiltered.NextCursor)
+	for position, cursor := range all {
+		expected := []string{}
+		for _, id := range all[position+1:] {
+			if slices.Contains(canceled, id) {
+				expected = append(expected, id)
+			}
+		}
+		page := fetchJobPage(t, h, url.Values{"state": {"canceled"}, "after": {cursor}})
+		listed := []string{}
+		for _, job := range page.Jobs {
+			listed = append(listed, job.ID)
+		}
+		require.Equal(t, expected, listed, "cursor at position %d", position)
+		require.Empty(t, page.NextCursor)
+	}
+
+	empty := request(h, "GET", "/jobs?state=complete", "", testToken)
+	require.Equal(t, 200, empty.Code)
+	require.JSONEq(t, `{"jobs":[]}`, empty.Body.String())
+
+	// State combines with the exact PDS filter.
+	require.Equal(t, []string{sourceJobs[origins[2]].ID}, walkJobPages(t, h, url.Values{"state": {"canceled"}, "pds": {origins[2]}}, 1))
+	require.Empty(t, walkJobPages(t, h, url.Values{"state": {"canceled"}, "pds": {origins[0]}}, 1))
+
+	// Without a state filter every job is listed, as before.
+	require.Equal(t, newestFirstJobIDs(manager, nil), walkJobPages(t, h, url.Values{"state": {""}}, 1))
+
+	for _, raw := range []string{"bogus", "ACTIVE", "queued"} {
+		invalid := request(h, "GET", "/jobs?state="+raw, "", testToken)
+		require.Equal(t, 400, invalid.Code, raw)
+		require.JSONEq(t, `{"error":"invalid_state"}`, invalid.Body.String(), raw)
+	}
+	// The state is validated before the cursor is resolved.
+	invalid := request(h, "GET", "/jobs?state=bogus&after=ffffffffffffffffffffffffffffffff", "", testToken)
+	require.Equal(t, 400, invalid.Code)
+	require.JSONEq(t, `{"error":"invalid_state"}`, invalid.Body.String())
+}
+
+func TestSnapshotsInStatesRechecksFilteredState(t *testing.T) {
+	snapshot := func(id string, state jobs.State) jobs.JobDiagnosticSnapshot {
+		return jobs.JobDiagnosticSnapshot{Job: jobs.Job{ID: id, State: state}}
+	}
+	ids := func(snapshots []jobs.JobDiagnosticSnapshot) []string {
+		out := []string{}
+		for _, entry := range snapshots {
+			out = append(out, entry.Job.ID)
+		}
+		return out
+	}
+	captured := func() []jobs.JobDiagnosticSnapshot {
+		// Listed as active, but "claimed" became running and "finished"
+		// completed before the diagnostic snapshot was taken.
+		return []jobs.JobDiagnosticSnapshot{snapshot("pending", jobs.Pending), snapshot("claimed", jobs.Running), snapshot("finished", jobs.Complete)}
+	}
+	active, ok := jobStateFilter("active")
+	require.True(t, ok)
+	require.Equal(t, []string{"pending", "claimed"}, ids(snapshotsInStates(captured(), active)))
+	pending, ok := jobStateFilter("pending")
+	require.True(t, ok)
+	require.Equal(t, []string{"pending"}, ids(snapshotsInStates(captured(), pending)))
+	unfiltered, ok := jobStateFilter("")
+	require.True(t, ok)
+	require.Equal(t, []string{"pending", "claimed", "finished"}, ids(snapshotsInStates(captured(), unfiltered)))
 }

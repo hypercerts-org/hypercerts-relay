@@ -43,6 +43,24 @@ action returns conflict. Without a receipt, repeated job requests coalesce only
 applicable pending or running work; a later unkeyed request after terminal work
 may create a new job.
 
+`GET /jobs` lists jobs newest created first, with ascending job ID breaking
+ties; a job without a recorded creation time sorts last. The optional exact
+`pds` filter keeps that order. `nextCursor` is the ID of the last job considered
+for the page (usually the last returned job; a `state` filter can drop a job
+whose state changed while the page was built), and an `after` value that names no job returns `400` with `invalid_cursor`. Retry,
+cancellation and progress do not change a job's creation time, so they do not
+move the job or invalidate a cursor that names it. Jobs created during
+pagination sort before the cursor and appear on a fresh listing.
+
+`GET /jobs` also accepts one optional `state` filter: a durable job state
+(`pending`, `running`, `incomplete`, `failed`, `canceled` or `complete`), or
+`active` for pending and running jobs. It filters the durable `state`, not
+`diagnostics.execution`, and keeps the newest-first order. Any other value,
+including a differently cased one, returns `400` with `invalid_state`; the state
+is validated before the cursor. The cursor is resolved against the unfiltered
+order, so any listed job ID remains a valid `after` under any combination of
+`state` and `pds` filters.
+
 Job list/detail and coverage responses, including coverage summaries, include
 optional camelCase `lastProgressAt` after a successful durable inventory or
 repository checkpoint. It is omitted when no date is known, including for legacy

@@ -374,6 +374,7 @@ test("job and coverage projections preserve bounded diagnostics and leave legacy
   const legacyJob = {
     ...currentJob,
     id: "1123456789abcdef0123456789abcdef",
+    createdAt: "0001-01-01T00:00:00Z",
     lastProgressAt: "0001-01-01T00:00:00Z",
     lastFailure: {
       category: "http",
@@ -382,6 +383,7 @@ test("job and coverage projections preserve bounded diagnostics and leave legacy
       failedAt: "0001-01-01T00:00:00Z",
     },
   };
+  const jobListQueries: URLSearchParams[] = [];
   const server = createServer((req, res) => {
     const url = new URL(req.url ?? "", "http://127.0.0.1");
     res.setHeader("Content-Type", "application/json");
@@ -410,6 +412,7 @@ test("job and coverage projections preserve bounded diagnostics and leave legacy
       return;
     }
     if (url.pathname.endsWith("/jobs")) {
+      jobListQueries.push(url.searchParams);
       res.end(JSON.stringify({ jobs: [currentJob, legacyJob], nextCursor: "" }));
       return;
     }
@@ -466,9 +469,15 @@ test("job and coverage projections preserve bounded diagnostics and leave legacy
   });
   assert.equal(jobs.jobs[1].lastProgressAt, undefined);
   assert.equal(jobs.jobs[1].lastFailure, undefined);
+  assert.equal(jobs.jobs[0].createdAt, currentJob.createdAt);
+  assert.equal(jobs.jobs[1].createdAt, undefined, "a zero creation time is unrecorded, not year 1");
+  assert.equal(jobListQueries[0].has("state"), false, "no status filter is forwarded unless requested");
+  await services.jobs("", "", "running");
+  assert.equal(jobListQueries[1].get("state"), "running");
 
   const details = await services.repositoryDetails(currentJob.id);
   assert.equal(details.job.lastProgressAt, undefined);
+  assert.equal(details.job.createdAt, undefined);
   assert.equal(details.repositories[0].failedAt, presentAt);
   assert.equal(details.repositories[1].failedAt, undefined);
 
@@ -621,6 +630,26 @@ test("administration repository detail route validates and proxies a read-only p
     (await request(`/api/v1/jobs/${id}/repositories?limit=101`)).status,
     400,
   );
+});
+test("administration job list route validates and forwards the status filter", async (t) => {
+  const { request, services } = await fixture(t);
+  const seen: unknown[] = [];
+  services.jobs = (after = "", pds = "", state = "") => {
+    seen.push([after, pds, state]);
+    return Promise.resolve({ jobs: [] });
+  };
+  const filtered = await request(
+    `/api/v1/jobs?after=&pds=${encodeURIComponent("https://pds.example")}&state=active`,
+  );
+  assert.equal(filtered.status, 200);
+  assert.equal((await request("/api/v1/jobs?after=")).status, 200);
+  const invalid = await request("/api/v1/jobs?state=bogus");
+  assert.equal(invalid.status, 400);
+  assert.equal((await invalid.json()).error, "invalid_input");
+  assert.deepEqual(seen, [
+    ["", "https://pds.example", "active"],
+    ["", "", ""],
+  ]);
 });
 test("T10 coverage preserves current-state limits, unknown historical provenance and Jetstream reason", async (t) => {
   const { request, services } = await fixture(t);

@@ -423,6 +423,35 @@ dd {
   margin: 0.3rem 0;
   font-weight: 600;
 }
+/* Job status quick filters: wrapping links. The current status uses the
+   sidebar's current-page text weight, with a border and white fill so it
+   stands out on the cream main surface. */
+.filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 0 0 1rem;
+}
+.filters a {
+  display: flex;
+  align-items: center;
+  min-height: 44px;
+  padding: 0.5rem 0.8rem;
+  border: 1px solid var(--color-ui-separator);
+  border-radius: var(--radius-brand);
+  color: var(--color-ui-grey-dark);
+  font-size: var(--text-body-sm);
+  text-decoration: none;
+}
+.filters a:hover {
+  background: var(--color-ui-grey-tag);
+}
+.filters a[aria-current] {
+  background: var(--color-brand-white);
+  border-color: var(--color-brand-black);
+  color: var(--color-brand-black);
+  font-weight: 600;
+}
 .pagination {
   display: flex;
   justify-content: flex-end;

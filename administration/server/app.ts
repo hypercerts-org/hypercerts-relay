@@ -11,6 +11,7 @@ import {
   ApiError,
   archiveKeyInput,
   command,
+  jobStateFilters,
   operationBodyLimit,
   origin,
 } from "./contracts.ts";
@@ -41,6 +42,7 @@ const page = z.object({
   after: z.string().max(200).default(""),
   limit: z.coerce.number().int().min(1).max(100).default(50),
 });
+const jobStateFilter = z.enum(jobStateFilters);
 export function createApp(
   store: Store,
   services: Services,
@@ -255,7 +257,11 @@ export function createApp(
   app.get("/api/v1/jobs", (req, res) => {
     const p = page.parse(req.query);
     return services
-      .jobs(p.after, req.query.pds ? origin.parse(req.query.pds) : "")
+      .jobs(
+        p.after,
+        req.query.pds ? origin.parse(req.query.pds) : "",
+        req.query.state ? jobStateFilter.parse(req.query.state) : "",
+      )
       .then((v) => res.json(v));
   });
   app.get("/api/v1/jobs/:id/repositories", (req, res) => {

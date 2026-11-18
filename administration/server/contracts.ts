@@ -186,6 +186,18 @@ export interface RepositoryDetailsPage {
   repositories: RepositoryDetail[];
   nextCursor?: string;
 }
+// Job-list status filters accepted by Jetstream: one durable job state, or
+// "active" for work that is pending or running.
+export const jobStateFilters = [
+  "active",
+  "pending",
+  "running",
+  "incomplete",
+  "failed",
+  "canceled",
+  "complete",
+] as const;
+export type JobStateFilter = (typeof jobStateFilters)[number];
 export interface Job {
   id: string;
   pds: string;
@@ -197,7 +209,8 @@ export interface Job {
   totalReposKnown: boolean;
   attempts: number;
   errorCode?: string;
-  createdAt: string;
+  // Omitted when Jetstream has no recorded creation time.
+  createdAt?: string;
   lastProgressAt?: string;
   lastFailure?: JobLastFailure;
   coverage: string;

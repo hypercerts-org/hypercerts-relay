@@ -12,6 +12,7 @@
   import {
     api,
     target,
+    jobStateOptions,
     type Command,
     type Operation,
     type Source,
@@ -22,6 +23,7 @@
     type Audit,
     type Limit,
     type Administrator,
+    type JobStateFilter,
   } from "./api";
   const navigation = [
     { label: "", items: [["overview", "Overview"]] },
@@ -91,6 +93,11 @@
     } | null = null,
     operation: Operation | null = null;
   const pdsFilter = new URLSearchParams(location.search).get("pds") ?? "";
+  // An unrecognized status in the address shows all jobs.
+  const requestedState =
+    new URLSearchParams(location.search).get("state") ?? "";
+  const stateFilter: JobStateFilter | "" =
+    jobStateOptions.find((state) => state === requestedState) ?? "";
   let cursor = "",
     next: string | null = null,
     previous: string[] = [];
@@ -121,7 +128,7 @@
           break;
         case "jobs": {
           const r = await api<{ jobs: Job[]; nextCursor?: string }>(
-            `/jobs?after=${encodeURIComponent(cursor)}&pds=${encodeURIComponent(pdsFilter)}`,
+            `/jobs?after=${encodeURIComponent(cursor)}&pds=${encodeURIComponent(pdsFilter)}${stateFilter ? `&state=${encodeURIComponent(stateFilter)}` : ""}`,
           );
           jobs = r.jobs;
           next = r.nextCursor ?? null;
@@ -415,6 +422,8 @@
       {:else if ["jobs", "coverage", "audit"].includes(screen)}<Operations
           {screen}
           {jobs}
+          {pdsFilter}
+          {stateFilter}
           {changes}
           {coverage}
           {audit}
