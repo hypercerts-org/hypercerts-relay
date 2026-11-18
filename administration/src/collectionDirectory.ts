@@ -103,17 +103,22 @@ export function crawlNotice(
         submitted: number;
         started: number;
         alreadyActive: number;
+        // Absent from results recorded before retries skipped them.
+        alreadySubmitted?: number;
         skipped: { not_enabled: number; not_https: number };
       };
     } | null
   )?.collectiondir;
   if (!result) return null;
   const scope = operation.command.scope;
+  const earlier = result.alreadySubmitted ?? 0;
   if (scope !== "all") {
     const row = rows.find(
       (candidate) =>
         candidate.operation === operation.id && candidate.pds === scope,
     );
+    if (earlier && !result.submitted)
+      return `The crawl of ${scope} was already submitted by an earlier attempt of this request. No second crawl was started.`;
     if (result.alreadyActive)
       return `A crawl of ${scope} is already running${
         row?.crawlStartedAt ? ` (started ${time(row.crawlStartedAt)})` : ""
@@ -123,6 +128,10 @@ export function crawlNotice(
   }
   const skipped = result.skipped.not_enabled + result.skipped.not_https;
   return `Crawl requested for ${result.submitted} sources: ${result.started} started, ${result.alreadyActive} already running.${
+    earlier
+      ? ` ${earlier} already submitted by an earlier attempt were not sent again.`
+      : ""
+  }${
     skipped
       ? ` Skipped ${result.skipped.not_enabled} not enabled and ${result.skipped.not_https} without HTTPS.`
       : ""
@@ -143,6 +152,43 @@ export function crawlsInProgress(
     (operation?.command.kind === "collection_crawl" &&
       ["requested", "applying"].includes(operation.state))
   );
+}
+
+export interface CrawlPage {
+  items: CollectionCrawl[];
+  next: string | null;
+}
+
+// Keep loaded history current after it moves beyond the newest page. Looking
+// up accepted row IDs also returns their final state once they stop running.
+export async function refreshCrawls(
+  loaded: CollectionCrawl[],
+  keepOlder: boolean,
+  read: (path: string) => Promise<CrawlPage>,
+): Promise<CrawlPage> {
+  const latest = await read("/collection-directory/crawls?limit=100");
+  if (!keepOlder) return latest;
+  const newest = new Set(latest.items.map((row) => row.id));
+  const open = loaded.filter(
+    (row) => row.state === "accepted" && !newest.has(row.id),
+  );
+  const refreshed = new Map<string, CollectionCrawl>();
+  for (let i = 0; i < open.length; i += 100) {
+    const ids = open.slice(i, i + 100).map((row) => row.id);
+    const page = await read(
+      `/collection-directory/crawls?limit=100&ids=${encodeURIComponent(ids.join(","))}`,
+    );
+    for (const row of page.items) refreshed.set(row.id, row);
+  }
+  return {
+    items: [
+      ...latest.items,
+      ...loaded
+        .filter((row) => !newest.has(row.id))
+        .map((row) => refreshed.get(row.id) ?? row),
+    ],
+    next: latest.next,
+  };
 }
 
 export interface DirectoryPoller {

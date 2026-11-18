@@ -30,6 +30,8 @@
     createDirectoryPoller,
     crawlNotice,
     crawlsInProgress,
+    refreshCrawls,
+    type CrawlPage,
     type DirectoryPoller,
   } from "./collectionDirectory";
   const navigation = [
@@ -208,56 +210,47 @@
   // failure: Relay source management must keep working without it.
   async function refreshDirectoryQuietly() {
     try {
-      await refreshDirectory();
-    } catch {
-      directory = {
-        configured: true,
-        available: false,
-        error: "status_request_failed",
-        observedAt: new Date().toISOString(),
-        processStartedAt: null,
-        historySupported: false,
-        active: [],
-        recent: [],
-      };
-    }
+      await refreshDirectory(true);
+    } catch {}
     poller?.update();
   }
   // Page loads and the poller can refresh concurrently; only the newest
   // refresh may change state, so a slower, older response (or failure) is
   // dropped instead of overwriting it.
   let directoryRequest = 0;
-  async function refreshDirectory() {
+  async function refreshDirectory(showFailure = false) {
     const request = ++directoryRequest;
+    const keepOlder = olderCrawlsLoaded;
     let directoryStatus: CollectionDirectoryStatus;
-    let crawlPage: { items: CollectionCrawl[]; next: string | null };
+    let crawlPage: CrawlPage;
     try {
       [directoryStatus, crawlPage] = await Promise.all([
         api<CollectionDirectoryStatus>("/collection-directory/status"),
-        api<{ items: CollectionCrawl[]; next: string | null }>(
-          "/collection-directory/crawls?limit=100",
-        ),
+        refreshCrawls(crawls, keepOlder, (path) => api<CrawlPage>(path)),
       ]);
     } catch (error) {
-      if (request === directoryRequest) throw error;
-      return;
+      if (request !== directoryRequest) return;
+      if (showFailure)
+        directory = {
+          configured: true,
+          available: false,
+          error: "status_request_failed",
+          observedAt: new Date().toISOString(),
+          processStartedAt: null,
+          historySupported: false,
+          active: [],
+          recent: [],
+        };
+      throw error;
     }
     if (request !== directoryRequest) return;
     directory = directoryStatus;
-    if (olderCrawlsLoaded) {
-      // Keep older pages the operator loaded; refresh only the newest rows.
-      const fresh = new Set(crawlPage.items.map((row) => row.id));
-      crawls = [
-        ...crawlPage.items,
-        ...crawls.filter((row) => !fresh.has(row.id)),
-      ];
-    } else {
-      crawls = crawlPage.items;
-      nextCrawls = crawlPage.next;
-    }
+    crawls = crawlPage.items;
+    if (!keepOlder) nextCrawls = crawlPage.next;
   }
   async function moreCrawls() {
     if (!nextCrawls) return;
+    const request = ++directoryRequest;
     try {
       const olderPage = await api<{
         items: CollectionCrawl[];
@@ -265,6 +258,7 @@
       }>(
         `/collection-directory/crawls?limit=100&after=${encodeURIComponent(nextCrawls)}`,
       );
+      if (request !== directoryRequest) return;
       const known = new Set(crawls.map((row) => row.id));
       crawls = [
         ...crawls,
@@ -272,8 +266,9 @@
       ];
       nextCrawls = olderPage.next;
       olderCrawlsLoaded = true;
+      poller?.update();
     } catch (e) {
-      error = (e as Error).message;
+      if (request === directoryRequest) error = (e as Error).message;
     }
   }
   function crawlActive() {

@@ -84,13 +84,26 @@ export class CollectionCrawls {
             targets: [await this.sourceTarget(command.scope)],
             skipped: { not_enabled: 0, not_https: 0 },
           };
-    const submissions = await this.submit(op, targets);
+    // A retry sends only sources this operation has not yet recorded, so a
+    // crawl that already finished is not started a second time.
+    const recorded = new Set(
+      (
+        this.store.db
+          .prepare("SELECT pds FROM collection_crawls WHERE operation=?")
+          .all(op.id) as { pds: string }[]
+      ).map((row) => row.pds),
+    );
+    const pending = targets.filter((target) => !recorded.has(target));
+    const submissions = await this.submit(op, pending);
     return {
       collectiondir: {
         submitted: submissions.length,
         started: submissions.filter((s) => s.outcome === "started").length,
         alreadyActive: submissions.filter((s) => s.outcome === "already_active")
           .length,
+        // Sources recorded by an earlier attempt of this operation; not sent
+        // again.
+        alreadySubmitted: targets.length - pending.length,
         skipped,
       },
     };
@@ -147,12 +160,12 @@ export class CollectionCrawls {
     op: Operation,
     targets: string[],
   ): Promise<CrawlSubmission[]> {
+    if (!targets.length) return [];
     // Fail before submitting when the directory is unreachable or rejects
     // the token.
     await this.collectiondir.status();
     // Each accepted chunk is recorded before the next is sent, so a later
     // failure leaves the operation incomplete without losing accepted crawls.
-    // A retry finds those crawls running and records nothing twice.
     const submissions: CrawlSubmission[] = [];
     for (let i = 0; i < targets.length; i += crawlSubmissionChunk) {
       const chunk = targets.slice(i, i + crawlSubmissionChunk);
@@ -422,12 +435,14 @@ export class CollectionCrawls {
     after: string,
     limit: number,
     pds?: string,
+    ids?: string[],
   ): { items: CollectionCrawl[]; next: string | null } {
     const [requestedAt, id] = crawlCursor(after);
     const rows = this.store.db
       .prepare(
         `SELECT * FROM collection_crawls
          WHERE (?='' OR (requestedAt,id)<(?,?)) AND (?='' OR pds=?)
+         ${ids ? `AND id IN (${ids.map(() => "?").join(",")})` : ""}
          ORDER BY requestedAt DESC,id DESC LIMIT ?`,
       )
       .all(
@@ -436,6 +451,7 @@ export class CollectionCrawls {
         id,
         pds ?? "",
         pds ?? "",
+        ...(ids ?? []),
         limit + 1,
       ) as unknown as CrawlRow[];
     const items = rows.slice(0, limit).map((row) => ({

@@ -17,6 +17,7 @@ import {
   directoryMessage,
   directoryPollMs,
   directoryRetryMs,
+  refreshCrawls,
 } from "../src/collectionDirectory";
 import type {
   CollectionCrawl,
@@ -319,6 +320,46 @@ test("an already running crawl is explained, not reported as a failure", () => {
   );
 });
 
+test("crawl notices explain sources already submitted by an earlier attempt", () => {
+  const op = {
+    id: "00000000-0000-4000-8000-000000000001",
+    command: { kind: "collection_crawl", scope: "https://pds.example" },
+    state: "applied",
+    result: {
+      collectiondir: {
+        submitted: 0,
+        started: 0,
+        alreadyActive: 0,
+        alreadySubmitted: 1,
+        skipped: { not_enabled: 0, not_https: 0 },
+      },
+    },
+  } as Operation;
+  expect(crawlNotice(op, [])).toBe(
+    "The crawl of https://pds.example was already submitted by an earlier attempt of this request. No second crawl was started.",
+  );
+  expect(
+    crawlNotice(
+      {
+        ...op,
+        command: { kind: "collection_crawl", scope: "all" },
+        result: {
+          collectiondir: {
+            submitted: 50,
+            started: 50,
+            alreadyActive: 0,
+            alreadySubmitted: 100,
+            skipped: { not_enabled: 0, not_https: 0 },
+          },
+        },
+      },
+      [],
+    ),
+  ).toBe(
+    "Crawl requested for 50 sources: 50 started, 0 already running. 100 already submitted by an earlier attempt were not sent again.",
+  );
+});
+
 test("crawl all requires confirmation before submitting every source", async () => {
   const submit = vi.fn(async () => {});
   render(CollectionDirectory, { directory: directory(), crawls: [], submit });
@@ -524,5 +565,62 @@ test("adding a source works while the collection directory is unconfigured", asy
     kind: "source",
     pds: "new.example",
     state: "enabled",
+  });
+});
+
+test("refreshing a finished crawl on page two lets polling go idle", async () => {
+  const newest = Array.from({ length: 100 }, (_, i) =>
+    crawl(`https://new${i}.example`, { state: "finished" }),
+  );
+  const older = crawl("https://older.example", {
+    id: "00000000-0000-4000-8000-000000000001",
+    requestedAt: "2026-11-01T10:00:00.000Z",
+  });
+  const finished = { ...older, state: "finished" as const, reposDescribed: 40 };
+  const read = vi.fn(async (path: string) =>
+    path.includes("&ids=")
+      ? { items: [finished], next: null }
+      : { items: newest, next: "newest-page-cursor" },
+  );
+  expect(crawlsInProgress(directory(), [...newest, older], null)).toBe(true);
+  const refreshed = await refreshCrawls([...newest, older], true, read);
+  expect(read).toHaveBeenLastCalledWith(
+    `/collection-directory/crawls?limit=100&ids=${older.id}`,
+  );
+  expect(refreshed.items).toHaveLength(101);
+  expect(refreshed.items[100]).toEqual(finished);
+  expect(crawlSummary(refreshed.items[100])).toBe(
+    "Finished · 40 repositories described",
+  );
+  expect(crawlsInProgress(directory(), refreshed.items, null)).toBe(false);
+});
+
+test("refreshing loaded history checks every older open row in bounded chunks", async () => {
+  const older = Array.from({ length: 101 }, (_, i) =>
+    crawl(`https://older${i}.example`, {
+      id: `00000000-0000-4000-8000-${String(i).padStart(12, "0")}`,
+    }),
+  );
+  const terminal = older.map((row) => ({ ...row, state: "finished" as const }));
+  const checked: string[][] = [];
+  const read = vi.fn(async (path: string) => {
+    const ids = new URL(path, "https://admin.example").searchParams.get("ids");
+    if (!ids) return { items: [], next: "newest-page-cursor" };
+    const chunk = ids.split(",");
+    checked.push(chunk);
+    return {
+      items: terminal.filter((row) => chunk.includes(row.id)),
+      next: null,
+    };
+  });
+  const refreshed = await refreshCrawls(older, true, read);
+  expect(checked.map((chunk) => chunk.length)).toEqual([100, 1]);
+  expect(checked.flat()).toEqual(older.map((row) => row.id));
+  expect(refreshed.items).toEqual(terminal);
+  expect(crawlsInProgress(directory(), refreshed.items, null)).toBe(false);
+  // Refreshing without loaded history keeps the original newest-page result.
+  expect(await refreshCrawls(older, false, read)).toEqual({
+    items: [],
+    next: "newest-page-cursor",
   });
 });

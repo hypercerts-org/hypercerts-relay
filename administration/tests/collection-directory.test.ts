@@ -628,6 +628,7 @@ test("a single enabled source is crawled at Relay's stored HTTPS origin and reco
       submitted: 1,
       started: 1,
       alreadyActive: 0,
+      alreadySubmitted: 0,
       skipped: { not_enabled: 0, not_https: 0 },
     },
   });
@@ -718,6 +719,7 @@ test("crawl all submits every eligible source across Relay pages", async (t) => 
       submitted: 2,
       started: 2,
       alreadyActive: 0,
+      alreadySubmitted: 0,
       skipped: { not_enabled: 2, not_https: 1 },
     },
   });
@@ -1020,6 +1022,80 @@ test("reconciliation records progress, completion, failure and unknown outcomes"
   );
 });
 
+test("crawl history can refresh selected IDs with pagination and validates the filter", async (t) => {
+  const directory = await stubDirectory(t, startingDirectory);
+  const sources = {
+    "https://a.example": sourceView("a.example"),
+    "https://b.example": sourceView("b.example"),
+    "https://c.example": sourceView("c.example"),
+  };
+  const { crawl, rows, request, store } = await fixture(
+    t,
+    directory.url,
+    sources,
+  );
+  for (const origin of Object.keys(sources)) await crawl(origin); // NOSONAR: the worker applies one operation per tick
+  const [first, , last] = rows();
+  store.db
+    .prepare("UPDATE collection_crawls SET state='finished' WHERE id=?")
+    .run(String(first.id));
+  const ids = `${first.id},${last.id}`;
+  const firstPage = await (
+    await request(
+      `/api/v1/collection-directory/crawls?ids=${encodeURIComponent(ids)}&limit=1`,
+    )
+  ).json();
+  assert.equal(firstPage.items.length, 1);
+  assert.ok(firstPage.next);
+  const secondPage = await (
+    await request(
+      `/api/v1/collection-directory/crawls?ids=${encodeURIComponent(ids)}&limit=1&after=${encodeURIComponent(firstPage.next)}`,
+    )
+  ).json();
+  assert.equal(secondPage.items.length, 1);
+  assert.equal(secondPage.next, null);
+  const selected = [...firstPage.items, ...secondPage.items];
+  assert.deepEqual(
+    new Set(selected.map((row) => row.id)),
+    new Set([first.id, last.id]),
+  );
+  assert.equal(selected.find((row) => row.id === first.id).state, "finished");
+  const byPDS = await (
+    await request(
+      `/api/v1/collection-directory/crawls?ids=${encodeURIComponent(ids)}&pds=${encodeURIComponent(String(first.pds))}`,
+    )
+  ).json();
+  assert.deepEqual(
+    byPDS.items.map((row: { id: string }) => row.id),
+    [first.id],
+  );
+  assert.deepEqual(
+    await (
+      await request(`/api/v1/collection-directory/crawls?ids=${randomUUID()}`)
+    ).json(),
+    { items: [], next: null },
+  );
+  for (const invalid of [
+    "",
+    "not-a-uuid",
+    `${first.id},`,
+    Array(101).fill(first.id).join(","),
+  ])
+    assert.equal(
+      (
+        await request(
+          `/api/v1/collection-directory/crawls?ids=${encodeURIComponent(invalid)}`,
+        )
+      ).status,
+      400,
+    );
+  assert.equal(
+    (await (await request("/api/v1/collection-directory/crawls")).json()).items
+      .length,
+    3,
+  );
+});
+
 test("a directory without status history marks unseen crawls as unsupported", async (t) => {
   const directory = await stubDirectory(t, (call) =>
     call.path === "/admin/crawlStatus"
@@ -1086,10 +1162,25 @@ test("crawl all records accepted chunks before a later chunk fails", async (t) =
   let posts = 0;
   const seen = new Set<string>();
   // The first chunk is accepted; the second fails until the directory
-  // recovers. Hosts already submitted then report an active crawl.
+  // recovers. The first chunk finishes before the operation is retried.
   let failSecond = true;
   const directory = await stubDirectory(t, (call) => {
-    if (call.path === "/admin/crawlStatus") return { body: emptyStatus() };
+    if (call.path === "/admin/crawlStatus")
+      return {
+        body: emptyStatus({
+          host_results: Object.fromEntries(
+            [...seen].map((host) => [
+              host,
+              {
+                start: crawlStart,
+                end: "2026-11-17T10:01:00Z",
+                seen: 1,
+                state: "finished",
+              },
+            ]),
+          ),
+        }),
+      };
     posts++;
     if (failSecond && posts === 2) return { status: 503 };
     const hosts = (JSON.parse(call.body) as { hosts: string[] }).hosts;
@@ -1097,7 +1188,7 @@ test("crawl all records accepted chunks before a later chunk fails", async (t) =
       hosts.map((host) => [
         host,
         {
-          state: seen.has(host) ? "already_active" : "started",
+          state: "started",
           start: crawlStart,
         },
       ]),
@@ -1105,10 +1196,8 @@ test("crawl all records accepted chunks before a later chunk fails", async (t) =
     for (const host of hosts) seen.add(host);
     return { body: { message: "ok", hosts: reply } };
   });
-  const { crawl, rows, services, store, request, worker } = await fixture(
-    t,
-    directory.url,
-  );
+  const { crawl, crawls, rows, services, store, request, worker } =
+    await fixture(t, directory.url);
   services.sources = async () => ({
     Sources: manySources(150),
     NextAfterHostID: 0,
@@ -1129,7 +1218,10 @@ test("crawl all records accepted chunks before a later chunk fails", async (t) =
   assert.equal(accepted(), 100);
   assert.ok(rows().every((row) => row.operation === op.id));
 
+  await crawls.reconcile();
+  assert.ok(rows().every((row) => row.state === "finished"));
   failSecond = false;
+  const callsBeforeRetry = directory.calls.length;
   assert.equal(
     (await request(`/api/v1/operations/${op.id}/retry`, {})).status,
     200,
@@ -1137,6 +1229,21 @@ test("crawl all records accepted chunks before a later chunk fails", async (t) =
   await worker.tick();
   const retried = store.operation(op.id)!;
   assert.equal(retried.state, "applied", retried.error ?? "");
+  assert.deepEqual(
+    postedHosts(directory.calls.slice(callsBeforeRetry)),
+    manySources(150)
+      .slice(100)
+      .map((source) => `https://${source.Hostname}`),
+  );
+  assert.deepEqual(retried.result, {
+    collectiondir: {
+      submitted: 50,
+      started: 50,
+      alreadyActive: 0,
+      alreadySubmitted: 100,
+      skipped: { not_enabled: 0, not_https: 0 },
+    },
+  });
   assert.equal(rows().length, 150);
   assert.equal(accepted(), 150);
   assert.equal(
@@ -1149,6 +1256,75 @@ test("crawl all records accepted chunks before a later chunk fails", async (t) =
       .slice(0, 100)
       .every((row) => row.submission === "started"),
   );
+});
+
+test("recovered applying crawls reuse recorded sources and skip directory calls when complete", async (t) => {
+  let posts = 0;
+  const directory = await stubDirectory(t, (call) => {
+    if (call.path === "/admin/pds/requestCrawl" && ++posts === 2)
+      return { status: 503 };
+    return startingDirectory(call);
+  });
+  const { crawls, rows, services, store, worker } = await fixture(
+    t,
+    directory.url,
+  );
+  const origins = manySources(150).map(
+    (source) => `https://${source.Hostname}`,
+  );
+  services.sources = async () => ({
+    Sources: manySources(150),
+    NextAfterHostID: 0,
+  });
+  const op = store.request(did, { kind: "collection_crawl", scope: "all" });
+  store.transition(op.id, "applying");
+  // Stop before the Worker can finalize the interrupted operation.
+  await assert.rejects(crawls.apply(store.operation(op.id)!), {
+    code: "collectiondir_unavailable",
+  });
+  assert.equal(store.operation(op.id)?.state, "applying");
+  assert.equal(rows().length, 100);
+
+  const callsBeforeRecovery = directory.calls.length;
+  const recovered = new Worker(store, services, crawls);
+  recovered.recover();
+  assert.equal(store.operation(op.id)?.state, "requested");
+  await recovered.tick();
+  assert.equal(store.operation(op.id)?.state, "applied");
+  assert.equal(rows().length, 150);
+  assert.deepEqual(
+    postedHosts(directory.calls.slice(callsBeforeRecovery)),
+    origins.slice(100),
+  );
+  assert.deepEqual(store.operation(op.id)?.result, {
+    collectiondir: {
+      submitted: 50,
+      started: 50,
+      alreadyActive: 0,
+      alreadySubmitted: 100,
+      skipped: { not_enabled: 0, not_https: 0 },
+    },
+  });
+
+  // Recovery after every chunk was recorded needs no status probe, even
+  // when the directory is unavailable.
+  store.transition(op.id, "applying");
+  directory.setHandler(() => ({ status: 503 }));
+  const callsBeforeCompleteRecovery = directory.calls.length;
+  worker.recover();
+  await worker.tick();
+  assert.equal(store.operation(op.id)?.state, "applied");
+  assert.equal(directory.calls.length, callsBeforeCompleteRecovery);
+  assert.equal(rows().length, 150);
+  assert.deepEqual(store.operation(op.id)?.result, {
+    collectiondir: {
+      submitted: 0,
+      started: 0,
+      alreadyActive: 0,
+      alreadySubmitted: 150,
+      skipped: { not_enabled: 0, not_https: 0 },
+    },
+  });
 });
 
 test("accepted crawls close as unknown once the directory is no longer configured", async (t) => {

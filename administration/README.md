@@ -141,7 +141,7 @@ The browser-facing API is `/api/v1`; all endpoints below require authorization.
 | `GET /limits`, `/status`, `/audit`       | Applied policies, bounded service health, durable actor-attributed history. `/status` includes `collectiondir`: `available`, `unavailable` or `not_configured`. |
 | `GET`, `POST /sources/discovery/settings` | Automatic PDS discovery settings: `{maxAccountLimit}`, a whole number of at least 1,000 (default 100,000). Changes are CSRF protected and audited as `discovery_settings_changed`. |
 | `GET /collection-directory/status`       | Always HTTP 200: `configured`, `available`, bounded `error` code, active crawls and recent crawl results.   |
-| `GET /collection-directory/crawls`       | Newest-first crawl requests with actor, times, submission, state and result; optional exact `pds` filter.  |
+| `GET /collection-directory/crawls`       | Newest-first crawl requests with actor, times, submission, state and result; optional exact `pds` and crawl-row `ids` filters.  |
 
 Commands are discriminated by `kind`: `source` (`pds`, `state`), `collections`
 (`expectedRevision`, exact `collections`), `job` (`pds`, `reason`), `job_action`
@@ -230,7 +230,12 @@ Relay or plaintext fails the operation without contacting the directory. An
 unreachable directory leaves the operation `incomplete` for an explicit retry.
 When crawling all sources, each batch of 100 accepted sources is recorded as soon
 as the directory accepts it, so a later failed batch keeps the earlier records;
-the retry finds those crawls already running and records nothing twice.
+retries and restart recovery skip sources already recorded for that operation,
+even if their crawls have finished, and report their count as `alreadySubmitted`.
+If Administration stops after the directory accepts a batch but before that batch
+is recorded, submission is at-least-once: a retry sends those sources again.
+The directory drops the duplicate only if the earlier crawl is still running;
+if it has ended, the retry starts another crawl.
 
 `applied` means the directory accepted the request, not that the crawl finished.
 If a crawl of that source was already running, the request is still applied, no
@@ -244,6 +249,14 @@ every five seconds while anything is running:
 | `finished` | The repository listing ended. Repositories that could not be described are counted separately.     |
 | `failed`   | The listing stopped early; a bounded category and HTTP status are shown, never raw response text. |
 | `unknown`  | The directory restarted, no longer reports the result, or is no longer configured, so the outcome cannot be known. |
+
+**Load more** keeps older requests visible. Refreshes also update loaded requests
+that are still open, so their final outcomes appear and polling stops when all
+crawls have ended. `GET /api/v1/collection-directory/crawls` accepts an optional
+`ids` filter: a comma-separated list of 1–100 UUID crawl-row IDs. It returns their
+current states, combines with `pds`, `after` and `limit`, and uses the same
+`{items, next}` cursor pagination. Invalid or empty lists are rejected with HTTP
+400. Without `ids`, the endpoint's behavior is unchanged.
 
 Crawl results are candidate DID/collection pairs for
 `com.atproto.sync.listReposByCollection`, not an authoritative inventory. A crawl

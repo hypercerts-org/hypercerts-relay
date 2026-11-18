@@ -301,11 +301,19 @@ export function createApp(
   });
   app.get("/api/v1/collection-directory/crawls", (req, res) => {
     const p = page.parse(req.query);
+    const ids = z
+      .string()
+      .max(3699)
+      .transform((value) => value.split(","))
+      .pipe(z.array(z.uuid()).min(1).max(100))
+      .optional()
+      .parse(req.query.ids);
     res.json(
       crawls.page(
         p.after,
         p.limit,
         req.query.pds ? origin.parse(req.query.pds) : undefined,
+        ids,
       ),
     );
   });
