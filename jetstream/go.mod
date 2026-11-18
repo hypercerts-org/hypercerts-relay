@@ -2,7 +2,7 @@ module github.com/bluesky-social/jetstream
 
 go 1.26.10
 
-toolchain go1.27.3
+toolchain go1.27.4
 
 require (
 	github.com/cockroachdb/errors v1.14.0
