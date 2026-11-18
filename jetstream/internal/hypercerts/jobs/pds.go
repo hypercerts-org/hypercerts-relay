@@ -1070,7 +1070,13 @@ func (p PDSProcessor) acquireSnapshot(ctx context.Context, client *atmossync.Cli
 	r, commit, err := fetchRepository(context.WithValue(ctx, pdsResponseCaptureKey{}, capture), client, entry.DID)
 	p.timings.record(repositoryStageGetRepo, stageStartedAt)
 	if err != nil {
-		return ingest.Snapshot{}, nil, nil, err
+		// A successful response whose body failed to read still reports the
+		// origin's request budget. Other statuses keep their own handling.
+		var headers http.Header
+		if capture.status >= 200 && capture.status < 300 {
+			headers = capture.header
+		}
+		return ingest.Snapshot{}, nil, headers, err
 	}
 	stageStartedAt = time.Now()
 	err = p.verifySnapshot(ctx, job, entry, commit)

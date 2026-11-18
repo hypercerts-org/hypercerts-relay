@@ -649,6 +649,31 @@ func TestPDSProcessorPacesOnRateLimitHeadersWithoutA429(t *testing.T) {
 	require.True(t, sawCooldown.Load(), "diagnostics report the pacing wait")
 }
 
+func TestPDSProcessorPacesWhenASuccessfulDownloadFailsToLoad(t *testing.T) {
+	fixture := newLatencyFixture(t, 1, 0, 0, 0)
+	reset := time.Now().Add(time.Minute).Unix()
+	fixture.setGetRepoHook(func(request *http.Request, index int) *http.Response {
+		car := fixture.repos[index].car
+		// A truncated body fails while loading the repository, after the
+		// response has reported an exhausted request budget.
+		response := latencyFixtureResponse(request, http.StatusOK, "application/vnd.ipld.car", car[:len(car)/2])
+		response.Header.Set("RateLimit-Remaining", "0")
+		response.Header.Set("RateLimit-Reset", strconv.FormatInt(reset, 10))
+		return response
+	})
+	m, db := openMemoryManager(t, vfs.NewMem())
+	defer db.Close()
+	_, err := m.AddSource(latencyFixturePDS)
+	require.NoError(t, err)
+	run := startManagerRun(m, fixture.processor(m, 1))
+	defer run.stop(t)
+	require.Eventually(t, func() bool {
+		_, found, err := m.GetPDSCooldown(latencyFixturePDS)
+		return err == nil && found
+	}, 10*time.Second, 5*time.Millisecond, "the failed download still paces the origin")
+	require.EqualValues(t, 1, fixture.getRepoByDID[0].Load())
+}
+
 func TestPaceRateLimitIgnoresMissingOrInvalidHeaders(t *testing.T) {
 	processor := PDSProcessor{}
 	for _, headers := range []http.Header{

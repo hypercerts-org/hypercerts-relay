@@ -140,7 +140,12 @@ func BenchmarkWriterReconcileSnapshot(b *testing.B) {
 				}
 			}
 			b.StopTimer()
-			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N)/float64(archiveRows), "ns/archive-row")
+			// Each iteration appends one replacement row that later iterations
+			// also scan, so iteration i scans archiveRows+i rows. Divide by the
+			// cumulative rows scanned rather than the seeded size.
+			n := float64(b.N)
+			scanned := float64(archiveRows)*n + n*(n-1)/2
+			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/scanned, "ns/archive-row")
 			b.ReportMetric(float64(len(files)), "segments-at-start")
 		})
 	}
