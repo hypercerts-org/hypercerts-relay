@@ -10,7 +10,6 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -20,16 +19,14 @@ const token = "fixture-service-credential-32-bytes-minimum";
 interface FixtureProcess {
   child: ChildProcess;
   ready: string;
+  exited: Promise<void>;
 }
 
 async function stopFixture(
-  { child, ready }: FixtureProcess,
+  { child, ready, exited }: FixtureProcess,
   graceful: boolean,
 ) {
-  if (child.exitCode !== null) return;
-  // Subscribe before signalling: a fixture that exits first would otherwise
-  // leave `once` waiting for an event that already fired.
-  const exited = once(child, "exit");
+  if (child.exitCode !== null || child.signalCode !== null) return;
   if (graceful) writeFileSync(`${ready}.stop`, "", { mode: 0o600 });
   else child.kill("SIGTERM");
   const timeout = setTimeout(() => child.kill("SIGKILL"), 5000);
@@ -47,7 +44,10 @@ export interface ControlFixtures {
   close(): Promise<void>;
 }
 
-export async function startControlFixtures(): Promise<ControlFixtures> {
+export async function startControlFixtures(
+  signal?: AbortSignal,
+): Promise<ControlFixtures> {
+  signal?.throwIfAborted();
   const go = process.env.CONTROL_GO_BINARY ?? "go";
   if (!isAbsolute(go))
     throw new Error(
@@ -73,20 +73,44 @@ export async function startControlFixtures(): Promise<ControlFixtures> {
   ];
   const launched: FixtureProcess[] = [];
   try {
-    await Promise.all(
-      specs.map(({ name, cwd, pkg }) =>
-        compile(go, ["test", "-c", "-o", join(dir, `${name}.test`), pkg], {
-          cwd,
-          env,
-          timeout: 300_000,
-          maxBuffer: 2 * 1024 * 1024,
-        }),
-      ),
+    const compiled = await Promise.allSettled(
+      specs.map(async ({ name, cwd, pkg }) => {
+        const pending = compile(
+          go,
+          ["test", "-c", "-o", join(dir, `${name}.test`), pkg],
+          {
+            cwd,
+            env,
+            signal,
+            timeout: 300_000,
+            maxBuffer: 2 * 1024 * 1024,
+          },
+        );
+        // An abort rejects execFile before its child closes. Reap it before
+        // allowing cleanup to remove the directory it can still write into.
+        const closed = new Promise<void>((resolve) =>
+          pending.child.once("close", () => resolve()),
+        );
+        try {
+          await pending;
+        } finally {
+          const timeout = setTimeout(() => pending.child.kill("SIGKILL"), 5000);
+          try {
+            await closed;
+          } finally {
+            clearTimeout(timeout);
+          }
+        }
+      }),
     );
+    const failed = compiled.find((result) => result.status === "rejected");
+    if (failed) throw failed.reason;
+    signal?.throwIfAborted();
     async function startFixture(
       { name, cwd }: (typeof specs)[number],
       relayURL?: string,
     ) {
+      signal?.throwIfAborted();
       const ready = join(dir, name);
       const child = spawn(
         join(dir, `${name}.test`),
@@ -102,14 +126,26 @@ export async function startControlFixtures(): Promise<ControlFixtures> {
           },
         },
       );
-      const fixture = { child, ready } satisfies FixtureProcess;
+      // Capture completion at spawn time, including a failed spawn, so cleanup
+      // never waits for an exit event that has already happened.
+      const exited = new Promise<void>((resolve) =>
+        child.once("close", () => resolve()),
+      );
+      const fixture = { child, ready, exited } satisfies FixtureProcess;
       launched.push(fixture);
       let output = "";
       child.stdout?.on("data", (data) => (output += data));
       child.stderr?.on("data", (data) => (output += data));
+      child.on("error", (error) => (output += error.message));
       const deadline = Date.now() + 15_000;
       while (!existsSync(ready)) {
-        if (child.exitCode !== null || Date.now() >= deadline) {
+        signal?.throwIfAborted();
+        if (
+          child.exitCode !== null ||
+          child.signalCode !== null ||
+          child.pid === undefined ||
+          Date.now() >= deadline
+        ) {
           child.kill("SIGKILL");
           throw new Error(output || `${name} control fixture did not start`);
         }
@@ -126,12 +162,15 @@ export async function startControlFixtures(): Promise<ControlFixtures> {
     const relayURL = readFileSync(relay.ready, "utf8");
     const jetstreamURL = readFileSync(jetstream.ready, "utf8");
     const configured = await fetch(`${relayURL}/_test/configure-handoff`, {
+      signal,
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ targetURL: jetstreamURL, token }),
     });
     if (!configured.ok)
-      throw new Error(`Relay handoff fixture configuration failed: ${configured.status}`);
+      throw new Error(
+        `Relay handoff fixture configuration failed: ${configured.status}`,
+      );
     return {
       relayURL,
       jetstreamURL,
@@ -144,8 +183,8 @@ export async function startControlFixtures(): Promise<ControlFixtures> {
       },
     };
   } catch (error) {
-    // Promise.all may reject while the sibling fixture is still starting. Stop
-    // and reap every child before removing their common ready-file directory.
+    // All compilers have settled. Stop and reap every launched fixture before
+    // removing their common ready-file directory.
     await Promise.all(launched.map((fixture) => stopFixture(fixture, false)));
     rmSync(dir, { recursive: true, force: true });
     throw error;

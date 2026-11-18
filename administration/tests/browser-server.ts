@@ -6,7 +6,11 @@ import { Store } from "../server/store.ts";
 import { Services } from "../server/services.ts";
 import { Worker } from "../server/worker.ts";
 import { resolve } from "node:path";
-import { startControlFixtures } from "./control-fixtures.ts";
+import type { Server } from "node:http";
+import {
+  startControlFixtures,
+  type ControlFixtures,
+} from "./control-fixtures.ts";
 const base = "http://127.0.0.1:3188",
   did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
 const store = new Store(":memory:");
@@ -30,29 +34,37 @@ const oauth: OAuthProvider = {
     return { handle: "operator.example", displayName: "Test Operator" };
   },
 };
-const fixtures = await startControlFixtures();
-const services = new Services(
-  { url: fixtures.relayURL, token: fixtures.token },
-  { url: fixtures.jetstreamURL, token: fixtures.token },
-);
-const worker = new Worker(store, services);
+const startup = new AbortController();
+let fixtures: ControlFixtures | undefined;
+let timer: ReturnType<typeof setInterval> | undefined;
+let server: Server | undefined;
 const ticks = new Set<Promise<void>>();
-function tick() {
-  const pending = worker.tick();
-  ticks.add(pending);
-  void pending.finally(() => ticks.delete(pending)).catch(console.error);
+async function start() {
+  fixtures = await startControlFixtures(startup.signal);
+  startup.signal.throwIfAborted();
+  const services = new Services(
+    { url: fixtures.relayURL, token: fixtures.token },
+    { url: fixtures.jetstreamURL, token: fixtures.token },
+  );
+  const worker = new Worker(store, services);
+  function tick() {
+    const pending = worker.tick();
+    ticks.add(pending);
+    void pending.finally(() => ticks.delete(pending)).catch(console.error);
+  }
+  timer = setInterval(tick, 50);
+  server = createApp(
+    store,
+    services,
+    new Auth(store, base, oauth),
+    {},
+    resolve("dist"),
+  ).listen(3188, "127.0.0.1");
 }
-const timer = setInterval(tick, 50);
-const server = createApp(
-  store,
-  services,
-  new Auth(store, base, oauth),
-  {},
-  resolve("dist"),
-).listen(3188, "127.0.0.1");
 let stopping: Promise<void> | undefined;
 function closeServer() {
   return new Promise<void>((resolve, reject) => {
+    if (!server) return resolve();
     server.close((error) => (error ? reject(error) : resolve()));
   });
 }
@@ -60,11 +72,15 @@ function closeServer() {
 // starts a second one nor exits before the first has finished.
 function shutdown() {
   stopping ??= (async () => {
+    startup.abort();
+    // Startup owns its catch-path cleanup until it settles, even when the
+    // signal arrives during compilation or before a fixture is ready.
+    await starting.catch(() => {});
     clearInterval(timer);
     await Promise.allSettled(ticks);
     await closeServer();
     store.close();
-    await fixtures.close();
+    await fixtures?.close();
   })();
   return stopping;
 }
@@ -83,3 +99,13 @@ function stop() {
 }
 process.on("SIGINT", stop);
 process.on("SIGTERM", stop);
+const starting = start();
+try {
+  await starting;
+} catch (error) {
+  if (!startup.signal.aborted) {
+    console.error(error);
+    await shutdown();
+    process.exitCode = 1;
+  }
+}

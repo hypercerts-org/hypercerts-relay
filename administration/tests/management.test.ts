@@ -62,9 +62,9 @@ test(
     ];
     // Finish cold dependency downloads and compilation before starting either
     // bounded fixture server. Compilation is not part of its startup deadline.
-    await Promise.all(
-      fixtures.map(({ name, cwd, pkg }) =>
-        compile(
+    const compiled = await Promise.allSettled(
+      fixtures.map(async ({ name, cwd, pkg }) => {
+        const pending = compile(
           goBinary,
           ["test", "-c", "-o", join(temp, name + ".test"), pkg],
           {
@@ -74,9 +74,26 @@ test(
             signal: t.signal,
             maxBuffer: 2 * 1024 * 1024,
           },
-        ),
-      ),
+        );
+        const closed = new Promise<void>((resolve) =>
+          pending.child.once("close", () => resolve()),
+        );
+        try {
+          await pending;
+        } finally {
+          // An aborted execFile rejects before its child is reaped. Keep the
+          // shared directory until every compiler has actually closed.
+          const timeout = setTimeout(() => pending.child.kill("SIGKILL"), 5000);
+          try {
+            await closed;
+          } finally {
+            clearTimeout(timeout);
+          }
+        }
+      }),
     );
+    const failed = compiled.find((result) => result.status === "rejected");
+    if (failed?.status === "rejected") throw failed.reason;
     async function fixture(
       name: string,
       cwd: string,
