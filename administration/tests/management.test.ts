@@ -131,10 +131,19 @@ test(
         },
       );
       teardown.push(async () => {
-        writeFileSync(ready + ".stop", "");
+        // If the graceful stop marker cannot be written (for example ENOSPC),
+        // signal the fixture instead and still reap it before reporting.
+        let stopError: unknown;
+        try {
+          writeFileSync(ready + ".stop", "");
+        } catch (error) {
+          stopError = error;
+          child.kill("SIGTERM");
+        }
         const deadline = setTimeout(() => child.kill("SIGKILL"), 5000);
         try {
           const result = await done;
+          if (stopError) throw stopError;
           assert.ifError(result.error);
           assert.equal(result.code, 0, output);
         } finally {

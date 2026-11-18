@@ -89,13 +89,16 @@ const output = process.argv[process.argv.indexOf("-o") + 1];
 const name = basename(output, ".test");
 writeFileSync(join(root, name + ".dir"), dirname(output));
 writeFileSync(join(root, name + ".pid"), String(process.pid));
-writeFileSync(join(root, name + ".compiling"), "");
+// Publish the marker only once this double can handle SIGTERM, so a test that
+// aborts on it never signals a double that would exit without its markers.
+const compiling = () => writeFileSync(join(root, name + ".compiling"), "");
 if (mode === "block-compile") {
   process.on("SIGTERM", () => setTimeout(() => {
     writeFileSync(join(root, name + ".directory-present"), String(existsSync(dirname(output))));
     process.exit(0);
   }, 150));
   setInterval(() => {}, 1000);
+  compiling();
 } else if (mode === "stubborn-compile") {
   process.on("SIGTERM", () => writeFileSync(join(root, name + ".aborted"), ""));
   setInterval(() => {
@@ -103,7 +106,9 @@ if (mode === "block-compile") {
     mkdirSync(dirname(output), { recursive: true });
     writeFileSync(output, "compiler still writing");
   }, 10);
+  compiling();
 } else if (mode === "fail-compile") {
+  compiling();
   if (name === "relay") {
     while (!existsSync(join(root, "jetstream.compiling"))) await delay(10);
     process.stderr.write("intentional compilation failure");
@@ -113,8 +118,11 @@ if (mode === "block-compile") {
   writeFileSync(join(root, name + ".directory-present"), String(existsSync(dirname(output))));
   mkdirSync(dirname(output), { recursive: true });
   writeFileSync(output, "sibling compiler finished");
-} else writeFileSync(output, ${JSON.stringify(`#!${process.execPath}
+} else {
+  compiling();
+  writeFileSync(output, ${JSON.stringify(`#!${process.execPath}
 ${fixture}`)}, { mode: 0o700 });
+}
 `,
     { mode: 0o700 },
   );

@@ -95,9 +95,11 @@ function shutdown() {
 // (gracefulShutdown in playwright.config.ts). Handle every signal, since an
 // unhandled repeat would kill the process while it removes the fixtures'
 // temporary directory, and exit once that is done.
+// A signal that joins cleanup after a startup failure keeps the failure status.
+let startupFailed = false;
 function stop() {
   shutdown().then(
-    () => process.exit(0),
+    () => process.exit(startupFailed ? 1 : 0),
     (error: unknown) => {
       console.error(error);
       process.exit(1);
@@ -112,7 +114,8 @@ try {
 } catch (error) {
   if (!startup.signal.aborted) {
     console.error(error);
-    await shutdown();
+    startupFailed = true;
     process.exitCode = 1;
+    await shutdown();
   }
 }
