@@ -1,3 +1,4 @@
+import { api } from "./api";
 import type {
   ActiveCrawl,
   CollectionBootstrapView,
@@ -10,6 +11,24 @@ import type {
 // Polling cadence while a crawl is running, and after a failed refresh.
 export const directoryPollMs = 5000;
 export const directoryRetryMs = 15000;
+
+// Load the complete open set before publishing a refresh, so older initial
+// crawls remain visible and keep polling alive beyond the first page.
+export async function loadOpenBootstraps(): Promise<CollectionBootstrapView[]> {
+  const rows: CollectionBootstrapView[] = [];
+  let after: string | null = null;
+  do {
+    const page: { items: CollectionBootstrapView[]; next: string | null } =
+      await api(
+        `/collection-directory/bootstraps?phase=open&limit=100${
+          after ? `&after=${encodeURIComponent(after)}` : ""
+        }`,
+      );
+    rows.push(...page.items);
+    after = page.next;
+  } while (after);
+  return rows;
+}
 
 // Only enabled, validated HTTPS sources can be crawled; the server enforces
 // the same rule against Relay when it applies the request.
@@ -139,10 +158,18 @@ export function crawlNotice(
   }`;
 }
 
-// Initial crawl phases that the server can still move forward on its own.
+// Initial crawls an operator may still need to act on.
+const awaitingBootstrapPhases = new Set([
+  "waiting",
+  "retrying",
+  "needs_attention",
+]);
+// Initial crawl phases the server can still move forward on its own. A
+// needs_attention row waits for an operator retry, which the poller follows
+// through the watched operation, so it does not keep polling alive.
 const openBootstrapPhases = new Set(["waiting", "retrying", "accepted"]);
 
-// Whether crawl status can still change and is worth polling. Accepted rows
+// Whether crawl status can still change and is worth polling. Accepted crawl rows
 // are ignored without a configured directory: only the server can close them.
 // A source enable is followed because applying it may queue an initial crawl.
 export function crawlsInProgress(
@@ -251,11 +278,11 @@ export function bootstrapSummary(
   }
 }
 
-// Initial crawls the collection directory has not yet accepted.
+// Open initial crawls the collection directory has not yet accepted. Terminal
+// skips and failed submissions stay in source details, not this work queue.
 export function awaitingBootstraps(bootstraps: CollectionBootstrapView[]) {
-  return bootstraps.filter(
-    (bootstrap) =>
-      !["accepted", "finished", "failed", "unknown"].includes(bootstrap.phase),
+  return bootstraps.filter((bootstrap) =>
+    awaitingBootstrapPhases.has(bootstrap.phase),
   );
 }
 

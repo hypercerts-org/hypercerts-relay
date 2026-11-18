@@ -33,6 +33,7 @@
     crawlNotice,
     crawlsInProgress,
     refreshCrawls,
+    loadOpenBootstraps,
     type CrawlPage,
     type DirectoryPoller,
   } from "./collectionDirectory";
@@ -102,6 +103,7 @@
   let directory: CollectionDirectoryStatus | null = null,
     crawls: CollectionCrawl[] = [],
     bootstraps: CollectionBootstrapView[] = [],
+    bootstrapsLoaded = false,
     nextCrawls: string | null = null,
     olderCrawlsLoaded = false,
     poller: DirectoryPoller | null = null;
@@ -226,17 +228,12 @@
     const keepOlder = olderCrawlsLoaded;
     let directoryStatus: CollectionDirectoryStatus;
     let crawlPage: CrawlPage;
-    let bootstrapPage: {
-      items: CollectionBootstrapView[];
-      next: string | null;
-    };
+    let openBootstraps: CollectionBootstrapView[];
     try {
-      [directoryStatus, crawlPage, bootstrapPage] = await Promise.all([
+      [directoryStatus, crawlPage, openBootstraps] = await Promise.all([
         api<CollectionDirectoryStatus>("/collection-directory/status"),
         refreshCrawls(crawls, keepOlder, (path) => api<CrawlPage>(path)),
-        api<{ items: CollectionBootstrapView[]; next: string | null }>(
-          "/collection-directory/bootstraps?limit=100",
-        ),
+        loadOpenBootstraps(),
       ]);
     } catch (error) {
       if (request !== directoryRequest) return;
@@ -255,7 +252,8 @@
     }
     if (request !== directoryRequest) return;
     directory = directoryStatus;
-    bootstraps = bootstrapPage.items;
+    bootstraps = openBootstraps;
+    bootstrapsLoaded = true;
     crawls = crawlPage.items;
     if (!keepOlder) nextCrawls = crawlPage.next;
   }
@@ -542,6 +540,7 @@
           {directory}
           {crawls}
           {bootstraps}
+          {bootstrapsLoaded}
           hasMore={!!nextCrawls}
           more={moreCrawls}
           {submit}

@@ -16,6 +16,7 @@
   export let directory: CollectionDirectoryStatus | null = null;
   export let crawls: CollectionCrawl[] = [];
   export let bootstraps: CollectionBootstrapView[] = [];
+  export let bootstrapsLoaded = false;
   export let hasMore = false;
   export let more: () => Promise<void> = async () => {};
   export let submit: (command: Command) => Promise<void>;
@@ -188,8 +189,9 @@
         >
       {:else}<tr
           ><td colspan="4" class="empty"
-            >No initial crawls are waiting. Accepted initial crawls appear under
-            Crawl requests.</td
+            >{bootstrapsLoaded
+              ? "No initial crawls are waiting. Accepted initial crawls appear under Crawl requests."
+              : "Initial crawl requests have not been loaded. Refresh to try again."}</td
           ></tr
         >{/each}
     </tbody>

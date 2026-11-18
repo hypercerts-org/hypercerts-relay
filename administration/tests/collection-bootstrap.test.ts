@@ -784,6 +784,130 @@ test("the bootstraps route pages newest first", async (t) => {
     assert.ok(key(items[i - 1]) > key(items[i]), "newest first");
 });
 
+test("open bootstraps remain pageable behind more than 100 terminal rows", async (t) => {
+  const { store, request } = await fixture(t, null);
+  const bootstrap = new CollectionBootstrap(store, true);
+  const record = (
+    index: number,
+    phase: "needs_attention" | "retrying" | "waiting" | "accepted" | "finished",
+  ) => {
+    const pds = `https://pds-${index}.example`;
+    const source = store.request(did, {
+      kind: "source",
+      pds,
+      state: "enabled",
+    });
+    const follow = bootstrap.plan(source, {
+      relay: {
+        HostID: index + 1,
+        Hostname: new URL(pds).host,
+        NoSSL: false,
+        DesiredState: "enabled",
+        Revision: 1,
+        Validation: { Status: "passed" },
+      },
+    })!;
+    store.transition(
+      source.id,
+      "applied",
+      follow.result,
+      null,
+      undefined,
+      ["requested"],
+      follow.commit,
+    );
+    const crawlOperation = bootstrapOperationId(source.id);
+    const createdAt = new Date(
+      Date.parse(crawlStart) + index * 1000,
+    ).toISOString();
+    store.db
+      .prepare(
+        "UPDATE collection_bootstraps SET createdAt=?,gaveUpAt=? WHERE sourceOperation=?",
+      )
+      .run(
+        createdAt,
+        phase === "needs_attention" ? createdAt : null,
+        source.id,
+      );
+    if (phase === "needs_attention" || phase === "retrying")
+      store.transition(
+        crawlOperation,
+        "incomplete",
+        null,
+        "collectiondir_unavailable",
+      );
+    else if (phase === "accepted" || phase === "finished") {
+      store.transition(crawlOperation, "applied", null, null);
+      store.db
+        .prepare(
+          "INSERT INTO collection_crawls(id,operation,pds,actor,cause,submission,state,requestedAt,acceptedAt) VALUES(?,?,?,?,?,?,?,?,?)",
+        )
+        .run(
+          randomUUID(),
+          crawlOperation,
+          pds,
+          did,
+          "source_added",
+          "started",
+          phase,
+          createdAt,
+          createdAt,
+        );
+    }
+    return source.id;
+  };
+  const needsAttention = record(0, "needs_attention");
+  const retrying = record(1, "retrying");
+  const waiting = record(2, "waiting");
+  const accepted = record(3, "accepted");
+  for (let i = 4; i < 105; i++) record(i, "finished");
+
+  type Page = { items: CollectionBootstrapView[]; next: string | null };
+  const page = async (query: string) => {
+    const response = await request(
+      `/api/v1/collection-directory/bootstraps?${query}`,
+    );
+    assert.equal(response.status, 200);
+    return (await response.json()) as Page;
+  };
+  const unfiltered = await page("limit=100");
+  assert.equal(unfiltered.items.length, 100);
+  assert.ok(unfiltered.next);
+  assert.ok(unfiltered.items.every((item) => item.phase === "finished"));
+
+  const first = await page("phase=open&limit=2");
+  assert.deepEqual(
+    first.items.map((item) => item.sourceOperation),
+    [accepted, waiting],
+  );
+  assert.ok(first.next);
+  const second = await page(
+    `phase=open&limit=2&after=${encodeURIComponent(first.next!)}`,
+  );
+  assert.deepEqual(
+    second.items.map((item) => item.sourceOperation),
+    [retrying, needsAttention],
+  );
+  assert.deepEqual(
+    second.items.map((item) => item.phase),
+    ["retrying", "needs_attention"],
+  );
+  assert.equal(second.next, null);
+  const filtered = await page(
+    "phase=open&limit=100&pds=https%3A%2F%2Fpds-0.example",
+  );
+  assert.deepEqual(
+    filtered.items.map((item) => item.sourceOperation),
+    [needsAttention],
+  );
+  assert.equal(filtered.next, null);
+  assert.equal(
+    (await request("/api/v1/collection-directory/bootstraps?phase=finished"))
+      .status,
+    400,
+  );
+});
+
 test("a source enabled by PDS discovery queues a crawl owned by the discovery actor", async (t) => {
   const directory = await stubDirectory(t, startingDirectory());
   const { store, request, worker, bootstraps, crawlRows, audit } =

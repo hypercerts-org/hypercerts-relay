@@ -5,7 +5,9 @@ import {
   fireEvent,
   cleanup,
   within,
+  waitFor,
 } from "@testing-library/svelte";
+import App from "../src/App.svelte";
 import Sources from "../src/Sources.svelte";
 import CollectionDirectory from "../src/CollectionDirectory.svelte";
 import {
@@ -33,6 +35,7 @@ afterEach(() => {
   cleanup();
   vi.useRealTimers();
   vi.unstubAllGlobals();
+  history.replaceState(null, "", "/");
 });
 
 // The URL a stubbed fetch was called with.
@@ -881,6 +884,19 @@ test("crawl requests show their trigger and initial crawls awaiting submission a
         pds: "https://accepted.example",
         sourceOperation: "00000000-0000-4000-8000-0000000000c3",
       }),
+      ...(
+        [
+          "not_requested",
+          "skipped_not_configured",
+          "skipped_not_https",
+          "skipped_conflict",
+        ] as const
+      ).map((phase) =>
+        bootstrap(phase, {
+          pds: `https://${phase}.example`,
+          sourceOperation: phase,
+        }),
+      ),
     ],
     submit: vi.fn(),
   });
@@ -900,6 +916,187 @@ test("crawl requests show their trigger and initial crawls awaiting submission a
   });
   expect(within(awaiting).getByText("https://waiting.example")).toBeTruthy();
   expect(within(awaiting).queryByText("https://accepted.example")).toBeNull();
+  expect(within(awaiting).getAllByRole("row")).toHaveLength(2);
+});
+
+test("the directory loads all open bootstrap pages before declaring its queue complete", async () => {
+  history.replaceState(null, "", "/collection-directory");
+  const newerTerminal = Array.from({ length: 101 }, (_, index) =>
+    bootstrap("skipped_not_configured", {
+      sourceOperation: `terminal-${index}`,
+      pds: `https://terminal-${index}.example`,
+    }),
+  );
+  const newerOpen = Array.from({ length: 100 }, (_, index) =>
+    bootstrap("waiting", {
+      sourceOperation: `open-${index}`,
+      pds: `https://open-${index}.example`,
+    }),
+  );
+  const olderOpen = (["needs_attention", "retrying", "accepted"] as const).map(
+    (phase) =>
+      bootstrap(phase, {
+        sourceOperation: `old-${phase}`,
+        pds: `https://old-${phase}.example`,
+        createdAt: "2026-11-01T10:00:00.000Z",
+      }),
+  );
+  let finish!: (response: Response) => void;
+  const lastPage = new Promise<Response>((resolve) => {
+    finish = resolve;
+  });
+  const fetcher = vi.fn((input: RequestInfo | URL) => {
+    const url = new URL(requestUrl(input), location.origin);
+    if (url.pathname === "/api/v1/session")
+      return Promise.resolve(
+        Response.json({ did: "did:plc:operator", csrf: "test" }),
+      );
+    if (url.pathname.endsWith("/status"))
+      return Promise.resolve(Response.json(directory()));
+    if (url.pathname.endsWith("/bootstraps")) {
+      if (url.searchParams.get("phase") !== "open")
+        return Promise.resolve(
+          Response.json({
+            items: newerTerminal.slice(0, 100),
+            next: "terminal-page",
+          }),
+        );
+      if (url.searchParams.has("after")) return lastPage;
+      return Promise.resolve(
+        Response.json({ items: newerOpen, next: "older/open+cursor" }),
+      );
+    }
+    return Promise.resolve(Response.json({ items: [], next: null }));
+  });
+  vi.stubGlobal("fetch", fetcher);
+  render(App);
+  const awaiting = await screen.findByRole("table", {
+    name: "Initial crawls awaiting submission",
+  });
+  await waitFor(() =>
+    expect(
+      fetcher.mock.calls.some(
+        ([input]) =>
+          requestUrl(input) ===
+          "/api/v1/collection-directory/bootstraps?phase=open&limit=100&after=older%2Fopen%2Bcursor",
+      ),
+    ).toBe(true),
+  );
+  expect(
+    within(awaiting).queryByText(/No initial crawls are waiting/),
+  ).toBeNull();
+  expect(within(awaiting).queryByText("https://open-0.example")).toBeNull();
+  finish(Response.json({ items: olderOpen, next: null }));
+  expect(
+    await within(awaiting).findByText("https://old-needs_attention.example"),
+  ).toBeTruthy();
+  expect(
+    within(awaiting).getByText("https://old-retrying.example"),
+  ).toBeTruthy();
+  expect(
+    within(awaiting).queryByText("https://old-accepted.example"),
+  ).toBeNull();
+  expect(within(awaiting).queryByText("https://terminal-0.example")).toBeNull();
+  for (const row of olderOpen)
+    expect(crawlsInProgress(directory(), [], null, [row])).toBe(
+      row.phase !== "needs_attention",
+    );
+});
+
+test.each([false, true])(
+  "a superseded bootstrap page cannot overwrite a newer refresh (failure: %s)",
+  async (fail) => {
+    history.replaceState(null, "", "/collection-directory");
+    let finish!: (response: Response) => void;
+    let reject!: (error: Error) => void;
+    const stalePage = new Promise<Response>((resolve, rejectPromise) => {
+      finish = resolve;
+      reject = rejectPromise;
+    });
+    let refresh = 0;
+    const freshBootstrap = bootstrap("retrying", {
+      pds: "https://fresh.example",
+    });
+    const fetcher = vi.fn((input: RequestInfo | URL) => {
+      const url = new URL(requestUrl(input), location.origin);
+      if (url.pathname === "/api/v1/session")
+        return Promise.resolve(
+          Response.json({ did: "did:plc:operator", csrf: "test" }),
+        );
+      if (url.pathname.endsWith("/status")) {
+        refresh++;
+        return Promise.resolve(
+          Response.json(directory({ available: refresh > 1 })),
+        );
+      }
+      if (url.pathname.endsWith("/bootstraps")) {
+        if (url.searchParams.has("after")) return stalePage;
+        return Promise.resolve(
+          Response.json(
+            refresh === 1
+              ? { items: [], next: "older" }
+              : { items: [freshBootstrap], next: null },
+          ),
+        );
+      }
+      return Promise.resolve(
+        Response.json({
+          items: [
+            crawl(
+              refresh === 1 ? "https://stale.example" : "https://fresh.example",
+            ),
+          ],
+          next: null,
+        }),
+      );
+    });
+    vi.stubGlobal("fetch", fetcher);
+    render(App);
+    await waitFor(() =>
+      expect(
+        fetcher.mock.calls.some(([input]) =>
+          requestUrl(input).includes("after=older"),
+        ),
+      ).toBe(true),
+    );
+    await fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    const awaiting = screen.getByRole("table", {
+      name: "Initial crawls awaiting submission",
+    });
+    expect(
+      await within(awaiting).findByText("https://fresh.example"),
+    ).toBeTruthy();
+    if (fail) reject(new Error("stale page failed"));
+    else
+      finish(
+        Response.json({
+          items: [bootstrap("waiting", { pds: "https://stale.example" })],
+          next: null,
+        }),
+      );
+    await stalePage.catch(() => {});
+    await waitFor(() => {
+      expect(within(awaiting).getByText("https://fresh.example")).toBeTruthy();
+      expect(screen.queryByText("https://stale.example")).toBeNull();
+      expect(
+        (
+          screen.getByRole("button", {
+            name: "Crawl all enabled sources",
+          }) as HTMLButtonElement
+        ).disabled,
+      ).toBe(false);
+    });
+  },
+);
+
+test("an unloaded bootstrap queue does not claim that no initial crawls are waiting", async () => {
+  const { rerender } = render(CollectionDirectory, {
+    directory: directory(),
+    submit: vi.fn(),
+  });
+  expect(screen.queryByText(/No initial crawls are waiting/)).toBeNull();
+  await rerender({ bootstrapsLoaded: true });
+  expect(screen.getByText(/No initial crawls are waiting/)).toBeTruthy();
 });
 
 test("polling continues for open initial crawls and pending source enables only", () => {

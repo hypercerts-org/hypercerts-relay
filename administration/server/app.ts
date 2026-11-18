@@ -330,9 +330,12 @@ export function createApp(
   // rather than the HTTPS-only PDS origin schema.
   app.get("/api/v1/collection-directory/bootstraps", (req, res) => {
     const p = page
-      .extend({ pds: z.string().max(300).optional() })
+      .extend({
+        pds: z.string().max(300).optional(),
+        phase: z.literal("open").optional(),
+      })
       .parse(req.query);
-    res.json(bootstraps.page(p.after, p.limit, p.pds));
+    res.json(bootstraps.page(p.after, p.limit, p.pds, p.phase));
   });
   app.get("/api/v1/limits", (req, res) =>
     services

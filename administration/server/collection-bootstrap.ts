@@ -240,13 +240,19 @@ export class CollectionBootstrap {
     after: string,
     limit: number,
     pds?: string,
+    phase?: "open",
   ): { items: CollectionBootstrapView[]; next: string | null } {
     const [createdAt, id] = crawlCursor(after);
     const rows = this.store.db
       .prepare(
-        `SELECT * FROM collection_bootstraps
-         WHERE (?='' OR (createdAt,sourceOperation)<(?,?)) AND (?='' OR pds=?)
-         ORDER BY createdAt DESC,sourceOperation DESC LIMIT ?`,
+        `SELECT b.* FROM collection_bootstraps b
+         LEFT JOIN operations o ON o.id=b.crawlOperation
+         LEFT JOIN collection_crawls c ON c.operation=o.id AND c.pds=b.pds
+         WHERE (?='' OR (b.createdAt,b.sourceOperation)<(?,?)) AND (?='' OR b.pds=?)
+           AND (?='' OR (b.outcome='queued' AND
+             (o.state IN ('requested','applying','incomplete') OR
+              (o.state='applied' AND c.state='accepted'))))
+         ORDER BY b.createdAt DESC,b.sourceOperation DESC LIMIT ?`,
       )
       .all(
         createdAt,
@@ -254,6 +260,7 @@ export class CollectionBootstrap {
         id,
         pds ?? "",
         pds ?? "",
+        phase ?? "",
         limit + 1,
       ) as unknown as BootstrapRow[];
     return {

@@ -142,7 +142,7 @@ The browser-facing API is `/api/v1`; all endpoints below require authorization.
 | `GET`, `POST /sources/discovery/settings` | Automatic PDS discovery settings: `{maxAccountLimit}`, a whole number of at least 1,000 (default 100,000). Changes are CSRF protected and audited as `discovery_settings_changed`. |
 | `GET /collection-directory/status`       | Always HTTP 200: `configured`, `available`, bounded `error` code, active crawls and recent crawl results.   |
 | `GET /collection-directory/crawls`       | Newest-first crawl requests with actor, times, trigger (`cause`: `manual` or `source_added`), the enabling `sourceOperation`, submission, state and result; optional exact `pds` and crawl-row `ids` filters. |
-| `GET /collection-directory/bootstraps`   | Newest-first automatic initial crawls with the enabling operation and actor, outcome, `phase`, follow-up request state, attempts and next retry time, and the crawl row once accepted; optional exact `pds` filter, which also matches `http://` sources. |
+| `GET /collection-directory/bootstraps`   | Newest-first automatic initial crawls with the enabling operation and actor, outcome, `phase`, follow-up request state, attempts and next retry time, and the crawl row once accepted; optional exact `pds` filter, which also matches `http://` sources. Optional `phase=open` selects only `waiting`, `retrying`, `needs_attention` and `accepted` before the same `after`/`limit` cursor paging; any other filter value is rejected, and omitting it returns all phases. |
 
 Commands are discriminated by `kind`: `source` (`pds`, `state`), `collections`
 (`expectedRevision`, exact `collections`), `job` (`pds`, `reason`), `job_action`
