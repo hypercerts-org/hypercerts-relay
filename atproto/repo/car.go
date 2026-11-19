@@ -13,10 +13,22 @@ import (
 	blocks "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
 	"github.com/ipld/go-car"
+	"github.com/multiformats/go-multihash"
 )
 
 var ErrNoRoot = errors.New("CAR file missing root CID")
 var ErrNoCommit = errors.New("no commit")
+
+// hypercerts: validateRepoCID rejects CIDs taken from untrusted repo data unless they use the 32-byte sha2-256 multihash that atproto repos require.
+//
+// go-car only checks a block against the hash function and digest length named in the block's own CID, so a weak or truncated hash (eg, a zero-length digest, which matches any data) would otherwise break content addressing.
+func validateRepoCID(c cid.Cid) error {
+	p := c.Prefix()
+	if p.MhType != multihash.SHA2_256 || p.MhLength != 32 {
+		return fmt.Errorf("unsupported CID hash (must be 32-byte sha2-256): %s", c)
+	}
+	return nil
+}
 
 func LoadRepoFromCAR(ctx context.Context, r io.Reader) (*Commit, *Repo, error) {
 
@@ -35,6 +47,9 @@ func LoadRepoFromCAR(ctx context.Context, r io.Reader) (*Commit, *Repo, error) {
 		return nil, nil, fmt.Errorf("CAR file missing root CID")
 	}
 	commitCID := cr.Header.Roots[0]
+	if err := validateRepoCID(commitCID); err != nil {
+		return nil, nil, fmt.Errorf("CAR file root: %w", err)
+	}
 
 	for {
 		blk, err := cr.Next()
@@ -45,6 +60,9 @@ func LoadRepoFromCAR(ctx context.Context, r io.Reader) (*Commit, *Repo, error) {
 			return nil, nil, err
 		}
 
+		if err := validateRepoCID(blk.Cid()); err != nil {
+			return nil, nil, fmt.Errorf("CAR file block: %w", err)
+		}
 		if err := bs.Put(ctx, blk); err != nil {
 			return nil, nil, err
 		}
@@ -66,6 +84,12 @@ func LoadRepoFromCAR(ctx context.Context, r io.Reader) (*Commit, *Repo, error) {
 	tree, err := mst.LoadTreeFromStore(ctx, bs, commit.Data)
 	if err != nil {
 		return nil, nil, fmt.Errorf("reading MST from CAR file: %w", err)
+	}
+	// hypercerts: MST blocks are untrusted input; check structure before any tree
+	// operations rely on it (removal, re-encoding, inversion). Missing (partial)
+	// child nodes are allowed by the loader and skipped by Verify.
+	if err := tree.Verify(); err != nil {
+		return nil, nil, fmt.Errorf("reading MST from CAR file: %w: %w", mst.ErrInvalidTree, err)
 	}
 	clk := syntax.ClockFromTID(syntax.TID(commit.Rev))
 	repo := Repo{
@@ -91,6 +115,9 @@ func LoadCommitFromCAR(ctx context.Context, r io.Reader) (*Commit, *cid.Cid, err
 		return nil, nil, ErrNoRoot
 	}
 	commitCID := cr.Header.Roots[0]
+	if err := validateRepoCID(commitCID); err != nil {
+		return nil, nil, fmt.Errorf("CAR file root: %w", err)
+	}
 	var commitBlock blocks.Block
 	for {
 		blk, err := cr.Next()
@@ -101,6 +128,9 @@ func LoadCommitFromCAR(ctx context.Context, r io.Reader) (*Commit, *cid.Cid, err
 			return nil, nil, err
 		}
 
+		if err := validateRepoCID(blk.Cid()); err != nil {
+			return nil, nil, fmt.Errorf("CAR file block: %w", err)
+		}
 		if blk.Cid().Equals(commitCID) {
 			commitBlock = blk
 			break

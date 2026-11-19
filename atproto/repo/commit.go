@@ -37,6 +37,15 @@ func (c *Commit) VerifyStructure() error {
 	if err != nil {
 		return fmt.Errorf("invalid commit data: %w", err)
 	}
+	// hypercerts: the signed commit must bind its MST root (and prev) with a full-strength hash.
+	if err := validateRepoCID(c.Data); err != nil {
+		return fmt.Errorf("invalid commit data: %w", err)
+	}
+	if c.Prev != nil {
+		if err := validateRepoCID(*c.Prev); err != nil {
+			return fmt.Errorf("invalid commit prev: %w", err)
+		}
+	}
 	return nil
 }
 

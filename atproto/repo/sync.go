@@ -40,6 +40,29 @@ func VerifyCommitMessage(ctx context.Context, msg *comatproto.SyncSubscribeRepos
 		logger.Warn("event with rebase flag set")
 	}
 
+	// hypercerts: CIDs carried beside the CAR must also use the 32-byte sha2-256 hash atproto repos require.
+	if msg.PrevData != nil {
+		if err := validateRepoCID(cid.Cid(*msg.PrevData)); err != nil {
+			return nil, fmt.Errorf("invalid prevData: %w", err)
+		}
+	}
+	for _, op := range msg.Ops {
+		// hypercerts: a CBOR null in the ops array decodes to a nil entry; reject it before dereferencing it.
+		if op == nil {
+			return nil, fmt.Errorf("null entry in ops list")
+		}
+		if op.Cid != nil {
+			if err := validateRepoCID(cid.Cid(*op.Cid)); err != nil {
+				return nil, fmt.Errorf("invalid repo op cid: %w", err)
+			}
+		}
+		if op.Prev != nil {
+			if err := validateRepoCID(cid.Cid(*op.Prev)); err != nil {
+				return nil, fmt.Errorf("invalid repo op prev: %w", err)
+			}
+		}
+	}
+
 	commit, repo, err := LoadRepoFromCAR(ctx, bytes.NewReader([]byte(msg.Blocks)))
 	if err != nil {
 		return nil, err
@@ -55,6 +78,10 @@ func VerifyCommitMessage(ctx context.Context, msg *comatproto.SyncSubscribeRepos
 
 	// load out all the records
 	for _, op := range msg.Ops {
+		// hypercerts: a CBOR null in the ops array decodes to a nil entry; reject it before any later loop dereferences it.
+		if op == nil {
+			return nil, fmt.Errorf("null entry in ops list")
+		}
 		if (op.Action == "create" || op.Action == "update") && op.Cid != nil {
 			c := (*cid.Cid)(op.Cid)
 			nsid, rkey, err := syntax.ParseRepoPath(op.Path)

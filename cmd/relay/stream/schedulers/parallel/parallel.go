@@ -3,7 +3,9 @@ package parallel
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 
@@ -186,6 +188,26 @@ func (p *Scheduler) AddWork(ctx context.Context, repo string, val *stream.XRPCSt
 	}
 }
 
+// doSafely runs the consumer callback, converting a panic into an error.
+//
+// hypercerts: upstream event data is untrusted, and a panic while processing
+// one event must not kill the whole relay process. Converting the panic to an
+// error stops only this source's scheduler (the same failure class as any
+// other consumer error) and surfaces the panic and stack in the log.
+func (p *Scheduler) doSafely(ctx context.Context, val *stream.XRPCStreamEvent) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if e, ok := r.(error); ok {
+				err = fmt.Errorf("event handler panicked: %w", e)
+			} else {
+				err = fmt.Errorf("event handler panicked: %v", r)
+			}
+			p.log.Error("caught panic in event handler", "ident", p.ident, "recover", r, "stack", string(debug.Stack()))
+		}
+	}()
+	return p.do(ctx, val)
+}
+
 func (p *Scheduler) worker() {
 	defer p.workers.Done()
 
@@ -200,7 +222,7 @@ func (p *Scheduler) worker() {
 				}
 
 				p.itemsActive.Inc()
-				if err := p.do(p.ctx, work.val); err != nil {
+				if err := p.doSafely(p.ctx, work.val); err != nil {
 					p.log.Error("event handler failed", "ident", p.ident, "err", err)
 					p.stop(err)
 					return
