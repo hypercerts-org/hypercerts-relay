@@ -25,7 +25,11 @@ func TestDiscardPendingChainFallsBackToArchivedState(t *testing.T) {
 	require.NoError(t, p.Flush())
 
 	require.NoError(t, p.SaveChain(t.Context(), did, atmossync.ChainState{Rev: "3mmoojp7vgo2f", Data: data}))
-	p.DiscardPendingChain(did)
+	p.DiscardPendingChain(did, "3mmoojp7vgo2e")
+	later, err := p.LoadChain(t.Context(), did)
+	require.NoError(t, err)
+	require.Equal(t, "3mmoojp7vgo2f", later.Rev, "state staged above the rejected revision belongs to a later event")
+	p.DiscardPendingChain(did, "3mmoojp7vgo2f")
 	p.PromoteChain(did, "3mmoojp7vgo2z")
 	require.NoError(t, p.Flush())
 

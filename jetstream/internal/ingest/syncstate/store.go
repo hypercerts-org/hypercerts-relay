@@ -359,9 +359,15 @@ func (p *PebbleStateStore) PromoteChain(did atmos.DID, maxRev string) {
 // back to the last promoted or durable state, so the DID's next commit is
 // checked against what the archive actually holds and a divergence triggers a
 // fresh resync instead of being promoted over the gap.
-func (p *PebbleStateStore) DiscardPendingChain(did atmos.DID) {
+//
+// Only state at or below maxRev is discarded. A later event for the same DID
+// may already have been verified and staged at a higher revision; that entry
+// belongs to the later event and is left for it to promote.
+func (p *PebbleStateStore) DiscardPendingChain(did atmos.DID, maxRev string) {
 	p.mu.Lock()
-	delete(p.pendingChain, did)
+	if pending, ok := p.pendingChain[did]; ok && pending.rev <= maxRev {
+		delete(p.pendingChain, did)
+	}
 	p.mu.Unlock()
 }
 

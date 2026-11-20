@@ -112,7 +112,8 @@ func (d *CacheDirectory) ResolveHandle(ctx context.Context, h syntax.Handle) (sy
 	handleCacheMisses.Inc()
 
 	// Coalesce multiple requests for the same Handle
-	res := make(chan struct{})
+	// hypercerts: share the result even when local admission bypasses the cache.
+	res := &handleLookupResult{done: make(chan struct{})}
 	val, loaded := d.handleLookupChans.LoadOrStore(h.String(), res)
 	if loaded {
 		handleRequestsCoalesced.Inc()
@@ -120,13 +121,9 @@ func (d *CacheDirectory) ResolveHandle(ctx context.Context, h syntax.Handle) (sy
 		handleResolutionDuration.WithLabelValues("lru", "coalesced").Observe(time.Since(start).Seconds())
 		// Wait for the result from the pending request
 		select {
-		case <-val.(chan struct{}):
-			// The result should now be in the cache
-			entry, ok := d.handleCache.Get(h)
-			if ok && !d.isHandleStale(&entry) {
-				return entry.DID, entry.Err
-			}
-			return "", fmt.Errorf("identity not found in cache after coalesce returned")
+		case <-val.(*handleLookupResult).done:
+			result := val.(*handleLookupResult).entry
+			return result.DID, result.Err
 		case <-ctx.Done():
 			return "", ctx.Err()
 		}
@@ -135,10 +132,9 @@ func (d *CacheDirectory) ResolveHandle(ctx context.Context, h syntax.Handle) (sy
 	// Update the Handle Entry from PLC and cache the result
 	newEntry := d.updateHandle(ctx, h)
 
-	// Cleanup the coalesce map and close the results channel
+	res.entry = newEntry
 	d.handleLookupChans.Delete(h.String())
-	// Callers waiting will now get the result from the cache
-	close(res)
+	close(res.done)
 
 	if newEntry.Err != nil {
 		handleResolution.WithLabelValues("lru", "error").Inc()
@@ -179,6 +175,11 @@ func (d *CacheDirectory) updateDID(ctx context.Context, did syntax.DID) identity
 		d.handleCache.Add(ident.Handle, *he)
 	}
 	return entry
+}
+
+type handleLookupResult struct {
+	done  chan struct{}
+	entry handleEntry
 }
 
 type didLookupResult struct {
