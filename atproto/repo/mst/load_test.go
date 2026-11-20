@@ -38,20 +38,17 @@ func (m mapBlockSource) putNode(t *testing.T, nd NodeData) cid.Cid {
 	return *c
 }
 
-// Shared subtrees: N(i) = {l: N(i-1), e: [{k: "a", t: N(i-1)}]}. Without a visited set, loading N(60) decodes ~2^61 nodes.
+// A node referenced more than once must be rejected.
 func TestLoadTreeRejectsSharedSubtree(t *testing.T) {
 	assert := assert.New(t)
 	ctx := context.Background()
 	bs := mapBlockSource{}
 
-	prev := bs.putNode(t, NodeData{Entries: []EntryData{{KeySuffix: []byte("a"), Value: testEntryCid(t)}}})
-	for i := 1; i <= 60; i++ {
-		child := prev
-		prev = bs.putNode(t, NodeData{
-			Left:    &child,
-			Entries: []EntryData{{KeySuffix: []byte("a"), Value: testEntryCid(t), Right: &child}},
-		})
-	}
+	child := bs.putNode(t, NodeData{Entries: []EntryData{{KeySuffix: []byte("a"), Value: testEntryCid(t)}}})
+	prev := bs.putNode(t, NodeData{
+		Left:    &child,
+		Entries: []EntryData{{KeySuffix: []byte("a"), Value: testEntryCid(t), Right: &child}},
+	})
 
 	_, err := LoadTreeFromStore(ctx, bs, prev)
 	assert.ErrorIs(err, ErrInvalidTree)
@@ -85,7 +82,7 @@ func TestLoadTreeDepthLimit(t *testing.T) {
 func TestLoadTreeRejectsWeakLinkCID(t *testing.T) {
 	ctx := context.Background()
 
-	// CIDv1 dag-cbor sha2-256 with a zero-length digest: matches any data
+	// a CID whose sha2-256 digest is not 32 bytes
 	emptyDigest, err := cid.Cast([]byte{0x01, 0x71, 0x12, 0x00})
 	if err != nil {
 		t.Fatal(err)

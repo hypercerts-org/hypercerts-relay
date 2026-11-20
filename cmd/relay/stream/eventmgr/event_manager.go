@@ -177,8 +177,8 @@ func (em *EventManager) Subscribe(ctx context.Context, ident string, filter func
 		}
 
 		// now, start buffering events from the live stream
-		// hypercerts: Register only if cleanup has not run. Cleanup closes
-		// sub.outgoing, and a broadcast to a re-registered subscriber panics.
+		// hypercerts: Register only if cleanup has not run; cleanup closes
+		// sub.outgoing.
 		sub.lk.Lock()
 		if sub.cleanedUp {
 			sub.lk.Unlock()

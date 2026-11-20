@@ -33,30 +33,32 @@ func (s testBlockSource) put(t *testing.T, nd NodeData) cid.Cid {
 	return *c
 }
 
-// Removing a key between two empty child nodes (invalid, but accepted when decoding) must return an error, not panic.
-func TestRemoveBetweenEmptyChildren(t *testing.T) {
+// Removing a key whose left neighbour is an empty child node must return an error, not panic.
+func TestRemoveAfterEmptyLeftChild(t *testing.T) {
 	assert := assert.New(t)
 	ctx := context.Background()
 	val := testEntryCid(t)
 
 	bs := testBlockSource{}
 	empty := bs.put(t, NodeData{Entries: []EntryData{}})
+	right := bs.put(t, NodeData{
+		Entries: []EntryData{{
+			KeySuffix: []byte("com.example.record/3jqfcqzm3fo2z"),
+			Value:     val,
+		}},
+	})
 	root := bs.put(t, NodeData{
 		Left: &empty,
 		Entries: []EntryData{{
 			KeySuffix: []byte("com.example.record/3jqfcqzm3fo2j"),
 			Value:     val,
-			Right:     &empty,
+			Right:     &right,
 		}},
 	})
 
 	tree, err := LoadTreeFromStore(ctx, bs, root)
 	if err != nil {
-		// Both empty children share one CID, so the loader (which refuses
-		// repeated node references) rejects the tree at load time — stronger
-		// than the mergeNodes guard this test was written for.
-		assert.ErrorIs(err, ErrInvalidTree)
-		return
+		t.Fatal(err)
 	}
 
 	assert.NotPanics(func() {
@@ -89,7 +91,9 @@ func TestRemoveBeforeEmptyRightChild(t *testing.T) {
 	})
 
 	tree, err := LoadTreeFromStore(ctx, bs, root)
-	assert.NoError(err)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	assert.NotPanics(func() {
 		_, err = tree.Remove([]byte("com.example.record/3jqfcqzm3fo2j"))

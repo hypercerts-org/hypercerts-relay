@@ -33,6 +33,9 @@ type PersistHostStatusFunc func(ctx context.Context, hostID uint64, state models
 //
 // It configures rate-limits, tracks cursors, and retries connections. It passes received messages on to the main relay via a callback function. `Slurper` does not talk to the database directly, but does have some callback to persist host state (cursors and hosting status for some error conditions).
 type Slurper struct {
+	// hypercerts: waits before redialing after the given number of consecutive handler panics; reports false if ctx ended. Replaced in tests.
+	waitAfterHandlerPanic func(ctx context.Context, attempt int) bool
+
 	processCallback ProcessMessageFunc
 	Config          *SlurperConfig
 
@@ -362,6 +365,8 @@ func (s *Slurper) subscribeWithRedialer(ctx context.Context, host *models.Host, 
 	cursor := host.LastSeq
 
 	var backoff int
+	// hypercerts: counts consecutive handler panics without cursor progress; kept apart from dial backoff.
+	var panicBackoff int
 	for {
 		select {
 		case <-ctx.Done():
@@ -429,7 +434,8 @@ func (s *Slurper) subscribeWithRedialer(ctx context.Context, host *models.Host, 
 		logger.Debug("event subscription response", "code", resp.StatusCode, "url", u)
 		sub.setState("connected")
 		connectedInbound.Inc()
-		if err := s.handleConnection(ctx, conn, sub); err != nil {
+		connErr := s.handleConnection(ctx, conn, sub)
+		if err := connErr; err != nil {
 
 			// TODO: measure the last N connection error times and if they're coming too fast reconnect slower or don't reconnect and wait for requestCrawl
 			// hypercerts: Preserve stream-processing errors as well as retry context.
@@ -446,6 +452,7 @@ func (s *Slurper) subscribeWithRedialer(ctx context.Context, host *models.Host, 
 			// did we make any progress?
 			cursor = updatedCursor
 			backoff = 0
+			panicBackoff = 0
 
 			// hypercerts: The deferred bounded flush owns cursor persistence after cancellation.
 			if ctx.Err() != nil {
@@ -459,7 +466,32 @@ func (s *Slurper) subscribeWithRedialer(ctx context.Context, host *models.Host, 
 					logger.Warn("failed to persist cursor", "err", err)
 				}
 			}
+		} else if errors.Is(connErr, parallel.ErrHandlerPanic) {
+			// hypercerts: the failed position is not acknowledged, so the redial
+			// replays it; wait first so a repeating panic cannot spin.
+			if panicBackoff < 10 {
+				panicBackoff++
+			}
+			wait := s.waitAfterHandlerPanic
+			if wait == nil {
+				wait = waitForBackoff
+			}
+			if !wait(ctx, panicBackoff) {
+				return
+			}
 		}
+	}
+}
+
+// hypercerts: waitForBackoff sleeps for the backoff step, reporting false if ctx ends first.
+func waitForBackoff(ctx context.Context, attempt int) bool {
+	timer := time.NewTimer(sleepForBackoff(attempt))
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 
@@ -561,7 +593,15 @@ func (s *Slurper) handleConnection(ctx context.Context, conn *websocket.Conn, su
 	connLogger := s.logger.With("host", sub.Hostname)
 	err := stream.HandleRepoStream(ctx, conn, rateScheduler{Scheduler: scheduler, wait: s.Config.WaitRateCapacity, host: sub.Hostname}, connLogger)
 	if processErr := scheduler.Err(); processErr != nil {
-		return processErr
+		err = processErr
+	}
+	// hypercerts: the workers have been joined, so the count is final. It is read
+	// apart from the stop reason, which a concurrent shutdown can leave empty.
+	if n := scheduler.HandlerPanics(); n > 0 {
+		handlerPanics.WithLabelValues(sub.Hostname).Add(float64(n))
+		if !errors.Is(err, parallel.ErrHandlerPanic) {
+			err = errors.Join(parallel.ErrHandlerPanic, err)
+		}
 	}
 	return err
 }
