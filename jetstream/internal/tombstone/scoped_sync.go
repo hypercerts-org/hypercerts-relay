@@ -10,7 +10,8 @@ import (
 
 const scopedSyncKey = "hypercertsSelectedSync"
 
-// ErrScopedSyncEncode wraps every EncodeScopedSync failure. The #sync payload
+// ErrScopedSyncEncode wraps every EncodeScopedSync failure caused by upstream
+// input; a local policy that cannot be represented is returned unwrapped. The #sync payload
 // is upstream-controlled: a payload the scoped marker cannot represent (for
 // example blocks above the CBOR codec's byte-string limit) is unrepresentable
 // input, and callers at the live-event boundary drop the whole event instead
