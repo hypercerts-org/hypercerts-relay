@@ -9,6 +9,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/bluesky-social/jetstream/internal/ingest/syncstate"
+	"github.com/jcalabro/atmos/cbor"
+	"github.com/jcalabro/atmos/mst"
 	"iter"
 	"log/slog"
 	"net"
@@ -355,7 +358,9 @@ func (c *Consumer) cursorValue() int64 {
 		cur := c.processedUpstream.Load()
 		// processedUpstream is the highest completed seq, and events for
 		// different DIDs complete out of order. Never checkpoint past the
-		// verifier's watermark, which trails every seq still in flight.
+		// verifier's watermark, which trails every seq still in flight. The
+		// watermark can lag completed work on an idle stream; the cost is a
+		// bounded replay of already-archived events after a restart.
 		if cl := c.client.Load(); cl != nil {
 			cur = min(cur, cl.Cursor())
 		}
@@ -1025,10 +1030,13 @@ func validateSyncMarker(marker segment.Event) error {
 // fetched. An empty set that cannot be bound is rejected rather than
 // reconciled as "the repository has no records".
 //
-// The chain state is per DID, not per event: a later event for the same DID
-// that was verified before this one is processed moves it. That normally
-// makes a valid empty set fail the check, which is the safe direction (drop
-// and recover). It is not a proof of equality for this event.
+// The chain state is per DID, not per event, so the check does not rely on
+// which event produced it. It is a statement about content: the verifier
+// holds a signed commit for this DID at exactly the #sync's revision whose
+// data root is the empty tree, so the repository at that revision has no
+// records. A later same-DID event that moved the state elsewhere makes a
+// valid empty set fail the check, which is the safe direction (drop and
+// recover).
 func (c *Consumer) preflightSync(ctx context.Context, evt streaming.Event, segEvts []segment.Event) error {
 	marker := segEvts[0]
 	if err := ingest.ValidateSyncReplacementRows(marker.DID, marker.Rev, segEvts[1:]); err != nil {
@@ -1052,30 +1060,46 @@ func (c *Consumer) preflightSync(ctx context.Context, evt streaming.Event, segEv
 	if err != nil {
 		return fmt.Errorf("livestream: bind empty sync replacement: %w", err)
 	}
-	if state == nil || state.Rev != marker.Rev {
+	emptyRoot, err := emptyRepoRoot()
+	if err != nil {
+		return fmt.Errorf("livestream: bind empty sync replacement: %w", err)
+	}
+	if state == nil || state.Rev != marker.Rev || !state.Data.Equal(emptyRoot) {
 		return errSyncUnbound
 	}
 	return nil
 }
 
+// emptyRepoRoot is the data root of a repository with no records.
+var emptyRepoRoot = sync.OnceValues(func() (cbor.CID, error) {
+	store := mst.NewMemBlockStore()
+	return mst.NewTree(store).WriteBlocks(store)
+})
+
 // dropRejectedSync drops one unrepresentable #sync whole. Nothing was
 // published for it, but the verifier has already staged chain state for the
-// repository it fetched. State staged at or below the revisions this event
-// carried is discarded rather than promoted, so this event cannot make the
-// verifier durable ahead of the archive; state a later same-DID event staged
-// at a higher revision is left to that event. The DID is also handed to the
-// recovery sink when one is configured. Both are best effort: the sink is
-// asynchronous and bounded, and an empty set does not reveal the revision
-// that was fetched. The upstream event itself is complete: redelivering it
+// repository it fetched, and that state must not become durable ahead of the
+// archive. For a set with rows, state staged at or below the highest revision
+// the event carried is discarded. An empty set does not reveal the revision
+// that was fetched, so all staged state for the DID is discarded. Discarding
+// too much is the safe direction: the verifier falls back to the state the
+// archive holds and the next commit repairs through a resync, whereas keeping
+// too much would verify later commits against a repository the archive never
+// accepted. The DID is also handed to the
+// recovery sink when one is configured; that sink is asynchronous and bounded,
+// so it is best effort. The upstream event itself is complete: redelivering it
 // would be rejected again. Counter only: upstream input must not drive log
 // volume.
 func (c *Consumer) dropRejectedSync(seq int64, segEvts []segment.Event, reason ingest.DropReason) {
 	did := segEvts[0].DID
 	c.cfg.DropMetrics.IncDropped(ingest.DropSourceLive, reason)
 	if c.cfg.SyncStateStore != nil {
-		var maxRev string
-		for i := range segEvts {
-			maxRev = max(maxRev, segEvts[i].Rev)
+		maxRev := syncstate.DiscardAllRevisions
+		if len(segEvts) > 1 {
+			maxRev = ""
+			for i := range segEvts {
+				maxRev = max(maxRev, segEvts[i].Rev)
+			}
 		}
 		c.cfg.SyncStateStore.DiscardPendingChain(atmos.DID(did), maxRev)
 	}

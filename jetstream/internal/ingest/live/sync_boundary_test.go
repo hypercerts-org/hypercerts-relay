@@ -21,6 +21,7 @@ import (
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos"
 	"github.com/jcalabro/atmos/api/comatproto"
+	"github.com/jcalabro/atmos/cbor"
 	"github.com/jcalabro/atmos/streaming"
 	atmossync "github.com/jcalabro/atmos/sync"
 	"github.com/jcalabro/atmos/xrpc"
@@ -137,6 +138,8 @@ func TestProcessBatchEmptySyncRequiresBoundRevision(t *testing.T) {
 	empty := func(seq int64) streaming.Event {
 		return streaming.Event{Seq: seq, Resync: streaming.ResyncSyncEvent, Sync: &comatproto.SyncSubscribeRepos_Sync{DID: did, Rev: rev, Time: "2026-05-21T00:00:00Z"}}
 	}
+	emptyRoot, err := emptyRepoRoot()
+	require.NoError(t, err)
 	markers := func(c *Consumer) (n int) {
 		entries, _, _, _ := c.writer.ReadLog().ReadFrom(1, 20)
 		for _, entry := range entries {
@@ -151,7 +154,7 @@ func TestProcessBatchEmptySyncRequiresBoundRevision(t *testing.T) {
 		t.Parallel()
 		verifier := newTestVerifier(t)
 		// The verifier fetched a later revision than the #sync named.
-		require.NoError(t, verifier.StateStore().SaveChain(t.Context(), did, atmossync.ChainState{Rev: "3mmoojp7vgo2h"}))
+		require.NoError(t, verifier.StateStore().SaveChain(t.Context(), did, atmossync.ChainState{Rev: "3mmoojp7vgo2h", Data: emptyRoot}))
 		b := openBoundaryConsumer(t, true, verifier)
 		t.Cleanup(func() { _ = b.c.Close() })
 		require.NoError(t, b.c.processBatch(t.Context(), []streaming.Event{empty(50)}))
@@ -160,6 +163,17 @@ func TestProcessBatchEmptySyncRequiresBoundRevision(t *testing.T) {
 		require.Zero(t, markers(b.c))
 		require.InDelta(t, 1.0, testutil.ToFloat64(b.drops.Counter(ingest.DropSourceLive, ingest.DropReasonInvalidRev)), 0)
 		require.Equal(t, int64(50), b.c.cursorValue())
+	})
+
+	t.Run("matching revision with a non-empty data root is not an empty repository", func(t *testing.T) {
+		t.Parallel()
+		verifier := newTestVerifier(t)
+		require.NoError(t, verifier.StateStore().SaveChain(t.Context(), did, atmossync.ChainState{Rev: rev, Data: cbor.ComputeCID(cbor.CodecDagCBOR, []byte("records"))}))
+		b := openBoundaryConsumer(t, true, verifier)
+		t.Cleanup(func() { _ = b.c.Close() })
+		require.NoError(t, b.c.processBatch(t.Context(), []streaming.Event{empty(50)}))
+		require.Zero(t, *b.reconciled)
+		require.Equal(t, []string{did}, *b.recovered)
 	})
 
 	t.Run("no verifier state is not treated as bound", func(t *testing.T) {
@@ -173,7 +187,7 @@ func TestProcessBatchEmptySyncRequiresBoundRevision(t *testing.T) {
 	t.Run("bound empty set is a valid empty repository", func(t *testing.T) {
 		t.Parallel()
 		verifier := newTestVerifier(t)
-		require.NoError(t, verifier.StateStore().SaveChain(t.Context(), did, atmossync.ChainState{Rev: rev}))
+		require.NoError(t, verifier.StateStore().SaveChain(t.Context(), did, atmossync.ChainState{Rev: rev, Data: emptyRoot}))
 		b := openBoundaryConsumer(t, true, verifier)
 		t.Cleanup(func() { _ = b.c.Close() })
 		require.NoError(t, b.c.processBatch(t.Context(), []streaming.Event{empty(50)}))

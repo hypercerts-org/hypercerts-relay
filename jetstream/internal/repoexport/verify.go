@@ -263,11 +263,11 @@ var reservedPDSNetworks = []netip.Prefix{
 	netip.MustParsePrefix("192.88.99.0/24"), netip.MustParsePrefix("198.18.0.0/15"),
 	netip.MustParsePrefix("198.51.100.0/24"), netip.MustParsePrefix("203.0.113.0/24"),
 	netip.MustParsePrefix("240.0.0.0/4"),
-	// IPv6 special-purpose blocks inside 2000::/3 that are not globally
-	// reachable: Teredo, benchmarking, ORCHIDv1/v2, DRIP, documentation, 6to4.
-	netip.MustParsePrefix("2001::/32"), netip.MustParsePrefix("2001:2::/48"),
-	netip.MustParsePrefix("2001:10::/28"), netip.MustParsePrefix("2001:20::/28"),
-	netip.MustParsePrefix("2001:30::/28"), netip.MustParsePrefix("2001:db8::/32"),
+	// IPv6 special-purpose space inside 2000::/3. The IETF protocol block
+	// 2001::/23 is refused whole: it is not globally reachable by default,
+	// and its few reachable assignments are anycast infrastructure, never a
+	// PDS. Then documentation and 6to4.
+	netip.MustParsePrefix("2001::/23"), netip.MustParsePrefix("2001:db8::/32"),
 	netip.MustParsePrefix("2002::/16"), netip.MustParsePrefix("3fff::/20"),
 }
 

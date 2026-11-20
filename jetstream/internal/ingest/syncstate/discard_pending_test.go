@@ -29,7 +29,7 @@ func TestDiscardPendingChainFallsBackToArchivedState(t *testing.T) {
 	later, err := p.LoadChain(t.Context(), did)
 	require.NoError(t, err)
 	require.Equal(t, "3mmoojp7vgo2f", later.Rev, "state staged above the rejected revision belongs to a later event")
-	p.DiscardPendingChain(did, "3mmoojp7vgo2f")
+	p.DiscardPendingChain(did, DiscardAllRevisions)
 	p.PromoteChain(did, "3mmoojp7vgo2z")
 	require.NoError(t, p.Flush())
 

@@ -354,15 +354,18 @@ func (p *PebbleStateStore) PromoteChain(did atmos.DID, maxRev string) {
 	delete(p.pendingChain, did)
 }
 
+// DiscardAllRevisions sorts above every revision TID.
+const DiscardAllRevisions = "\xff"
+
 // hypercerts: DiscardPendingChain forgets verifier chain state that was staged
 // for an event the consumer then refused to archive. The verifier's view falls
 // back to the last promoted or durable state, so the DID's next commit is
 // checked against what the archive actually holds and a divergence triggers a
 // fresh resync instead of being promoted over the gap.
 //
-// Only state at or below maxRev is discarded. A later event for the same DID
-// may already have been verified and staged at a higher revision; that entry
-// belongs to the later event and is left for it to promote.
+// Only state at or below maxRev is discarded; DiscardAllRevisions discards
+// whatever is staged. Discarding a later event's staged state is safe: its
+// promotion becomes a no-op and the DID repairs through a resync.
 func (p *PebbleStateStore) DiscardPendingChain(did atmos.DID, maxRev string) {
 	p.mu.Lock()
 	if pending, ok := p.pendingChain[did]; ok && pending.rev <= maxRev {
