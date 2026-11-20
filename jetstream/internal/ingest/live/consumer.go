@@ -9,7 +9,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/bluesky-social/jetstream/internal/ingest/syncstate"
 	"github.com/jcalabro/atmos/cbor"
 	"github.com/jcalabro/atmos/mst"
 	"iter"
@@ -895,11 +894,13 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 				if c.cfg.Attribution != nil {
 					// The sync marker was appended under the same policy admission
 					// as reconciliation, including successful empty/no-op results.
+					c.syncReconciled(segEvts)
 					c.promoteSyncState(segEvts)
 					c.completeUpstreamEvent(evt.Seq)
 					continue
 				}
 				if handled {
+					c.syncReconciled(segEvts)
 					c.promoteSyncState(segEvts)
 					c.completeUpstreamEvent(evt.Seq)
 					continue
@@ -974,6 +975,7 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 				}
 			}
 
+			c.syncReconciled(segEvts)
 			c.promoteSyncState(segEvts)
 
 			// Track the highest seq we've witnessed. Under
@@ -1078,35 +1080,34 @@ var emptyRepoRoot = sync.OnceValues(func() (cbor.CID, error) {
 
 // dropRejectedSync drops one unrepresentable #sync whole. Nothing was
 // published for it, but the verifier has already staged chain state for the
-// repository it fetched, and that state must not become durable ahead of the
-// archive. For a set with rows, state staged at or below the highest revision
-// the event carried is discarded. An empty set does not reveal the revision
-// that was fetched, so all staged state for the DID is discarded. Discarding
-// too much is the safe direction: the verifier falls back to the state the
-// archive holds and the next commit repairs through a resync, whereas keeping
-// too much would verify later commits against a repository the archive never
-// accepted. The DID is also handed to the
-// recovery sink when one is configured; that sink is asynchronous and bounded,
-// so it is best effort. The upstream event itself is complete: redelivering it
-// would be rejected again. Counter only: upstream input must not drive log
-// volume.
+// repository it fetched, and neither that state nor anything verified on top
+// of it may become durable ahead of the archive. Promotion of chain state for
+// the DID is therefore blocked until a later sync for it is reconciled; the
+// verifier falls back to the state the archive holds and the DID's next
+// commit repairs through the ordinary resync path. The DID is also handed to
+// the recovery sink when one is configured; that sink is asynchronous and
+// bounded, so it is best effort. The upstream event itself is complete:
+// redelivering it would be rejected again. Counter only: upstream input must
+// not drive log volume.
 func (c *Consumer) dropRejectedSync(seq int64, segEvts []segment.Event, reason ingest.DropReason) {
 	did := segEvts[0].DID
 	c.cfg.DropMetrics.IncDropped(ingest.DropSourceLive, reason)
 	if c.cfg.SyncStateStore != nil {
-		maxRev := syncstate.DiscardAllRevisions
-		if len(segEvts) > 1 {
-			maxRev = ""
-			for i := range segEvts {
-				maxRev = max(maxRev, segEvts[i].Rev)
-			}
-		}
-		c.cfg.SyncStateStore.DiscardPendingChain(atmos.DID(did), maxRev)
+		c.cfg.SyncStateStore.BlockChainPromotion(atmos.DID(did))
 	}
 	if c.cfg.DroppedEvents != nil {
 		c.cfg.DroppedEvents(did, 1)
 	}
 	c.completeUpstreamEvent(seq)
+}
+
+// syncReconciled lifts the promotion block left by an earlier dropped #sync
+// once a sync for the same DID has been reconciled into the archive.
+func (c *Consumer) syncReconciled(segEvts []segment.Event) {
+	if c.cfg.SyncStateStore == nil || len(segEvts) == 0 || segEvts[0].Kind != segment.KindSync {
+		return
+	}
+	c.cfg.SyncStateStore.UnblockChainPromotion(atmos.DID(segEvts[0].DID))
 }
 
 // completeUpstreamEvent records that one upstream event was fully resolved,

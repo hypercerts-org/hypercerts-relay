@@ -85,6 +85,10 @@ type PebbleStateStore struct {
 	capturedHosting map[atmos.DID][]byte
 	capturedIdent   map[atmos.DID]int64
 	capturedAccount map[atmos.DID]int64
+
+	// hypercerts: DIDs whose chain state must not be promoted; see
+	// BlockChainPromotion.
+	blockedChain map[atmos.DID]struct{}
 }
 
 type pendingChainState struct {
@@ -346,6 +350,10 @@ func (p *PebbleStateStore) RecordAccountSeq(did atmos.DID, seq int64) {
 func (p *PebbleStateStore) PromoteChain(did atmos.DID, maxRev string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if _, blocked := p.blockedChain[did]; blocked {
+		delete(p.pendingChain, did)
+		return
+	}
 	pending, ok := p.pendingChain[did]
 	if !ok || pending.rev > maxRev {
 		return
@@ -354,23 +362,30 @@ func (p *PebbleStateStore) PromoteChain(did atmos.DID, maxRev string) {
 	delete(p.pendingChain, did)
 }
 
-// DiscardAllRevisions sorts above every revision TID.
-const DiscardAllRevisions = "\xff"
-
-// hypercerts: DiscardPendingChain forgets verifier chain state that was staged
-// for an event the consumer then refused to archive. The verifier's view falls
-// back to the last promoted or durable state, so the DID's next commit is
-// checked against what the archive actually holds and a divergence triggers a
-// fresh resync instead of being promoted over the gap.
-//
-// Only state at or below maxRev is discarded; DiscardAllRevisions discards
-// whatever is staged. Discarding a later event's staged state is safe: its
-// promotion becomes a no-op and the DID repairs through a resync.
-func (p *PebbleStateStore) DiscardPendingChain(did atmos.DID, maxRev string) {
+// hypercerts: BlockChainPromotion records that the consumer refused to archive
+// a verified repository state for did. Until a later sync for the DID is
+// reconciled, no chain state for it is promoted, so durable verifier state
+// cannot move across the archive gap, whichever event staged it and whenever.
+// Staged state is dropped now and again at each promotion attempt, so the
+// verifier falls back to the state the archive holds and the DID's next commit
+// repairs through the ordinary resync path. The block is in memory only: after
+// a restart the durable state is still the pre-drop state, which has the same
+// effect.
+func (p *PebbleStateStore) BlockChainPromotion(did atmos.DID) {
 	p.mu.Lock()
-	if pending, ok := p.pendingChain[did]; ok && pending.rev <= maxRev {
-		delete(p.pendingChain, did)
+	defer p.mu.Unlock()
+	if p.blockedChain == nil {
+		p.blockedChain = map[atmos.DID]struct{}{}
 	}
+	p.blockedChain[did] = struct{}{}
+	delete(p.pendingChain, did)
+}
+
+// UnblockChainPromotion lifts the block once a sync for did was reconciled
+// into the archive.
+func (p *PebbleStateStore) UnblockChainPromotion(did atmos.DID) {
+	p.mu.Lock()
+	delete(p.blockedChain, did)
 	p.mu.Unlock()
 }
 
