@@ -231,6 +231,11 @@ func TestHypercertsMixedSnapshotSyncAndConcurrentAccountDeletion(t *testing.T) {
 	post.Rkey = "resurrect"
 	require.ErrorIs(t, w.ReconcileSnapshot(t.Context(), Snapshot{DID: did, Rev: post.Rev, Collections: []string{post.Collection}, Records: []segment.Event{post}}), ErrAccountUnavailable)
 	require.Equal(t, next, w.NextSeq())
+	// hypercerts: the sync entry points report the same outcome instead of
+	// success, so a caller can tell that nothing was published.
+	_, err = w.ReconcileSyncWithCollections(t.Context(), did, post.Rev, []segment.Event{post}, []string{post.Collection})
+	require.ErrorIs(t, err, ErrAccountUnavailable)
+	require.Equal(t, next, w.NextSeq())
 }
 
 func TestHypercertsFirstSyncAlwaysUsesSnapshotSerialization(t *testing.T) {

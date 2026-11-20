@@ -428,11 +428,9 @@ func (w *Writer) reconcileSync(ctx context.Context, did, rev string, rows []segm
 	if reconcile == nil {
 		reconcile = w.ReconcileSnapshot
 	}
-	err := reconcile(ctx, snapshot)
-	if errors.Is(err, ErrAccountUnavailable) {
-		return nil // stale sync cannot revive an inactive account.
-	}
-	return err
+	// hypercerts: ErrAccountUnavailable is returned, not swallowed, so a
+	// caller can tell that nothing was published.
+	return reconcile(ctx, snapshot)
 }
 
 func (w *Writer) prepareSnapshotMetadata(snapshot Snapshot) (*AttributionMetadata, error) {
