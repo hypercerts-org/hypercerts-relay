@@ -516,9 +516,9 @@ func sleepForBackoff(b int) time.Duration {
 
 // Configures event processing for a websocket connection, using the parallel schedule helper library, with all events processed using the configured callback function.
 //
-// hypercerts: firstSeen is the lowest source sequence observed on the
-// connection, or zero when none was; it is read after the workers are joined,
-// before the panicking position can be acknowledged.
+// hypercerts: firstSeen is the lowest source sequence handed to the scheduler
+// on the connection, or zero when none was; it is recorded at hand-off, before
+// dispatch, and read after the reader and workers have stopped.
 func (s *Slurper) handleConnection(ctx context.Context, conn *websocket.Conn, sub *Subscription) (firstSeen int64, err error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -575,8 +575,9 @@ func (s *Slurper) handleConnection(ctx context.Context, conn *websocket.Conn, su
 	// NOTE: `InstrumentedRepoStreamCallbacks` is where event limiters get called/enforced
 	instrumentedRSC := stream.NewInstrumentedRepoStreamCallbacks(limiters, rsc.EventHandler)
 
-	// hypercerts: remember the lowest sequence observed on this connection so a
-	// panic retry with no acknowledged cursor can replay from it.
+	// hypercerts: remember the lowest sequence handed to the scheduler on this
+	// connection — recorded at hand-off, before dispatch, so an event whose
+	// callback never runs still bounds the panic-retry replay cursor.
 	var firstSeenSeq atomic.Int64
 	noteSeen := func(seq int64) {
 		for {
@@ -595,7 +596,6 @@ func (s *Slurper) handleConnection(ctx context.Context, conn *websocket.Conn, su
 		s.Config.QueueDepthPerHost,
 		conn.RemoteAddr().String(),
 		func(_ context.Context, evt *stream.XRPCStreamEvent) error {
-			noteSeen(evt.Sequence())
 			return instrumentedRSC.EventHandler(ctx, evt)
 		},
 	)
@@ -618,7 +618,7 @@ func (s *Slurper) handleConnection(ctx context.Context, conn *websocket.Conn, su
 		_ = conn.Close()
 	}()
 	connLogger := s.logger.With("host", sub.Hostname)
-	err = stream.HandleRepoStream(ctx, conn, rateScheduler{Scheduler: scheduler, wait: s.Config.WaitRateCapacity, host: sub.Hostname}, connLogger)
+	err = stream.HandleRepoStream(ctx, conn, rateScheduler{Scheduler: scheduler, wait: s.Config.WaitRateCapacity, host: sub.Hostname, noteSeq: noteSeen}, connLogger)
 	if processErr := scheduler.Err(); processErr != nil {
 		err = processErr
 	}

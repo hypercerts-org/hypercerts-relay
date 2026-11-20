@@ -10,6 +10,7 @@ import (
 	comatproto "github.com/bluesky-social/indigo/api/atproto"
 	"github.com/bluesky-social/indigo/cmd/relay/relay/models"
 	"github.com/bluesky-social/indigo/cmd/relay/stream"
+	"github.com/bluesky-social/indigo/cmd/relay/stream/schedulers/parallel"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
 )
@@ -178,5 +179,76 @@ func TestSourceHandlerPanicWithoutCursorRetainsReplayBoundary(t *testing.T) {
 		require.Equal(t, int64(11), seq)
 	case <-time.After(5 * time.Second):
 		t.Fatal("source event was not retried")
+	}
+}
+
+// hypercerts: the replay boundary must cover events handed to the scheduler
+// even when their callbacks never run. With two workers, seq 12 panics and
+// stops the scheduler while seq 11 — handed earlier but still queued behind
+// the occupied workers — never reaches a callback; a boundary recorded in the
+// callback would be 12 and the redial cursor would skip event 11.
+func TestRateSchedulerRecordsHandoffBeforeDispatch(t *testing.T) {
+	var firstSeen atomic.Int64
+	noteSeen := func(seq int64) {
+		for {
+			cur := firstSeen.Load()
+			if seq <= 0 || (cur != 0 && seq >= cur) {
+				return
+			}
+			if firstSeen.CompareAndSwap(cur, seq) {
+				return
+			}
+		}
+	}
+
+	startedPanic := make(chan struct{}, 1)
+	startedBlocker := make(chan struct{}, 1)
+	releasePanic := make(chan struct{})
+	dispatched := make(chan int64, 4)
+	scheduler := parallel.NewScheduler(2, 8, "handoff-test", func(ctx context.Context, evt *stream.XRPCStreamEvent) error {
+		switch evt.Sequence() {
+		case 12: // occupies the first worker, then panics on release
+			startedPanic <- struct{}{}
+			select {
+			case <-releasePanic:
+				panic("injected handler panic")
+			case <-ctx.Done():
+				return nil
+			}
+		case 13: // occupies the second worker until the scheduler stops
+			startedBlocker <- struct{}{}
+			<-ctx.Done()
+			return nil
+		default:
+			dispatched <- evt.Sequence()
+			return nil
+		}
+	})
+	t.Cleanup(scheduler.Shutdown)
+
+	rs := rateScheduler{Scheduler: scheduler, noteSeq: noteSeen}
+	identity := func(seq int64) *stream.XRPCStreamEvent {
+		return &stream.XRPCStreamEvent{RepoIdentity: &comatproto.SyncSubscribeRepos_Identity{Seq: seq, Did: "did:plc:abcdefghijklmnopqrstuvwx", Time: "2026-09-07T12:00:00Z"}}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	require.NoError(t, rs.AddWork(ctx, "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", identity(12)))
+	<-startedPanic
+	require.NoError(t, rs.AddWork(ctx, "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb", identity(13)))
+	<-startedBlocker
+	// seq 11 is handed while both workers are occupied, so it stays queued
+	// and its callback never runs once the panic stops the scheduler.
+	require.NoError(t, rs.AddWork(ctx, "did:plc:cccccccccccccccccccccccc", identity(11)))
+	require.Equal(t, int64(11), firstSeen.Load(), "the hand-off, not the callback, records the replay boundary")
+
+	close(releasePanic)
+	<-scheduler.Done()
+	require.ErrorIs(t, scheduler.Err(), parallel.ErrHandlerPanic)
+	require.Equal(t, int64(11), firstSeen.Load(), "the replay boundary must include the undispatched event")
+	select {
+	case seq := <-dispatched:
+		t.Fatalf("event %d was dispatched despite the stopped scheduler", seq)
+	default:
 	}
 }
