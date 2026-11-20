@@ -107,8 +107,8 @@ func TestCommitMessageEmptyKeyEntry(t *testing.T) {
 	assert.ErrorIs(err, mst.ErrInvalidTree)
 }
 
-// MST root whose key sits between two empty child nodes must be rejected, not
-// panic when the "create" op is inverted. (F3, through the full path.)
+// MST root that references the same empty child node twice must be rejected
+// when the CAR is loaded.
 func TestCommitMessageEmptyChildNodes(t *testing.T) {
 	assert := assert.New(t)
 	path := "com.example.record/3jqfcqzm3fo2j"
