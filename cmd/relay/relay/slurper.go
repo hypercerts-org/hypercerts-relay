@@ -33,6 +33,9 @@ type PersistHostStatusFunc func(ctx context.Context, hostID uint64, state models
 //
 // It configures rate-limits, tracks cursors, and retries connections. It passes received messages on to the main relay via a callback function. `Slurper` does not talk to the database directly, but does have some callback to persist host state (cursors and hosting status for some error conditions).
 type Slurper struct {
+	// hypercerts: waits before redialing after the given number of consecutive handler panics; reports false if ctx ended. Replaced in tests.
+	waitAfterHandlerPanic func(ctx context.Context, attempt int) bool
+
 	processCallback ProcessMessageFunc
 	Config          *SlurperConfig
 
@@ -469,14 +472,26 @@ func (s *Slurper) subscribeWithRedialer(ctx context.Context, host *models.Host, 
 			if panicBackoff < 10 {
 				panicBackoff++
 			}
-			timer := time.NewTimer(sleepForBackoff(panicBackoff))
-			select {
-			case <-ctx.Done():
-				timer.Stop()
+			wait := s.waitAfterHandlerPanic
+			if wait == nil {
+				wait = waitForBackoff
+			}
+			if !wait(ctx, panicBackoff) {
 				return
-			case <-timer.C:
 			}
 		}
+	}
+}
+
+// hypercerts: waitForBackoff sleeps for the backoff step, reporting false if ctx ends first.
+func waitForBackoff(ctx context.Context, attempt int) bool {
+	timer := time.NewTimer(sleepForBackoff(attempt))
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 
