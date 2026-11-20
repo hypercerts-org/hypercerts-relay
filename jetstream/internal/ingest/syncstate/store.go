@@ -379,8 +379,10 @@ func (p *PebbleStateStore) PromoteChain(did atmos.DID, maxRev string) {
 // memory only.
 //
 // Where the DID has no earlier chain state, LoadChain returns
-// blockedChainPlaceholder instead of nil, so the next commit breaks the chain
-// and repairs the same way rather than being verified as a first sighting.
+// blockedChainPlaceholder instead of nil, so the next commit takes the same
+// chain-break path, which attempts a resync, rather than being verified as a
+// first sighting. Either way the DID's commits are not archived until a resync
+// for it is reconciled.
 //
 // Known limitation: the block does not survive a restart. After one, a DID
 // that still has no chain state is verified as a first sighting and its
@@ -388,10 +390,12 @@ func (p *PebbleStateStore) PromoteChain(did atmos.DID, maxRev string) {
 // for the DID is reconciled; records present only in the dropped sync stay
 // missing until recovery. A durable marker was deliberately not added, to
 // keep this store close to upstream Jetstream; the recovery sink covers the
-// gap on a best-effort basis. Two cases are not repaired while blocked
+// gap on a best-effort basis. Three cases are not repaired while blocked
 // either, for a DID with or without earlier state: a commit already verified
-// against the dropped sync's staged state before the block, and a commit the
-// verifier accepts without a chain check (Sync 1.0 shape).
+// against the dropped sync's staged state before the block, a commit the
+// verifier accepts without a chain check (Sync 1.0 shape), and a commit
+// buffered during a resync whose fetched state is discarded before the
+// verifier replays it, which is reported as a failed replay and not retried.
 func (p *PebbleStateStore) BlockChainPromotion(did atmos.DID) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -405,14 +409,16 @@ func (p *PebbleStateStore) BlockChainPromotion(did atmos.DID) {
 // hypercerts: blockedChainPlaceholder stands in for the chain state of a
 // blocked DID that has none, so the verifier takes its chain-break path (a
 // resync whose replacement can be reconciled and lift the block) instead of
-// its first-sighting path. The empty revision sorts below every revision, so
-// no commit is dropped as a replay and no fetched repository is rejected as a
-// regression. The data root is a fresh random CID on every load, so neither
-// an inverted root nor an upstream-declared prevData or sync data root can
-// equal it; a zero CID would not do, because a commit without prevData
-// compares equal to it and is then accepted. The value is only ever returned:
-// it is never staged or promoted, and the verifier saves the commit's own or
-// the fetched root, never the loaded one, when they differ.
+// its first-sighting path. The empty revision sorts below every valid
+// revision, so no commit is dropped as a replay and no fetched repository is
+// rejected as a regression; a sync or fetched commit that itself carries an
+// empty revision is malformed and is not processed. The data root is a fresh
+// random CID on every load, so an inverted root, an upstream-declared
+// prevData or a sync data root cannot be made to match it; a zero CID would
+// not do, because the verifier's lenient inversion accepts a commit without
+// prevData against it. The value is only ever returned: it is never staged or
+// promoted, and the verifier saves the commit's own or the fetched root,
+// never the loaded one, when they differ.
 func blockedChainPlaceholder() *atmossync.ChainState {
 	var nonce [32]byte
 	_, _ = rand.Read(nonce[:])

@@ -55,8 +55,9 @@ func TestUnblockChainPromotionAfterReconciledSync(t *testing.T) {
 	require.Equal(t, "3mmoojp7vgo2h", state.Rev)
 }
 
-// hypercerts: a blocked DID with no chain state loads a placeholder that can
-// never be matched or made durable; other DIDs still load nothing.
+// hypercerts: a blocked DID with no chain state loads a placeholder that is
+// never staged or made durable; other DIDs still load nothing. The verifier's
+// handling of the placeholder is covered in the live package.
 func TestBlockedChainWithoutStateLoadsUnmatchablePlaceholder(t *testing.T) {
 	st, err := store.Open(t.TempDir(), nil)
 	require.NoError(t, err)
@@ -75,13 +76,15 @@ func TestBlockedChainWithoutStateLoadsUnmatchablePlaceholder(t *testing.T) {
 	require.True(t, first.Data.Defined(), "a zero root would equal an absent prevData")
 	second, err := p.LoadChain(t.Context(), did)
 	require.NoError(t, err)
-	require.False(t, first.Data.Equal(second.Data), "the placeholder root must not be predictable")
+	require.False(t, first.Data.Equal(second.Data), "the placeholder root must differ on every load")
+	require.NotContains(t, p.pendingChain, did, "loading the placeholder must not stage it")
+	require.NotContains(t, p.promotedChain, did)
 
 	unaffected, err := p.LoadChain(t.Context(), other)
 	require.NoError(t, err)
 	require.Nil(t, unaffected)
 
-	// Loading it stages nothing, so a promotion and flush persist nothing.
+	// A promotion and flush persist nothing.
 	p.PromoteChain(did, "zzzzzzzzzzzzz")
 	require.NoError(t, p.Flush())
 	durable, err := New(st).LoadChain(t.Context(), did)
