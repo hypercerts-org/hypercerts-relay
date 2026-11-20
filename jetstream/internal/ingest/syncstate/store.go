@@ -3,6 +3,7 @@ package syncstate
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"sync"
@@ -10,6 +11,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/cockroachdb/pebble"
 	"github.com/jcalabro/atmos"
+	"github.com/jcalabro/atmos/cbor"
 	atmossync "github.com/jcalabro/atmos/sync"
 )
 
@@ -140,6 +142,7 @@ func (p *PebbleStateStore) LoadChain(_ context.Context, did atmos.DID) (*atmossy
 	} else if promoted, ok := p.promotedChain[did]; ok {
 		buf = append([]byte(nil), promoted...)
 	}
+	_, blocked := p.blockedChain[did]
 	p.mu.Unlock()
 	if buf != nil {
 		state, err := decodeChainState(buf)
@@ -151,6 +154,10 @@ func (p *PebbleStateStore) LoadChain(_ context.Context, did atmos.DID) (*atmossy
 
 	val, closer, err := p.s.Get(chainKey(did))
 	if errors.Is(err, store.ErrNotFound) {
+		if blocked {
+			// hypercerts: see blockedChainPlaceholder.
+			return blockedChainPlaceholder(), nil
+		}
 		return nil, nil
 	}
 	if err != nil {
@@ -371,13 +378,20 @@ func (p *PebbleStateStore) PromoteChain(did atmos.DID, maxRev string) {
 // next commit repairs through the ordinary resync path. The block is in
 // memory only.
 //
-// Known limitation: for a DID with no earlier chain state, a commit that
-// loads no chain state is verified as a first sighting and its delta is
-// archived without repairing the gap, with or without a restart, until a
-// later sync for the DID is reconciled. Records present only in the dropped
-// sync stay missing until recovery. A durable marker was deliberately not
-// added, to keep this store close to upstream Jetstream; the recovery sink
-// covers the gap on a best-effort basis.
+// Where the DID has no earlier chain state, LoadChain returns
+// blockedChainPlaceholder instead of nil, so the next commit breaks the chain
+// and repairs the same way rather than being verified as a first sighting.
+//
+// Known limitation: the block does not survive a restart. After one, a DID
+// that still has no chain state is verified as a first sighting and its
+// commit deltas are archived without repairing the gap, until a later sync
+// for the DID is reconciled; records present only in the dropped sync stay
+// missing until recovery. A durable marker was deliberately not added, to
+// keep this store close to upstream Jetstream; the recovery sink covers the
+// gap on a best-effort basis. Two cases are not repaired while blocked
+// either, for a DID with or without earlier state: a commit already verified
+// against the dropped sync's staged state before the block, and a commit the
+// verifier accepts without a chain check (Sync 1.0 shape).
 func (p *PebbleStateStore) BlockChainPromotion(did atmos.DID) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -386,6 +400,23 @@ func (p *PebbleStateStore) BlockChainPromotion(did atmos.DID) {
 	}
 	p.blockedChain[did] = struct{}{}
 	delete(p.pendingChain, did)
+}
+
+// hypercerts: blockedChainPlaceholder stands in for the chain state of a
+// blocked DID that has none, so the verifier takes its chain-break path (a
+// resync whose replacement can be reconciled and lift the block) instead of
+// its first-sighting path. The empty revision sorts below every revision, so
+// no commit is dropped as a replay and no fetched repository is rejected as a
+// regression. The data root is a fresh random CID on every load, so neither
+// an inverted root nor an upstream-declared prevData or sync data root can
+// equal it; a zero CID would not do, because a commit without prevData
+// compares equal to it and is then accepted. The value is only ever returned:
+// it is never staged or promoted, and the verifier saves the commit's own or
+// the fetched root, never the loaded one, when they differ.
+func blockedChainPlaceholder() *atmossync.ChainState {
+	var nonce [32]byte
+	_, _ = rand.Read(nonce[:])
+	return &atmossync.ChainState{Data: cbor.ComputeCID(cbor.CodecRaw, nonce[:])}
 }
 
 // UnblockChainPromotion lifts the block once a sync for did was reconciled

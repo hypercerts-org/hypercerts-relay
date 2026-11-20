@@ -54,3 +54,42 @@ func TestUnblockChainPromotionAfterReconciledSync(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "3mmoojp7vgo2h", state.Rev)
 }
+
+// hypercerts: a blocked DID with no chain state loads a placeholder that can
+// never be matched or made durable; other DIDs still load nothing.
+func TestBlockedChainWithoutStateLoadsUnmatchablePlaceholder(t *testing.T) {
+	st, err := store.Open(t.TempDir(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+	p := New(st)
+	did, other := atmos.DID("did:plc:blockednostate"), atmos.DID("did:plc:notblocked")
+
+	// State staged by the refused sync is discarded, leaving none.
+	require.NoError(t, p.SaveChain(t.Context(), did, atmossync.ChainState{Rev: "3mmoojp7vgo2f", Data: cbor.ComputeCID(cbor.CodecDagCBOR, []byte("root"))}))
+	p.BlockChainPromotion(did)
+
+	first, err := p.LoadChain(t.Context(), did)
+	require.NoError(t, err)
+	require.NotNil(t, first)
+	require.Empty(t, first.Rev, "the placeholder revision must sort below every revision")
+	require.True(t, first.Data.Defined(), "a zero root would equal an absent prevData")
+	second, err := p.LoadChain(t.Context(), did)
+	require.NoError(t, err)
+	require.False(t, first.Data.Equal(second.Data), "the placeholder root must not be predictable")
+
+	unaffected, err := p.LoadChain(t.Context(), other)
+	require.NoError(t, err)
+	require.Nil(t, unaffected)
+
+	// Loading it stages nothing, so a promotion and flush persist nothing.
+	p.PromoteChain(did, "zzzzzzzzzzzzz")
+	require.NoError(t, p.Flush())
+	durable, err := New(st).LoadChain(t.Context(), did)
+	require.NoError(t, err)
+	require.Nil(t, durable)
+
+	p.UnblockChainPromotion(did)
+	lifted, err := p.LoadChain(t.Context(), did)
+	require.NoError(t, err)
+	require.Nil(t, lifted)
+}
