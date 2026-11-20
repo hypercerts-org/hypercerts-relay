@@ -34,6 +34,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/manifest"
 	"github.com/bluesky-social/jetstream/internal/obs"
+	"github.com/bluesky-social/jetstream/internal/repoexport"
 	"github.com/bluesky-social/jetstream/internal/server"
 	"github.com/bluesky-social/jetstream/internal/status"
 	"github.com/bluesky-social/jetstream/internal/store"
@@ -686,8 +687,11 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		return fail(fmt.Errorf("serve: build status collector: %w", err))
 	}
 	statusHandler, err := web.New(web.Options{
-		Snapshotter:                statusCollector,
-		RepoActions:                web.NewRepoActions(opts.DataDir, resolver, newManifestSelector(mft), pendingEventsForDID(&writerPtr)),
+		Snapshotter: statusCollector,
+		// hypercerts: anonymous /status verification resolves account-chosen
+		// DIDs, so it gets its own public-address-only resolver rather than the
+		// ingest resolver, which may be relaxed for an operator PLC.
+		RepoActions:                web.NewRepoActions(opts.DataDir, repoexport.NewStatusResolver(opts.PLCURL, opts.HTTPTransport), newManifestSelector(mft), pendingEventsForDID(&writerPtr)),
 		DisableRepoActionRateLimit: opts.DisableRepoActionRateLimits,
 		Logger:                     processLogger,
 	})

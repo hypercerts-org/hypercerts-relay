@@ -3,39 +3,40 @@ on:
   schedule:
     - cron: '43 8 * * 1'
   workflow_dispatch:
-# Unreviewed upstream code runs only in the read-only sync job. The write token
-# is granted to open-pr, which runs git and this repository's update script but
-# never upstream code.
+# Three jobs keep unreviewed upstream code away from the write token:
+#   prepare  trusted code only: pins the base and target commits and the exact
+#            tree the update produces. Read-only token.
+#   verify   rebuilds that tree, confirms it is the pinned tree, then builds and
+#            tests it. This is the only job that runs upstream code. Read-only
+#            token, no persisted credentials, no cache.
+#   open-pr  rebuilds the tree again from the pinned commits with the same
+#            trusted script, confirms it is the pinned tree, and opens the review
+#            PR. Holds the write token; runs no upstream code and consumes
+#            nothing produced by verify except its pass/fail result.
 permissions: {}
 concurrency:
   group: jetstream-upstream-sync
   cancel-in-progress: false
 jobs:
-  sync:
-    # Builds and tests unreviewed upstream Jetstream code. The token is read-only
-    # and not persisted in git config, and setup-go neither restores nor saves a
-    # cache here. Code in this job can still reach the runner's own Actions cache
-    # credentials and write default-branch cache entries, so jobs that hold
-    # write credentials must not restore Actions caches (see release.yml).
+  prepare:
+    # Runs git and this repository's update script only. Nothing from the
+    # upstream tree is built or executed here, so its outputs are trusted.
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 15
     permissions:
       contents: read
       pull-requests: read
     outputs:
-      needed: ${{ steps.update.outputs.needed }}
-      target: ${{ steps.update.outputs.target }}
-      main: ${{ steps.update.outputs.main }}
+      needed: ${{ steps.pin.outputs.needed }}
+      main: ${{ steps.pin.outputs.main }}
+      target: ${{ steps.pin.outputs.target }}
+      tree: ${{ steps.pin.outputs.tree }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: main
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
-        with:
-          go-version-file: jetstream/go.mod
-          cache: false
       - name: Check existing review
         id: existing
         env:
@@ -44,39 +45,84 @@ jobs:
           set -euo pipefail
           count=$(gh pr list --base main --state open --search 'Jetstream upstream sync in:title' --json number --jq 'length')
           echo "count=$count" >> "$GITHUB_OUTPUT"
-      - name: Prepare scoped update
+      - name: Pin base, target and expected tree
         if: steps.existing.outputs.count == '0'
-        id: update
+        id: pin
         run: |
           set -euo pipefail
+          main=$(git rev-parse HEAD)
           git fetch https://github.com/bluesky-social/jetstream.git main
           target=$(git rev-parse FETCH_HEAD)
-          main=$(git rev-parse HEAD)
-          branch="jetstream-upstream/$(date -u +%Y-%m-%d)-${GITHUB_RUN_ID}"
-          git switch -c "$branch"
-          python3 scripts/jetstream-upstream.py "$target" --apply | tee "$RUNNER_TEMP/jetstream-review.md"
+          cp scripts/jetstream-upstream.py "$RUNNER_TEMP/jetstream-upstream.py"
+          git switch -c jetstream-upstream/prepare
+          python3 -I "$RUNNER_TEMP/jetstream-upstream.py" "$target" --apply | tee "$RUNNER_TEMP/jetstream-review.md"
           cat "$RUNNER_TEMP/jetstream-review.md" >> "$GITHUB_STEP_SUMMARY"
-          if ! git diff --cached --quiet; then
-            echo 'needed=true' >> "$GITHUB_OUTPUT"
-            echo "target=$target" >> "$GITHUB_OUTPUT"
-            echo "main=$main" >> "$GITHUB_OUTPUT"
+          if git diff --cached --quiet; then
+            exit 0
           fi
-      - name: Verify update
-        if: steps.update.outputs.needed == 'true'
-        run: |
-          set -euo pipefail
-          ./scripts/verify-jetstream.sh 2>&1 | tee "$RUNNER_TEMP/jetstream-verification.log"
           git diff --cached --check
+          {
+            echo 'needed=true'
+            echo "main=$main"
+            echo "target=$target"
+            echo "tree=$(git write-tree)"
+          } >> "$GITHUB_OUTPUT"
       - name: Preserve failure report
         if: failure()
         run: |
           test ! -f "$RUNNER_TEMP/jetstream-review.md" || cat "$RUNNER_TEMP/jetstream-review.md" >> "$GITHUB_STEP_SUMMARY"
-          echo 'Update stopped. A maintainer must inspect conflicts or failed verification; no pull request was pushed by the failed step.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Update stopped. A maintainer must inspect the conflict; no pull request was opened.' >> "$GITHUB_STEP_SUMMARY"
+  verify:
+    # Builds and tests unreviewed upstream Jetstream code. The token is read-only
+    # and not persisted in git config, and setup-go neither restores nor saves a
+    # cache here. Code in this job can still reach the runner's own Actions cache
+    # credentials and write default-branch cache entries, so jobs that hold
+    # write credentials must not restore Actions caches (see release.yml).
+    needs: prepare
+    if: needs.prepare.outputs.needed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ needs.prepare.outputs.main }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: jetstream/go.mod
+          cache: false
+      - name: Rebuild pinned tree
+        env:
+          TARGET: ${{ needs.prepare.outputs.target }}
+          TREE: ${{ needs.prepare.outputs.tree }}
+        run: |
+          set -euo pipefail
+          git fetch https://github.com/bluesky-social/jetstream.git "$TARGET"
+          cp scripts/jetstream-upstream.py "$RUNNER_TEMP/jetstream-upstream.py"
+          git switch -c jetstream-upstream/verify
+          python3 -I "$RUNNER_TEMP/jetstream-upstream.py" "$TARGET" --apply > /dev/null
+          if [ "$(git write-tree)" != "$TREE" ]; then
+            echo '::error::The rebuilt update is not the pinned tree.'
+            exit 1
+          fi
+      - name: Verify pinned tree
+        run: |
+          set -euo pipefail
+          ./scripts/verify-jetstream.sh
+          git diff --cached --check
+      - name: Report failure
+        if: failure()
+        run: echo 'Verification failed. A maintainer must inspect it; no pull request was opened.' >> "$GITHUB_STEP_SUMMARY"
   open-pr:
-    # Holds the write token and runs no upstream code or cache restore. It
-    # rebuilds the verified update with git alone and opens the review PR.
-    needs: sync
-    if: needs.sync.outputs.needed == 'true'
+    # Holds the write token. It runs git and the update script from the pinned
+    # base commit, never upstream code, restores no cache and downloads no
+    # artifact: the tree it pushes is rebuilt here and must equal the tree that
+    # prepare pinned and verify tested.
+    needs: [prepare, verify]
+    if: needs.prepare.outputs.needed == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -85,36 +131,54 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
-          ref: main
+          ref: ${{ needs.prepare.outputs.main }}
           fetch-depth: 0
-      - name: Rebuild verified update
+      - name: Rebuild pinned tree
         id: rebuild
         env:
-          TARGET: ${{ needs.sync.outputs.target }}
-          MAIN: ${{ needs.sync.outputs.main }}
+          TARGET: ${{ needs.prepare.outputs.target }}
+          MAIN: ${{ needs.prepare.outputs.main }}
+          TREE: ${{ needs.prepare.outputs.tree }}
         run: |
           set -euo pipefail
-          # The sync job ran upstream code, so its outputs are untrusted input.
-          if [[ ! "$TARGET" =~ ^[0-9a-f]{40}$ || ! "$MAIN" =~ ^[0-9a-f]{40}$ ]]; then
-            echo '::error::The sync job did not report two commit SHAs.'
+          for value in "$TARGET" "$MAIN" "$TREE"; do
+            if [[ ! "$value" =~ ^[0-9a-f]{40}$ ]]; then
+              echo '::error::The pinned base, target and tree must be full object names.'
+              exit 1
+            fi
+          done
+          if [ "$(git rev-parse HEAD)" != "$MAIN" ]; then
+            echo '::error::The checkout is not the pinned base commit.'
             exit 1
           fi
-          if ! git merge-base --is-ancestor "$MAIN" HEAD; then
-            echo '::error::The verified base commit is not in the history of main.'
+          git fetch origin main
+          if ! git merge-base --is-ancestor "$MAIN" FETCH_HEAD; then
+            echo '::error::The pinned base commit is not in the history of main.'
             exit 1
           fi
           git fetch https://github.com/bluesky-social/jetstream.git main
           if ! git merge-base --is-ancestor "$TARGET" FETCH_HEAD; then
-            echo '::error::The verified upstream commit is not in the history of Jetstream main.'
+            echo '::error::The pinned upstream commit is not in the history of Jetstream main.'
             exit 1
           fi
-          # Run the update script from the main checked out here, not from MAIN.
           cp scripts/jetstream-upstream.py "$RUNNER_TEMP/jetstream-upstream.py"
           branch="jetstream-upstream/$(date -u +%Y-%m-%d)-${GITHUB_RUN_ID}"
-          git switch -c "$branch" "$MAIN"
+          git switch -c "$branch"
           python3 -I "$RUNNER_TEMP/jetstream-upstream.py" "$TARGET" --apply | tee "$RUNNER_TEMP/jetstream-review.md"
+          if [ "$(git write-tree)" != "$TREE" ]; then
+            echo '::error::The rebuilt update is not the pinned tree that was verified.'
+            exit 1
+          fi
+          # The update may only touch the Jetstream module and its base marker.
+          if git diff --cached --name-only | grep -Ev '^(jetstream/|\.hypercerts/jetstream-upstream-base$)'; then
+            echo '::error::The update touches a path outside the Jetstream module.'
+            exit 1
+          fi
           git diff --cached --check
-          echo 'Passed: module tests, vet, build, stress lifecycle oracle, restart oracle checks, whitespace.' >> "$RUNNER_TEMP/jetstream-review.md"
+          {
+            echo "Verified tree: $TREE"
+            echo 'Passed: module tests, vet, build, stress lifecycle oracle, restart oracle checks, whitespace.'
+          } >> "$RUNNER_TEMP/jetstream-review.md"
           echo "branch=$branch" >> "$GITHUB_OUTPUT"
       - name: Open review pull request
         env:

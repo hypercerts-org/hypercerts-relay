@@ -380,16 +380,20 @@ func runRelay(ctx context.Context, cmd *cli.Command) error {
 	// hypercerts: did:web documents are fetched from operator-uncontrolled
 	// hosts, sized by the document itself, and cached for 24h. A modest global
 	// budget on those fetches bounds how fast unauthenticated resolution
-	// (public getRepo, firehose events) can fill the identity cache from a
-	// wildcard-DNS did:web farm (TECH-932 F9).
+	// (public getRepo, firehose events) can fill the identity cache. A request
+	// over the budget is rejected immediately rather than queued, so callers
+	// cannot accumulate behind the limiter, and the rejection is not cached.
 	webDIDBudget := rate.NewLimiter(10, 30)
 	baseDir := identity.BaseDirectory{
 		SkipHandleVerification: true,
 		SkipDNSDomainSuffixes:  []string{".bsky.social"},
 		TryAuthoritativeDNS:    true,
 		PLCURL:                 cmd.String("plc-host"),
-		DIDWebLimitFunc: func(ctx context.Context, hostname string) error {
-			return webDIDBudget.Wait(ctx)
+		DIDWebLimitFunc: func(_ context.Context, _ string) error {
+			if !webDIDBudget.Allow() {
+				return identity.ErrDIDWebRateLimited
+			}
+			return nil
 		},
 		HTTPClient: http.Client{
 			Timeout:   time.Second * 5,

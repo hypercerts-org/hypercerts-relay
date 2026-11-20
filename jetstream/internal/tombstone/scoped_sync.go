@@ -1,6 +1,7 @@
 package tombstone
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/bluesky-social/jetstream/segment"
@@ -8,6 +9,13 @@ import (
 )
 
 const scopedSyncKey = "hypercertsSelectedSync"
+
+// ErrScopedSyncEncode wraps every EncodeScopedSync failure. The #sync payload
+// is upstream-controlled: a payload the scoped marker cannot represent (for
+// example blocks above the CBOR codec's byte-string limit) is unrepresentable
+// input, and callers at the live-event boundary drop the whole event instead
+// of failing the process.
+var ErrScopedSyncEncode = errors.New("tombstone: scoped sync marker could not be encoded")
 
 type SyncScope struct {
 	Collections []string
@@ -17,11 +25,11 @@ type SyncScope struct {
 func EncodeScopedSync(payload []byte, scope SyncScope) ([]byte, error) {
 	decoded, err := cbor.Unmarshal(payload)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", ErrScopedSyncEncode, err)
 	}
 	fields, ok := decoded.(map[string]any)
 	if !ok {
-		return nil, fmt.Errorf("invalid sync payload")
+		return nil, fmt.Errorf("%w: invalid sync payload", ErrScopedSyncEncode)
 	}
 	collections := make([]any, len(scope.Collections))
 	for i, collection := range scope.Collections {
@@ -32,7 +40,19 @@ func EncodeScopedSync(payload []byte, scope SyncScope) ([]byte, error) {
 		paths[i] = path
 	}
 	fields[scopedSyncKey] = map[string]any{"collections": collections, "paths": paths}
-	return cbor.Marshal(fields)
+	out, err := cbor.Marshal(fields)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrScopedSyncEncode, err)
+	}
+	// The marker is only useful if every reader can recover the scope from it.
+	decodedScope, err := DecodeScopedSync(&segment.Event{Kind: segment.KindSync, Payload: out})
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrScopedSyncEncode, err)
+	}
+	if decodedScope == nil || len(decodedScope.Collections) != len(scope.Collections) || len(decodedScope.Paths) != len(scope.Paths) {
+		return nil, fmt.Errorf("%w: scope does not round-trip", ErrScopedSyncEncode)
+	}
+	return out, nil
 }
 
 func DecodeScopedSync(event *segment.Event) (*SyncScope, error) {

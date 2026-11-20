@@ -799,6 +799,17 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 
 			// hypercerts: A full sync must preserve newer per-collection snapshots.
 			if len(segEvts) > 0 && segEvts[0].Kind == segment.KindSync {
+				// hypercerts: bind and validate the whole replacement set before
+				// any policy or column-width filter, and before either reconciler
+				// or the unmanaged append fallback can publish a row.
+				if err := c.preflightSync(ctx, evt, segEvts); err != nil {
+					reason, rejected := syncInputRejection(err)
+					if !rejected {
+						return err
+					}
+					c.dropRejectedSync(evt.Seq, segEvts[0].DID, reason)
+					continue
+				}
 				segEvts = c.dropUnarchivableSyncRows(ctx, evt.Seq, segEvts)
 				handled := false
 				var reconcileErr error
@@ -819,20 +830,30 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 							StreamID: c.cfg.AttributionStreamID, Policy: fullPolicy,
 							Provenance: attribution.ProvenanceReconciliation,
 						}
-						handled, reconcileErr = c.writer.ReconcileSyncWithMetadata(admittedCtx, segEvts[0].DID, segEvts[0].Rev, segEvts[1:], policy.Collections, metadata)
-						if reconcileErr != nil {
-							return reconcileErr
-						}
+						// hypercerts: prepare the scoped marker before any replacement row
+						// is published. A #sync envelope the marker codec or the segment
+						// payload column cannot represent must be rejected here, while the
+						// archive is unchanged, and dropped at the event boundary.
 						scope := tombstone.SyncScope{Collections: policy.Collections, Paths: []string{}}
 						for _, row := range segEvts[1:] {
 							if row.Kind.IsMaterialization() && slices.Contains(policy.Collections, row.Collection) {
 								scope.Paths = append(scope.Paths, row.Collection+"/"+row.Rkey)
 							}
 						}
-						segEvts[0].Payload, err = tombstone.EncodeScopedSync(segEvts[0].Payload, scope)
+						scopedPayload, err := tombstone.EncodeScopedSync(segEvts[0].Payload, scope)
 						if err != nil {
 							return err
 						}
+						scopedMarker := segEvts[0]
+						scopedMarker.Payload = scopedPayload
+						if err := validateSyncMarker(scopedMarker); err != nil {
+							return err
+						}
+						handled, reconcileErr = c.writer.ReconcileSyncWithMetadata(admittedCtx, segEvts[0].DID, segEvts[0].Rev, segEvts[1:], policy.Collections, metadata)
+						if reconcileErr != nil {
+							return reconcileErr
+						}
+						segEvts[0].Payload = scopedPayload
 						return c.writer.AppendAttributed(admittedCtx, &segEvts[0], ingest.AttributionMetadata{
 							StreamID: c.cfg.AttributionStreamID, Policy: fullPolicy,
 							Provenance: attribution.ProvenanceLive,
@@ -841,22 +862,17 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 				} else {
 					handled, reconcileErr = c.writer.ReconcileSync(ctx, segEvts[0].DID, segEvts[0].Rev, segEvts[1:])
 				}
-				if errors.Is(reconcileErr, ingest.ErrSyncRecordMismatch) {
-					// The verified replacement set does not carry this
-					// #sync's DID and rev (e.g. getRepo served a later
-					// commit than the #sync named), or repeats a key. It
-					// cannot be reconciled under the #sync: hostile or
-					// racing upstream input, not a local fault. Nothing was
-					// written, so drop the whole event, count it, and
-					// advance the cursor instead of ending Run. Counter
-					// only, like the invalid-event arm above.
-					c.cfg.DropMetrics.IncDropped(ingest.DropSourceLive, ingest.DropReasonInvalidRev)
-					c.noteUpstreamSeq(evt.Seq)
+				if reason, rejected := syncInputRejection(reconcileErr); rejected {
+					// Only upstream input the archive cannot represent is
+					// classified here; every rejection is raised before a
+					// row is published. Storage, archive and attribution
+					// failures stay fatal below.
+					c.dropRejectedSync(evt.Seq, segEvts[0].DID, reason)
 					continue
 				}
 				if errors.Is(reconcileErr, ingest.ErrAccountUnavailable) {
 					c.promoteSyncState(segEvts)
-					c.noteUpstreamSeq(evt.Seq)
+					c.completeUpstreamEvent(evt.Seq)
 					continue
 				}
 				if reconcileErr != nil {
@@ -866,12 +882,12 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 					// The sync marker was appended under the same policy admission
 					// as reconciliation, including successful empty/no-op results.
 					c.promoteSyncState(segEvts)
-					c.noteUpstreamSeq(evt.Seq)
+					c.completeUpstreamEvent(evt.Seq)
 					continue
 				}
 				if handled {
 					c.promoteSyncState(segEvts)
-					c.noteUpstreamSeq(evt.Seq)
+					c.completeUpstreamEvent(evt.Seq)
 					continue
 				}
 			}
@@ -952,14 +968,116 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 			// blindly. lastUpstream is informational; the
 			// cursor we persist comes from cursorValue() which
 			// prefers atmos's watermark.
-			c.noteUpstreamSeq(evt.Seq)
-			if c.upstreamLossEnabled() && evt.Seq > c.processedUpstream.Load() {
-				c.processedUpstream.Store(evt.Seq)
-			}
+			c.completeUpstreamEvent(evt.Seq)
 		}
 
 		return nil
 	})
+}
+
+// errSyncUnbound marks an empty replacement set whose fetched revision cannot
+// be shown to be the #sync's own revision.
+var errSyncUnbound = errors.New("livestream: empty sync replacement is not bound to the sync revision")
+
+// errSyncMarkerUnarchivable marks a #sync marker wider than a segment column.
+var errSyncMarkerUnarchivable = errors.New("livestream: sync marker cannot be archived")
+
+// syncInputRejection classifies the errors that mean "this upstream #sync
+// cannot be represented", as opposed to a local archive, storage or
+// attribution failure. Rejected events are dropped whole.
+func syncInputRejection(err error) (ingest.DropReason, bool) {
+	switch {
+	case err == nil:
+		return "", false
+	case errors.Is(err, ingest.ErrSyncRecordMismatch), errors.Is(err, errSyncUnbound):
+		return ingest.DropReasonInvalidRev, true
+	case errors.Is(err, tombstone.ErrScopedSyncEncode), errors.Is(err, errSyncMarkerUnarchivable):
+		return ingest.DropReasonFieldTooLong, true
+	}
+	return "", false
+}
+
+func validateSyncMarker(marker segment.Event) error {
+	err := segment.ValidateEvent(marker)
+	if errors.Is(err, segment.ErrFieldTooLong) {
+		return fmt.Errorf("%w: %w", errSyncMarkerUnarchivable, err)
+	}
+	if err != nil {
+		return fmt.Errorf("livestream: invalid sync marker: %w", err)
+	}
+	return nil
+}
+
+// preflightSync establishes, before anything is filtered or published, that
+// the replacement set belongs to this #sync: every row carries the marker's
+// DID and revision and no key repeats. An empty set carries no revision of its
+// own, so for a verifier-fetched #sync it is bound through the verifier's
+// chain state, which records the revision of the repository that was actually
+// fetched. An empty set that cannot be bound is rejected rather than
+// reconciled as "the repository has no records".
+func (c *Consumer) preflightSync(ctx context.Context, evt streaming.Event, segEvts []segment.Event) error {
+	marker := segEvts[0]
+	if err := ingest.ValidateSyncReplacementRows(marker.DID, marker.Rev, segEvts[1:]); err != nil {
+		return err
+	}
+	if err := validateSyncMarker(marker); err != nil {
+		return err
+	}
+	// ResyncAsync envelopes are synthesized from the fetched commit, so their
+	// revision is the fetched revision by construction. ResyncNone is not
+	// produced while a verifier is attached, which Config requires.
+	if evt.Resync != streaming.ResyncSyncEvent {
+		return nil
+	}
+	for i := range segEvts[1:] {
+		if segEvts[1+i].Kind.IsMaterialization() {
+			return nil
+		}
+	}
+	state, err := c.cfg.Verifier.StateStore().LoadChain(ctx, atmos.DID(marker.DID))
+	if err != nil {
+		return fmt.Errorf("livestream: bind empty sync replacement: %w", err)
+	}
+	if state == nil || state.Rev != marker.Rev {
+		return errSyncUnbound
+	}
+	return nil
+}
+
+// dropRejectedSync drops one unrepresentable #sync whole. Nothing was
+// published for it, but the verifier has already staged chain state for the
+// repository it fetched. That state is discarded, never promoted, so the
+// verifier cannot become durable ahead of the archive: the DID's next commit
+// is checked against the archived state and a divergence repairs itself
+// through the ordinary resync path, in this process or after a restart. The
+// DID is also handed to the recovery sink, which books a repository re-fetch;
+// that booking is asynchronous and is an accelerator, not the guarantee. The
+// upstream event itself is complete: redelivering it would be rejected again.
+// Counter only: upstream input must not drive log volume.
+func (c *Consumer) dropRejectedSync(seq int64, did string, reason ingest.DropReason) {
+	c.cfg.DropMetrics.IncDropped(ingest.DropSourceLive, reason)
+	if c.cfg.SyncStateStore != nil {
+		c.cfg.SyncStateStore.DiscardPendingChain(atmos.DID(did))
+	}
+	if c.cfg.DroppedEvents != nil {
+		c.cfg.DroppedEvents(did, 1)
+	}
+	c.completeUpstreamEvent(seq)
+}
+
+// completeUpstreamEvent records that one upstream event was fully resolved,
+// advancing the frontier the persisted cursor is taken from.
+func (c *Consumer) completeUpstreamEvent(seq int64) {
+	c.noteUpstreamSeq(seq)
+	if !c.upstreamLossEnabled() {
+		return
+	}
+	for {
+		prev := c.processedUpstream.Load()
+		if seq <= prev || c.processedUpstream.CompareAndSwap(prev, seq) {
+			return
+		}
+	}
 }
 
 // dropUnarchivableSyncRows removes the #sync replacement rows (segEvts[1:])

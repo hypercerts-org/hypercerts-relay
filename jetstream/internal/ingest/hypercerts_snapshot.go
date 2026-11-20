@@ -236,7 +236,7 @@ func (s *snapshotArchiveState) planReplacement(snapshot Snapshot) ([]segment.Eve
 		if keys[key] {
 			// hypercerts: the same key in two snapshot rows cannot be reconciled
 			// under one rev. Map it to ErrSyncRecordMismatch so the live consumer
-			// drops the upstream event instead of ending Run (TECH-932 F8); other
+			// drops the upstream event instead of ending Run; other
 			// callers surface it like any reconciliation error.
 			return nil, fmt.Errorf("%w: duplicate snapshot record %s", ErrSyncRecordMismatch, key)
 		}
@@ -359,15 +359,46 @@ func (w *Writer) ReconcileSyncWithCollectionsIfNeeded(ctx context.Context, did, 
 // returned, and the live consumer drops the upstream event.
 var ErrSyncRecordMismatch = errors.New("ingest: sync replacement record does not match sync DID and rev")
 
+// ValidateSyncReplacementRows checks the invariants every reconciler relies on
+// across ALL rows of a #sync replacement set — including rows a policy or
+// column-width filter would drop. A set fetched at a DID or revision other
+// than the #sync's own, or repeating a record key, cannot be reconciled or
+// appended under the #sync: callers at the live-event boundary drop the whole
+// event. Without the all-rows check, a fetched snapshot whose
+// selected rows were all filtered out would reconcile an empty projection at
+// the #sync's revision and generate deletes for records that still exist.
+func ValidateSyncReplacementRows(did, rev string, rows []segment.Event) error {
+	keys := make(map[string]struct{}, len(rows))
+	for _, row := range rows {
+		if !row.Kind.IsMaterialization() {
+			continue
+		}
+		if row.DID != did || row.Rev != rev {
+			return fmt.Errorf("%w: replacement row %s/%s carries rev %s", ErrSyncRecordMismatch, row.Collection, row.Rkey, row.Rev)
+		}
+		key := row.Collection + "/" + row.Rkey
+		if _, ok := keys[key]; ok {
+			return fmt.Errorf("%w: replacement set repeats %s", ErrSyncRecordMismatch, key)
+		}
+		keys[key] = struct{}{}
+	}
+	return nil
+}
+
 // ReconcileSyncWithMetadata always reconciles a managed projection using the
 // policy and provenance captured by the caller's admission.
 func (w *Writer) ReconcileSyncWithMetadata(ctx context.Context, did, rev string, rows []segment.Event, collections []string, metadata AttributionMetadata) (bool, error) {
 	snapshot := Snapshot{DID: did, Rev: rev, Collections: slices.Clone(collections), AppendMetadata: &metadata}
 	for _, row := range rows {
-		if row.Kind.IsMaterialization() && slices.Contains(snapshot.Collections, row.Collection) {
-			if row.DID != did || row.Rev != rev {
-				return true, ErrSyncRecordMismatch
-			}
+		if !row.Kind.IsMaterialization() {
+			continue
+		}
+		// hypercerts: check every row's DID/rev, not only selected collections,
+		// so filtered rows cannot hide a fetched-at-another-revision set.
+		if row.DID != did || row.Rev != rev {
+			return true, ErrSyncRecordMismatch
+		}
+		if slices.Contains(snapshot.Collections, row.Collection) {
 			snapshot.Records = append(snapshot.Records, row)
 		}
 	}
@@ -381,10 +412,15 @@ func (w *Writer) ReconcileSyncWithMetadata(ctx context.Context, did, rev string,
 func (w *Writer) reconcileSync(ctx context.Context, did, rev string, rows []segment.Event, collections []string) error {
 	snapshot := Snapshot{DID: did, Rev: rev, Collections: slices.Clone(collections)}
 	for _, row := range rows {
-		if row.Kind.IsMaterialization() && slices.Contains(snapshot.Collections, row.Collection) {
-			if row.DID != did || row.Rev != rev {
-				return ErrSyncRecordMismatch
-			}
+		if !row.Kind.IsMaterialization() {
+			continue
+		}
+		// hypercerts: check every row's DID/rev, not only selected collections,
+		// so filtered rows cannot hide a fetched-at-another-revision set.
+		if row.DID != did || row.Rev != rev {
+			return ErrSyncRecordMismatch
+		}
+		if slices.Contains(snapshot.Collections, row.Collection) {
 			snapshot.Records = append(snapshot.Records, row)
 		}
 	}

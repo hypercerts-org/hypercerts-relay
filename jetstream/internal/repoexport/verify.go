@@ -126,7 +126,7 @@ func loadAuthoritativeRoot(ctx context.Context, did string, resolver identity.Re
 	if err != nil {
 		return "", "", err
 	}
-	// The PDS endpoint comes from a DID document the account owner controls,
+	// hypercerts: The PDS endpoint comes from a DID document the account owner controls,
 	// and verification runs on behalf of anonymous /status viewers, so it
 	// must not be able to point the relay at internal hosts.
 	pdsOrigin, err := pdsEndpointOrigin(pdsURL, allowPrivatePDS)
@@ -161,7 +161,7 @@ func resolvePDSEndpoint(ctx context.Context, did string, resolver identity.Resol
 		return "", fmt.Errorf("repoexport: parse DID %q: %w", did, err)
 	}
 	if resolver == nil {
-		resolver = &identity.DefaultResolver{}
+		resolver = NewStatusResolver("", nil)
 	}
 	doc, err := resolver.ResolveDID(ctx, parsedDID)
 	if err != nil {
@@ -220,7 +220,7 @@ func pdsEndpointOrigin(raw string, allowPrivate bool) (string, error) {
 	return origin, nil
 }
 
-// newPublicPDSHTTPClient builds the client used to query an account's PDS.
+// hypercerts: newPublicPDSHTTPClient builds the client used to query an account's PDS.
 // The endpoint is account-controlled, and a public-looking name can resolve
 // anywhere, so like atmos's default backfill host client it layers jttp's
 // strict SSRF check on the initial request (redirect hops are checked by
@@ -255,11 +255,20 @@ func refuseNonPublicDial(_, address string, _ syscall.RawConn) error {
 	return nil
 }
 
-// nonPublicAddr reports whether addr is outside public unicast space, using
-// the ranges atmos's backfill dialer refuses: loopback, link-local (including
-// cloud metadata), private and IPv6 ULA, multicast, unspecified, 0.0.0.0/8,
-// limited broadcast, CGNAT 100.64.0.0/10 and benchmarking 198.18.0.0/15.
-// Zoned and invalid addresses fail closed.
+var publicIPv6 = netip.MustParsePrefix("2000::/3")
+
+var reservedPDSNetworks = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"), netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("192.0.0.0/24"), netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("192.88.99.0/24"), netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("198.51.100.0/24"), netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("240.0.0.0/4"), netip.MustParsePrefix("2001::/23"),
+	netip.MustParsePrefix("2001:db8::/32"), netip.MustParsePrefix("2002::/16"),
+	netip.MustParsePrefix("3fff::/20"),
+}
+
+// nonPublicAddr conservatively refuses special-use and translation networks
+// in addition to private addresses. Zoned addresses fail closed.
 func nonPublicAddr(addr netip.Addr) bool {
 	if !addr.IsValid() || addr.Zone() != "" {
 		return true
@@ -268,14 +277,11 @@ func nonPublicAddr(addr netip.Addr) bool {
 	if addr.IsLoopback() || addr.IsLinkLocalUnicast() || addr.IsMulticast() || addr.IsUnspecified() || addr.IsPrivate() {
 		return true
 	}
-	if addr.Is4() {
-		b := addr.As4()
-		switch {
-		case b[0] == 0, b == [4]byte{255, 255, 255, 255}:
-			return true
-		case b[0] == 100 && b[1]&0xc0 == 0x40: // 100.64.0.0/10
-			return true
-		case b[0] == 198 && b[1]&0xfe == 18: // 198.18.0.0/15
+	if addr.Is6() && !publicIPv6.Contains(addr) {
+		return true
+	}
+	for _, prefix := range reservedPDSNetworks {
+		if prefix.Contains(addr) {
 			return true
 		}
 	}

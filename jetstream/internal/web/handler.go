@@ -187,8 +187,8 @@ func (h *Handler) serveStatus(w http.ResponseWriter, r *http.Request) {
 		} else {
 			report, err := h.repoActions.VerifyRepo(r.Context(), verifyDID)
 			if err != nil {
-				// Verification fetches from a PDS endpoint the account owner
-				// chooses, so the raw error can describe how the relay's own
+				// hypercerts: Verification fetches from a PDS endpoint the account
+				// owner chooses, so the raw error can describe how the relay's own
 				// network answered (DNS results, refused or timed-out dials,
 				// upstream replies). Keep that detail in the server log and
 				// show anonymous viewers a generic message.

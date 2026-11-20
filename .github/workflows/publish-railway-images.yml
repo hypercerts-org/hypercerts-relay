@@ -39,6 +39,8 @@ jobs:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
           driver: docker-container
+          # No Actions cache of any kind in this job, including the Buildx binary.
+          cache-binary: false
       - name: Build and publish immutable candidate images
         env:
           IMAGE_PREFIX: ghcr.io/${{ github.repository }}

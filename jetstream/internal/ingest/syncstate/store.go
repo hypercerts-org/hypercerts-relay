@@ -354,6 +354,17 @@ func (p *PebbleStateStore) PromoteChain(did atmos.DID, maxRev string) {
 	delete(p.pendingChain, did)
 }
 
+// hypercerts: DiscardPendingChain forgets verifier chain state that was staged
+// for an event the consumer then refused to archive. The verifier's view falls
+// back to the last promoted or durable state, so the DID's next commit is
+// checked against what the archive actually holds and a divergence triggers a
+// fresh resync instead of being promoted over the gap.
+func (p *PebbleStateStore) DiscardPendingChain(did atmos.DID) {
+	p.mu.Lock()
+	delete(p.pendingChain, did)
+	p.mu.Unlock()
+}
+
 // PromoteHosting marks the pending hosting entry for did as flushable
 // iff its source #account event seq is <= maxSeq — i.e. the archived
 // KindAccount row the caller just appended (UpstreamRelayCursor) is

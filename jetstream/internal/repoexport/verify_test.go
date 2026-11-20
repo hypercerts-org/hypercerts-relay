@@ -273,8 +273,8 @@ func TestPDSEndpointOrigin_AcceptsPublicOrigins(t *testing.T) {
 		"https://pds.example.com/":       "https://pds.example.com",
 		"https://PDS.Example.com:2583":   "https://PDS.Example.com:2583",
 		"http://pds.example.com":         "http://pds.example.com",
-		"https://203.0.113.5":            "https://203.0.113.5",
-		"http://203.0.113.5:8080":        "http://203.0.113.5:8080",
+		"https://93.184.216.34":          "https://93.184.216.34",
+		"http://93.184.216.34:8080":      "http://93.184.216.34:8080",
 		"https://[2606:4700:4700::1111]": "https://[2606:4700:4700::1111]",
 		"https://bücher.example":         "https://bücher.example",
 		"https://xn--bcher-kva.example":  "https://xn--bcher-kva.example",
@@ -329,7 +329,10 @@ func TestRefuseNonPublicDial(t *testing.T) {
 	for _, address := range []string{"127.0.0.1:80", "[::1]:443", "10.0.0.1:443", "169.254.169.254:80", "[fd00:ec2::254]:80", "[::ffff:192.168.0.1]:80", "100.100.1.1:443", "not-an-ip:80"} {
 		require.Error(t, refuseNonPublicDial("tcp", address, nil), address)
 	}
-	for _, address := range []string{"203.0.113.5:443", "[2606:4700:4700::1111]:443"} {
+	for _, address := range []string{"192.0.2.1:443", "198.51.100.7:443", "203.0.113.5:443", "192.88.99.1:443", "240.0.0.1:443"} {
+		require.Error(t, refuseNonPublicDial("tcp", address, nil), address)
+	}
+	for _, address := range []string{"[2606:4700:4700::1111]:443", "8.8.8.8:443"} {
 		require.NoError(t, refuseNonPublicDial("tcp", address, nil), address)
 	}
 }

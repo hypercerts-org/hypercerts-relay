@@ -2,6 +2,7 @@ package identity
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -72,7 +73,10 @@ func (d *CacheDirectory) updateHandle(ctx context.Context, h syntax.Handle) hand
 			DID:     "",
 			Err:     err,
 		}
-		d.handleCache.Add(h, he)
+		// hypercerts: local did:web admission failures say nothing about the identity.
+		if !errors.Is(err, ErrDIDWebRateLimited) {
+			d.handleCache.Add(h, he)
+		}
 		return he
 	}
 
@@ -167,11 +171,19 @@ func (d *CacheDirectory) updateDID(ctx context.Context, did syntax.DID) identity
 		}
 	}
 
-	d.identityCache.Add(did, entry)
+	// hypercerts: do not turn local overload into a negative cache entry.
+	if !errors.Is(err, ErrDIDWebRateLimited) {
+		d.identityCache.Add(did, entry)
+	}
 	if he != nil {
 		d.handleCache.Add(ident.Handle, *he)
 	}
 	return entry
+}
+
+type didLookupResult struct {
+	done  chan struct{}
+	entry identityEntry
 }
 
 func (d *CacheDirectory) LookupDID(ctx context.Context, did syntax.DID) (*Identity, error) {
@@ -191,7 +203,8 @@ func (d *CacheDirectory) LookupDIDWithCacheState(ctx context.Context, did syntax
 	identityCacheMisses.Inc()
 
 	// Coalesce multiple requests for the same DID
-	res := make(chan struct{})
+	// hypercerts: share the result even when local admission bypasses the cache.
+	res := &didLookupResult{done: make(chan struct{})}
 	val, loaded := d.didLookupChans.LoadOrStore(did.String(), res)
 	if loaded {
 		identityRequestsCoalesced.Inc()
@@ -199,13 +212,9 @@ func (d *CacheDirectory) LookupDIDWithCacheState(ctx context.Context, did syntax
 		didResolutionDuration.WithLabelValues("lru", "coalesced").Observe(time.Since(start).Seconds())
 		// Wait for the result from the pending request
 		select {
-		case <-val.(chan struct{}):
-			// The result should now be in the cache
-			entry, ok := d.identityCache.Get(did)
-			if ok && !d.isIdentityStale(&entry) {
-				return entry.Identity, false, entry.Err
-			}
-			return nil, false, fmt.Errorf("identity not found in cache after coalesce returned")
+		case <-val.(*didLookupResult).done:
+			result := val.(*didLookupResult).entry
+			return result.Identity, false, result.Err
 		case <-ctx.Done():
 			return nil, false, ctx.Err()
 		}
@@ -214,10 +223,9 @@ func (d *CacheDirectory) LookupDIDWithCacheState(ctx context.Context, did syntax
 	// Update the Identity Entry from PLC and cache the result
 	newEntry := d.updateDID(ctx, did)
 
-	// Cleanup the coalesce map and close the results channel
+	res.entry = newEntry
 	d.didLookupChans.Delete(did.String())
-	// Callers waiting will now get the result from the cache
-	close(res)
+	close(res.done)
 
 	if newEntry.Err != nil {
 		didResolution.WithLabelValues("lru", "error").Inc()
