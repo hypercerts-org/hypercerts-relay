@@ -366,17 +366,18 @@ func (p *PebbleStateStore) PromoteChain(did atmos.DID, maxRev string) {
 // a verified repository state for did. Until a later sync for the DID is
 // reconciled, no chain state for it is promoted, so durable verifier state
 // cannot move across the archive gap, whichever event staged it and whenever.
-// Staged state is dropped now and again at each promotion attempt, so the
-// verifier falls back to the state the archive holds and the DID's next commit
-// repairs through the ordinary resync path. The block is in memory only: after
-// a restart the durable state is still the pre-drop state, which has the same
-// effect.
+// Staged state is dropped now and again at each promotion attempt. Where the
+// DID has earlier chain state, the verifier falls back to it and the DID's
+// next commit repairs through the ordinary resync path. The block is in
+// memory only.
 //
-// Known limitation: for a DID with no durable chain state, the block does not
-// survive a restart (the next commit is then accepted as a first sighting),
-// and without a restart it lasts until a later sync for the DID is reconciled.
-// A durable marker was deliberately not added, to keep this store close to
-// upstream Jetstream; the recovery sink covers the gap on a best-effort basis.
+// Known limitation: for a DID with no earlier chain state, a commit that
+// loads no chain state is verified as a first sighting and its delta is
+// archived without repairing the gap, with or without a restart, until a
+// later sync for the DID is reconciled. Records present only in the dropped
+// sync stay missing until recovery. A durable marker was deliberately not
+// added, to keep this store close to upstream Jetstream; the recovery sink
+// covers the gap on a best-effort basis.
 func (p *PebbleStateStore) BlockChainPromotion(did atmos.DID) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

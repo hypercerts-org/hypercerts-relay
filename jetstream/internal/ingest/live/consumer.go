@@ -1082,9 +1082,10 @@ var emptyRepoRoot = sync.OnceValues(func() (cbor.CID, error) {
 // published for it, but the verifier has already staged chain state for the
 // repository it fetched, and neither that state nor anything verified on top
 // of it may become durable ahead of the archive. Promotion of chain state for
-// the DID is therefore blocked until a later sync for it is reconciled; the
-// verifier falls back to the state the archive holds and the DID's next
-// commit repairs through the ordinary resync path. The DID is also handed to
+// the DID is therefore blocked until a later sync for it is reconciled. Where
+// the DID has earlier chain state, the verifier falls back to it and the
+// DID's next commit repairs through the ordinary resync path; see
+// BlockChainPromotion for the case where it has none. The DID is also handed to
 // the recovery sink when one is configured; that sink is asynchronous and
 // bounded, so it is best effort. The upstream event itself is complete:
 // redelivering it would be rejected again. Counter only: upstream input must
