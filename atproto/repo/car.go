@@ -13,20 +13,10 @@ import (
 	blocks "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
 	"github.com/ipld/go-car"
-	"github.com/multiformats/go-multihash"
 )
 
 var ErrNoRoot = errors.New("CAR file missing root CID")
 var ErrNoCommit = errors.New("no commit")
-
-// hypercerts: validateRepoCID requires the 32-byte sha2-256 multihash that atproto repos use for every CID taken from repo data.
-func validateRepoCID(c cid.Cid) error {
-	p := c.Prefix()
-	if p.MhType != multihash.SHA2_256 || p.MhLength != 32 {
-		return fmt.Errorf("unsupported CID hash (must be 32-byte sha2-256): %s", c)
-	}
-	return nil
-}
 
 func LoadRepoFromCAR(ctx context.Context, r io.Reader) (*Commit, *Repo, error) {
 
@@ -45,7 +35,7 @@ func LoadRepoFromCAR(ctx context.Context, r io.Reader) (*Commit, *Repo, error) {
 		return nil, nil, fmt.Errorf("CAR file missing root CID")
 	}
 	commitCID := cr.Header.Roots[0]
-	if err := validateRepoCID(commitCID); err != nil {
+	if err := mst.ValidateCIDHash(commitCID); err != nil {
 		return nil, nil, fmt.Errorf("CAR file root: %w", err)
 	}
 
@@ -58,7 +48,7 @@ func LoadRepoFromCAR(ctx context.Context, r io.Reader) (*Commit, *Repo, error) {
 			return nil, nil, err
 		}
 
-		if err := validateRepoCID(blk.Cid()); err != nil {
+		if err := mst.ValidateCIDHash(blk.Cid()); err != nil {
 			return nil, nil, fmt.Errorf("CAR file block: %w", err)
 		}
 		if err := bs.Put(ctx, blk); err != nil {
@@ -113,7 +103,7 @@ func LoadCommitFromCAR(ctx context.Context, r io.Reader) (*Commit, *cid.Cid, err
 		return nil, nil, ErrNoRoot
 	}
 	commitCID := cr.Header.Roots[0]
-	if err := validateRepoCID(commitCID); err != nil {
+	if err := mst.ValidateCIDHash(commitCID); err != nil {
 		return nil, nil, fmt.Errorf("CAR file root: %w", err)
 	}
 	var commitBlock blocks.Block
@@ -126,7 +116,7 @@ func LoadCommitFromCAR(ctx context.Context, r io.Reader) (*Commit, *cid.Cid, err
 			return nil, nil, err
 		}
 
-		if err := validateRepoCID(blk.Cid()); err != nil {
+		if err := mst.ValidateCIDHash(blk.Cid()); err != nil {
 			return nil, nil, fmt.Errorf("CAR file block: %w", err)
 		}
 		if blk.Cid().Equals(commitCID) {

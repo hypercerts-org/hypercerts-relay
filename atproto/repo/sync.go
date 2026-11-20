@@ -8,6 +8,7 @@ import (
 
 	comatproto "github.com/bluesky-social/indigo/api/atproto"
 	"github.com/bluesky-social/indigo/atproto/identity"
+	"github.com/bluesky-social/indigo/atproto/repo/mst"
 	"github.com/bluesky-social/indigo/atproto/syntax"
 
 	"github.com/ipfs/go-cid"
@@ -42,7 +43,7 @@ func VerifyCommitMessage(ctx context.Context, msg *comatproto.SyncSubscribeRepos
 
 	// hypercerts: CIDs carried beside the CAR must also use the 32-byte sha2-256 hash atproto repos require.
 	if msg.PrevData != nil {
-		if err := validateRepoCID(cid.Cid(*msg.PrevData)); err != nil {
+		if err := mst.ValidateCIDHash(cid.Cid(*msg.PrevData)); err != nil {
 			return nil, fmt.Errorf("invalid prevData: %w", err)
 		}
 	}
@@ -52,12 +53,12 @@ func VerifyCommitMessage(ctx context.Context, msg *comatproto.SyncSubscribeRepos
 			return nil, fmt.Errorf("null entry in ops list")
 		}
 		if op.Cid != nil {
-			if err := validateRepoCID(cid.Cid(*op.Cid)); err != nil {
+			if err := mst.ValidateCIDHash(cid.Cid(*op.Cid)); err != nil {
 				return nil, fmt.Errorf("invalid repo op cid: %w", err)
 			}
 		}
 		if op.Prev != nil {
-			if err := validateRepoCID(cid.Cid(*op.Prev)); err != nil {
+			if err := mst.ValidateCIDHash(cid.Cid(*op.Prev)); err != nil {
 				return nil, fmt.Errorf("invalid repo op prev: %w", err)
 			}
 		}

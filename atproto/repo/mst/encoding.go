@@ -68,11 +68,19 @@ func NodeDataFromCBOR(r io.Reader) (*NodeData, error) {
 	return &nd, nil
 }
 
-// hypercerts: validateLinkCID requires the 32-byte sha2-256 multihash that atproto repos use for CID links in decoded MST nodes. Mirrors validateRepoCID in the parent repo package.
-func validateLinkCID(c cid.Cid) error {
+// hypercerts: ValidateCIDHash requires the 32-byte sha2-256 multihash that atproto repos use. It checks the hash only; CID version and codec are left to the existing readers.
+func ValidateCIDHash(c cid.Cid) error {
 	p := c.Prefix()
 	if p.MhType != multihash.SHA2_256 || p.MhLength != 32 {
-		return fmt.Errorf("%w: unsupported CID hash (must be 32-byte sha2-256): %s", ErrInvalidTree, c)
+		return fmt.Errorf("unsupported CID hash (must be 32-byte sha2-256): %s", c)
+	}
+	return nil
+}
+
+// hypercerts: validateLinkCID applies ValidateCIDHash to CID links in decoded MST nodes.
+func validateLinkCID(c cid.Cid) error {
+	if err := ValidateCIDHash(c); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidTree, err)
 	}
 	return nil
 }
