@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"fmt"
 	"testing"
 
 	comatproto "github.com/bluesky-social/indigo/api/atproto"
@@ -58,6 +59,23 @@ func TestInitialCommitStillValidatesTimestampAndRoot(t *testing.T) {
 			rejections, err := r.ListRejectedEvents(t.Context(), 0, 100)
 			require.NoError(t, err)
 			require.Len(t, rejections, 1)
+			require.Empty(t, output.events)
+		})
+	}
+}
+
+func TestCommitWithNullOpIsRejectedInEveryMode(t *testing.T) {
+	for _, lenient := range []bool{false, true} {
+		t.Run(fmt.Sprintf("lenient=%t", lenient), func(t *testing.T) {
+			ident, commit := loadIngestFixture(t)
+			r, _, output := newIngestTestRelay(t, newFixtureDirectory(ident), ident.DID, true, nil)
+			r.Config.LenientSyncValidation = lenient
+			commit.Ops = append(commit.Ops, nil)
+			require.NoError(t, r.processRepoEvent(t.Context(), &stream.XRPCStreamEvent{RepoCommit: &commit}, "source.example", ingestTestHostID))
+			rejections, err := r.ListRejectedEvents(t.Context(), 0, 100)
+			require.NoError(t, err)
+			require.Len(t, rejections, 1)
+			require.Equal(t, rejectionReasonMalformedCommit, rejections[0].ReasonCode)
 			require.Empty(t, output.events)
 		})
 	}

@@ -35,6 +35,9 @@ func LoadRepoFromCAR(ctx context.Context, r io.Reader) (*Commit, *Repo, error) {
 		return nil, nil, fmt.Errorf("CAR file missing root CID")
 	}
 	commitCID := cr.Header.Roots[0]
+	if err := mst.ValidateCIDHash(commitCID); err != nil {
+		return nil, nil, fmt.Errorf("CAR file root: %w", err)
+	}
 
 	for {
 		blk, err := cr.Next()
@@ -45,6 +48,9 @@ func LoadRepoFromCAR(ctx context.Context, r io.Reader) (*Commit, *Repo, error) {
 			return nil, nil, err
 		}
 
+		if err := mst.ValidateCIDHash(blk.Cid()); err != nil {
+			return nil, nil, fmt.Errorf("CAR file block: %w", err)
+		}
 		if err := bs.Put(ctx, blk); err != nil {
 			return nil, nil, err
 		}
@@ -66,6 +72,12 @@ func LoadRepoFromCAR(ctx context.Context, r io.Reader) (*Commit, *Repo, error) {
 	tree, err := mst.LoadTreeFromStore(ctx, bs, commit.Data)
 	if err != nil {
 		return nil, nil, fmt.Errorf("reading MST from CAR file: %w", err)
+	}
+	// hypercerts: MST blocks are untrusted input; check structure before any tree
+	// operations rely on it (removal, re-encoding, inversion). Missing (partial)
+	// child nodes are allowed by the loader and skipped by Verify.
+	if err := tree.Verify(); err != nil {
+		return nil, nil, fmt.Errorf("reading MST from CAR file: %w: %w", mst.ErrInvalidTree, err)
 	}
 	clk := syntax.ClockFromTID(syntax.TID(commit.Rev))
 	repo := Repo{
@@ -91,6 +103,9 @@ func LoadCommitFromCAR(ctx context.Context, r io.Reader) (*Commit, *cid.Cid, err
 		return nil, nil, ErrNoRoot
 	}
 	commitCID := cr.Header.Roots[0]
+	if err := mst.ValidateCIDHash(commitCID); err != nil {
+		return nil, nil, fmt.Errorf("CAR file root: %w", err)
+	}
 	var commitBlock blocks.Block
 	for {
 		blk, err := cr.Next()
@@ -101,6 +116,9 @@ func LoadCommitFromCAR(ctx context.Context, r io.Reader) (*Commit, *cid.Cid, err
 			return nil, nil, err
 		}
 
+		if err := mst.ValidateCIDHash(blk.Cid()); err != nil {
+			return nil, nil, fmt.Errorf("CAR file block: %w", err)
+		}
 		if blk.Cid().Equals(commitCID) {
 			commitBlock = blk
 			break

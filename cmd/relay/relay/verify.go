@@ -50,6 +50,12 @@ func (r *Relay) VerifyRepoCommit(ctx context.Context, evt *comatproto.SyncSubscr
 	if len(evt.Ops) > MaxCommitOps {
 		return nil, newPermanentEventError(rejectionReasonMalformedCommit, fmt.Errorf("too many ops in commit: %d", len(evt.Ops)))
 	}
+	// hypercerts: a null ops entry is malformed in every mode, so lenient validation cannot forward it downstream.
+	for _, op := range evt.Ops {
+		if op == nil {
+			return nil, newPermanentEventError(rejectionReasonMalformedCommit, errors.New("null entry in commit ops"))
+		}
+	}
 
 	// even in lenient/legacy mode (eg, tooBig), we need to verify commit
 	commit, commitCID, err := repo.LoadCommitFromCAR(ctx, bytes.NewReader(evt.Blocks))

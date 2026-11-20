@@ -92,6 +92,10 @@ func (n *Node) remove(key []byte, height int) (*Node, *cid.Cid, error) {
 }
 
 func mergeNodes(left *Node, right *Node) (*Node, error) {
+	// an empty non-root node is never valid, but may be present in trees decoded from untrusted data
+	if len(left.Entries) == 0 || len(right.Entries) == 0 {
+		return nil, fmt.Errorf("%w: can not merge empty child node", ErrInvalidTree)
+	}
 	idx := len(left.Entries)
 	n := &Node{
 		Height:  left.Height,

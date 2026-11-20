@@ -6,6 +6,7 @@ import (
 
 	"github.com/bluesky-social/indigo/atproto/atcrypto"
 	"github.com/bluesky-social/indigo/atproto/atdata"
+	"github.com/bluesky-social/indigo/atproto/repo/mst"
 	"github.com/bluesky-social/indigo/atproto/syntax"
 
 	"github.com/ipfs/go-cid"
@@ -36,6 +37,15 @@ func (c *Commit) VerifyStructure() error {
 	_, err = syntax.ParseTID(c.Rev)
 	if err != nil {
 		return fmt.Errorf("invalid commit data: %w", err)
+	}
+	// hypercerts: the signed commit must bind its MST root (and prev) with a full-strength hash.
+	if err := mst.ValidateCIDHash(c.Data); err != nil {
+		return fmt.Errorf("invalid commit data: %w", err)
+	}
+	if c.Prev != nil {
+		if err := mst.ValidateCIDHash(*c.Prev); err != nil {
+			return fmt.Errorf("invalid commit prev: %w", err)
+		}
 	}
 	return nil
 }

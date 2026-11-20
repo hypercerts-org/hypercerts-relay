@@ -150,7 +150,7 @@ func (t *Tree) Copy() Tree {
 }
 
 func LoadTreeFromStore(ctx context.Context, bs MSTBlockSource, root cid.Cid) (*Tree, error) {
-	n, err := loadNodeFromStore(ctx, bs, root)
+	n, err := loadNodeFromStore(ctx, bs, root, 1, map[string]struct{}{})
 	if err != nil {
 		return nil, err
 	}
