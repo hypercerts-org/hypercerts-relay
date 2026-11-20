@@ -434,7 +434,7 @@ func (s *Slurper) subscribeWithRedialer(ctx context.Context, host *models.Host, 
 		logger.Debug("event subscription response", "code", resp.StatusCode, "url", u)
 		sub.setState("connected")
 		connectedInbound.Inc()
-		connErr := s.handleConnection(ctx, conn, sub)
+		connFirstSeen, connErr := s.handleConnection(ctx, conn, sub)
 		if err := connErr; err != nil {
 
 			// TODO: measure the last N connection error times and if they're coming too fast reconnect slower or don't reconnect and wait for requestCrawl
@@ -468,9 +468,14 @@ func (s *Slurper) subscribeWithRedialer(ctx context.Context, host *models.Host, 
 			}
 		} else if errors.Is(connErr, parallel.ErrHandlerPanic) {
 			// hypercerts: the failed position is not acknowledged, so a redial with
-			// a cursor replays it; wait first so a repeating panic cannot spin. With
-			// no acknowledged cursor the redial resumes at the live tail, as it does
-			// after any other processing error.
+			// a cursor replays it; wait first so a repeating panic cannot spin.
+			// Without an acknowledged cursor a cursorless redial would resume at
+			// the live tail and skip the failed event and everything emitted during
+			// the wait, so the first sequence observed on the connection is kept as
+			// the dial boundary. The acknowledged cursor itself is not advanced.
+			if cursor <= 0 && connFirstSeen > 1 {
+				cursor = connFirstSeen - 1
+			}
 			if panicBackoff < 10 {
 				panicBackoff++
 			}
@@ -510,7 +515,11 @@ func sleepForBackoff(b int) time.Duration {
 }
 
 // Configures event processing for a websocket connection, using the parallel schedule helper library, with all events processed using the configured callback function.
-func (s *Slurper) handleConnection(ctx context.Context, conn *websocket.Conn, sub *Subscription) error {
+//
+// hypercerts: firstSeen is the lowest source sequence observed on the
+// connection, or zero when none was; it is read after the workers are joined,
+// before the panicking position can be acknowledged.
+func (s *Slurper) handleConnection(ctx context.Context, conn *websocket.Conn, sub *Subscription) (firstSeen int64, err error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -566,11 +575,27 @@ func (s *Slurper) handleConnection(ctx context.Context, conn *websocket.Conn, su
 	// NOTE: `InstrumentedRepoStreamCallbacks` is where event limiters get called/enforced
 	instrumentedRSC := stream.NewInstrumentedRepoStreamCallbacks(limiters, rsc.EventHandler)
 
+	// hypercerts: remember the lowest sequence observed on this connection so a
+	// panic retry with no acknowledged cursor can replay from it.
+	var firstSeenSeq atomic.Int64
+	noteSeen := func(seq int64) {
+		for {
+			cur := firstSeenSeq.Load()
+			if seq <= 0 || (cur != 0 && seq >= cur) {
+				return
+			}
+			if firstSeenSeq.CompareAndSwap(cur, seq) {
+				return
+			}
+		}
+	}
+
 	scheduler := parallel.NewScheduler(
 		s.Config.ConcurrencyPerHost,
 		s.Config.QueueDepthPerHost,
 		conn.RemoteAddr().String(),
 		func(_ context.Context, evt *stream.XRPCStreamEvent) error {
+			noteSeen(evt.Sequence())
 			return instrumentedRSC.EventHandler(ctx, evt)
 		},
 	)
@@ -593,7 +618,7 @@ func (s *Slurper) handleConnection(ctx context.Context, conn *websocket.Conn, su
 		_ = conn.Close()
 	}()
 	connLogger := s.logger.With("host", sub.Hostname)
-	err := stream.HandleRepoStream(ctx, conn, rateScheduler{Scheduler: scheduler, wait: s.Config.WaitRateCapacity, host: sub.Hostname}, connLogger)
+	err = stream.HandleRepoStream(ctx, conn, rateScheduler{Scheduler: scheduler, wait: s.Config.WaitRateCapacity, host: sub.Hostname}, connLogger)
 	if processErr := scheduler.Err(); processErr != nil {
 		err = processErr
 	}
@@ -605,7 +630,7 @@ func (s *Slurper) handleConnection(ctx context.Context, conn *websocket.Conn, su
 			err = errors.Join(parallel.ErrHandlerPanic, err)
 		}
 	}
-	return err
+	return firstSeenSeq.Load(), err
 }
 
 type HostCursor struct {
