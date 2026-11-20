@@ -1,6 +1,6 @@
 # Build from the repository root:
 # docker build -f cmd/pdsdiscovery/Dockerfile -t hypercerts-pdsdiscovery .
-ARG VERSION=0.10.1
+ARG VERSION=0.11.0
 ARG COMMIT=unknown
 ARG DATE=unknown
 
