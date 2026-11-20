@@ -34,6 +34,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/lifecycle"
 	"github.com/bluesky-social/jetstream/internal/manifest"
 	"github.com/bluesky-social/jetstream/internal/obs"
+	"github.com/bluesky-social/jetstream/internal/repoexport"
 	"github.com/bluesky-social/jetstream/internal/server"
 	"github.com/bluesky-social/jetstream/internal/status"
 	"github.com/bluesky-social/jetstream/internal/store"
@@ -672,12 +673,15 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 
 	// Status collector + handler are built here (after the import manager) so
 	// the status page can surface the current import job.
+	statusIdentityResolver := repoexport.NewStatusResolver(opts.PLCURL, opts.HTTPTransport)
 	statusCollector, err := status.New(status.Options{
-		Store:                 metaStore,
-		DataDir:               opts.DataDir,
-		Manifest:              mft,
-		CursorLookback:        opts.CursorLookback,
-		IdentityResolver:      resolver,
+		Store:          metaStore,
+		DataDir:        opts.DataDir,
+		Manifest:       mft,
+		CursorLookback: opts.CursorLookback,
+		// hypercerts: the status page is anonymous; its handle and DID lookups
+		// use the same public-address-only resolver as repo verification.
+		IdentityResolver:      statusIdentityResolver,
 		ImportReporter:        importReporter{mgr: importMgr},
 		CoverageReporter:      coverageReporter{source: rt.BackfillJobs},
 		LastSeenUpstreamEvent: liveMetrics.LastSeenUpstreamEvent,
@@ -686,8 +690,11 @@ func Build(ctx context.Context, opts Options) (*Runtime, error) {
 		return fail(fmt.Errorf("serve: build status collector: %w", err))
 	}
 	statusHandler, err := web.New(web.Options{
-		Snapshotter:                statusCollector,
-		RepoActions:                web.NewRepoActions(opts.DataDir, resolver, newManifestSelector(mft), pendingEventsForDID(&writerPtr)),
+		Snapshotter: statusCollector,
+		// hypercerts: anonymous /status verification resolves account-chosen
+		// DIDs, so it gets its own public-address-only resolver rather than the
+		// ingest resolver, which may be relaxed for an operator PLC.
+		RepoActions:                web.NewRepoActions(opts.DataDir, statusIdentityResolver, newManifestSelector(mft), pendingEventsForDID(&writerPtr)),
 		DisableRepoActionRateLimit: opts.DisableRepoActionRateLimits,
 		Logger:                     processLogger,
 	})

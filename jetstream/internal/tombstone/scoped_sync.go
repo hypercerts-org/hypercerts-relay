@@ -1,6 +1,7 @@
 package tombstone
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/bluesky-social/jetstream/segment"
@@ -9,19 +10,34 @@ import (
 
 const scopedSyncKey = "hypercertsSelectedSync"
 
+// ErrScopedSyncEncode wraps every EncodeScopedSync failure caused by upstream
+// input; a local policy that cannot be represented is returned unwrapped. The #sync payload
+// is upstream-controlled: a payload the scoped marker cannot represent (for
+// example blocks above the CBOR codec's byte-string limit) is unrepresentable
+// input, and callers at the live-event boundary drop the whole event instead
+// of failing the process.
+var ErrScopedSyncEncode = errors.New("tombstone: scoped sync marker could not be encoded")
+
 type SyncScope struct {
 	Collections []string
 	Paths       []string
 }
 
 func EncodeScopedSync(payload []byte, scope SyncScope) ([]byte, error) {
+	// The collections come from the local collection policy. If they cannot
+	// be represented on their own, that is a local fault and must not be
+	// reported as unrepresentable upstream input. The paths come from the
+	// upstream replacement rows and are covered by the checks below.
+	if err := checkScopeRepresentable(SyncScope{Collections: scope.Collections}); err != nil {
+		return nil, err
+	}
 	decoded, err := cbor.Unmarshal(payload)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", ErrScopedSyncEncode, err)
 	}
 	fields, ok := decoded.(map[string]any)
 	if !ok {
-		return nil, fmt.Errorf("invalid sync payload")
+		return nil, fmt.Errorf("%w: invalid sync payload", ErrScopedSyncEncode)
 	}
 	collections := make([]any, len(scope.Collections))
 	for i, collection := range scope.Collections {
@@ -32,7 +48,46 @@ func EncodeScopedSync(payload []byte, scope SyncScope) ([]byte, error) {
 		paths[i] = path
 	}
 	fields[scopedSyncKey] = map[string]any{"collections": collections, "paths": paths}
-	return cbor.Marshal(fields)
+	out, err := cbor.Marshal(fields)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrScopedSyncEncode, err)
+	}
+	// The marker is only useful if every reader can recover the scope from it.
+	decodedScope, err := DecodeScopedSync(&segment.Event{Kind: segment.KindSync, Payload: out})
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrScopedSyncEncode, err)
+	}
+	if decodedScope == nil || len(decodedScope.Collections) != len(scope.Collections) || len(decodedScope.Paths) != len(scope.Paths) {
+		return nil, fmt.Errorf("%w: scope does not round-trip", ErrScopedSyncEncode)
+	}
+	return out, nil
+}
+
+func scopeFields(scope SyncScope) map[string]any {
+	collections := make([]any, len(scope.Collections))
+	for i, collection := range scope.Collections {
+		collections[i] = collection
+	}
+	paths := make([]any, len(scope.Paths))
+	for i, path := range scope.Paths {
+		paths[i] = path
+	}
+	return map[string]any{"collections": collections, "paths": paths}
+}
+
+func checkScopeRepresentable(scope SyncScope) error {
+	out, err := cbor.Marshal(map[string]any{scopedSyncKey: scopeFields(scope)})
+	if err != nil {
+		return fmt.Errorf("tombstone: sync scope cannot be encoded: %w", err)
+	}
+	decoded, err := DecodeScopedSync(&segment.Event{Kind: segment.KindSync, Payload: out})
+	if err != nil {
+		return fmt.Errorf("tombstone: sync scope cannot be decoded: %w", err)
+	}
+	if decoded == nil || len(decoded.Collections) != len(scope.Collections) || len(decoded.Paths) != len(scope.Paths) {
+		return errors.New("tombstone: sync scope does not round-trip")
+	}
+	return nil
 }
 
 func DecodeScopedSync(event *segment.Event) (*SyncScope, error) {

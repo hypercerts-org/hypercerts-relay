@@ -3,6 +3,7 @@ package syncstate
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"sync"
@@ -10,6 +11,7 @@ import (
 	"github.com/bluesky-social/jetstream/internal/store"
 	"github.com/cockroachdb/pebble"
 	"github.com/jcalabro/atmos"
+	"github.com/jcalabro/atmos/cbor"
 	atmossync "github.com/jcalabro/atmos/sync"
 )
 
@@ -85,6 +87,10 @@ type PebbleStateStore struct {
 	capturedHosting map[atmos.DID][]byte
 	capturedIdent   map[atmos.DID]int64
 	capturedAccount map[atmos.DID]int64
+
+	// hypercerts: DIDs whose chain state must not be promoted; see
+	// BlockChainPromotion.
+	blockedChain map[atmos.DID]struct{}
 }
 
 type pendingChainState struct {
@@ -136,6 +142,7 @@ func (p *PebbleStateStore) LoadChain(_ context.Context, did atmos.DID) (*atmossy
 	} else if promoted, ok := p.promotedChain[did]; ok {
 		buf = append([]byte(nil), promoted...)
 	}
+	_, blocked := p.blockedChain[did]
 	p.mu.Unlock()
 	if buf != nil {
 		state, err := decodeChainState(buf)
@@ -147,6 +154,10 @@ func (p *PebbleStateStore) LoadChain(_ context.Context, did atmos.DID) (*atmossy
 
 	val, closer, err := p.s.Get(chainKey(did))
 	if errors.Is(err, store.ErrNotFound) {
+		if blocked {
+			// hypercerts: see blockedChainPlaceholder.
+			return blockedChainPlaceholder(), nil
+		}
 		return nil, nil
 	}
 	if err != nil {
@@ -346,12 +357,80 @@ func (p *PebbleStateStore) RecordAccountSeq(did atmos.DID, seq int64) {
 func (p *PebbleStateStore) PromoteChain(did atmos.DID, maxRev string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if _, blocked := p.blockedChain[did]; blocked {
+		delete(p.pendingChain, did)
+		return
+	}
 	pending, ok := p.pendingChain[did]
 	if !ok || pending.rev > maxRev {
 		return
 	}
 	p.promotedChain[did] = pending.buf
 	delete(p.pendingChain, did)
+}
+
+// hypercerts: BlockChainPromotion records that the consumer refused to archive
+// a verified repository state for did. Until a later sync for the DID is
+// reconciled, no chain state for it is promoted, so durable verifier state
+// cannot move across the archive gap, whichever event staged it and whenever.
+// Staged state is dropped now and again at each promotion attempt. Where the
+// DID has earlier chain state, the verifier falls back to it and the DID's
+// next commit repairs through the ordinary resync path. The block is in
+// memory only.
+//
+// Where the DID has no earlier chain state, LoadChain returns
+// blockedChainPlaceholder instead of nil, so the next commit takes the same
+// chain-break path, which attempts a resync, rather than being verified as a
+// first sighting. Either way the DID's commits are not archived until a resync
+// for it is reconciled.
+//
+// Known limitation: the block does not survive a restart. After one, a DID
+// that still has no chain state is verified as a first sighting and its
+// commit deltas are archived without repairing the gap, until a later sync
+// for the DID is reconciled; records present only in the dropped sync stay
+// missing until recovery. A durable marker was deliberately not added, to
+// keep this store close to upstream Jetstream; the recovery sink covers the
+// gap on a best-effort basis. Three cases are not repaired while blocked
+// either, for a DID with or without earlier state: a commit already verified
+// against the dropped sync's staged state before the block, a commit the
+// verifier accepts without a chain check (Sync 1.0 shape), and a commit
+// buffered during a resync whose fetched state is discarded before the
+// verifier replays it, which is reported as a failed replay and not retried.
+func (p *PebbleStateStore) BlockChainPromotion(did atmos.DID) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.blockedChain == nil {
+		p.blockedChain = map[atmos.DID]struct{}{}
+	}
+	p.blockedChain[did] = struct{}{}
+	delete(p.pendingChain, did)
+}
+
+// hypercerts: blockedChainPlaceholder stands in for the chain state of a
+// blocked DID that has none, so the verifier takes its chain-break path (a
+// resync whose replacement can be reconciled and lift the block) instead of
+// its first-sighting path. The empty revision sorts below every valid
+// revision, so no commit is dropped as a replay and no fetched repository is
+// rejected as a regression; a sync or fetched commit that itself carries an
+// empty revision is malformed and is not processed. The data root is a fresh
+// random CID on every load, so an inverted root, an upstream-declared
+// prevData or a sync data root cannot be made to match it; a zero CID would
+// not do, because the verifier's lenient inversion accepts a commit without
+// prevData against it. The value is only ever returned: it is never staged or
+// promoted, and the verifier saves the commit's own or the fetched root,
+// never the loaded one, when they differ.
+func blockedChainPlaceholder() *atmossync.ChainState {
+	var nonce [32]byte
+	_, _ = rand.Read(nonce[:])
+	return &atmossync.ChainState{Data: cbor.ComputeCID(cbor.CodecRaw, nonce[:])}
+}
+
+// UnblockChainPromotion lifts the block once a sync for did was reconciled
+// into the archive.
+func (p *PebbleStateStore) UnblockChainPromotion(did atmos.DID) {
+	p.mu.Lock()
+	delete(p.blockedChain, did)
+	p.mu.Unlock()
 }
 
 // PromoteHosting marks the pending hosting entry for did as flushable

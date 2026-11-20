@@ -17,6 +17,12 @@ import (
 // 5 MByte as a somewhat arbitrary value to start (should probably be smaller)
 var maxDIDBodySize int64 = 5 * 1024 * 1024
 
+// hypercerts: bound untrusted did:web documents before decoding or caching.
+const maxDIDWebBodySize int64 = 64 * 1024
+
+// ErrDIDWebRateLimited is a local admission rejection, not an identity error.
+var ErrDIDWebRateLimited = errors.New("did:web fetch rate limited")
+
 // Resolves a DID to a parsed `DIDDocument` struct.
 //
 // This method does not bi-directionally verify handles. Most atproto-specific code should use the `identity.Directory` interface ("Lookup" methods), which implement that check by default, and provide more ergonomic helpers for working with atproto-relevant information in DID documents.
@@ -119,22 +125,26 @@ func (d *BaseDirectory) resolveDIDWeb(ctx context.Context, did syntax.DID) ([]by
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
-		io.Copy(io.Discard, io.LimitReader(resp.Body, maxDIDBodySize))
+		io.Copy(io.Discard, io.LimitReader(resp.Body, maxDIDWebBodySize))
 		return nil, fmt.Errorf("%w: did:web HTTP status 404", ErrDIDNotFound)
 	}
 	if resp.StatusCode != http.StatusOK {
-		io.Copy(io.Discard, io.LimitReader(resp.Body, maxDIDBodySize))
+		io.Copy(io.Discard, io.LimitReader(resp.Body, maxDIDWebBodySize))
 		return nil, fmt.Errorf("%w: did:web HTTP status %d", ErrDIDResolutionFailed, resp.StatusCode)
 	}
 
-	if resp.ContentLength > maxDIDBodySize {
-		// NOTE: intentionally not draining body
-		return nil, fmt.Errorf("%w: did:web body too large for %s", ErrDIDResolutionFailed, did)
+	// hypercerts: an oversized document is an error, never a silent truncation.
+	if resp.ContentLength > maxDIDWebBodySize {
+		return nil, fmt.Errorf("%w: did:web document too large", ErrDIDResolutionFailed)
 	}
-
-	// TODO: this could result in a truncated handle value with no error thrown (if Content-Length is not set).
-	// See: https://github.com/bluesky-social/indigo/issues/1460
-	return io.ReadAll(io.LimitReader(resp.Body, maxDIDBodySize))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxDIDWebBodySize+1))
+	if err != nil {
+		return nil, fmt.Errorf("%w: read did:web document: %w", ErrDIDResolutionFailed, err)
+	}
+	if int64(len(body)) > maxDIDWebBodySize {
+		return nil, fmt.Errorf("%w: did:web document too large", ErrDIDResolutionFailed)
+	}
+	return body, nil
 }
 
 func (d *BaseDirectory) resolveDIDPLC(ctx context.Context, did syntax.DID) ([]byte, error) {
