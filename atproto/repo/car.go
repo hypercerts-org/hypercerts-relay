@@ -19,9 +19,7 @@ import (
 var ErrNoRoot = errors.New("CAR file missing root CID")
 var ErrNoCommit = errors.New("no commit")
 
-// hypercerts: validateRepoCID rejects CIDs taken from untrusted repo data unless they use the 32-byte sha2-256 multihash that atproto repos require.
-//
-// go-car only checks a block against the hash function and digest length named in the block's own CID, so a weak or truncated hash (eg, a zero-length digest, which matches any data) would otherwise break content addressing.
+// hypercerts: validateRepoCID requires the 32-byte sha2-256 multihash that atproto repos use for every CID taken from repo data.
 func validateRepoCID(c cid.Cid) error {
 	p := c.Prefix()
 	if p.MhType != multihash.SHA2_256 || p.MhLength != 32 {

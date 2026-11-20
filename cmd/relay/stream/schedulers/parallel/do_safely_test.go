@@ -1,8 +1,7 @@
 package parallel
 
-// hypercerts: a panic in the consumer callback (e.g. from malformed upstream
-// event data reaching an unchecked path) must surface as a scheduler error,
-// not kill the relay process (TECH-932 defense-in-depth for F2/F3/F4).
+// hypercerts: a panic in the consumer callback must surface as a scheduler
+// error.
 
 import (
 	"context"

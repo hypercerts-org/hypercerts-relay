@@ -1,9 +1,7 @@
 package repo
 
-// hypercerts: end-to-end regression tests for malformed MST shapes inside an
-// upstream #commit CAR (TECH-932 F2/F3). LoadRepoFromCAR must reject
-// structurally invalid trees (tree.Verify) instead of panicking later when the
-// inverted tree is re-encoded.
+// hypercerts: malformed MST shapes inside a #commit CAR must be rejected
+// when the CAR is loaded.
 
 import (
 	"bytes"

@@ -36,7 +36,7 @@ func buildTestCAR(t *testing.T, root cid.Cid, blks ...testCARBlock) []byte {
 	return buf.Bytes()
 }
 
-// CIDv1 dag-cbor sha2-256 with a zero-length digest: go-car accepts any block data under it.
+// A CID whose sha2-256 digest is not 32 bytes.
 func emptyDigestCID(t *testing.T) cid.Cid {
 	c, err := cid.Cast([]byte{0x01, 0x71, 0x12, 0x00})
 	if err != nil {
@@ -64,7 +64,7 @@ func testCommitBlock(t *testing.T, data cid.Cid) testCARBlock {
 	return testCARBlock{c: c, data: buf.Bytes()}
 }
 
-// The finding's exploit: commit.data points at a zero-length-digest CID whose block is a self-referencing MST node.
+// A CAR whose commit data CID does not use a 32-byte sha2-256 hash must be rejected.
 func TestLoadCARRejectsEmptyDigestMSTRoot(t *testing.T) {
 	assert := assert.New(t)
 	ctx := context.Background()

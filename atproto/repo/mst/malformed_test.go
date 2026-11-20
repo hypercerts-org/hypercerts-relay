@@ -1,9 +1,7 @@
 package mst
 
-// hypercerts: regression tests for structurally malformed MST nodes from
-// untrusted CAR data (TECH-932 F2). Empty-key entries and child pointers
-// without a preceding value must be rejected with ErrInvalidTree, never
-// panic.
+// hypercerts: structurally malformed MST nodes must be rejected with
+// ErrInvalidTree.
 
 import (
 	"testing"

@@ -1,8 +1,7 @@
 package mst
 
-// hypercerts: positive coverage that trees produced by the insert path (the
-// shape a well-behaved PDS ships in a #commit CAR) still load and pass
-// structural verification after the untrusted-input hardening (TECH-932).
+// hypercerts: trees produced by the insert path still load and pass
+// structural verification.
 
 import (
 	"context"

@@ -68,7 +68,7 @@ func NodeDataFromCBOR(r io.Reader) (*NodeData, error) {
 	return &nd, nil
 }
 
-// hypercerts: validateLinkCID rejects CID links in decoded MST nodes unless they use the 32-byte sha2-256 multihash that atproto repos require. A weak or truncated hash (eg, a zero-length digest) would let a node link to content it does not commit to. Mirrors validateRepoCID in the parent repo package.
+// hypercerts: validateLinkCID requires the 32-byte sha2-256 multihash that atproto repos use for CID links in decoded MST nodes. Mirrors validateRepoCID in the parent repo package.
 func validateLinkCID(c cid.Cid) error {
 	p := c.Prefix()
 	if p.MhType != multihash.SHA2_256 || p.MhLength != 32 {
