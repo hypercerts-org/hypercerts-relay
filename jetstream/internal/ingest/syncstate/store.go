@@ -371,6 +371,12 @@ func (p *PebbleStateStore) PromoteChain(did atmos.DID, maxRev string) {
 // repairs through the ordinary resync path. The block is in memory only: after
 // a restart the durable state is still the pre-drop state, which has the same
 // effect.
+//
+// Known limitation: for a DID with no durable chain state, the block does not
+// survive a restart (the next commit is then accepted as a first sighting),
+// and without a restart it lasts until a later sync for the DID is reconciled.
+// A durable marker was deliberately not added, to keep this store close to
+// upstream Jetstream; the recovery sink covers the gap on a best-effort basis.
 func (p *PebbleStateStore) BlockChainPromotion(did atmos.DID) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
