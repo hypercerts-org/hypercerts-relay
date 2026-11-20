@@ -23,10 +23,11 @@ type SyncScope struct {
 }
 
 func EncodeScopedSync(payload []byte, scope SyncScope) ([]byte, error) {
-	// The scope comes from the local collection policy and archived keys. If
-	// it cannot be represented on its own, that is a local fault and must not
-	// be reported as unrepresentable upstream input.
-	if err := checkScopeRepresentable(scope); err != nil {
+	// The collections come from the local collection policy. If they cannot
+	// be represented on their own, that is a local fault and must not be
+	// reported as unrepresentable upstream input. The paths come from the
+	// upstream replacement rows and are covered by the checks below.
+	if err := checkScopeRepresentable(SyncScope{Collections: scope.Collections}); err != nil {
 		return nil, err
 	}
 	decoded, err := cbor.Unmarshal(payload)

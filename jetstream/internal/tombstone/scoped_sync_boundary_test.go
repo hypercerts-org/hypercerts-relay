@@ -23,3 +23,21 @@ func TestEncodeScopedSyncRoundTripsAndClassifiesBadInput(t *testing.T) {
 		require.ErrorIs(t, err, ErrScopedSyncEncode)
 	}
 }
+
+// hypercerts: an oversize path set comes from upstream rows and is classified
+// as upstream input; oversize collections come from local policy and are not.
+func TestEncodeScopedSyncClassifiesOversizeScopeBySource(t *testing.T) {
+	payload, err := cbor.Marshal(map[string]any{"did": "did:plc:scoped", "rev": "3mmoojp7vgo2g"})
+	require.NoError(t, err)
+	oversize := make([]string, 1<<20+1)
+	for i := range oversize {
+		oversize[i] = "a"
+	}
+
+	_, err = EncodeScopedSync(payload, SyncScope{Collections: []string{"app.example.record"}, Paths: oversize})
+	require.ErrorIs(t, err, ErrScopedSyncEncode)
+
+	_, err = EncodeScopedSync(payload, SyncScope{Collections: oversize, Paths: []string{}})
+	require.Error(t, err)
+	require.NotErrorIs(t, err, ErrScopedSyncEncode)
+}
