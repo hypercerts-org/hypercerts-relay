@@ -13,7 +13,7 @@ import (
 )
 
 func TestDoSafelyConvertsPanicToError(t *testing.T) {
-	boom := errors.New("boom from malformed event")
+	boom := errors.New("boom")
 	p := &Scheduler{ident: "test", log: slog.Default()}
 
 	called := false
@@ -32,17 +32,33 @@ func TestDoSafelyConvertsPanicToError(t *testing.T) {
 	if !errors.Is(err, boom) {
 		t.Fatalf("expected wrapped panic error, got: %v", err)
 	}
-	if want := "event handler panicked: boom from malformed event"; err.Error() != want {
+	if want := "event handler panicked: boom"; err.Error() != want {
 		t.Fatalf("got %q, want %q", err.Error(), want)
 	}
 }
 
-func TestDoSafelyPassesThroughValue(t *testing.T) {
-	sentinel := errors.New("ordinary error")
-	p := &Scheduler{ident: "test", log: slog.Default()}
-	p.do = func(ctx context.Context, val *stream.XRPCStreamEvent) error { return sentinel }
+// A handler panic must stop the scheduler through the worker, leave the failed
+// position unacknowledged, and be counted.
+func TestWorkerStopsSchedulerOnHandlerPanic(t *testing.T) {
+	boom := errors.New("boom")
+	s := NewScheduler(1, 0, t.Name(), func(context.Context, *stream.XRPCStreamEvent) error {
+		panic(boom)
+	})
+	defer s.Shutdown()
 
-	if err := p.doSafely(context.Background(), &stream.XRPCStreamEvent{}); !errors.Is(err, sentinel) {
-		t.Fatalf("got %v, want sentinel", err)
+	if err := s.AddWork(context.Background(), "did:example:a", schedulerEvent(7)); err != nil {
+		t.Fatal(err)
+	}
+	requireReceive(t, s.Done())
+
+	err := s.Err()
+	if !errors.Is(err, boom) || !errors.Is(err, ErrHandlerPanic) {
+		t.Fatalf("got %v, want the recovered panic", err)
+	}
+	if got := s.LastSeq(); got != 0 {
+		t.Fatalf("failed position was acknowledged: %d", got)
+	}
+	if got := s.HandlerPanics(); got != 1 {
+		t.Fatalf("got %d recovered panics, want 1", got)
 	}
 }
