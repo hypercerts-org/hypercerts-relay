@@ -467,8 +467,10 @@ func (s *Slurper) subscribeWithRedialer(ctx context.Context, host *models.Host, 
 				}
 			}
 		} else if errors.Is(connErr, parallel.ErrHandlerPanic) {
-			// hypercerts: the failed position is not acknowledged, so the redial
-			// replays it; wait first so a repeating panic cannot spin.
+			// hypercerts: the failed position is not acknowledged, so a redial with
+			// a cursor replays it; wait first so a repeating panic cannot spin. With
+			// no acknowledged cursor the redial resumes at the live tail, as it does
+			// after any other processing error.
 			if panicBackoff < 10 {
 				panicBackoff++
 			}
