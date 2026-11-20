@@ -40,9 +40,8 @@ type ServiceEndpoint struct {
 //
 // Always returns an invalid Handle field; calling code should only populate that field if it has been bi-directionally verified.
 func ParseIdentity(doc *DIDDocument) Identity {
-	// hypercerts: the element count is untrusted (it sizes eager map
-	// allocation and the result is cached), so the maps are not pre-sized from
-	// it (TECH-932 F9).
+	// hypercerts: the maps are not pre-sized from the document's element
+	// counts.
 	keys := make(map[string]VerificationMethod)
 	for _, vm := range doc.VerificationMethod {
 		parts := strings.SplitN(vm.ID, "#", 2)
