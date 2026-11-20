@@ -21,9 +21,13 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # This job can publish packages, so it restores no Actions cache: jobs that
+      # run unreviewed code, such as the Jetstream upstream check, can write
+      # default-branch cache entries, which runs on dev can restore.
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
+          package-manager-cache: false
       - name: Validate unified component versions
         run: npm run check-component-versions
       - name: Log in to GitHub Container Registry

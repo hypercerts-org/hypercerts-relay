@@ -252,3 +252,43 @@ func TestHypercertsFirstSyncAlwaysUsesSnapshotSerialization(t *testing.T) {
 	require.True(t, handled)
 	require.True(t, called)
 }
+
+// hypercerts: TECH-932 F8 — unreconcilable upstream #sync replacement sets must
+// surface as ErrSyncRecordMismatch so the live consumer drops the event instead
+// of ending Run in a restart loop.
+
+func TestReconcileSyncRecordMismatchIsSentinel(t *testing.T) {
+	did, rev := "did:plc:mismatch", "3l4qkcqzmcs2c"
+	cols := []string{"app.bsky.feed.post"}
+	rows := []segment.Event{
+		{Kind: segment.KindCreate, DID: did, Rev: rev, Collection: cols[0], Rkey: "ok"},
+		{Kind: segment.KindCreate, DID: did, Rev: "3l4qkcqzmcs2z", Collection: cols[0], Rkey: "wrongrev"},
+	}
+
+	reached := false
+	w := &Writer{cfg: Config{ReconcileSnapshot: func(context.Context, Snapshot) error {
+		reached = true
+		return nil
+	}}}
+
+	_, err := w.ReconcileSyncWithMetadata(t.Context(), did, rev, rows, cols, AttributionMetadata{})
+	require.ErrorIs(t, err, ErrSyncRecordMismatch)
+	require.ErrorIs(t, w.reconcileSync(t.Context(), did, rev, rows, cols), ErrSyncRecordMismatch)
+	require.False(t, reached, "a mismatched row must fail before any reconciliation or write")
+}
+
+// The same key in two snapshot rows maps to the drop sentinel, not an
+// unclassified error that would end the live consumer.
+func TestPlanReplacementDuplicateRecordIsSentinel(t *testing.T) {
+	did, rev := "did:plc:dupe", "3l4qkcqzmcs2c"
+	s := &snapshotArchiveState{latest: map[string]segment.Event{}}
+	snap := Snapshot{
+		DID: did, Rev: rev, Collections: []string{"app.bsky.feed.post"},
+		Records: []segment.Event{
+			{Kind: segment.KindCreate, DID: did, Rev: rev, Collection: "app.bsky.feed.post", Rkey: "twice"},
+			{Kind: segment.KindCreate, DID: did, Rev: rev, Collection: "app.bsky.feed.post", Rkey: "twice"},
+		},
+	}
+	_, err := s.planReplacement(snap)
+	require.ErrorIs(t, err, ErrSyncRecordMismatch)
+}

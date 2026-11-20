@@ -25,6 +25,8 @@ const (
 	// per the atproto repository spec. Drops the whole event (live)
 	// or fails the repo (backfill) — rev ordering drives merge and
 	// compaction decisions, so an unparseable rev is never archived.
+	// Live also drops a reconciled #sync under this reason when its
+	// verified replacement records do not carry the #sync's DID and rev.
 	DropReasonInvalidRev DropReason = "invalid_rev"
 
 	// DropReasonInvalidCollection: the op's collection is not a

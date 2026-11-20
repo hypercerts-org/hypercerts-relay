@@ -799,6 +799,7 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 
 			// hypercerts: A full sync must preserve newer per-collection snapshots.
 			if len(segEvts) > 0 && segEvts[0].Kind == segment.KindSync {
+				segEvts = c.dropUnarchivableSyncRows(ctx, evt.Seq, segEvts)
 				handled := false
 				var reconcileErr error
 				if c.cfg.Attribution != nil {
@@ -839,6 +840,19 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 					})
 				} else {
 					handled, reconcileErr = c.writer.ReconcileSync(ctx, segEvts[0].DID, segEvts[0].Rev, segEvts[1:])
+				}
+				if errors.Is(reconcileErr, ingest.ErrSyncRecordMismatch) {
+					// The verified replacement set does not carry this
+					// #sync's DID and rev (e.g. getRepo served a later
+					// commit than the #sync named), or repeats a key. It
+					// cannot be reconciled under the #sync: hostile or
+					// racing upstream input, not a local fault. Nothing was
+					// written, so drop the whole event, count it, and
+					// advance the cursor instead of ending Run. Counter
+					// only, like the invalid-event arm above.
+					c.cfg.DropMetrics.IncDropped(ingest.DropSourceLive, ingest.DropReasonInvalidRev)
+					c.noteUpstreamSeq(evt.Seq)
+					continue
 				}
 				if errors.Is(reconcileErr, ingest.ErrAccountUnavailable) {
 					c.promoteSyncState(segEvts)
@@ -946,6 +960,28 @@ func (c *Consumer) processBatch(ctx context.Context, batch []streaming.Event) er
 
 		return nil
 	})
+}
+
+// dropUnarchivableSyncRows removes the #sync replacement rows (segEvts[1:])
+// that exceed a segment column width, e.g. a spec-valid 256-512 byte rkey,
+// counting them under field_too_long as the append loop does for other
+// events. Reconciliation would otherwise reject the whole #sync as a fatal
+// error, and a dropped row must not be listed among the scoped marker's
+// present paths. Such a key can never have been archived, so dropping it
+// leaves no stale row behind. One log line per event bounds the volume a
+// hostile repo can drive.
+func (c *Consumer) dropUnarchivableSyncRows(ctx context.Context, seq int64, segEvts []segment.Event) []segment.Event {
+	kept := slices.DeleteFunc(segEvts[1:], func(row segment.Event) bool {
+		return errors.Is(segment.ValidateEvent(row), segment.ErrFieldTooLong)
+	})
+	if dropped := len(segEvts) - 1 - len(kept); dropped > 0 {
+		c.cfg.DropMetrics.AddDropped(ingest.DropSourceLive, ingest.DropReasonFieldTooLong, dropped)
+		c.logger.WarnContext(ctx, "dropped unarchivable upstream sync replacement rows",
+			"seq", seq,
+			"count", dropped,
+		)
+	}
+	return segEvts[:1+len(kept)]
 }
 
 func (c *Consumer) maybeTriggerCompaction() {

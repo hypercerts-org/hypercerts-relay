@@ -234,7 +234,11 @@ func (s *snapshotArchiveState) planReplacement(snapshot Snapshot) ([]segment.Eve
 		}
 		key := row.Collection + "/" + row.Rkey
 		if keys[key] {
-			return nil, errors.New("duplicate snapshot record")
+			// hypercerts: the same key in two snapshot rows cannot be reconciled
+			// under one rev. Map it to ErrSyncRecordMismatch so the live consumer
+			// drops the upstream event instead of ending Run (TECH-932 F8); other
+			// callers surface it like any reconciliation error.
+			return nil, fmt.Errorf("%w: duplicate snapshot record %s", ErrSyncRecordMismatch, key)
 		}
 		keys[key] = true
 		if old, ok := s.latest[key]; ok && old.Rev >= row.Rev {
@@ -348,12 +352,22 @@ func (w *Writer) ReconcileSyncWithCollectionsIfNeeded(ctx context.Context, did, 
 	return true, w.reconcileSync(ctx, did, rev, rows, collections)
 }
 
+// ErrSyncRecordMismatch rejects a sync whose replacement records do not all
+// carry the sync's own DID and rev (an upstream #sync can name one rev while
+// the repo the verifier fetched for it is at another). Such a set cannot be
+// reconciled under the sync's rev; nothing has been written when it is
+// returned, and the live consumer drops the upstream event.
+var ErrSyncRecordMismatch = errors.New("ingest: sync replacement record does not match sync DID and rev")
+
 // ReconcileSyncWithMetadata always reconciles a managed projection using the
 // policy and provenance captured by the caller's admission.
 func (w *Writer) ReconcileSyncWithMetadata(ctx context.Context, did, rev string, rows []segment.Event, collections []string, metadata AttributionMetadata) (bool, error) {
 	snapshot := Snapshot{DID: did, Rev: rev, Collections: slices.Clone(collections), AppendMetadata: &metadata}
 	for _, row := range rows {
 		if row.Kind.IsMaterialization() && slices.Contains(snapshot.Collections, row.Collection) {
+			if row.DID != did || row.Rev != rev {
+				return true, ErrSyncRecordMismatch
+			}
 			snapshot.Records = append(snapshot.Records, row)
 		}
 	}
@@ -368,6 +382,9 @@ func (w *Writer) reconcileSync(ctx context.Context, did, rev string, rows []segm
 	snapshot := Snapshot{DID: did, Rev: rev, Collections: slices.Clone(collections)}
 	for _, row := range rows {
 		if row.Kind.IsMaterialization() && slices.Contains(snapshot.Collections, row.Collection) {
+			if row.DID != did || row.Rev != rev {
+				return ErrSyncRecordMismatch
+			}
 			snapshot.Records = append(snapshot.Records, row)
 		}
 	}

@@ -31,6 +31,7 @@ import (
 	"github.com/bluesky-social/indigo/util/cliutil"
 	"github.com/bluesky-social/indigo/util/ssrf"
 	"github.com/urfave/cli/v3"
+	"golang.org/x/time/rate"
 	"gorm.io/plugin/opentelemetry/tracing"
 )
 
@@ -376,11 +377,20 @@ func runRelay(ctx context.Context, cmd *cli.Command) error {
 	}
 
 	// TODO: add shared external cache
+	// hypercerts: did:web documents are fetched from operator-uncontrolled
+	// hosts, sized by the document itself, and cached for 24h. A modest global
+	// budget on those fetches bounds how fast unauthenticated resolution
+	// (public getRepo, firehose events) can fill the identity cache from a
+	// wildcard-DNS did:web farm (TECH-932 F9).
+	webDIDBudget := rate.NewLimiter(10, 30)
 	baseDir := identity.BaseDirectory{
 		SkipHandleVerification: true,
 		SkipDNSDomainSuffixes:  []string{".bsky.social"},
 		TryAuthoritativeDNS:    true,
 		PLCURL:                 cmd.String("plc-host"),
+		DIDWebLimitFunc: func(ctx context.Context, hostname string) error {
+			return webDIDBudget.Wait(ctx)
+		},
 		HTTPClient: http.Client{
 			Timeout:   time.Second * 5,
 			Transport: ssrf.PublicOnlyTransport(),

@@ -3,25 +3,39 @@ on:
   schedule:
     - cron: '43 8 * * 1'
   workflow_dispatch:
-permissions:
-  contents: write
-  pull-requests: write
+# Unreviewed upstream code runs only in the read-only sync job. The write token
+# is granted to open-pr, which runs git and this repository's update script but
+# never upstream code.
+permissions: {}
 concurrency:
   group: jetstream-upstream-sync
   cancel-in-progress: false
 jobs:
   sync:
+    # Builds and tests unreviewed upstream Jetstream code. The token is read-only
+    # and not persisted in git config, and setup-go neither restores nor saves a
+    # cache here. Code in this job can still reach the runner's own Actions cache
+    # credentials and write default-branch cache entries, so jobs that hold
+    # write credentials must not restore Actions caches (see release.yml).
     runs-on: ubuntu-latest
     timeout-minutes: 150
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      needed: ${{ steps.update.outputs.needed }}
+      target: ${{ steps.update.outputs.target }}
+      main: ${{ steps.update.outputs.main }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: main
           fetch-depth: 0
+          persist-credentials: false
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: jetstream/go.mod
-          cache-dependency-path: jetstream/go.sum
+          cache: false
       - name: Check existing review
         id: existing
         env:
@@ -37,13 +51,15 @@ jobs:
           set -euo pipefail
           git fetch https://github.com/bluesky-social/jetstream.git main
           target=$(git rev-parse FETCH_HEAD)
+          main=$(git rev-parse HEAD)
           branch="jetstream-upstream/$(date -u +%Y-%m-%d)-${GITHUB_RUN_ID}"
           git switch -c "$branch"
           python3 scripts/jetstream-upstream.py "$target" --apply | tee "$RUNNER_TEMP/jetstream-review.md"
           cat "$RUNNER_TEMP/jetstream-review.md" >> "$GITHUB_STEP_SUMMARY"
           if ! git diff --cached --quiet; then
             echo 'needed=true' >> "$GITHUB_OUTPUT"
-            echo "branch=$branch" >> "$GITHUB_OUTPUT"
+            echo "target=$target" >> "$GITHUB_OUTPUT"
+            echo "main=$main" >> "$GITHUB_OUTPUT"
           fi
       - name: Verify update
         if: steps.update.outputs.needed == 'true'
@@ -51,12 +67,59 @@ jobs:
           set -euo pipefail
           ./scripts/verify-jetstream.sh 2>&1 | tee "$RUNNER_TEMP/jetstream-verification.log"
           git diff --cached --check
+      - name: Preserve failure report
+        if: failure()
+        run: |
+          test ! -f "$RUNNER_TEMP/jetstream-review.md" || cat "$RUNNER_TEMP/jetstream-review.md" >> "$GITHUB_STEP_SUMMARY"
+          echo 'Update stopped. A maintainer must inspect conflicts or failed verification; no pull request was pushed by the failed step.' >> "$GITHUB_STEP_SUMMARY"
+  open-pr:
+    # Holds the write token and runs no upstream code or cache restore. It
+    # rebuilds the verified update with git alone and opens the review PR.
+    needs: sync
+    if: needs.sync.outputs.needed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Rebuild verified update
+        id: rebuild
+        env:
+          TARGET: ${{ needs.sync.outputs.target }}
+          MAIN: ${{ needs.sync.outputs.main }}
+        run: |
+          set -euo pipefail
+          # The sync job ran upstream code, so its outputs are untrusted input.
+          if [[ ! "$TARGET" =~ ^[0-9a-f]{40}$ || ! "$MAIN" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::The sync job did not report two commit SHAs.'
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$MAIN" HEAD; then
+            echo '::error::The verified base commit is not in the history of main.'
+            exit 1
+          fi
+          git fetch https://github.com/bluesky-social/jetstream.git main
+          if ! git merge-base --is-ancestor "$TARGET" FETCH_HEAD; then
+            echo '::error::The verified upstream commit is not in the history of Jetstream main.'
+            exit 1
+          fi
+          # Run the update script from the main checked out here, not from MAIN.
+          cp scripts/jetstream-upstream.py "$RUNNER_TEMP/jetstream-upstream.py"
+          branch="jetstream-upstream/$(date -u +%Y-%m-%d)-${GITHUB_RUN_ID}"
+          git switch -c "$branch" "$MAIN"
+          python3 -I "$RUNNER_TEMP/jetstream-upstream.py" "$TARGET" --apply | tee "$RUNNER_TEMP/jetstream-review.md"
+          git diff --cached --check
           echo 'Passed: module tests, vet, build, stress lifecycle oracle, restart oracle checks, whitespace.' >> "$RUNNER_TEMP/jetstream-review.md"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
       - name: Open review pull request
-        if: steps.update.outputs.needed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          BRANCH: ${{ steps.update.outputs.branch }}
+          BRANCH: ${{ steps.rebuild.outputs.branch }}
         run: |
           set -euo pipefail
           git config user.name 'github-actions[bot]'
@@ -64,8 +127,3 @@ jobs:
           git commit -m 'chore: Jetstream upstream sync'
           git push origin "$BRANCH"
           gh pr create --base main --head "$BRANCH" --title 'chore: Jetstream upstream sync' --body-file "$RUNNER_TEMP/jetstream-review.md"
-      - name: Preserve failure report
-        if: failure()
-        run: |
-          test ! -f "$RUNNER_TEMP/jetstream-review.md" || cat "$RUNNER_TEMP/jetstream-review.md" >> "$GITHUB_STEP_SUMMARY"
-          echo 'Update stopped. A maintainer must inspect conflicts or failed verification; no pull request was pushed by the failed step.' >> "$GITHUB_STEP_SUMMARY"
