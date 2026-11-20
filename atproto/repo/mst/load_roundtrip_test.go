@@ -47,8 +47,9 @@ func TestLoadRoundTripValidTree(t *testing.T) {
 	}
 	assert.NoError(loaded.Verify())
 
-	// the loaded tree serializes back to the same root
-	again, err := loaded.RootCID()
+	// the loaded tree serializes back to the same root; every node is
+	// re-encoded, as RootCID would return the CID stored at load time
+	again, err := loaded.Root.writeBlocks(ctx, nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
