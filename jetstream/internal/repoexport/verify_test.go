@@ -276,7 +276,8 @@ func TestPDSEndpointOrigin_AcceptsPublicOrigins(t *testing.T) {
 		"https://93.184.216.34":          "https://93.184.216.34",
 		"http://93.184.216.34:8080":      "http://93.184.216.34:8080",
 		"https://[2606:4700:4700::1111]": "https://[2606:4700:4700::1111]",
-		"https://bücher.example":         "https://bücher.example",
+		"https://bücher.example":         "https://xn--bcher-kva.example",
+		"https://bücher.example:8443":    "https://xn--bcher-kva.example:8443",
 		"https://xn--bcher-kva.example":  "https://xn--bcher-kva.example",
 	} {
 		got, err := pdsEndpointOrigin(raw, false)

@@ -26,6 +26,8 @@ import (
 	"github.com/jcalabro/atmos/xrpc"
 	"github.com/jcalabro/gt"
 	"github.com/jcalabro/jttp"
+
+	"golang.org/x/net/idna"
 )
 
 const (
@@ -197,6 +199,18 @@ func pdsEndpointOrigin(raw string, allowPrivate bool) (string, error) {
 	if u.Host == "" || u.Opaque != "" || u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
 		return "", errors.New("PDS endpoint must be a bare origin without credentials, path, query or fragment")
 	}
+	// hypercerts: a non-ASCII host is converted to its ASCII form, which is
+	// what the resolver and the checks below need. ASCII hosts are unchanged.
+	if name := u.Hostname(); !isASCII(name) {
+		ascii, err := idna.Lookup.ToASCII(name)
+		if err != nil {
+			return "", errors.New("PDS endpoint host is not a valid domain name")
+		}
+		if port := u.Port(); port != "" {
+			ascii = net.JoinHostPort(ascii, port)
+		}
+		u.Host = ascii
+	}
 	origin := u.Scheme + "://" + u.Host
 	if allowPrivate {
 		return origin, nil
@@ -218,6 +232,15 @@ func pdsEndpointOrigin(raw string, allowPrivate bool) (string, error) {
 		}
 	}
 	return origin, nil
+}
+
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
 }
 
 // hypercerts: newPublicPDSHTTPClient builds the client used to query an account's PDS.
