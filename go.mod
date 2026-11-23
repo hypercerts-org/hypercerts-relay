@@ -32,7 +32,7 @@ require (
 	github.com/urfave/cli/v3 v3.14.0
 	github.com/whyrusleeping/cbor-gen v0.3.1
 	gitlab.com/yawning/secp256k1-voi v0.0.0-20230925100816-f2616030848b
-	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.70.0
+	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.72.0
 	go.opentelemetry.io/otel v1.47.0
 	go.opentelemetry.io/otel/exporters/jaeger v1.17.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.47.0
