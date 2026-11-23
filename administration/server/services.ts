@@ -7,11 +7,15 @@ import {
   type Job,
   type JobDiagnostics,
   type JobLastFailure,
+  type JobStateFilter,
   type Policy,
   type CoverageSource,
   type RepositoryDetailsPage,
 } from "./contracts.ts";
 
+// Commands applied by Relay or Jetstream. Collection directory crawls are
+// applied by CollectionCrawls instead.
+export type ServiceCommand = Exclude<Command, { kind: "collection_crawl" }>;
 export interface ServiceConfig {
   url: string;
   token: string;
@@ -86,14 +90,15 @@ export class Services {
       "DELETE",
     );
   }
-  async jobs(after = "", pds = "") {
-    const page = await this.call<{ jobs: Job[]; nextCursor?: string }>("jetstream", `/jobs?limit=50&after=${encodeURIComponent(after)}&pds=${encodeURIComponent(pds)}`);
-    return { ...page, jobs: page.jobs.map(normalizeJobDiagnostics) };
+  async jobs(after = "", pds = "", state: JobStateFilter | "" = "") {
+    const stateQuery = state ? `&state=${encodeURIComponent(state)}` : "";
+    const page = await this.call<{ jobs: Job[]; nextCursor?: string }>("jetstream", `/jobs?limit=50&after=${encodeURIComponent(after)}&pds=${encodeURIComponent(pds)}${stateQuery}`);
+    return { ...page, jobs: page.jobs.map(normalizeJob) };
   }
   async repositoryDetails(id: string, after = "", limit = 100) {
     const query = new URLSearchParams({ limit: String(limit) }); if (after) query.set("after", after);
     const page = await this.call<RepositoryDetailsPage>("jetstream", `/jobs/${encodeURIComponent(id)}/repositories?${query}`);
-    return { ...page, job: normalizeJobDiagnostics(page.job), repositories: page.repositories.map((repository) => ({ ...repository, failedAt: recordedTimestamp(repository.failedAt) })) };
+    return { ...page, job: normalizeJob(page.job), repositories: page.repositories.map((repository) => ({ ...repository, failedAt: recordedTimestamp(repository.failedAt) })) };
   }
   async coverage(after = "", pds = "") {
     const page = await this.call<CoveragePage>("jetstream", `/coverage?limit=50&after=${encodeURIComponent(after)}&pds=${encodeURIComponent(pds)}`);
@@ -129,7 +134,7 @@ export class Services {
     );
   }
   async apply(
-    command: Command,
+    command: ServiceCommand,
     id: string,
     progress: (value: unknown) => void = () => {},
   ): Promise<unknown> {
@@ -263,7 +268,7 @@ async function controlError(
   );
 }
 
-async function readControlBody<T>(response: Response): Promise<T> {
+export async function readControlBody<T>(response: Response): Promise<T> {
   const reader = response.body!.getReader();
   const chunks: Uint8Array[] = [];
   let size = 0;
@@ -353,6 +358,15 @@ function normalizeJobDiagnostics<T extends {
   } as T;
 }
 
+// Jetstream serializes an unrecorded creation time as the zero timestamp; the
+// administration API omits it instead. Coverage items have no creation time.
+function normalizeJob(job: Job): Job {
+  return {
+    ...normalizeJobDiagnostics(job),
+    createdAt: recordedTimestamp(job.createdAt),
+  };
+}
+
 function normalizeCoverageDiagnostics<T extends CoverageSource & {
   lastProgressAt?: string;
   lastFailure?: unknown;
@@ -430,7 +444,10 @@ async function remoteArchiveError(response: Response): Promise<string | null> {
     : null;
 }
 
-function allowedControlTransport(url: URL, railwayPrivateNetwork: boolean) {
+export function allowedControlTransport(
+  url: URL,
+  railwayPrivateNetwork: boolean,
+) {
   if (url.protocol === "https:") return true;
   if (url.protocol !== "http:") return false;
   if (["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)) return true;

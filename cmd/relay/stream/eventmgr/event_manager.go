@@ -177,7 +177,16 @@ func (em *EventManager) Subscribe(ctx context.Context, ident string, filter func
 		}
 
 		// now, start buffering events from the live stream
+		// hypercerts: Register only if cleanup has not run; cleanup closes
+		// sub.outgoing.
+		sub.lk.Lock()
+		if sub.cleanedUp {
+			sub.lk.Unlock()
+			close(out)
+			return
+		}
 		em.addSubscriber(sub)
+		sub.lk.Unlock()
 
 		// ensure that we clean up any return paths from here out, after having added the subscriber. Note that `out` is not `sub.output`, so needs to be closed separately.
 		defer func() {

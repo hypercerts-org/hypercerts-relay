@@ -48,14 +48,49 @@ func NodeDataFromCBOR(r io.Reader) (*NodeData, error) {
 	if err := nd.UnmarshalCBOR(r); err != nil {
 		return nil, err
 	}
-	// TODO: verify CID type, and "non-empty" here?
+	// hypercerts: reject weak or truncated hashes in node links before any lookup or traversal.
+	if nd.Left != nil {
+		if err := validateLinkCID(*nd.Left); err != nil {
+			return nil, err
+		}
+	}
+	for _, e := range nd.Entries {
+		if err := validateLinkCID(e.Value); err != nil {
+			return nil, err
+		}
+		if e.Right != nil {
+			if err := validateLinkCID(*e.Right); err != nil {
+				return nil, err
+			}
+		}
+	}
+	// TODO: verify "non-empty" here?
 	return &nd, nil
+}
+
+// hypercerts: ValidateCIDHash requires the 32-byte sha2-256 multihash that atproto repos use. It checks the hash only; CID version and codec are left to the existing readers.
+func ValidateCIDHash(c cid.Cid) error {
+	p := c.Prefix()
+	if p.MhType != multihash.SHA2_256 || p.MhLength != 32 {
+		return fmt.Errorf("unsupported CID hash (must be 32-byte sha2-256): %s", c)
+	}
+	return nil
+}
+
+// hypercerts: validateLinkCID applies ValidateCIDHash to CID links in decoded MST nodes.
+func validateLinkCID(c cid.Cid) error {
+	if err := ValidateCIDHash(c); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidTree, err)
+	}
+	return nil
 }
 
 // Transforms `Node` struct to `NodeData`, which is the format used for encoding to CBOR.
 //
-// Will panic if any entries are missing a CID (must compute those first)
-func (n *Node) NodeData() NodeData {
+// Child entries must have their CID computed first.
+//
+// hypercerts: returns a wrapped [ErrInvalidTree] if the entry list is malformed (a child pointer which does not follow a key/value entry), instead of panicking on untrusted tree shapes.
+func (n *Node) NodeData() (NodeData, error) {
 	d := NodeData{
 		Left:    nil,
 		Entries: []EntryData{}, // TODO perf: pre-allocate an array
@@ -69,7 +104,7 @@ func (n *Node) NodeData() NodeData {
 		}
 		if e.IsChild() {
 			if len(d.Entries) == 0 {
-				panic("malformed tree node") // TODO: return error?
+				return NodeData{}, fmt.Errorf("%w: malformed tree node", ErrInvalidTree)
 			}
 			d.Entries[len(d.Entries)-1].Right = e.ChildCID
 		}
@@ -84,7 +119,7 @@ func (n *Node) NodeData() NodeData {
 			prevKey = e.Key
 		}
 	}
-	return d
+	return d, nil
 }
 
 // Transforms an encoded [NodeData] to [Node] data structure format.
@@ -113,6 +148,10 @@ func (d *NodeData) Node(c *cid.Cid) (Node, error) {
 		key := []byte{}
 		key = append(key, prevKey[:e.PrefixLen]...)
 		key = append(key, e.KeySuffix...)
+		// hypercerts: an empty key is neither a value nor a child once loaded, and later re-encoding panics; reject it at decode time.
+		if len(key) == 0 {
+			return n, fmt.Errorf("%w: node entry with empty key", ErrInvalidTree)
+		}
 		n.Entries = append(n.Entries, NodeEntry{
 			Key:   key,
 			Value: &e.Value,
@@ -183,7 +222,11 @@ func (n *Node) writeBlocks(ctx context.Context, bs blockstore.Blockstore, onlyDi
 	}
 
 	// compute this block
-	nd := n.NodeData()
+	// hypercerts: NodeData errors on malformed entry lists instead of panicking (untrusted tree shapes).
+	nd, err := n.NodeData()
+	if err != nil {
+		return nil, err
+	}
 	b, c, err := nd.Bytes()
 	if err != nil {
 		return nil, err
@@ -204,7 +247,25 @@ func (n *Node) writeBlocks(ctx context.Context, bs blockstore.Blockstore, onlyDi
 	return c, nil
 }
 
-func loadNodeFromStore(ctx context.Context, bs MSTBlockSource, ref cid.Cid) (*Node, error) {
+// hypercerts: key heights are at most 128 (the count of leading zero bit-pairs in a SHA-256 hash, see HeightForKey), and each child node is exactly one level below its parent, so a well-formed tree has at most 129 levels of nodes.
+const maxTreeLevels = 129
+
+// Recursively loads the sub-tree rooted at `ref`.
+//
+// hypercerts: depth and seen bound the work done on untrusted blocks.
+//
+// depth: level of `ref` in the tree being loaded, starting at 1 for the root
+// seen:CIDs of every node referenced so far while loading this tree. A well-formed tree never references the same node twice (it would contain duplicate keys), and refusing repeats keeps the work bounded by the number of distinct blocks.
+func loadNodeFromStore(ctx context.Context, bs MSTBlockSource, ref cid.Cid, depth int, seen map[string]struct{}) (*Node, error) {
+	if depth > maxTreeLevels {
+		return nil, fmt.Errorf("%w: tree is deeper than %d levels", ErrInvalidTree, maxTreeLevels)
+	}
+	key := ref.KeyString()
+	if _, ok := seen[key]; ok {
+		return nil, fmt.Errorf("%w: node referenced more than once: %s", ErrInvalidTree, ref)
+	}
+	seen[key] = struct{}{}
+
 	block, err := bs.Get(ctx, ref)
 	if err != nil {
 		return nil, err
@@ -222,7 +283,7 @@ func loadNodeFromStore(ctx context.Context, bs MSTBlockSource, ref cid.Cid) (*No
 
 	for i, e := range n.Entries {
 		if e.IsChild() {
-			child, err := loadNodeFromStore(ctx, bs, *e.ChildCID)
+			child, err := loadNodeFromStore(ctx, bs, *e.ChildCID, depth+1, seen)
 			if err != nil && ipld.IsNotFound(err) {
 				// allow "partial" trees
 				continue

@@ -40,7 +40,9 @@ type ServiceEndpoint struct {
 //
 // Always returns an invalid Handle field; calling code should only populate that field if it has been bi-directionally verified.
 func ParseIdentity(doc *DIDDocument) Identity {
-	keys := make(map[string]VerificationMethod, len(doc.VerificationMethod))
+	// hypercerts: the maps are not pre-sized from the document's element
+	// counts.
+	keys := make(map[string]VerificationMethod)
 	for _, vm := range doc.VerificationMethod {
 		parts := strings.SplitN(vm.ID, "#", 2)
 		if len(parts) < 2 {
@@ -60,7 +62,7 @@ func ParseIdentity(doc *DIDDocument) Identity {
 			PublicKeyMultibase: vm.PublicKeyMultibase,
 		}
 	}
-	svc := make(map[string]ServiceEndpoint, len(doc.Service))
+	svc := make(map[string]ServiceEndpoint)
 	for _, s := range doc.Service {
 		parts := strings.SplitN(s.ID, "#", 2)
 		if len(parts) < 2 {

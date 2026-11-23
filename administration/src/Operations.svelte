@@ -5,7 +5,10 @@
   import {
     api,
     target,
+    jobStateLabels,
+    jobStateOptions,
     type Job,
+    type JobStateFilter,
     type Operation,
     type Coverage,
     type Audit,
@@ -15,6 +18,8 @@
   } from "./api";
   export let screen: string;
   export let jobs: Job[] = [];
+  export let pdsFilter = "";
+  export let stateFilter: JobStateFilter | "" = "";
   export let changes: Operation[] = [];
   export let coverage: (CoveragePage & { next: string | null }) | null = null;
   export let audit: Audit[] = [];
@@ -36,6 +41,15 @@
       item,
       collections: item.policy.collections,
     }));
+  }
+  // Status links reload the jobs screen so paging restarts at the first page;
+  // Jetstream applies the filter, keeping any PDS filter.
+  function filterHref(state: JobStateFilter | "") {
+    const query = new URLSearchParams();
+    if (state) query.set("state", state);
+    if (pdsFilter) query.set("pds", pdsFilter);
+    const search = query.toString();
+    return search ? `/jobs?${search}` : "/jobs";
   }
   function jobPurpose(job: Job) {
     return job.reason === "quota_recovery"
@@ -215,6 +229,7 @@
       backfill inventories active repositories directly from that PDS;
       Relay-observed account counts do not limit it. Job status comes from
       Jetstream. Acquisition progress is job-wide, not measured per collection.
+      Newest jobs are listed first.
     </p>
   </div>
   <div class="notice">
@@ -251,6 +266,13 @@
     </div>
     <button class="primary" disabled={busy}>Submit backfill</button>
   </form>
+  <nav class="filters" aria-label="Filter jobs by status">
+    {#each ["", ...jobStateOptions] as const as state}<a
+        href={filterHref(state)}
+        aria-current={state === stateFilter ? "true" : undefined}
+        >{state ? jobStateLabels[state] : "All"}</a
+      >{/each}
+  </nav>
   <!-- svelte-ignore a11y_no_noninteractive_tabindex (Scrollable tables need keyboard access; verified with axe and Chromium.) -->
   <div
     class="table-wrap"
@@ -261,14 +283,20 @@
     <table>
       <caption>Jetstream jobs</caption><thead
         ><tr
-          ><th>PDS / Job id</th><th>Collections</th><th>Purpose</th><th
-            >Acquisition evidence</th
-          ><th>Status</th><th>Actions</th></tr
+          ><th>PDS / Job id / Created</th><th>Collections</th><th>Purpose</th
+          ><th>Acquisition evidence</th><th>Status</th><th>Actions</th></tr
         ></thead
       ><tbody
         >{#each jobs as job}{@const currentJob =
             repositoryJobs[job.id] ?? job}<tr
-            ><td>{currentJob.pds}<small>{currentJob.id}</small></td><td
+            ><td
+              >{currentJob.pds}<small>{currentJob.id}</small><small
+                >Created: {#if currentJob.createdAt}<time
+                    datetime={currentJob.createdAt}
+                    >{timeLabel(currentJob.createdAt)}</time
+                  >{:else}Not recorded{/if}</small
+              ></td
+            ><td
               >{currentJob.policy.collections.join(", ") ||
                 "No collections"}</td
             ><td>{jobPurpose(currentJob)}</td><td
@@ -429,7 +457,10 @@
             >{/if}
         {:else}<tr
             ><td colspan="6" class="empty"
-              >No jobs on this page. Submit a backfill for an enabled source.</td
+              >{#if stateFilter}No {jobStateLabels[stateFilter].toLowerCase()} jobs
+                on this page.
+                <a href={filterHref("")}>Show all statuses</a>{:else}No jobs on
+                this page. Submit a backfill for an enabled source.{/if}</td
             ></tr
           >{/each}</tbody
       >

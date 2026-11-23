@@ -125,7 +125,10 @@ func TestSourceHandlerFailurePreservesCursor(t *testing.T) {
 			sub := &Subscription{Hostname: f.host, HostID: 1, ctx: ctx, cancel: cancel, Limiters: testStreamLimiters(counts)}
 			sub.LastSeq.Store(10)
 			result := make(chan error, 1)
-			go func() { result <- s.handleConnection(ctx, conn, sub) }()
+			go func() {
+				_, err := s.handleConnection(ctx, conn, sub)
+				result <- err
+			}()
 			did := "did:plc:abcdefghijklmnopqrstuvwx"
 			evt := &stream.XRPCStreamEvent{}
 			switch kind {

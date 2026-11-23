@@ -11,7 +11,11 @@ import Collections from "../src/Collections.svelte";
 import Operations from "../src/Operations.svelte";
 import Limits from "../src/Limits.svelte";
 import AccountQuota from "../src/AccountQuota.svelte";
-import type { Job, JobDiagnostics } from "../server/contracts.ts";
+import type {
+  Job,
+  JobDiagnostics,
+  JobStateFilter,
+} from "../server/contracts.ts";
 
 type RepositoryJobOverrides = Partial<
   Omit<Job, "id" | "pds" | "policy" | "diagnostics">
@@ -46,12 +50,16 @@ function repositoryJob(
   };
 }
 
-function renderJobs(jobs: Job[]) {
+function renderJobs(
+  jobs: Job[],
+  filters: { pdsFilter?: string; stateFilter?: JobStateFilter | "" } = {},
+) {
   return render(Operations, {
     screen: "jobs",
     submit: vi.fn(),
     action: vi.fn(),
     jobs,
+    ...filters,
   });
 }
 
@@ -437,7 +445,7 @@ test("jobs explain recovery types and use operator-facing progress labels", () =
     ],
   });
   expect(screen.getByText(/Selected-collection backfill fills/)).toBeTruthy();
-  expect(screen.getByText("PDS / Job id")).toBeTruthy();
+  expect(screen.getByText("PDS / Job id / Created")).toBeTruthy();
   expect(screen.getByText("Collections")).toBeTruthy();
   expect(screen.getAllByText("Purpose")).toHaveLength(2);
   expect(screen.getAllByText("Quota recovery")).toHaveLength(2);
@@ -458,6 +466,111 @@ test("jobs explain recovery types and use operator-facing progress labels", () =
   expect(
     screen.getByText(
       `Repository listing failed at: ${new Date("2026-09-09T00:01:00.000Z").toLocaleString()}`,
+    ),
+  ).toBeTruthy();
+});
+
+test("jobs render in exactly the order Jetstream returns", () => {
+  // Middle, highest, lowest by ID, PDS and creation time: no ascending or
+  // descending sort on any of those keys produces this order.
+  renderJobs([
+    repositoryJob("m-job", "https://m.example", {
+      createdAt: "2026-09-10T00:00:00.000Z",
+    }),
+    repositoryJob("z-job", "https://z.example", {
+      createdAt: "2026-09-11T00:00:00.000Z",
+    }),
+    repositoryJob("a-job", "https://a.example", {
+      createdAt: "2026-09-09T00:00:00.000Z",
+    }),
+  ]);
+  expect(screen.getByText(/Newest jobs are listed first\./)).toBeTruthy();
+  const rows = within(screen.getByRole("table", { name: "Jetstream jobs" }))
+    .getAllByRole("row")
+    .slice(1);
+  expect(rows.map((row) => row.querySelector("small")?.textContent)).toEqual([
+    "m-job",
+    "z-job",
+    "a-job",
+  ]);
+});
+
+test("job rows show the recorded creation time or say it is not recorded", () => {
+  const createdAt = "2026-09-10T12:34:56.000Z";
+  renderJobs([
+    repositoryJob("recorded-job", "https://recorded.example", { createdAt }),
+    repositoryJob("unrecorded-job", "https://unrecorded.example", {
+      createdAt: undefined,
+    }),
+  ]);
+  const rows = within(screen.getByRole("table", { name: "Jetstream jobs" }))
+    .getAllByRole("row")
+    .slice(1);
+  const recorded = rows[0].querySelector("time");
+  expect(recorded?.getAttribute("datetime")).toBe(createdAt);
+  expect(recorded?.textContent).toBe(new Date(createdAt).toLocaleString());
+  expect(rows[0].querySelector("small")?.textContent).toBe("recorded-job");
+  expect(rows[0].querySelectorAll("small")[1]?.textContent).toBe(
+    `Created: ${new Date(createdAt).toLocaleString()}`,
+  );
+  expect(rows[1].querySelector("time")).toBeNull();
+  expect(within(rows[1]).getByText("Created: Not recorded")).toBeTruthy();
+});
+
+test("status links select one job status and keep the PDS filter", () => {
+  renderJobs([repositoryJob("job", "https://pds.example")]);
+  const allStatuses = within(
+    screen.getByRole("navigation", { name: "Filter jobs by status" }),
+  ).getAllByRole("link");
+  expect(allStatuses.map((link) => link.textContent)).toEqual([
+    "All",
+    "Active",
+    "Pending",
+    "Running",
+    "Incomplete",
+    "Failed",
+    "Canceled",
+    "Complete",
+  ]);
+  expect(allStatuses[0].getAttribute("aria-current")).toBe("true");
+  expect(allStatuses[0].getAttribute("href")).toBe("/jobs");
+  expect(
+    allStatuses.filter((link) => link.hasAttribute("aria-current")),
+  ).toHaveLength(1);
+  cleanup();
+
+  renderJobs([repositoryJob("job", "https://pds.example")], {
+    pdsFilter: "https://pds.example",
+    stateFilter: "running",
+  });
+  const nav = screen.getByRole("navigation", {
+    name: "Filter jobs by status",
+  });
+  const current = within(nav)
+    .getAllByRole("link")
+    .filter((link) => link.hasAttribute("aria-current"));
+  expect(current.map((link) => link.textContent)).toEqual(["Running"]);
+  expect(
+    within(nav).getByRole("link", { name: "Canceled" }).getAttribute("href"),
+  ).toBe("/jobs?state=canceled&pds=https%3A%2F%2Fpds.example");
+  expect(
+    within(nav).getByRole("link", { name: "All" }).getAttribute("href"),
+  ).toBe("/jobs?pds=https%3A%2F%2Fpds.example");
+});
+
+test("an empty filtered job page names the status and links back to all statuses", () => {
+  renderJobs([], { stateFilter: "canceled" });
+  expect(screen.getByText(/No canceled jobs on this page\./)).toBeTruthy();
+  expect(
+    screen
+      .getByRole("link", { name: "Show all statuses" })
+      .getAttribute("href"),
+  ).toBe("/jobs");
+  cleanup();
+  renderJobs([]);
+  expect(
+    screen.getByText(
+      "No jobs on this page. Submit a backfill for an enabled source.",
     ),
   ).toBeTruthy();
 });

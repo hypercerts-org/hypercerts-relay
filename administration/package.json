@@ -1,6 +1,6 @@
 {
   "name": "@hypercerts/relay-administration",
-  "version": "0.10.1",
+  "version": "0.11.0",
   "license": "MIT OR Apache-2.0",
   "private": true,
   "type": "module",
@@ -21,7 +21,7 @@
     "@atproto/syntax": "0.7.5",
     "express": "5.2.1",
     "tsx": "4.23.13",
-    "zod": "4.5.4"
+    "zod": "4.6.6"
   },
   "devDependencies": {
     "@axe-core/playwright": "4.13.0",
@@ -38,7 +38,7 @@
     "svelte-check": "4.7.6",
     "tailwindcss": "4.3.3",
     "typescript": "6.0.3",
-    "vite": "8.2.2",
-    "vitest": "5.0.0"
+    "vite": "8.3.8",
+    "vitest": "5.1.1"
   }
 }

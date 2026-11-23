@@ -1,6 +1,14 @@
 import { Store } from "./store.ts";
 import { Services } from "./services.ts";
-import { ApiError } from "./contracts.ts";
+import { ApiError, type Operation } from "./contracts.ts";
+import {
+  discoveryActor,
+  discoverySettings,
+  machineEnableBlocked,
+} from "./machine.ts";
+import { CollectionCrawls } from "./collection-crawls.ts";
+import { Collectiondir } from "./collectiondir.ts";
+import { CollectionBootstrap } from "./collection-bootstrap.ts";
 
 // One worker per database. Never infer archive completion from command acceptance.
 export class Worker {
@@ -8,6 +16,15 @@ export class Worker {
   constructor(
     private readonly store: Store,
     private readonly services: Services,
+    private readonly crawls: CollectionCrawls = new CollectionCrawls(
+      store,
+      services,
+      new Collectiondir(null),
+    ),
+    private readonly bootstrap: CollectionBootstrap = new CollectionBootstrap(
+      store,
+      false,
+    ),
   ) {}
   recover() {
     const pending = this.store.db
@@ -41,14 +58,31 @@ export class Worker {
       )
         return;
       try {
-        const result = await this.services.apply(op.command, op.id, (value) => {
-          this.store.transition(op.id, "applying", value, null, undefined, [
-            "applying",
-          ]);
-        });
-        this.store.transition(op.id, "applied", result, null, undefined, [
-          "applying",
-        ]);
+        // Discovery requests are re-checked at apply time, so an operator
+        // disable or a lowered maximum made after the request still wins.
+        if (op.actor === discoveryActor) {
+          if (
+            op.command.kind === "account_quota" &&
+            op.command.accountLimit >
+              discoverySettings(this.store).maxAccountLimit
+          )
+            throw new ApiError(403, "account_limit_above_discovery_maximum");
+          if (await machineEnableBlocked(this.services, op.command))
+            throw new ApiError(409, "source_disabled_by_operator");
+        }
+        const result = await this.execute(op);
+        // An applied source enable queues its initial collection directory
+        // crawl in the same transaction.
+        const follow = this.bootstrap.plan(op, result);
+        this.store.transition(
+          op.id,
+          "applied",
+          follow?.result ?? result,
+          null,
+          undefined,
+          ["applying"],
+          follow?.commit,
+        );
       } catch (e) {
         this.store.transition(
           op.id,
@@ -64,5 +98,15 @@ export class Worker {
     } finally {
       this.busy = false;
     }
+  }
+  // A collection directory crawl is applied here; every other command goes to
+  // Relay or Jetstream, which report progress while it applies.
+  private execute(op: Operation): Promise<unknown> {
+    if (op.command.kind === "collection_crawl") return this.crawls.apply(op);
+    return this.services.apply(op.command, op.id, (value) => {
+      this.store.transition(op.id, "applying", value, null, undefined, [
+        "applying",
+      ]);
+    });
   }
 }

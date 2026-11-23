@@ -11,12 +11,27 @@ import {
   ApiError,
   archiveKeyInput,
   command,
+  jobStateFilters,
   operationBodyLimit,
   origin,
+  type CollectionDirectoryStatus,
 } from "./contracts.ts";
 import { Store } from "./store.ts";
 import { Services } from "./services.ts";
 import type { AdministratorProfile } from "./profile.ts";
+import {
+  changeDiscoverySettings,
+  discoveryPrefix,
+  discoverySettings,
+  discoverySettingsInput,
+  machineRouter,
+} from "./machine.ts";
+import { CollectionCrawls } from "./collection-crawls.ts";
+import { Collectiondir } from "./collectiondir.ts";
+import {
+  CollectionBootstrap,
+  clientIdempotencyKey,
+} from "./collection-bootstrap.ts";
 
 export interface PublicServiceOrigins {
   relay?: string;
@@ -25,12 +40,20 @@ export interface PublicServiceOrigins {
 }
 export interface AppOptions extends ProxyOptions {
   publicServiceOrigins?: PublicServiceOrigins;
+  // Bearer token for the automatic PDS discovery service. When it is unset,
+  // the machine routes are not mounted.
+  machineToken?: string;
+  // Absent means the collection directory is not configured.
+  collectionCrawls?: CollectionCrawls;
+  // Automatic initial crawls; absent means none are recorded.
+  collectionBootstrap?: CollectionBootstrap;
 }
 
 const page = z.object({
   after: z.string().max(200).default(""),
   limit: z.coerce.number().int().min(1).max(100).default(50),
 });
+const jobStateFilter = z.enum(jobStateFilters);
 export function createApp(
   store: Store,
   services: Services,
@@ -39,6 +62,12 @@ export function createApp(
   staticDir?: string,
   options: AppOptions = {},
 ) {
+  const crawls =
+    options.collectionCrawls ??
+    new CollectionCrawls(store, services, new Collectiondir(null));
+  const bootstraps =
+    options.collectionBootstrap ??
+    new CollectionBootstrap(store, crawls.configured);
   const app = express();
   app.disable("x-powered-by");
   app.set("trust proxy", options.trustProxy ?? false);
@@ -70,6 +99,8 @@ export function createApp(
   app.get("/oauth-client-metadata.json", (_req, res) => res.json(metadata));
   app.post("/auth/login", loginLimit(), (req, res) => auth.login(req, res));
   app.get("/auth/callback", (req, res) => auth.callback(req, res));
+  if (options.machineToken)
+    app.use(discoveryPrefix, machineRouter(store, services, options.machineToken));
   app.use("/api/v1", auth.require);
   app.get("/api/v1/session", (_req, res) => {
     const { did, csrf, expires } = res.locals.session as Session;
@@ -118,7 +149,9 @@ export function createApp(
   });
   app.post("/api/v1/operations", operationBody, (req, res) => {
     const input = command.parse(req.body),
-      key = z.uuid().parse(req.get("Idempotency-Key"));
+      key = clientIdempotencyKey(req.get("Idempotency-Key"));
+    if (input.kind === "collection_crawl" && !crawls.configured)
+      throw new ApiError(409, "collectiondir_not_configured");
     res
       .status(202)
       .json(store.request((res.locals.session as Session).did, input, key));
@@ -200,6 +233,15 @@ export function createApp(
       )
       .then((v) => res.json(v)),
   );
+  app.get(`${discoveryPrefix}/settings`, (_req, res) => {
+    res.json(discoverySettings(store));
+  });
+  app.post(`${discoveryPrefix}/settings`, (req, res) => {
+    const input = discoverySettingsInput.parse(req.body);
+    res.json(
+      changeDiscoverySettings(store, (res.locals.session as Session).did, input),
+    );
+  });
   app.get("/api/v1/policy", (_req, res) =>
     services.policy().then((v) => res.json(v)),
   );
@@ -234,7 +276,11 @@ export function createApp(
   app.get("/api/v1/jobs", (req, res) => {
     const p = page.parse(req.query);
     return services
-      .jobs(p.after, req.query.pds ? origin.parse(req.query.pds) : "")
+      .jobs(
+        p.after,
+        req.query.pds ? origin.parse(req.query.pds) : "",
+        req.query.state ? jobStateFilter.parse(req.query.state) : "",
+      )
       .then((v) => res.json(v));
   });
   app.get("/api/v1/jobs/:id/repositories", (req, res) => {
@@ -265,6 +311,38 @@ export function createApp(
       next: coverage.nextCursor ?? null,
     });
   });
+  app.get("/api/v1/collection-directory/status", async (_req, res) => {
+    res.json(await crawls.status());
+  });
+  app.get("/api/v1/collection-directory/crawls", (req, res) => {
+    const p = page.parse(req.query);
+    const ids = z
+      .string()
+      .max(3699)
+      .transform((value) => value.split(","))
+      .pipe(z.array(z.uuid()).min(1).max(100))
+      .optional()
+      .parse(req.query.ids);
+    res.json(
+      crawls.page(
+        p.after,
+        p.limit,
+        req.query.pds ? origin.parse(req.query.pds) : undefined,
+        ids,
+      ),
+    );
+  });
+  // Plaintext sources are recorded too, so the filter is an exact origin
+  // rather than the HTTPS-only PDS origin schema.
+  app.get("/api/v1/collection-directory/bootstraps", (req, res) => {
+    const p = page
+      .extend({
+        pds: z.string().max(300).optional(),
+        phase: z.literal("open").optional(),
+      })
+      .parse(req.query);
+    res.json(bootstraps.page(p.after, p.limit, p.pds, p.phase));
+  });
   app.get("/api/v1/limits", (req, res) =>
     services
       .call(
@@ -274,13 +352,15 @@ export function createApp(
       .then((v) => res.json(v)),
   );
   app.get("/api/v1/status", async (_req, res) => {
-    const checks = await Promise.allSettled([
-      services.sources(),
-      services.policy(),
+    const [checks, directory] = await Promise.all([
+      Promise.allSettled([services.sources(), services.policy()]),
+      // A short probe: overview health must not wait on the directory.
+      crawls.status(1000),
     ]);
     res.json({
       relay: checks[0].status === "fulfilled" ? "available" : "unavailable",
       jetstream: checks[1].status === "fulfilled" ? "available" : "unavailable",
+      collectiondir: directoryHealth(directory),
       publicServiceOrigins: options.publicServiceOrigins ?? {},
       observedAt: new Date().toISOString(),
     });
@@ -316,4 +396,10 @@ export function createApp(
   };
   app.use(errors);
   return app;
+}
+
+// The overview's one-word collection directory health.
+function directoryHealth(directory: CollectionDirectoryStatus) {
+  if (!directory.configured) return "not_configured";
+  return directory.available ? "available" : "unavailable";
 }

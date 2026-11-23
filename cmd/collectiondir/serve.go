@@ -74,6 +74,9 @@ var serveCmd = &cli.Command{
 			Name:  "crawl-qps",
 			Usage: "per-PDS crawl queries-per-second limit",
 			Value: 100,
+
+			// hypercerts: let container deployments set the crawl rate.
+			Sources: cli.EnvVars("COLLECTIONS_CRAWL_QPS"),
 		},
 		&cli.Uint64Flag{
 			Name:    "clist-min-dids",
@@ -139,6 +142,16 @@ type collectionServer struct {
 	activeCrawls     map[string]activeCrawl
 	activeCrawlsLock sync.Mutex
 
+	// hypercerts: latest ended crawl per host, guarded by activeCrawlsLock and
+	// bounded by maxCrawlResults, so administrators can see an outcome after a
+	// crawl leaves activeCrawls.
+	crawlResults map[string]crawlResult
+	// hypercerts: reported by crawlStatus so clients can detect a restart that
+	// discarded in-memory crawl state.
+	processStart time.Time
+	// hypercerts: test seam; nil uses the public-only crawl transport.
+	crawlHTTPClient *http.Client
+
 	shutdown chan struct{}
 
 	wg           sync.WaitGroup
@@ -162,11 +175,25 @@ type activeCrawl struct {
 	stats *CrawlStats
 }
 
+// hypercerts: bounded in-memory history of ended crawls; lost on restart.
+const maxCrawlResults = 256
+
+// hypercerts: how one ended crawl finished, kept in crawlResults.
+type crawlResult struct {
+	start          time.Time
+	end            time.Time
+	reposDescribed uint32
+	describeErrors uint32
+	errorCategory  string
+	httpStatus     int
+}
+
 func (cs *collectionServer) run(ctx context.Context, cmd *cli.Command) error {
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(signals)
 	cs.shutdown = make(chan struct{})
+	cs.processStart = time.Now() // hypercerts: see crawlStatus process_start.
 	level := slog.LevelInfo
 	if cmd.Bool("verbose") {
 		level = slog.LevelDebug
@@ -817,6 +844,16 @@ type CrawlRequest struct {
 type CrawlRequestResponse struct {
 	Message string `json:"message,omitempty"`
 	Error   string `json:"error,omitempty"`
+	// hypercerts: per-host outcome keyed by normalized host URL, so callers can
+	// tell a new crawl from one that was already active.
+	Hosts map[string]CrawlRequestHost `json:"hosts"`
+}
+
+// hypercerts: State is "started" or "already_active"; Start identifies the
+// crawl in crawlStatus and matches its RFC 3339 formatting.
+type CrawlRequestHost struct {
+	State string `json:"state"`
+	Start string `json:"start"`
 }
 
 func hostOrUrlToUrl(host string) string {
@@ -852,16 +889,20 @@ func (cs *collectionServer) isAdmin(c echo.Context) bool {
 //
 // POST {"hostname":"one hostname or URL", "hosts":["up to 1000 hosts", "..."]}
 // OR
-// POST /admin/pds/requestCrawl?hostname={one host}
+// POST /admin/pds/requestCrawl?host={one host}
+//
+// hypercerts: the reply's "hosts" map reports each normalized host as
+// "started" or "already_active" with the crawl start time.
 func (cs *collectionServer) crawlPds(c echo.Context) error {
 	isAdmin := cs.isAdmin(c)
 	if !isAdmin {
 		return c.JSON(http.StatusForbidden, xrpc.XRPCError{ErrStr: "AdminRequired", Message: "this endpoint requires admin auth"})
 	}
+	reply := CrawlRequestResponse{Message: "ok", Hosts: make(map[string]CrawlRequestHost)}
 	hostQ := c.QueryParam("host")
 	if hostQ != "" {
-		cs.startCrawl(hostQ)
-		return c.JSON(http.StatusOK, CrawlRequestResponse{Message: "ok"})
+		cs.startCrawlReply(hostQ, reply.Hosts)
+		return c.JSON(http.StatusOK, reply)
 	}
 
 	var req CrawlRequest
@@ -871,34 +912,66 @@ func (cs *collectionServer) crawlPds(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, xrpc.XRPCError{ErrStr: "BadRequest", Message: fmt.Sprintf("failed to parse body: %s", err)})
 	}
 	if req.Host != "" {
-		cs.startCrawl(req.Host)
+		cs.startCrawlReply(req.Host, reply.Hosts)
 	}
 	for _, host := range req.Hosts {
-		cs.startCrawl(host)
+		cs.startCrawlReply(host, reply.Hosts)
 	}
-	return c.JSON(http.StatusOK, CrawlRequestResponse{Message: "ok"})
+	return c.JSON(http.StatusOK, reply)
 }
 
-// hypercerts: register crawls before the HTTP handler returns so shutdown can join them.
-func (cs *collectionServer) startCrawl(host string) {
-	cs.producerWG.Add(1)
-	go func() {
-		defer cs.producerWG.Done()
-		cs.crawlThread(host)
-	}()
+// hypercerts: record one host's synchronous registration outcome in a reply.
+func (cs *collectionServer) startCrawlReply(hostIn string, hosts map[string]CrawlRequestHost) {
+	host, started, start := cs.startCrawl(hostIn)
+	state := "already_active"
+	if started {
+		state = "started"
+	}
+	hosts[host] = CrawlRequestHost{State: state, Start: formatCrawlTime(start)}
 }
 
-func (cs *collectionServer) crawlThread(hostIn string) {
-	host := hostOrUrlToUrl(hostIn)
+// hypercerts: register crawls before the HTTP handler returns so shutdown can
+// join them and the caller learns whether a crawl started. A duplicate returns
+// the active crawl's start and spawns nothing.
+func (cs *collectionServer) startCrawl(hostIn string) (host string, started bool, start time.Time) {
+	host = hostOrUrlToUrl(hostIn)
 	if host != hostIn {
 		cs.log.Info("going to crawl", "in", hostIn, "as", host)
 	}
-	httpClient := http.Client{
-		Transport: ssrf.PublicOnlyTransport(),
+	ok, start, crawlStats := cs.recordCrawlStart(host, time.Now())
+	if !ok {
+		cs.log.Info("not crawling dup", "host", host)
+		return host, false, start
+	}
+	cs.producerWG.Add(1)
+	go func() {
+		defer cs.producerWG.Done()
+		cs.crawlThread(host, start, crawlStats)
+	}()
+	return host, true, start
+}
+
+// hypercerts: bounds the wait for each crawl response's headers, so a PDS that
+// accepts a connection but never answers cannot hold its crawl active forever.
+// It does not limit body reads or the length of the whole crawl.
+const crawlResponseHeaderTimeout = 30 * time.Second
+
+// hypercerts: the public-only crawl client, with crawlResponseHeaderTimeout.
+func defaultCrawlHTTPClient() *http.Client {
+	transport := ssrf.PublicOnlyTransport()
+	transport.ResponseHeaderTimeout = crawlResponseHeaderTimeout
+	return &http.Client{Transport: transport}
+}
+
+// hypercerts: the crawl is registered by startCrawl before this runs.
+func (cs *collectionServer) crawlThread(host string, start time.Time, crawlStats *CrawlStats) {
+	httpClient := cs.crawlHTTPClient
+	if httpClient == nil {
+		httpClient = defaultCrawlHTTPClient()
 	}
 	rpcClient := xrpc.Client{
 		Host:   host,
-		Client: &httpClient,
+		Client: httpClient,
 	}
 	// hypercerts: never forward shared bypass credentials to crawl targets.
 	crawler := Crawler{
@@ -908,16 +981,10 @@ func (cs *collectionServer) crawlThread(hostIn string) {
 		Results:   cs.ingestCrawl,
 		Log:       cs.log,
 	}
-	start := time.Now()
-	ok, crawlStats := cs.recordCrawlStart(host, start)
-	if !ok {
-		cs.log.Info("not crawling dup", "host", host)
-		return
-	}
 	crawler.Stats = crawlStats
 	cs.log.Info("crawling", "host", host)
 	err := crawler.CrawlPDSRepoCollections()
-	cs.clearActiveCrawl(host)
+	cs.finishCrawl(host, start, crawlStats, err)
 	pdsCrawledCounter.Inc()
 	if err != nil {
 		cs.log.Warn("crawl err", "host", host, "err", err)
@@ -928,15 +995,16 @@ func (cs *collectionServer) crawlThread(hostIn string) {
 }
 
 // recordCrawlStart returns true if ok, false if duplicate
-func (cs *collectionServer) recordCrawlStart(host string, start time.Time) (ok bool, stats *CrawlStats) {
+// hypercerts: a duplicate also returns the active crawl's start.
+func (cs *collectionServer) recordCrawlStart(host string, start time.Time) (ok bool, activeStart time.Time, stats *CrawlStats) {
 	cs.activeCrawlsLock.Lock()
 	defer cs.activeCrawlsLock.Unlock()
 	if cs.activeCrawls == nil {
 		cs.activeCrawls = make(map[string]activeCrawl)
 	} else {
-		_, dup := cs.activeCrawls[host]
+		existing, dup := cs.activeCrawls[host]
 		if dup {
-			return false, nil
+			return false, existing.start, nil
 		}
 	}
 	stats = new(CrawlStats)
@@ -944,25 +1012,96 @@ func (cs *collectionServer) recordCrawlStart(host string, start time.Time) (ok b
 		start: start,
 		stats: stats,
 	}
-	return true, stats
+	return true, start, stats
 }
 
-func (cs *collectionServer) clearActiveCrawl(host string) {
+// hypercerts: end an active crawl and retain its outcome in one critical
+// section, so a status reader never sees it in neither or both maps. The
+// oldest result is evicted beyond maxCrawlResults.
+func (cs *collectionServer) finishCrawl(host string, start time.Time, stats *CrawlStats, err error) {
+	result := crawlResult{
+		start:          start,
+		end:            time.Now(),
+		reposDescribed: stats.ReposDescribed.Load(),
+		describeErrors: stats.DescribeErrors.Load(),
+	}
+	if err != nil {
+		result.errorCategory, result.httpStatus = classifyCrawlError(err)
+	}
 	cs.activeCrawlsLock.Lock()
 	defer cs.activeCrawlsLock.Unlock()
-	if cs.activeCrawls == nil {
-		return
+	if active, ok := cs.activeCrawls[host]; ok && active.start.Equal(start) {
+		delete(cs.activeCrawls, host)
 	}
-	delete(cs.activeCrawls, host)
+	if cs.crawlResults == nil {
+		cs.crawlResults = make(map[string]crawlResult)
+	}
+	cs.crawlResults[host] = result
+	for len(cs.crawlResults) > maxCrawlResults {
+		oldestHost := ""
+		var oldestEnd time.Time
+		for candidate, previous := range cs.crawlResults {
+			if oldestHost == "" || previous.end.Before(oldestEnd) {
+				oldestHost, oldestEnd = candidate, previous.end
+			}
+		}
+		delete(cs.crawlResults, oldestHost)
+	}
+}
+
+// hypercerts: reduce a crawl failure to a bounded category and optional HTTP
+// status. Raw error text can contain upstream response content and is only
+// logged, never returned to API clients.
+func classifyCrawlError(err error) (category string, httpStatus int) {
+	var xrpcErr *xrpc.Error
+	var netErr net.Error
+	var opErr *net.OpError
+	var urlErr *url.Error
+	switch {
+	case errors.Is(err, context.Canceled):
+		return "canceled", 0
+	case errors.Is(err, ssrf.ErrUnsafeNetworkAddress):
+		return "blocked_address", 0
+	case errors.Is(err, context.DeadlineExceeded), errors.As(err, &netErr) && netErr.Timeout():
+		return "timeout", 0
+	case errors.As(err, &xrpcErr):
+		return "http", xrpcErr.StatusCode
+	case errors.As(err, &opErr), errors.As(err, &urlErr):
+		return "transport", 0
+	default:
+		return "unknown", 0
+	}
+}
+
+// hypercerts: one format for crawl times, so a request reply's start matches
+// crawlStatus and identifies the crawl.
+func formatCrawlTime(t time.Time) string {
+	return t.UTC().Format(time.RFC3339Nano)
 }
 
 type CrawlStatusResponse struct {
 	HostCrawls map[string]HostCrawl `json:"host_starts"`
 	ServerTime string               `json:"server_time"`
+	// hypercerts: additive fields; see HostCrawlResult and processStart.
+	ProcessStart string                     `json:"process_start,omitempty"`
+	HostResults  map[string]HostCrawlResult `json:"host_results"`
 }
 type HostCrawl struct {
 	Start          string `json:"start"`
 	ReposDescribed uint32 `json:"seen"`
+	DescribeErrors uint32 `json:"describe_errors"` // hypercerts: describeRepo failures skipped so far.
+}
+
+// hypercerts: the latest ended crawl for a host. State is "finished" when the
+// repository listing ended without error, otherwise "failed".
+type HostCrawlResult struct {
+	Start          string `json:"start"`
+	End            string `json:"end"`
+	ReposDescribed uint32 `json:"seen"`
+	DescribeErrors uint32 `json:"describe_errors"`
+	State          string `json:"state"`
+	ErrorCategory  string `json:"error_category,omitempty"`
+	HTTPStatus     int    `json:"http_status,omitempty"`
 }
 
 // GET /v1/crawlStatus
@@ -980,9 +1119,30 @@ func (cs *collectionServer) crawlStatus(c echo.Context) error {
 		out.HostCrawls[host] = HostCrawl{
 			Start:          start.UTC().Format(time.RFC3339Nano),
 			ReposDescribed: rec.stats.ReposDescribed.Load(),
+			DescribeErrors: rec.stats.DescribeErrors.Load(),
 		}
 	}
 	out.ServerTime = time.Now().UTC().Format(time.RFC3339Nano)
+	// hypercerts: report retained crawl outcomes and the process start.
+	if !cs.processStart.IsZero() {
+		out.ProcessStart = formatCrawlTime(cs.processStart)
+	}
+	out.HostResults = make(map[string]HostCrawlResult, len(cs.crawlResults))
+	for host, result := range cs.crawlResults {
+		state := "finished"
+		if result.errorCategory != "" {
+			state = "failed"
+		}
+		out.HostResults[host] = HostCrawlResult{
+			Start:          formatCrawlTime(result.start),
+			End:            formatCrawlTime(result.end),
+			ReposDescribed: result.reposDescribed,
+			DescribeErrors: result.describeErrors,
+			State:          state,
+			ErrorCategory:  result.errorCategory,
+			HTTPStatus:     result.httpStatus,
+		}
+	}
 	return c.JSON(http.StatusOK, out)
 }
 

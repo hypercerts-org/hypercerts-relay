@@ -11,14 +11,32 @@
     type CoveragePage,
     type JetstreamSummary,
     type Command,
+    type CollectionCrawl,
+    type CollectionDirectoryStatus,
+    type CollectionBootstrapView,
   } from "./api";
+  import {
+    bootstrapSummary,
+    crawlEligible,
+    crawlSummary,
+    directoryMessage,
+  } from "./collectionDirectory";
   export let rows: Source[] = [];
   export let submit: (command: Command) => Promise<void>;
   export let busy = false;
+  export let directory: CollectionDirectoryStatus | null = null;
+  export let crawls: CollectionCrawl[] = [];
+  export let action: (id: string, kind: "retry" | "cancel") => Promise<void> =
+    async () => {};
   let pds = "",
     search = "",
     selected: Source | null = null,
     error = "";
+  // The selected source's newest crawl request, fetched by origin so it is
+  // found even when it is older than the shared list. Undefined until fetched.
+  let latestCrawl: CollectionCrawl | null | undefined = undefined;
+  // The selected source's newest automatic initial crawl, if any.
+  let latestBootstrap: CollectionBootstrapView | null = null;
   let detailUnavailable = false,
     coverage: Coverage | null = null,
     coverageUnavailable = false,
@@ -29,6 +47,65 @@
     .toLowerCase()
     .replace(/^https?:\/\//, "");
   $: jetstreamStats = coverage ?? selected?.JetstreamCoverage ?? null;
+  $: crawlBlocked = directoryMessage(directory);
+  $: activeCrawls = new Map(
+    (directory?.active ?? []).map((crawl) => [crawl.pds, crawl]),
+  );
+  $: selectedCrawl = selected
+    ? newestCrawl(
+        crawls.find((row) => row.pds === sourceOrigin(selected!)) ?? null,
+        latestCrawl?.pds === sourceOrigin(selected) ? latestCrawl : null,
+      )
+    : null;
+  function newestCrawl(
+    listed: CollectionCrawl | null,
+    fetched: CollectionCrawl | null,
+  ) {
+    if (!listed || !fetched) return listed ?? fetched;
+    return fetched.requestedAt > listed.requestedAt ? fetched : listed;
+  }
+  // Crawl details load only when the page supplies collection directory
+  // status, so screens without it make no crawl requests.
+  async function refreshCrawl(origin: string, request: number) {
+    if (directory === null) return;
+    await Promise.all([
+      refreshLatestCrawl(origin, request),
+      refreshBootstrap(origin, request),
+    ]);
+  }
+  async function refreshBootstrap(origin: string, request: number) {
+    try {
+      const page = await api<{ items: CollectionBootstrapView[] }>(
+        `/collection-directory/bootstraps?pds=${encodeURIComponent(origin)}&limit=1`,
+      );
+      if (
+        request === detailRequest &&
+        selected &&
+        sourceOrigin(selected) === origin
+      )
+        latestBootstrap = page.items[0] ?? null;
+    } catch {
+      // The initial crawl row stays hidden; other details are unaffected.
+    }
+  }
+  async function refreshLatestCrawl(origin: string, request: number) {
+    try {
+      const page = await api<{ items: CollectionCrawl[] }>(
+        `/collection-directory/crawls?pds=${encodeURIComponent(origin)}&limit=1`,
+      );
+      if (
+        request === detailRequest &&
+        selected &&
+        sourceOrigin(selected) === origin
+      )
+        latestCrawl = page.items[0] ?? null;
+    } catch {
+      // The shared crawl list remains the fallback.
+    }
+  }
+  export async function refreshCrawlDetail() {
+    if (selected) await refreshCrawl(sourceOrigin(selected), detailRequest);
+  }
   $: displayedRows = filter
     ? rows.filter((source) => source.Hostname.toLowerCase().includes(filter))
     : rows;
@@ -55,6 +132,8 @@
     detailRequest++;
     coverage = null;
     coverageUnavailable = false;
+    latestCrawl = undefined;
+    latestBootstrap = null;
   }
   async function refreshCoverage(origin: string, request: number) {
     try {
@@ -110,6 +189,7 @@
         }
       })(),
       refreshCoverage(origin, request),
+      refreshCrawl(origin, request),
     ]);
   }
   function select(source: Source) {
@@ -119,6 +199,7 @@
     detailUnavailable = false;
     resetCoverage();
     void refreshCoverage(sourceOrigin(source), detailRequest);
+    void refreshCrawl(sourceOrigin(source), detailRequest);
   }
   async function find() {
     const query = search,
@@ -133,7 +214,10 @@
       detailUnavailable = false;
       resetCoverage();
       const detail = ++detailRequest;
-      await refreshCoverage(sourceOrigin(found), detail);
+      await Promise.all([
+        refreshCoverage(sourceOrigin(found), detail),
+        refreshCrawl(sourceOrigin(found), detail),
+      ]);
     } catch (e) {
       if (request === lookupRequest) error = (e as Error).message;
     }
@@ -209,6 +293,9 @@
   <button>Filter</button>
 </form>
 {#if error}<p role="alert" class="error">{error}</p>{/if}
+{#if crawlBlocked}<p class="note" role="status" id="crawl-blocked">
+    {crawlBlocked}
+  </p>{/if}
 {#if selected}
   <section class="detail" aria-label="Source detail">
     {#if detailUnavailable}<p class="error" role="status">
@@ -423,6 +510,79 @@
         {/if}
       </dl>
     </section>
+    <section class="detail" aria-label="Collection directory crawl">
+      <h3>Collection directory</h3>
+      <dl>
+        {#if latestBootstrap && latestBootstrap.pds === sourceOrigin(selected)}
+          <div>
+            <dt>Initial crawl</dt>
+            <dd>
+              {bootstrapSummary(
+                latestBootstrap,
+                activeCrawls.get(latestBootstrap.pds),
+              )}{#if latestBootstrap.phase === "needs_attention" && latestBootstrap.crawlOperation}
+                <button
+                  disabled={busy}
+                  onclick={() =>
+                    action(latestBootstrap!.crawlOperation!, "retry")}
+                  >Retry initial crawl</button
+                >{/if}<small
+                >Requested automatically when the source was enabled
+                {recordedTime(latestBootstrap.createdAt)} by {latestBootstrap.actorHandle
+                  ? `@${latestBootstrap.actorHandle}`
+                  : latestBootstrap.actor}. The source was added whatever
+                happens to this crawl.</small
+              >
+            </dd>
+          </div>
+        {/if}
+        <div>
+          <dt>Latest crawl</dt>
+          <dd>
+            {crawlSummary(
+              selectedCrawl,
+              activeCrawls.get(sourceOrigin(selected)),
+            )}
+          </dd>
+        </div>
+        {#if selectedCrawl}
+          <div>
+            <dt>Requested</dt>
+            <dd>
+              {recordedTime(selectedCrawl.requestedAt)}<small
+                >by {selectedCrawl.actorHandle
+                  ? `@${selectedCrawl.actorHandle}`
+                  : selectedCrawl.actor}</small
+              >
+            </dd>
+          </div>
+          <div>
+            <dt>Crawl started</dt>
+            <dd>{recordedTime(selectedCrawl.crawlStartedAt ?? undefined)}</dd>
+          </div>
+          <div>
+            <dt>Repositories described</dt>
+            <dd>
+              {activeCrawls.get(selectedCrawl.pds)?.reposDescribed ??
+                selectedCrawl.reposDescribed ??
+                "Not reported"}
+            </dd>
+          </div>
+          <div>
+            <dt>Could not be described</dt>
+            <dd>
+              {activeCrawls.get(selectedCrawl.pds)?.describeErrors ??
+                selectedCrawl.describeErrors ??
+                "Not reported"}
+            </dd>
+          </div>
+        {/if}
+      </dl>
+      <p class="note">
+        Results are candidate DID/collection pairs, not an authoritative
+        inventory.
+      </p>
+    </section>
     {#key sourceOrigin(selected)}
       <AccountQuota
         source={selected}
@@ -528,7 +688,21 @@
                     pds: sourceOrigin(source),
                     state: "removed",
                   })}>Remove</button
-              >
+              >{#if crawlEligible(source)}{#if activeCrawls.has(sourceOrigin(source))}<button
+                    disabled
+                    >Crawling… {activeCrawls.get(sourceOrigin(source))
+                      ?.reposDescribed} repositories described</button
+                  >{:else}<button
+                    disabled={busy || !!crawlBlocked}
+                    aria-describedby={crawlBlocked
+                      ? "crawl-blocked"
+                      : undefined}
+                    onclick={() =>
+                      submit({
+                        kind: "collection_crawl",
+                        scope: sourceOrigin(source),
+                      })}>Crawl collection directory</button
+                  >{/if}{/if}
             </div></td
           ></tr
         >

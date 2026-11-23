@@ -18,7 +18,10 @@ const fixtureSecret = "deployment-fixture-credential-32-bytes"
 // the Jetstream credential.
 const relayFixtureSecret = "relay-fixture-credential-differs-32-bytes"
 
-var allSecrets = []secretFile{relaySecret, jetstreamSecret, administrationSecret, jetstreamRelaySecret}
+var allSecrets = []secretFile{relaySecret, jetstreamSecret, administrationSecret, jetstreamRelaySecret, discoverySecret, administrationDiscoverySecret}
+
+// optionalSecrets are materialized only when their input is supplied.
+var optionalSecrets = []secretFile{collectiondirSecret}
 
 func setup(t *testing.T) {
 	t.Helper()
@@ -28,15 +31,21 @@ func setup(t *testing.T) {
 	for _, secret := range allSecrets {
 		t.Setenv(secret.input, fixtureSecret)
 	}
-	for _, secret := range allSecrets {
+	for _, secret := range append(allSecrets, optionalSecrets...) {
 		if err := os.Unsetenv(secret.output); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, secret := range optionalSecrets {
+		t.Setenv(secret.input, "")
+		if err := os.Unsetenv(secret.input); err != nil {
 			t.Fatal(err)
 		}
 	}
 }
 
 func TestSecretFiles(t *testing.T) {
-	for component, count := range map[string]int{"relay": 1, "jetstream": 2, "administration": 3, "rainbow": 0} {
+	for component, count := range map[string]int{"relay": 1, "jetstream": 2, "administration": 4, "pdsdiscovery": 1, "rainbow": 0} {
 		t.Run(component, func(t *testing.T) {
 			setup(t)
 			if err := prepare(component); err != nil {
@@ -58,6 +67,75 @@ func TestSecretFiles(t *testing.T) {
 				t.Fatalf("got %d files, want %d", found, count)
 			}
 		})
+	}
+}
+
+func TestOptionalCollectiondirSecret(t *testing.T) {
+	t.Run("absent", testCollectiondirSecretAbsent)
+	t.Run("supplied", testCollectiondirSecretSupplied)
+	t.Run("other components ignore it", testCollectiondirSecretIgnoredElsewhere)
+	t.Run("short", testCollectiondirSecretShort)
+}
+
+func testCollectiondirSecretAbsent(t *testing.T) {
+	setup(t)
+	if err := prepare("administration"); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := os.LookupEnv(collectiondirSecret.output); present {
+		t.Fatal("administration received a collection directory token file without input")
+	}
+}
+
+func testCollectiondirSecretSupplied(t *testing.T) {
+	setup(t)
+	t.Setenv(collectiondirSecret.input, relayFixtureSecret)
+	if err := prepare("administration"); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := os.LookupEnv(collectiondirSecret.input); present {
+		t.Fatalf("raw %s remains in environment", collectiondirSecret.input)
+	}
+	found := 0
+	for _, secret := range append(allSecrets, optionalSecrets...) {
+		if os.Getenv(secret.output) != "" {
+			found++
+		}
+	}
+	// Three required administration files, the discovery file that setup
+	// supplies, and the collection directory file.
+	if found != 5 {
+		t.Fatalf("got %d files, want 5", found)
+	}
+	assertSecretFile(t, os.Getenv(collectiondirSecret.output), collectiondirSecret.output, relayFixtureSecret)
+}
+
+func testCollectiondirSecretIgnoredElsewhere(t *testing.T) {
+	setup(t)
+	t.Setenv(collectiondirSecret.input, relayFixtureSecret)
+	if err := prepare("relay"); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := os.LookupEnv(collectiondirSecret.output); present {
+		t.Fatal("relay received the collection directory token file")
+	}
+	if _, present := os.LookupEnv(collectiondirSecret.input); present {
+		t.Fatalf("raw %s remains in environment", collectiondirSecret.input)
+	}
+}
+
+func testCollectiondirSecretShort(t *testing.T) {
+	setup(t)
+	t.Setenv(collectiondirSecret.input, "short-credential")
+	err := prepare("administration")
+	if err == nil || !strings.Contains(err.Error(), "at least 32 bytes") {
+		t.Fatal("short collection directory secret accepted")
+	}
+	if strings.Contains(err.Error(), "short-credential") {
+		t.Fatal("secret included in diagnostic")
+	}
+	if _, present := os.LookupEnv(collectiondirSecret.input); present {
+		t.Fatalf("raw %s remains in environment", collectiondirSecret.input)
 	}
 }
 
@@ -166,5 +244,52 @@ func TestExecPassthrough(t *testing.T) {
 	}
 	if output.String() != strconv.Itoa(command.Process.Pid)+":argument preserved" {
 		t.Fatalf("PID or arguments changed across exec: %s", output.String())
+	}
+}
+
+// Administration mounts its discovery machine routes only when the shared
+// discovery credential is configured; it remains optional.
+func TestAdministrationDiscoverySecretIsOptional(t *testing.T) {
+	setup(t)
+	if err := os.Unsetenv(discoverySecret.input); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepare("administration"); err != nil {
+		t.Fatal(err)
+	}
+	if os.Getenv(administrationDiscoverySecret.output) != "" {
+		t.Fatalf("unexpected %s without a discovery credential", administrationDiscoverySecret.output)
+	}
+	if os.Getenv(administrationSecret.output) == "" {
+		t.Fatal("administration lost its required credential")
+	}
+}
+
+func TestAdministrationRejectsShortDiscoverySecret(t *testing.T) {
+	setup(t)
+	t.Setenv(discoverySecret.input, "short")
+	if err := prepare("administration"); err == nil {
+		t.Fatal("expected a short discovery credential to fail")
+	}
+}
+
+// PDS discovery is stateless and must start without a Railway volume, but it
+// still requires its credential.
+func TestPDSDiscoveryNeedsNoVolume(t *testing.T) {
+	setup(t)
+	if err := os.Unsetenv("RAILWAY_VOLUME_MOUNT_PATH"); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepare("pdsdiscovery"); err != nil {
+		t.Fatal(err)
+	}
+	assertSecretFile(t, os.Getenv(discoverySecret.output), discoverySecret.output, fixtureSecret)
+
+	setup(t)
+	if err := os.Unsetenv(discoverySecret.input); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepare("pdsdiscovery"); err == nil {
+		t.Fatal("expected a missing discovery credential to fail")
 	}
 }

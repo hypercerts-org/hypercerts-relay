@@ -62,3 +62,9 @@ var accountVerifyWarnings = promauto.NewCounterVec(prometheus.CounterOpts{
 	Help: "things that have been a little bit wrong with account messages",
 }, []string{"host", "warn"})
 */
+
+// hypercerts: counts recovered event-handler panics so a failing source is alertable.
+var handlerPanics = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "relay_handler_panics_total",
+	Help: "Event handler panics recovered while processing a source",
+}, []string{"host"})

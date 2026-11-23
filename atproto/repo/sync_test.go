@@ -29,6 +29,21 @@ func TestFirehoseMergePartialNodes(t *testing.T) {
 	//testCommitFile(t, "testdata/firehose_commit_4621332152.json")
 }
 
+func TestVerifyCommitMessageRejectsNullOp(t *testing.T) {
+	body, err := os.ReadFile("testdata/firehose_commit_4623075231.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var msg comatproto.SyncSubscribeRepos_Commit
+	if err := json.Unmarshal(body, &msg); err != nil {
+		t.Fatal(err)
+	}
+	msg.Ops = append(msg.Ops, nil)
+
+	_, err = VerifyCommitMessage(context.Background(), &msg)
+	assert.Error(t, err)
+}
+
 func testCommitFile(t *testing.T, p string) {
 	assert := assert.New(t)
 	ctx := context.Background()

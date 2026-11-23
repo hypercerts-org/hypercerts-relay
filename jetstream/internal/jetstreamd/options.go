@@ -34,6 +34,9 @@ const (
 	// hypercerts: Live ingestion verify sizing and read pacing (TECH-883).
 	DefaultLiveVerifyParallelism = live.DefaultVerifyParallelism
 	DefaultLiveUpstreamReadRate  = live.DefaultUpstreamReadRate
+	// hypercerts: Repositories one direct-PDS backfill job acquires at once (TECH-901).
+	DefaultPDSJobRepoWorkers = 2
+	MaxPDSJobRepoWorkers     = 32
 )
 
 // PhaseBarrier is a test hook that can pause execution after a major
@@ -50,6 +53,9 @@ type CompactionPassResult struct {
 type Options struct {
 	// hypercerts: Explicit initial direct-PDS sources get durable jobs, even when quiet.
 	InitialPDSSources []string
+	// hypercerts: PDSJobRepoWorkers bounds concurrent repository downloads
+	// within one direct-PDS job. Zero uses DefaultPDSJobRepoWorkers.
+	PDSJobRepoWorkers int
 	// hypercerts: Private service credential, loaded from a mounted secret file by the CLI.
 	ControlToken string
 	// ArchiveKeyAuthEnabled enables Hypercerts archive key enforcement and the private key lifecycle API.
@@ -220,6 +226,14 @@ func (o Options) effectiveBackfillMaxHosts() int {
 		return o.BackfillMaxHosts
 	}
 	return DefaultBackfillMaxHosts
+}
+
+// hypercerts: Values above the maximum are capped; the CLI rejects them.
+func (o Options) effectivePDSJobRepoWorkers() int {
+	if o.PDSJobRepoWorkers > 0 {
+		return min(o.PDSJobRepoWorkers, MaxPDSJobRepoWorkers)
+	}
+	return DefaultPDSJobRepoWorkers
 }
 
 func (o Options) effectiveBackfillBatchSize() int {
