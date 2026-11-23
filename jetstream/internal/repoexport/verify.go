@@ -8,7 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
+	"net/netip"
+	"net/url"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/bluesky-social/jetstream/segment"
 	"github.com/jcalabro/atmos"
@@ -20,6 +26,8 @@ import (
 	"github.com/jcalabro/atmos/xrpc"
 	"github.com/jcalabro/gt"
 	"github.com/jcalabro/jttp"
+
+	"golang.org/x/net/idna"
 )
 
 const (
@@ -44,6 +52,12 @@ type VerifyConfig struct {
 	// into the local reconstruction so a record created moments ago is
 	// reflected before the next compaction flush. See Config.PendingEvents.
 	PendingEvents []segment.Event
+
+	// allowPrivatePDS is a test-only escape hatch: this package's tests
+	// serve the authoritative PDS from loopback httptest servers, which the
+	// public-endpoint checks refuse. Unexported so no production caller can
+	// set it.
+	allowPrivatePDS bool
 }
 
 // VerifyReport describes the outcome of comparing a local reconstruction
@@ -72,7 +86,7 @@ func Verify(ctx context.Context, cfg VerifyConfig) (VerifyReport, error) {
 		return VerifyReport{}, err
 	}
 
-	authoritativeRev, authoritativeRoot, err := loadAuthoritativeRoot(ctx, cfg.DID, cfg.IdentityResolver)
+	authoritativeRev, authoritativeRoot, err := loadAuthoritativeRoot(ctx, cfg.DID, cfg.IdentityResolver, cfg.allowPrivatePDS)
 	if err != nil {
 		return VerifyReport{}, err
 	}
@@ -109,14 +123,25 @@ func Verify(ctx context.Context, cfg VerifyConfig) (VerifyReport, error) {
 	return report, nil
 }
 
-func loadAuthoritativeRoot(ctx context.Context, did string, resolver identity.Resolver) (string, string, error) {
+func loadAuthoritativeRoot(ctx context.Context, did string, resolver identity.Resolver, allowPrivatePDS bool) (string, string, error) {
 	pdsURL, err := resolvePDSEndpoint(ctx, did, resolver)
 	if err != nil {
 		return "", "", err
 	}
+	// hypercerts: The PDS endpoint comes from a DID document the account owner controls,
+	// and verification runs on behalf of anonymous /status viewers, so it
+	// must not be able to point the relay at internal hosts.
+	pdsOrigin, err := pdsEndpointOrigin(pdsURL, allowPrivatePDS)
+	if err != nil {
+		return "", "", fmt.Errorf("repoexport: authoritative PDS endpoint for %s: %w", did, err)
+	}
+	httpClient := newPublicPDSHTTPClient()
+	if allowPrivatePDS {
+		httpClient = jttp.New(xrpc.BulkDownloadOpts()...)
+	}
 	xrpcClient := &xrpc.Client{
-		Host:       pdsURL,
-		HTTPClient: gt.Some(jttp.New(xrpc.BulkDownloadOpts()...)),
+		Host:       pdsOrigin,
+		HTTPClient: gt.Some(httpClient),
 	}
 	syncClient := atmossync.NewClient(atmossync.Options{Client: xrpcClient})
 
@@ -138,7 +163,7 @@ func resolvePDSEndpoint(ctx context.Context, did string, resolver identity.Resol
 		return "", fmt.Errorf("repoexport: parse DID %q: %w", did, err)
 	}
 	if resolver == nil {
-		resolver = &identity.DefaultResolver{}
+		resolver = NewStatusResolver("", nil)
 	}
 	doc, err := resolver.ResolveDID(ctx, parsedDID)
 	if err != nil {
@@ -153,6 +178,141 @@ func resolvePDSEndpoint(ctx context.Context, did string, resolver identity.Resol
 		return "", fmt.Errorf("repoexport: no authoritative PDS endpoint for %s", did)
 	}
 	return pdsURL, nil
+}
+
+// pdsEndpointOrigin checks that raw is a bare http(s) origin and returns it
+// rebuilt from its parsed scheme and host, so nothing else in the DID
+// document's value can reshape the request URL xrpc builds by appending
+// "/xrpc/<nsid>". Unless allowPrivate is set, it also refuses hosts that
+// name an internal target outright: non-public IP literals, localhost,
+// single-label names and private naming suffixes. Any other host, including
+// public IP literals and IDNs, passes; where a name actually resolves is
+// enforced at request time by newPublicPDSHTTPClient.
+func pdsEndpointOrigin(raw string, allowPrivate bool) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", errors.New("PDS endpoint is not a valid URL")
+	}
+	if u.Scheme != "https" && u.Scheme != "http" {
+		return "", errors.New("PDS endpoint must be an http or https URL")
+	}
+	if u.Host == "" || u.Opaque != "" || u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+		return "", errors.New("PDS endpoint must be a bare origin without credentials, path, query or fragment")
+	}
+	// hypercerts: a non-ASCII host is converted to its ASCII form, which is
+	// what the resolver and the checks below need. ASCII hosts are unchanged.
+	if name := u.Hostname(); !isASCII(name) {
+		ascii, err := idna.Lookup.ToASCII(name)
+		if err != nil {
+			return "", errors.New("PDS endpoint host is not a valid domain name")
+		}
+		if port := u.Port(); port != "" {
+			ascii = net.JoinHostPort(ascii, port)
+		}
+		u.Host = ascii
+	}
+	origin := u.Scheme + "://" + u.Host
+	if allowPrivate {
+		return origin, nil
+	}
+
+	host := strings.ToLower(strings.TrimRight(u.Hostname(), "."))
+	if addr, err := netip.ParseAddr(host); err == nil {
+		if nonPublicAddr(addr) {
+			return "", fmt.Errorf("PDS endpoint address %s is not public", host)
+		}
+		return origin, nil
+	}
+	if host == "localhost" || !strings.Contains(host, ".") {
+		return "", errors.New("PDS endpoint host must not be localhost or a single-label name")
+	}
+	for _, suffix := range []string{".localhost", ".local", ".internal", ".lan"} {
+		if strings.HasSuffix(host, suffix) {
+			return "", fmt.Errorf("PDS endpoint host must not use private suffix %q", suffix)
+		}
+	}
+	return origin, nil
+}
+
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
+// hypercerts: newPublicPDSHTTPClient builds the client used to query an account's PDS.
+// The endpoint is account-controlled, and a public-looking name can resolve
+// anywhere, so like atmos's default backfill host client it layers jttp's
+// strict SSRF check on the initial request (redirect hops are checked by
+// default), a dial hook that refuses any non-public address actually being
+// connected to (closing the DNS-rebinding gap between that check and the
+// dial), and no proxy, so every connection passes through the hook.
+func newPublicPDSHTTPClient() *http.Client {
+	dialer := &net.Dialer{
+		// BulkDownloadOpts' dial settings, which a custom DialContext replaces.
+		Timeout:   5 * time.Second,
+		KeepAlive: 30 * time.Second,
+		Control:   refuseNonPublicDial,
+	}
+	return jttp.New(append(xrpc.BulkDownloadOpts(),
+		jttp.WithStrictSSRFProtection(),
+		jttp.WithNoProxy(),
+		jttp.WithDialContext(dialer.DialContext),
+	)...)
+}
+
+// refuseNonPublicDial is a net.Dialer Control hook; address is the resolved
+// IP and port about to be connected to.
+func refuseNonPublicDial(_, address string, _ syscall.RawConn) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("repoexport: refusing to dial %q: %w", address, err)
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil || nonPublicAddr(addr) {
+		return fmt.Errorf("repoexport: refusing to dial non-public address %s", host)
+	}
+	return nil
+}
+
+var publicIPv6 = netip.MustParsePrefix("2000::/3")
+
+var reservedPDSNetworks = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"), netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("192.0.0.0/24"), netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("192.88.99.0/24"), netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("198.51.100.0/24"), netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+	// IPv6 special-purpose space inside 2000::/3. The IETF protocol block
+	// 2001::/23 is refused whole: it is not globally reachable by default,
+	// and its few reachable assignments are anycast infrastructure, never a
+	// PDS. Then documentation and 6to4.
+	netip.MustParsePrefix("2001::/23"), netip.MustParsePrefix("2001:db8::/32"),
+	netip.MustParsePrefix("2002::/16"), netip.MustParsePrefix("3fff::/20"),
+}
+
+// nonPublicAddr conservatively refuses special-use and translation networks
+// in addition to private addresses. Zoned addresses fail closed.
+func nonPublicAddr(addr netip.Addr) bool {
+	if !addr.IsValid() || addr.Zone() != "" {
+		return true
+	}
+	addr = addr.Unmap()
+	if addr.IsLoopback() || addr.IsLinkLocalUnicast() || addr.IsMulticast() || addr.IsUnspecified() || addr.IsPrivate() {
+		return true
+	}
+	if addr.Is6() && !publicIPv6.Contains(addr) {
+		return true
+	}
+	for _, prefix := range reservedPDSNetworks {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 
 func loadAuthoritativeCommit(ctx context.Context, xrpcClient *xrpc.Client, did, rev string, commitCID cbor.CID) (*repo.Commit, error) {

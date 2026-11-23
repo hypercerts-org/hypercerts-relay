@@ -1,12 +1,14 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 
 	comatproto "github.com/bluesky-social/indigo/api/atproto"
 	"github.com/bluesky-social/indigo/atproto/atclient"
+	"github.com/bluesky-social/indigo/atproto/identity"
 	"github.com/bluesky-social/indigo/atproto/syntax"
 	"github.com/bluesky-social/indigo/cmd/relay/relay"
 
@@ -138,8 +140,15 @@ func (s *Service) HandleComAtprotoSyncGetRepo(c echo.Context) error {
 
 	ident, err := s.relay.Dir.LookupDID(ctx, did)
 	if err != nil {
-		// TODO: could handle lookup errors more granularly
-		return c.JSON(http.StatusNotFound, atclient.ErrorBody{Name: "RepoNotFound", Message: fmt.Sprintf("could not resolve DID: %s", err)})
+		// hypercerts: Preserve retryable lookup failures for getRepo clients.
+		switch {
+		case errors.Is(err, identity.ErrDIDWebRateLimited):
+			return c.JSON(http.StatusTooManyRequests, atclient.ErrorBody{Name: "RateLimitExceeded", Message: "DID lookup rate limit exceeded"})
+		case errors.Is(err, identity.ErrDIDNotFound):
+			return c.JSON(http.StatusNotFound, atclient.ErrorBody{Name: "RepoNotFound", Message: fmt.Sprintf("could not resolve DID: %s", err)})
+		default:
+			return c.JSON(http.StatusServiceUnavailable, atclient.ErrorBody{Name: "ServiceUnavailable", Message: "DID lookup temporarily unavailable"})
+		}
 	}
 	pdsHost, _, err := relay.ParseHostname(ident.PDSEndpoint())
 	if err != nil {
