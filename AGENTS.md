@@ -16,11 +16,14 @@ Approved PDS instances
 Raw Relay stream and explicitly crawled PDS instances
   -> optional collection directory -> candidate repositories by collection
 
+Public Bluesky Jetstream (retained collections) and Bluesky relay host status
+  -> optional PDS discovery -> administration source and account-limit operations
+
 Administration control plane and Svelte web UI
   -> PDS allowlist, retained collections, rate limits, jobs, telemetry
 ```
 
-The Relay publishes raw `com.atproto.sync.subscribeRepos` events. The `jetstream/` module owns retention of selected record collections and PDS/collection backfill. Rainbow is a raw event-stream proxy. The optional collection directory indexes observed DID and collection pairs for `com.atproto.sync.listReposByCollection`; results are candidates, not proof of current records or complete coverage. It does not replace Jetstream backfill. See `cmd/collectiondir/README.md` for operational and recovery limitations. Do not move those responsibilities between components without an explicit architecture decision.
+The Relay publishes raw `com.atproto.sync.subscribeRepos` events. The `jetstream/` module owns retention of selected record collections and PDS/collection backfill. Rainbow is a raw event-stream proxy. The optional collection directory indexes observed DID and collection pairs for `com.atproto.sync.listReposByCollection`; results are candidates, not proof of current records or complete coverage. It does not replace Jetstream backfill. See `cmd/collectiondir/README.md` for operational and recovery limitations. The optional PDS discovery service owns automatic PDS admission: it may only request source-enable and account-limit-raise operations through the administration machine API, never call Relay or Jetstream directly, and never re-enable a source an operator disabled or removed. See `cmd/pdsdiscovery/README.md` and `docs/contracts/management.md`. Do not move those responsibilities between components without an explicit architecture decision.
 
 The inherited Basic-auth Relay admin UI is upstream code. It is not the Hypercerts administration control plane and must not be extended as a substitute for the planned AT Protocol OAuth UI.
 
@@ -29,6 +32,7 @@ The inherited Basic-auth Relay admin UI is upstream code. It is not the Hypercer
 - `cmd/relay` contains the Relay command and its services.
 - `cmd/rainbow` contains the raw Relay fan-out proxy.
 - `cmd/collectiondir` contains the optional repository-by-collection discovery service.
+- `cmd/pdsdiscovery` contains the optional automatic PDS discovery service.
 - `jetstream` is a separately versioned Go module containing the copied Jetstream v2 runtime; read `jetstream/README.md` for provenance and its update procedure.
 - `atproto`, `api`, `events`, `models`, `splitter`, `util`, `xrpc`, and `lex/util` are the selected Indigo dependency closure.
 - `.agents/skills/hypercerts-relay` is the project skill for work in this fork.
@@ -57,14 +61,14 @@ Read `FORK.md` before changing upstream-derived code or synchronizing Indigo. It
 
 ## Validation
 
-Run this before requesting review for Relay, Rainbow, or collection directory changes:
+Run this before requesting review for Relay, Rainbow, collection directory, or PDS discovery changes:
 
 ```bash
 ./scripts/verify.sh
 git diff --check
 ```
 
-`./scripts/verify.sh` runs Relay, Rainbow, and collection directory tests, `go vet`, and builds all three commands. It excludes only the locally failing baseline test `TestClaimDueAccountLimitAlertsRepeatsAfterInterval`; the CI workflow runs that test separately as a non-blocking signal. Do not add further skipped tests without recording the observed behavior and removal condition in the script and README.
+`./scripts/verify.sh` runs Relay, Rainbow, collection directory, and PDS discovery tests, `go vet`, and builds all four commands. It excludes only the locally failing baseline test `TestClaimDueAccountLimitAlertsRepeatsAfterInterval`; the CI workflow runs that test separately as a non-blocking signal. Do not add further skipped tests without recording the observed behavior and removal condition in the script and README.
 
 Use `gofmt` on changed Go files. Validate workflow changes with the repository's workflow checks when available, and inspect the rendered YAML for permissions, branch conditions, and write steps.
 

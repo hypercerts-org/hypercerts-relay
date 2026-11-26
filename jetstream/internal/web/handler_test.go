@@ -1,8 +1,10 @@
 package web_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -579,6 +581,40 @@ func TestHandler_RendersRepoVerificationMismatch(t *testing.T) {
 	require.Contains(t, body, "Match failure")
 	require.Contains(t, body, "match-fail")
 	require.Contains(t, body, "root mismatch")
+}
+
+func TestHandler_HidesRepoVerificationErrorDetailFromViewers(t *testing.T) {
+	t.Parallel()
+	s := newFixtureSnap()
+	s.Request = status.Request{Tab: "accounts", DID: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"}
+	s.Account = status.AccountLookup{
+		Query:    "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+		Found:    true,
+		DID:      "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+		Backfill: "complete",
+	}
+	const detail = "dial tcp 10.0.0.5:6379: connect: connection refused"
+	actions := &fakeRepoActions{verifyErr: errors.New(detail)}
+	var logs bytes.Buffer
+	h, err := web.New(web.Options{
+		Snapshotter: &fakeSnapshotter{snap: s},
+		RepoActions: actions,
+		Logger:      slog.New(slog.NewTextHandler(&logs, nil)),
+	})
+	require.NoError(t, err)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/status?tab=accounts&did=did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", nil)
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	require.Equal(t, 1, actions.verifyCalls)
+	body := rr.Body.String()
+	require.Contains(t, body, "Repo verification")
+	require.Contains(t, body, "repo verification failed")
+	require.NotContains(t, body, "10.0.0.5")
+	require.NotContains(t, body, "connection refused")
+	require.Contains(t, logs.String(), "10.0.0.5:6379")
 }
 
 func TestHandler_RateLimitsAutomaticRepoVerificationBySourceIP(t *testing.T) {

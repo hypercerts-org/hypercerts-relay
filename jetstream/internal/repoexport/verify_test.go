@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/bluesky-social/jetstream/segment"
@@ -36,6 +39,7 @@ func TestVerify_MatchingRoots(t *testing.T) {
 		DataDir:          dataDir,
 		DID:              testDID,
 		IdentityResolver: newTestIdentityResolver(testDID, relay.URL),
+		allowPrivatePDS:  true,
 		Selector:         openSelector(t, dataDir),
 	})
 	require.NoError(t, err)
@@ -73,6 +77,7 @@ func TestVerify_PendingEventsMatchAuthoritativeRoot(t *testing.T) {
 		DataDir:          dataDir,
 		DID:              testDID,
 		IdentityResolver: newTestIdentityResolver(testDID, relay.URL),
+		allowPrivatePDS:  true,
 		Selector:         openSelector(t, dataDir),
 		PendingEvents:    pending,
 	})
@@ -104,6 +109,7 @@ func TestVerify_MismatchingRootsReturnsReport(t *testing.T) {
 		DataDir:          dataDir,
 		DID:              testDID,
 		IdentityResolver: newTestIdentityResolver(testDID, relay.URL),
+		allowPrivatePDS:  true,
 		Selector:         openSelector(t, dataDir),
 	})
 	require.NoError(t, err)
@@ -133,6 +139,7 @@ func TestVerify_MissingLocalRepoReturnsMismatchReport(t *testing.T) {
 		DataDir:          emptyDir,
 		DID:              testDID,
 		IdentityResolver: newTestIdentityResolver(testDID, relay.URL),
+		allowPrivatePDS:  true,
 		Selector:         openSelector(t, emptyDir),
 	})
 	require.NoError(t, err)
@@ -155,6 +162,7 @@ func TestVerify_MalformedLatestCommitCIDReturnsError(t *testing.T) {
 		DataDir:          t.TempDir(),
 		DID:              testDID,
 		IdentityResolver: newTestIdentityResolver(testDID, relay.URL),
+		allowPrivatePDS:  true,
 	})
 	require.Error(t, err)
 }
@@ -172,6 +180,7 @@ func TestVerify_MissingAuthoritativeCommitBlockReturnsError(t *testing.T) {
 		DataDir:          t.TempDir(),
 		DID:              testDID,
 		IdentityResolver: newTestIdentityResolver(testDID, relay.URL),
+		allowPrivatePDS:  true,
 	})
 	require.ErrorContains(t, err, "not found in getBlocks response")
 }
@@ -187,6 +196,7 @@ func TestVerify_AuthoritativeCommitDIDMismatchReturnsError(t *testing.T) {
 		DataDir:          t.TempDir(),
 		DID:              testDID,
 		IdentityResolver: newTestIdentityResolver(testDID, relay.URL),
+		allowPrivatePDS:  true,
 	})
 	require.ErrorContains(t, err, "authoritative commit DID mismatch")
 }
@@ -202,6 +212,7 @@ func TestVerify_AuthoritativeCommitRevMismatchReturnsError(t *testing.T) {
 		DataDir:          t.TempDir(),
 		DID:              testDID,
 		IdentityResolver: newTestIdentityResolver(testDID, relay.URL),
+		allowPrivatePDS:  true,
 	})
 	require.ErrorContains(t, err, "authoritative commit rev mismatch")
 }
@@ -215,6 +226,7 @@ func TestVerify_HTTPFailureReturnsError(t *testing.T) {
 		DataDir:          t.TempDir(),
 		DID:              testDID,
 		IdentityResolver: newTestIdentityResolver(testDID, relay.URL),
+		allowPrivatePDS:  true,
 	})
 	require.Error(t, err)
 }
@@ -227,6 +239,128 @@ func TestVerify_ValidatesConfig(t *testing.T) {
 
 	_, err = Verify(t.Context(), VerifyConfig{DataDir: t.TempDir()})
 	require.ErrorContains(t, err, "DID is required")
+}
+
+func TestVerify_RefusesNonPublicPDSWithoutContactingIt(t *testing.T) {
+	t.Parallel()
+
+	var hits atomic.Int64
+	internal := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		rw.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(internal.Close)
+
+	for _, endpoint := range []string{
+		internal.URL,
+		strings.Replace(internal.URL, "127.0.0.1", "localhost", 1),
+	} {
+		_, err := Verify(t.Context(), VerifyConfig{
+			DataDir:          t.TempDir(),
+			DID:              testDID,
+			IdentityResolver: newTestIdentityResolver(testDID, endpoint),
+		})
+		require.Error(t, err, endpoint)
+	}
+	require.Zero(t, hits.Load())
+}
+
+func TestPDSEndpointOrigin_AcceptsPublicOrigins(t *testing.T) {
+	t.Parallel()
+
+	for raw, want := range map[string]string{
+		"https://pds.example.com":        "https://pds.example.com",
+		"https://pds.example.com/":       "https://pds.example.com",
+		"https://PDS.Example.com:2583":   "https://PDS.Example.com:2583",
+		"http://pds.example.com":         "http://pds.example.com",
+		"https://93.184.216.34":          "https://93.184.216.34",
+		"http://93.184.216.34:8080":      "http://93.184.216.34:8080",
+		"https://[2606:4700:4700::1111]": "https://[2606:4700:4700::1111]",
+		"https://bücher.example":         "https://xn--bcher-kva.example",
+		"https://bücher.example:8443":    "https://xn--bcher-kva.example:8443",
+		"https://xn--bcher-kva.example":  "https://xn--bcher-kva.example",
+	} {
+		got, err := pdsEndpointOrigin(raw, false)
+		require.NoError(t, err, raw)
+		require.Equal(t, want, got, raw)
+	}
+}
+
+func TestPDSEndpointOrigin_RejectsInternalOrNonOriginEndpoints(t *testing.T) {
+	t.Parallel()
+
+	for _, raw := range []string{
+		// Not a bare http(s) origin.
+		"ftp://pds.example.com",
+		"https://user:pass@pds.example.com",
+		"https://pds.example.com/base",
+		"https://pds.example.com?x=1",
+		"https://pds.example.com#frag",
+		"https:pds.example.com",
+		"https://",
+		// Internal names.
+		"http://localhost:6060",
+		"http://localhost.:6060",
+		"http://debug.localhost",
+		"http://pds",
+		"http://svc.railway.internal:8080",
+		"http://printer.local",
+		"http://nas.lan",
+		// Non-public addresses.
+		"http://127.0.0.1:6060",
+		"http://[::1]:6060",
+		"http://[::ffff:127.0.0.1]",
+		"http://10.1.2.3",
+		"http://172.16.0.1",
+		"http://192.168.1.1",
+		"http://169.254.169.254",
+		"http://100.64.0.1",
+		"http://0.0.0.0",
+		"http://[fd12::1]",
+		"http://[fe80::1%25en0]",
+	} {
+		_, err := pdsEndpointOrigin(raw, false)
+		require.Error(t, err, raw)
+	}
+}
+
+func TestRefuseNonPublicDial(t *testing.T) {
+	t.Parallel()
+
+	for _, address := range []string{"127.0.0.1:80", "[::1]:443", "10.0.0.1:443", "169.254.169.254:80", "[fd00:ec2::254]:80", "[::ffff:192.168.0.1]:80", "100.100.1.1:443", "not-an-ip:80"} {
+		require.Error(t, refuseNonPublicDial("tcp", address, nil), address)
+	}
+	for _, address := range []string{"192.0.2.1:443", "198.51.100.7:443", "203.0.113.5:443", "192.88.99.1:443", "240.0.0.1:443"} {
+		require.Error(t, refuseNonPublicDial("tcp", address, nil), address)
+	}
+	for _, address := range []string{"[2606:4700:4700::1111]:443", "8.8.8.8:443"} {
+		require.NoError(t, refuseNonPublicDial("tcp", address, nil), address)
+	}
+}
+
+func TestPublicPDSHTTPClient_RefusesLoopbackTarget(t *testing.T) {
+	t.Parallel()
+
+	var hits atomic.Int64
+	internal := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		rw.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(internal.Close)
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, internal.URL, nil)
+	require.NoError(t, err)
+	resp, err := newPublicPDSHTTPClient().Do(req)
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	require.Error(t, err)
+
+	// The dial hook alone also refuses the connection, covering a name that
+	// passes the request-time check but resolves to loopback at dial time.
+	_, err = (&net.Dialer{Control: refuseNonPublicDial}).DialContext(t.Context(), "tcp", internal.Listener.Addr().String())
+	require.Error(t, err)
+	require.Zero(t, hits.Load())
 }
 
 func newAuthoritativeCommitServer(t *testing.T, did string, rev string, root cbor.CID) *httptest.Server {

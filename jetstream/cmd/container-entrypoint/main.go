@@ -30,15 +30,27 @@ var administrationSecret = secretFile{"HC_ADMIN_ENCRYPTION_SECRET", "ADMIN_ENCRY
 // the same input as relaySecret because both services must hold the same value.
 var jetstreamRelaySecret = secretFile{"HC_RELAY_CONTROL_SECRET", "JETSTREAM_RELAY_CONTROL_TOKEN_FILE"}
 
+// The PDS discovery service and administration share one machine credential.
+// Administration mounts its machine routes only when the credential is present.
+var discoverySecret = secretFile{"HC_DISCOVERY_SECRET", "DISCOVERY_ADMIN_TOKEN_FILE"}
+var administrationDiscoverySecret = secretFile{"HC_DISCOVERY_SECRET", "ADMIN_DISCOVERY_TOKEN_FILE"}
+
+// collectiondirSecret is optional: Administration enables its collection
+// directory crawl action only when this credential is supplied.
+var collectiondirSecret = secretFile{"HC_COLLECTIONDIR_CONTROL_SECRET", "COLLECTIONDIR_CONTROL_TOKEN_FILE"}
+
 func clearRawSecrets() {
-	for _, secret := range []secretFile{relaySecret, jetstreamSecret, administrationSecret} {
+	for _, secret := range []secretFile{relaySecret, jetstreamSecret, administrationSecret, discoverySecret, collectiondirSecret} {
 		_ = os.Unsetenv(secret.input)
 	}
 }
 
 func prepare(component string) error {
 	defer clearRawSecrets()
-	var secrets []secretFile
+	// optional secrets are converted only when their input is set; once set,
+	// they must meet the same length rule as required secrets.
+	var secrets, optional []secretFile
+	needsVolume := true
 	switch component {
 	case "relay":
 		secrets = []secretFile{relaySecret}
@@ -46,6 +58,11 @@ func prepare(component string) error {
 		secrets = []secretFile{jetstreamSecret, jetstreamRelaySecret}
 	case "administration":
 		secrets = []secretFile{relaySecret, jetstreamSecret, administrationSecret}
+		optional = []secretFile{administrationDiscoverySecret, collectiondirSecret}
+	case "pdsdiscovery":
+		// Stateless: discovery keeps no local data, so it needs no volume.
+		secrets = []secretFile{discoverySecret}
+		needsVolume = false
 	case "rainbow":
 	default:
 		return errors.New("unknown service name")
@@ -54,36 +71,48 @@ func prepare(component string) error {
 	if os.Getenv("HC_RAILWAY_STARTUP") != "1" {
 		return nil
 	}
-	if os.Getenv("RAILWAY_VOLUME_MOUNT_PATH") != "/data" {
+	if needsVolume && os.Getenv("RAILWAY_VOLUME_MOUNT_PATH") != "/data" {
 		return errors.New("a persistent Railway volume mounted at /data is required")
+	}
+	for _, secret := range optional {
+		if os.Getenv(secret.input) != "" {
+			secrets = append(secrets, secret)
+		}
 	}
 	for _, secret := range secrets {
 		if len(strings.TrimSpace(os.Getenv(secret.input))) < 32 {
 			return fmt.Errorf("%s must contain at least 32 bytes", secret.input)
 		}
 	}
-	if len(secrets) > 0 {
-		dir, err := os.MkdirTemp("", "hypercerts-secrets-")
-		if err != nil {
-			return fmt.Errorf("create secret directory: %w", err)
-		}
-		complete := false
-		defer func() {
-			if !complete {
-				_ = os.RemoveAll(dir)
-			}
-		}()
-		for _, secret := range secrets {
-			path := filepath.Join(dir, secret.output)
-			if err := os.WriteFile(path, []byte(strings.TrimSpace(os.Getenv(secret.input))), 0600); err != nil {
-				return fmt.Errorf("write %s: %w", secret.output, err)
-			}
-			if err := os.Setenv(secret.output, path); err != nil {
-				return fmt.Errorf("configure %s: %w", secret.output, err)
-			}
-		}
-		complete = true
+	return writeSecretFiles(secrets)
+}
+
+// writeSecretFiles writes each secret to a private temporary file and points
+// its output variable at that file. A failure removes the directory.
+func writeSecretFiles(secrets []secretFile) error {
+	if len(secrets) == 0 {
+		return nil
 	}
+	dir, err := os.MkdirTemp("", "hypercerts-secrets-")
+	if err != nil {
+		return fmt.Errorf("create secret directory: %w", err)
+	}
+	complete := false
+	defer func() {
+		if !complete {
+			_ = os.RemoveAll(dir)
+		}
+	}()
+	for _, secret := range secrets {
+		path := filepath.Join(dir, secret.output)
+		if err := os.WriteFile(path, []byte(strings.TrimSpace(os.Getenv(secret.input))), 0600); err != nil {
+			return fmt.Errorf("write %s: %w", secret.output, err)
+		}
+		if err := os.Setenv(secret.output, path); err != nil {
+			return fmt.Errorf("configure %s: %w", secret.output, err)
+		}
+	}
+	complete = true
 	return nil
 }
 

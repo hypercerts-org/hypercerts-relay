@@ -10,6 +10,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -533,14 +534,31 @@ func (h *Handler) listJobs(w http.ResponseWriter, r *http.Request) {
 		}
 		limit = n
 	}
-	after := r.URL.Query().Get("after")
+	states, ok := jobStateFilter(r.URL.Query().Get("state"))
+	if !ok {
+		reply(w, 400, map[string]string{"error": "invalid_state"})
+		return
+	}
+	// Jobs are listed newest first, so the cursor is resolved by the position
+	// of the last returned job ID rather than by comparing IDs.
+	all := h.jobs.ListForDiagnostics()
+	start := 0
+	if after := r.URL.Query().Get("after"); after != "" {
+		position := slices.IndexFunc(all, func(j jobs.Job) bool { return j.ID == after })
+		if position < 0 {
+			reply(w, 400, map[string]string{"error": "invalid_cursor"})
+			return
+		}
+		start = position + 1
+	}
+	pds := r.URL.Query().Get("pds")
 	selected := make([]jobs.Job, 0, limit)
 	next := ""
-	for _, j := range h.jobs.ListForDiagnostics() {
-		if pds := r.URL.Query().Get("pds"); pds != "" && j.PDS != pds {
+	for _, j := range all[start:] {
+		if pds != "" && j.PDS != pds {
 			continue
 		}
-		if j.ID <= after {
+		if states != nil && !states[j.State] {
 			continue
 		}
 		if len(selected) == limit {
@@ -558,6 +576,10 @@ func (h *Handler) listJobs(w http.ResponseWriter, r *http.Request) {
 		failure(w, err)
 		return
 	}
+	// A job can be claimed or finish between the listing capture and the
+	// diagnostic snapshot, so recheck the state filter on the snapshot. The page
+	// may then be short; nextCursor still resolves by position.
+	snapshots = snapshotsInStates(snapshots, states)
 	out := make([]jobView, 0, len(snapshots))
 	for _, snapshot := range snapshots {
 		out = append(out, view(snapshot.Job, snapshot.CompletedRepos, snapshot.Diagnostics))
@@ -566,6 +588,31 @@ func (h *Handler) listJobs(w http.ResponseWriter, r *http.Request) {
 		Jobs       []jobView `json:"jobs"`
 		NextCursor string    `json:"nextCursor,omitempty"`
 	}{out, next})
+}
+
+// snapshotsInStates keeps the snapshots whose job state the filter selects. A nil
+// filter selects every state.
+func snapshotsInStates(snapshots []jobs.JobDiagnosticSnapshot, states map[jobs.State]bool) []jobs.JobDiagnosticSnapshot {
+	if states == nil {
+		return snapshots
+	}
+	return slices.DeleteFunc(snapshots, func(snapshot jobs.JobDiagnosticSnapshot) bool { return !states[snapshot.Job.State] })
+}
+
+// jobStateFilter maps the optional job-list state query to the durable job
+// states it selects. An empty value selects every state (nil map); "active"
+// selects work that can still be canceled. Unknown values are rejected.
+func jobStateFilter(raw string) (map[jobs.State]bool, bool) {
+	switch state := jobs.State(raw); state {
+	case "":
+		return nil, true
+	case "active":
+		return map[jobs.State]bool{jobs.Pending: true, jobs.Running: true}, true
+	case jobs.Pending, jobs.Running, jobs.Failed, jobs.Canceled, jobs.Incomplete, jobs.Complete:
+		return map[jobs.State]bool{state: true}, true
+	default:
+		return nil, false
+	}
 }
 
 // jobView reports bounded progress counters instead of embedding every DID in

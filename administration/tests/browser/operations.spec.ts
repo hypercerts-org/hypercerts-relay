@@ -141,6 +141,33 @@ test("administrator operates sources, collections, jobs, rates and revokes the s
   ).toBeVisible();
   expect((await page.request.get("/api/v1/session")).status()).toBe(401);
 });
+test("an unconfigured collection directory disables crawls without blocking source management", async ({
+  page,
+}) => {
+  await login(page);
+  await page
+    .getByRole("link", { name: "Collection directory", exact: true })
+    .click();
+  await expect(
+    page.getByRole("heading", { name: "Collection directory", level: 1 }),
+  ).toBeVisible();
+  await expect(page.getByRole("status").first()).toContainText(
+    "COLLECTIONDIR_CONTROL_URL",
+  );
+  await expect(
+    page.getByRole("button", { name: "Crawl all enabled sources" }),
+  ).toBeDisabled();
+  await page.getByRole("link", { name: "PDS sources", exact: true }).click();
+  await expect(
+    page.getByRole("table", { name: "Configured sources" }),
+  ).toBeVisible();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await page.goto("/");
+  await expect(
+    page.getByRole("term").filter({ hasText: "Collection directory" }),
+  ).toBeVisible();
+  await expect(page.getByText("not configured", { exact: true })).toBeVisible();
+});
 test("desktop and mobile screens have no serious accessibility violations or page overflow", async ({
   page,
 }) => {
@@ -156,6 +183,7 @@ test("desktop and mobile screens have no serious accessibility violations or pag
       "/limits",
       "/audit",
       "/manage-adminis",
+      "/collection-directory",
     ]) {
       await page.goto(route);
       await expect(page.locator("h1")).toBeVisible();
@@ -394,6 +422,33 @@ test("coverage read pages preserve global aggregate, diagnostics, and exact PDS 
   expect(readPaths).toContain(
     "/api/v1/jobs?after=&pds=https%3A%2F%2Ffailed.example",
   );
+  await expect(
+    page.locator("small", { hasText: /^Created: / }).first(),
+  ).toBeVisible();
+  // A status link reloads the jobs screen at the first page, keeping the PDS
+  // filter, and Jetstream receives the status filter.
+  await page
+    .getByRole("navigation", { name: "Filter jobs by status" })
+    .getByRole("link", { name: "Canceled", exact: true })
+    .click();
+  await expect(page).toHaveURL(
+    /\/jobs\?state=canceled&pds=https%3A%2F%2Ffailed\.example$/,
+  );
+  await expect(
+    page
+      .getByRole("navigation", { name: "Filter jobs by status" })
+      .getByRole("link", { name: "Canceled", exact: true }),
+  ).toHaveAttribute("aria-current", "true");
+  await expect(
+    page
+      .getByRole("navigation", { name: "Result pages" })
+      .getByText("Page 1", { exact: true }),
+  ).toBeVisible();
+  await expect
+    .poll(() => readPaths)
+    .toContain(
+      "/api/v1/jobs?after=&pds=https%3A%2F%2Ffailed.example&state=canceled",
+    );
   releaseSecondPage();
   await page.goto("/coverage");
   await page

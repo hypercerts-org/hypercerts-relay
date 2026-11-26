@@ -32,6 +32,9 @@ npm run server
 | `RELAY_PUBLIC_ORIGIN`          | Optional public Relay HTTPS origin displayed on the Overview page; never use the control URL.           |
 | `RAINBOW_PUBLIC_ORIGIN`        | Optional public Rainbow HTTPS origin displayed on the Overview page.                                    |
 | `JETSTREAM_PUBLIC_ORIGIN`      | Optional public Jetstream HTTPS origin displayed on the Overview page; never use the control URL.       |
+| `ADMIN_DISCOVERY_TOKEN_FILE`   | Optional machine token, at least 32 bytes, for `cmd/pdsdiscovery`. When unset, the discovery `state` and `operations` routes are not mounted. |
+| `COLLECTIONDIR_CONTROL_URL`        | Optional private collection directory origin, such as `http://collectiondir.railway.internal:2510`. Unset disables crawls. |
+| `COLLECTIONDIR_CONTROL_TOKEN_FILE` | File containing the collection directory's `COLLECTIONS_ADMIN_TOKEN`, at least 32 bytes. Required with the URL. |
 
 The Relay independently uses `JETSTREAM_CONTROL_URL` and `JETSTREAM_CONTROL_TOKEN`
 for its durable source-lifecycle handoff to Jetstream. Configure both on the Relay
@@ -57,6 +60,13 @@ Control URLs reject plaintext HTTP except loopback and single-service
 `*_PUBLIC_ORIGIN` values accept only HTTPS origins (or loopback HTTP for local
 development) and are display-only; they must not expose private management/debug
 listeners. No component is deployed by this change.
+
+`COLLECTIONDIR_CONTROL_URL` and `COLLECTIONDIR_CONTROL_TOKEN_FILE` are optional
+and must be set together; if exactly one is set, startup fails. The URL follows
+the same transport rules as the other control URLs and must not equal the Relay
+or Jetstream control origin or any `*_PUBLIC_ORIGIN`. The collection directory
+itself accepts any nonempty token, but Administration requires at least 32 bytes,
+so set a `COLLECTIONS_ADMIN_TOKEN` of that length before enabling crawls.
 
 `/oauth-client-metadata.json` must be reachable by authorization servers at the
 public origin. OAuth uses the maintained AT Protocol Node client for discovery,
@@ -121,19 +131,24 @@ The browser-facing API is `/api/v1`; all endpoints below require authorization.
 | `POST /administrators`                   | `{did, action}` with `grant` or `remove`; actor audited, CSRF protected; cannot remove oneself.            |
 | `GET /session`                           | Current DID, CSRF token, expiry.                                                                           |
 | `POST /signout`, `/revoke-sessions`      | Revoke the current or all local sessions.                                                                  |
-| `POST /operations`                       | Validated command plus UUID `Idempotency-Key`; returns durable operation and HTTP 202.                     |
+| `POST /operations`                       | Validated command plus UUID `Idempotency-Key` (version 8 is reserved for server-derived IDs and returns HTTP 400 `reserved_idempotency_key`); returns durable operation and HTTP 202. |
 | `GET /operations`, `/operations/{id}`    | Requested command, actor, state, observed result and bounded failure code.                                 |
 | `POST /operations/{id}/retry`, `/cancel` | Retry failed/incomplete work or cancel work not yet applying; actor audited.                               |
 | `GET /sources`, `/source?pds=…`          | Relay's desired, validation, connection, admission-quota, Relay-observed-account and durable-cursor state. |
 | `GET /policy`                            | Jetstream's applied collection-policy revision.                                                            |
-| `GET /jobs`, `/coverage`                 | Jetstream job state, bounded execution diagnostics, last progress and inventory-failure details, and source/policy-scoped current-state coverage; optional exact `pds` filter. |
+| `GET /jobs`, `/coverage`                 | Jetstream job state, bounded execution diagnostics, last progress and inventory-failure details, and source/policy-scoped current-state coverage; optional exact `pds` filter. Jobs are listed newest created first across pages, in the order Jetstream returns. `GET /jobs` also accepts an optional `state` filter (`active`, `pending`, `running`, `incomplete`, `failed`, `canceled` or `complete`); another value returns `400` `invalid_input`. A job without a recorded creation time omits `createdAt`. |
 | `GET /jobs/{id}/repositories`            | Lazy, cursor-paginated unresolved repository details from Jetstream's frozen inventory, including recorded failure times. |
-| `GET /limits`, `/status`, `/audit`       | Applied policies, bounded service health, durable actor-attributed history.                                |
+| `GET /limits`, `/status`, `/audit`       | Applied policies, bounded service health, durable actor-attributed history. `/status` includes `collectiondir`: `available`, `unavailable` or `not_configured`. |
+| `GET`, `POST /sources/discovery/settings` | Automatic PDS discovery settings: `{maxAccountLimit}`, a whole number of at least 1,000 (default 100,000). Changes are CSRF protected and audited as `discovery_settings_changed`. |
+| `GET /collection-directory/status`       | Always HTTP 200: `configured`, `available`, bounded `error` code, active crawls and recent crawl results.   |
+| `GET /collection-directory/crawls`       | Newest-first crawl requests with actor, times, trigger (`cause`: `manual` or `source_added`), the enabling `sourceOperation`, submission, state and result; optional exact `pds` and crawl-row `ids` filters. |
+| `GET /collection-directory/bootstraps`   | Newest-first automatic initial crawls with the enabling operation and actor, outcome, `phase`, follow-up request state, attempts and next retry time, and the crawl row once accepted; optional exact `pds` filter, which also matches `http://` sources. Optional `phase=open` selects only `waiting`, `retrying`, `needs_attention` and `accepted` before the same `after`/`limit` cursor paging; any other filter value is rejected, and omitting it returns all phases. |
 
 Commands are discriminated by `kind`: `source` (`pds`, `state`), `collections`
 (`expectedRevision`, exact `collections`), `job` (`pds`, `reason`), `job_action`
-(`id`, `action`), `account_quota` (`pds`, `expectedLimit`, `accountLimit`), and
-`limit` (`scope`, `eventsPerSecond`). Bodies are limited to
+(`id`, `action`), `account_quota` (`pds`, `expectedLimit`, `accountLimit`),
+`limit` (`scope`, `eventsPerSecond`), and `collection_crawl` (`scope`: `all` or a
+PDS origin). Bodies are limited to
 64 KiB. Lists use bounded pages and opaque `after` cursors; restart pagination to
 include newly added items that sort before the current cursor. Collection lists
 are limited to 1,000 exact NSIDs per request.
@@ -171,11 +186,155 @@ the unresolved count and per-repository attempt limit only while repositories
 remain unresolved. The page notice, not each row, states that diagnostics describe
 current state rather than historical coverage; API field names and error codes are unchanged.
 
+Each job row shows “Created:” with the recorded creation time in the browser's
+locale and time zone, or “Not recorded” when Jetstream has none; this is when the
+job was created, not when it last made progress. The status links above the table
+(All, Active, Pending, Running, Incomplete, Failed, Canceled, Complete) reload the
+list at its first page, showing only jobs in that durable state; Active means
+pending or running. Jetstream applies the filter across all pages, and it combines
+with the PDS filter.
+
 Viewing does not change jobs. Retry is an audited action that preserves completed
 work, resets eligible retries for incomplete jobs, and refreshes the inventory for
 failed jobs. The Backfill jobs table offers no Retry action for complete jobs.
 
 The administration UI presents the authoritative aggregate for all enabled sources under the current policy, independent of page and exact-source filters. It shows nullable initial inventory, verified scanned, matching, successful no-match, unresolved and attributable-record counts as job-wide evidence—not per-collection progress. Null remains Unknown while zero is a measured value. Failure category, last progress timestamp, attempts, affected repository DID and explicit retry action are shown only when supplied; throttling and incomplete work do not imply a retry countdown or ETA. History and live freshness remain independently unknown; completed acquisition does not establish either. Acquisition diagnostics show recorded repository retry and PDS cooldown deadlines and the current wait reason when supplied. Retry-waiting evidence without either deadline explicitly reports unknown timing; no countdown or ETA is inferred. Stopped work still requires the explicit job retry action when reported.
+
+### Machine API for PDS discovery
+
+When `ADMIN_DISCOVERY_TOKEN_FILE` is set, administration also serves the
+`state` and `operations` routes below under `/api/v1/sources/discovery`, which
+the optional [PDS discovery service](../cmd/pdsdiscovery/README.md) uses. These
+two routes require `Authorization: Bearer <token>`. They do not use OAuth
+sessions or CSRF. The token grants no access to any other `/api/v1` route, and
+a browser session cannot use these two routes. The discovery `settings` route
+under the same prefix is part of the browser API above and is always mounted.
+
+| Endpoint                | Contract                                                                                                     |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `GET /state`            | `{policyRevision, collections, sources: [{pds, state, accountLimit}], maxAccountLimit}`, covering every Relay source in any state. |
+| `POST /operations`      | Only a `source` command with state `enabled`, or an `account_quota` command that raises the limit. Requires a UUID `Idempotency-Key` that is not version 8 (HTTP 400 `reserved_idempotency_key`) and returns HTTP 202. Any other command returns HTTP 403. A source enable for a PDS that Relay reports as `disabled` or `removed` returns HTTP 409 `source_disabled_by_operator`. An account limit above the discovery maximum returns HTTP 403 `account_limit_above_discovery_maximum`. |
+
+Before applying a discovery operation, the worker checks again. An account
+limit above the current discovery maximum fails with
+`account_limit_above_discovery_maximum`. For a source enable, it checks Relay again. If an
+operator disabled or removed the source in the meantime, the operation fails
+with `source_disabled_by_operator` and nothing is changed. Machine operations use the normal journal and worker. They are recorded and
+audited under the actor `service:pds-discovery` and are shown on the Operations
+screen, where they can be retried or cancelled like any other operation.
+
+## Collection directory crawls
+
+When the collection directory is configured, **PDS sources** offers **Crawl
+collection directory** for each enabled, validation-passed HTTPS source, and
+**Collection directory** offers **Crawl all enabled sources** after a
+confirmation. Without configuration, or while the directory is unreachable, the
+actions are disabled with an explanation; source management keeps working.
+
+Each request is a `collection_crawl` journal operation. When it is applied, the
+service checks each source against Relay, sends `https://<Relay hostname>` to the
+collection directory, and records one crawl row per source with the actor and
+time, and an audit entry. A source that is disabled, unvalidated, unknown to
+Relay or plaintext fails the operation without contacting the directory. An
+unreachable directory leaves the operation `incomplete` for an explicit retry.
+When crawling all sources, each batch of 100 accepted sources is recorded as soon
+as the directory accepts it, so a later failed batch keeps the earlier records;
+retries and restart recovery skip sources already recorded for that operation,
+even if their crawls have finished, and report their count as `alreadySubmitted`.
+If Administration stops after the directory accepts a batch but before that batch
+is recorded, submission is at-least-once: a retry sends those sources again.
+The directory drops the duplicate only if the earlier crawl is still running;
+if it has ended, the retry starts another crawl.
+
+`applied` means the directory accepted the request, not that the crawl finished.
+If a crawl of that source was already running, the request is still applied, no
+second crawl starts, and the page explains this. The service then polls the
+directory every five seconds while crawls are open, and the browser refreshes
+every five seconds while anything is running:
+
+| State      | Meaning                                                                                           |
+| ---------- | ------------------------------------------------------------------------------------------------- |
+| `accepted` | The directory took the request; the crawl is running or not yet observed.                         |
+| `finished` | The repository listing ended. Repositories that could not be described are counted separately.     |
+| `failed`   | The listing stopped early; a bounded category and HTTP status are shown, never raw response text. |
+| `unknown`  | The directory restarted, no longer reports the result, or is no longer configured, so the outcome cannot be known. |
+
+**Load more** keeps older requests visible. Refreshes also update loaded requests
+that are still open, so their final outcomes appear and polling stops when all
+crawls have ended. `GET /api/v1/collection-directory/crawls` accepts an optional
+`ids` filter: a comma-separated list of 1–100 UUID crawl-row IDs. It returns their
+current states, combines with `pds`, `after` and `limit`, and uses the same
+`{items, next}` cursor pagination. Invalid or empty lists are rejected with HTTP
+400. Without `ids`, the endpoint's behavior is unchanged.
+
+Crawl results are candidate DID/collection pairs for
+`com.atproto.sync.listReposByCollection`, not an authoritative inventory. A crawl
+does not admit a source to Relay and is not a Jetstream backfill. See
+[the collection directory guide](../cmd/collectiondir/README.md). The PDS
+discovery machine API cannot request crawls; it rejects `collection_crawl` with
+HTTP 403.
+
+### Automatic initial crawl
+
+When a `source` operation with state `enabled` is applied, administration also
+asks the collection directory to crawl that source. This applies to sources
+added or re-enabled by an operator and to sources enabled by PDS discovery. It
+needs no extra configuration beyond the two collection directory settings
+above.
+
+- **What triggers it.** Only an applied enable that Relay reports as enabled
+  and validated. A source operation that fails or is left incomplete, and any
+  disable or remove, requests nothing. An enable that leaves the source
+  unchanged does not request a crawl if one was already queued at that source
+  revision; disabling and then re-enabling does request one.
+- **How it is recorded.** In the same transaction that marks the source
+  operation applied, administration queues a follow-up `collection_crawl`
+  operation for `https://<Relay hostname>`, owned by the same actor. The
+  source operation's result gains `collectionDirectory.bootstrap`: `queued`,
+  `not_configured`, `not_https`, `conflict` or `unchanged`. The crawl appears
+  under **Crawl requests** with the trigger **Source added**. The follow-up
+  ID is a version 8 UUID; both operation routes refuse client
+  `Idempotency-Key` values of that version with HTTP 400
+  `reserved_idempotency_key`. If an operation nevertheless already holds the
+  ID, the crawl is skipped as `conflict`, audited as
+  `collection_bootstrap_conflict`, and the source still applies.
+- **The source is added whatever happens to the crawl.** The source operation
+  stays applied. The crawl's progress is shown as **Initial crawl** in the
+  source's detail panel. Crawls not yet accepted by the directory are listed
+  under **Initial crawls awaiting submission** on the Collection directory
+  page.
+- **Retries.** If the directory is unavailable or refuses the request, the
+  follow-up operation is left `incomplete` and retried automatically after
+  30 seconds, doubling up to every 10 minutes, for 24 hours after the source
+  was enabled. Retries are audited under `system:collection-bootstrap`. After
+  24 hours the source detail shows **Retry initial crawl**, and the operation
+  can also be retried from the Operations screen. A follow-up that `failed`,
+  for example because the source was disabled before it ran, is never
+  retried automatically.
+- **Not configured or plaintext.** Without a collection directory, or for an
+  `http://` source, nothing is requested and the skip is recorded and shown.
+  Configuring the directory later does not automatically crawl those
+  sources.
+- **Sources enabled before this feature** are not crawled automatically. Use
+  **Crawl all enabled sources** once.
+
+The `phase` reported by `GET /collection-directory/bootstraps`:
+
+| Phase                    | Meaning                                                                    |
+| ------------------------ | -------------------------------------------------------------------------- |
+| `waiting`                | The crawl request is queued and has not yet been sent.                     |
+| `retrying`               | The directory was unavailable or refused; an automatic retry is scheduled. |
+| `needs_attention`        | Automatic retries stopped after 24 hours; retry manually.                  |
+| `not_requested`          | The request failed or was canceled, for example `source_not_enabled`.      |
+| `accepted`, `finished`, `failed`, `unknown` | The crawl row's state, as for manual crawls.            |
+| `skipped_not_configured` | No collection directory was configured when the source was enabled.        |
+| `skipped_not_https`      | The source is plaintext; the directory only crawls HTTPS sources.          |
+| `skipped_conflict`       | Another operation already held the follow-up ID; nothing was requested.    |
+
+Each crawl is limited by the collection directory's per-PDS rate,
+`--crawl-qps` or `COLLECTIONS_CRAWL_QPS` (default 100 requests per second).
+The directory does not limit how many crawls run at once, so enabling many
+sources at once starts that many crawls.
 
 ## Rate policy
 

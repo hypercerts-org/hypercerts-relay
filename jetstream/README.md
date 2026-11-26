@@ -364,8 +364,10 @@ to 30 minutes. Unavailable work that is not automatically retried, or remains
 unavailable after the attempt budget, leaves the job `incomplete`; permanently
 invalid or unverifiable input leaves it `failed`. Operators can retry either
 status with the same job retry action. Local persistence failures stop the
-runtime without acknowledging completion. Each repository fetch and
-reconciliation share a two-minute deadline.
+runtime without acknowledging completion. Each repository's identity checks,
+download and verification share a two-minute deadline. Reconciliation, and
+time spent waiting for another repository's reconciliation, do not count
+against it. A repository that exceeds it is retried as a timeout.
 
 `lastFailure` contains only `stage`, `category`, optional `httpStatus`, and UTC
 `failedAt`. For inventory listing failures, `stage` is `listRepos`; `category`
@@ -380,6 +382,50 @@ status and repository DID are included only when known.
 Reconciliation currently scans the archive
 under its rewrite lock, so large archives can pause live appends during an
 individual repository reconciliation.
+
+### Repository download concurrency
+
+Each PDS job downloads and verifies several repositories at once. Only one job
+runs at a time, so this is also the request concurrency against one PDS.
+
+| Flag | Environment | Default | Meaning |
+| --- | --- | --- | --- |
+| `--pds-job-repo-workers` | `JETSTREAM_PDS_JOB_REPO_WORKERS` | 2 | Repositories one PDS job acquires at once, from 1 to 32. Startup fails outside that range. Set `1` for one request at a time, the behavior before this setting existed. |
+
+The `JETSTREAM_BACKFILL_*` settings size bootstrap backfill only; they do not
+apply to PDS jobs.
+
+Each worker can hold one repository of up to 64 MiB in memory while it is
+verified, so allow about 64 MiB per worker. Reconciliation into the archive
+stays serial: workers overlap downloads and identity checks, not archive
+writes. When reconciliation dominates, as described above, more workers add
+little.
+
+After an HTTP 429 is recorded, the job starts no further `getRepo` request,
+lets downloads already under way finish, and waits for the PDS cooldown. A
+worker that was about to send its request while the 429 was being recorded
+can still send it. A repository stopped before its request keeps its attempt
+budget. It then resumes with half as many
+workers (at least one). It adds one worker back after every 64 repositories
+completed since the last 429, up to the configured value. This reduction is
+held in memory and resets when Jetstream restarts. When a successful `getRepo`
+response reports a `RateLimit-Remaining` below twice the current worker count
+with a valid `RateLimit-Reset`, the job pauses until one second after that
+reset. Unlike a 429,
+this pause does not use a repository attempt; job diagnostics report it as
+waiting with reason `pds_cooldown`.
+
+While a job runs, `retryingRepos` counts in-flight repositories, so it can show
+up to the worker count without any failure. Each job pass logs `direct PDS
+backfill pass finished` with completed repositories, elapsed time,
+repositories per second and the worker ceiling. At debug level,
+`direct PDS backfill pass stages` adds time spent on identity checks,
+`getRepo`, reconciliation and checkpoints.
+
+Repository checkpoints are written as small journal entries, and the job state
+document absorbs them at the next job state change or restart. If you
+downgrade to an earlier release, it ignores unabsorbed entries and downloads
+those repositories again.
 
 ### Public status evidence
 
@@ -475,7 +521,7 @@ All paths below start with `/hypercerts/v1`:
 | `POST /sources` | `{"pds":"https://pds.example"}`; adds source and returns its job. |
 | `DELETE /sources` | Same body; cancels acquisition without deleting the archive. |
 | `POST /jobs` | `{"pds":"https://pds.example","reason":"backfill","requestId":"optional-idempotency-key"}` or reason `quota_recovery`; the same nonempty request ID returns its prior job, while unkeyed duplicate active work is reused and a later terminal recovery creates fresh work. |
-| `GET /jobs?limit=100&after=<cursor>` | Sorted page, maximum 200 jobs, optional `nextCursor`. Concurrent additions may require a fresh listing. |
+| `GET /jobs?limit=100&after=<cursor>&pds=<origin>&state=<state>` | Page of jobs, newest created first with job ID breaking ties; maximum 200 jobs and optional `nextCursor` (the ID of the last job considered for the page, usually the last returned job). Optional exact `pds` filter; optional `state` filter of `pending`, `running`, `incomplete`, `failed`, `canceled`, `complete`, or `active` (pending or running). `state`, `pds` and `after` combine. An unknown `state` returns `400` `invalid_state`; an unknown `after` returns `400` `invalid_cursor`. Jobs created during pagination appear on a fresh listing. |
 | `GET /snapshot-rejections?limit=100&after=<cursor>` | The most recent 1,000 bounded non-payload direct-PDS snapshot rejections, with optional repeated exact `pds` filters. Older rejections are evicted. Returns origin, policy/listed revisions, DID, kind/code and timestamp; never CAR bytes, records, tokens or storage keys. |
 | `GET /coverage?limit=100&after=<pds>` | Schema v1 evidence for enabled sources at the current policy and exact source revision, sorted and paginated by PDS with optional repeated exact `pds` filters. `summary=1` preserves authoritative source, acquisition, history and live evidence; the aggregate always covers all enabled sources, not just this page. Unmatched jobs leave counts null, never zero. |
 | `GET /jobs/{id}` | Durable state, progress, attempt count, coverage, and bounded execution diagnostics. |

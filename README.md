@@ -66,6 +66,7 @@ DID migration never admits or connects the resolved target automatically. Each o
 | `cmd/relay` | Indigo Relay base for accepting PDS subscriptions and emitting the raw repository event stream. |
 | `cmd/rainbow` | Indigo raw-stream fan-out proxy for reducing direct Relay connections. |
 | `cmd/collectiondir` | Optional directory for discovering candidate repository DIDs by collection; see the [operator guide](cmd/collectiondir/README.md) for limitations and exposure. |
+| `cmd/pdsdiscovery` | Optional service that asks administration to enable PDSes publishing retained collections and to raise their account limits; see its [README](cmd/pdsdiscovery/README.md). |
 | `jetstream/` | Copied Jetstream v2 runtime module for archive, replay, live subscriptions, and Hypercerts-owned collection/backfill work. See [`jetstream/README.md`](jetstream/README.md) for provenance and operations. |
 | `atproto`, `api`, `events`, `models`, `splitter`, `util`, `xrpc`, and `lex/util` | The dependency closure required to build and test the Indigo services. |
 
@@ -93,7 +94,7 @@ request before selecting the names in the ruleset. GitHub requires a successful
 check within the past seven days; see
 [troubleshooting required status checks](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks).
 
-Install Go 1.27.3 or the toolchain selected by `go.mod`. Relay links SQLite through CGO, so a working C compiler is also required.
+Install Go 1.27.4 or the toolchain selected by `go.mod`. Relay links SQLite through CGO, so a working C compiler is also required.
 
 ```bash
 git clone git@github.com:hypercerts-org/hypercerts-relay.git
@@ -101,7 +102,7 @@ cd hypercerts-relay
 ./scripts/verify.sh
 ```
 
-The verification script runs focused tests, static checks, and builds for Relay, Rainbow, and collection directory. One Relay test is inconsistent across environments at the tracked Indigo baseline: `TestClaimDueAccountLimitAlertsRepeatsAfterInterval` fails in the local verification environment but passed the published GitHub Actions run. The script skips only that local failure. CI runs the test separately as a non-blocking signal while the difference is investigated.
+The verification script runs focused tests, static checks, and builds for Relay, Rainbow, collection directory, and PDS discovery. One Relay test is inconsistent across environments at the tracked Indigo baseline: `TestClaimDueAccountLimitAlertsRepeatsAfterInterval` fails in the local verification environment but passed the published GitHub Actions run. The script skips only that local failure. CI runs the test separately as a non-blocking signal while the difference is investigated.
 
 Build a service locally with:
 
@@ -109,6 +110,7 @@ Build a service locally with:
 go build ./cmd/relay
 go build ./cmd/rainbow
 go build ./cmd/collectiondir
+go build ./cmd/pdsdiscovery
 (cd jetstream && go build ./cmd/jetstream)
 ```
 
@@ -144,3 +146,5 @@ Licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at you
 A file that states its own license keeps it. For example, [`util/ssrf/ssrf.go`](util/ssrf/ssrf.go) is dedicated to the public domain under CC0.
 
 The licenses don't cover the Hypercerts logo in `administration/src/brand/assets/logo/` and `administration/public/favicon.svg`, which is a mark of the Hypercerts Foundation. They also don't cover the fonts in `administration/src/brand/assets/fonts/`, which keep their own licenses; see the [brand notes](administration/src/brand/README.md).
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.

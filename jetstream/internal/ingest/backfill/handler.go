@@ -203,6 +203,11 @@ func (h *SegmentHandler) handleRepoResyncCore(ctx context.Context, did atmos.DID
 		} else {
 			_, err = h.writer.ReconcileSync(ctx, string(did), commit.Rev, rows)
 		}
+		// hypercerts: a stale sync cannot revive an inactive account; without
+		// attribution metadata that is not a failure.
+		if (!managed || metadata == nil) && errors.Is(err, ingest.ErrAccountUnavailable) {
+			err = nil
+		}
 		if err != nil {
 			h.abortOnWriterError(err)
 		}

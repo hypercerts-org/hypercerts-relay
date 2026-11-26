@@ -1,5 +1,76 @@
 <!-- hypercerts: project-owned release history; review this file during every Indigo upstream sync. -->
 
+## 0.11.0
+
+### Minor Changes
+
+- [#125](https://github.com/hypercerts-org/hypercerts-relay/pull/125) [`b55da8d`](https://github.com/hypercerts-org/hypercerts-relay/commit/b55da8d18919a9c345a1c48a80950210a001557c) Thanks [@Ashex](https://github.com/Ashex)! - Enabling a PDS source in Administration now automatically requests an initial collection directory crawl of it, whether an operator or PDS discovery added the source. The source is added whatever happens to the crawl. Progress and outcome are shown as "Initial crawl" in the source's detail panel and on the Collection directory page, where crawl requests now show whether they were manual or triggered by a source being added. If the collection directory is unavailable, the request is retried automatically for 24 hours and then waits for a manual retry. Re-enabling a source crawls it again; an enable that leaves the source unchanged does not request a crawl if one was already queued at that source revision. Nothing is requested when the collection directory is not configured or the source is plaintext HTTP, and sources enabled before this release are not crawled automatically; use "Crawl all enabled sources" once. A retried crawl request now sends only the sources it has not already recorded, so a finished crawl is not started a second time. Operation requests to Administration may no longer use a version 8 UUID as the `Idempotency-Key`; those are reserved for IDs the server derives, and such requests are refused with HTTP 400 `reserved_idempotency_key`. The collection directory's `--crawl-qps` can now also be set with `COLLECTIONS_CRAWL_QPS`.
+
+- [#123](https://github.com/hypercerts-org/hypercerts-relay/pull/123) [`23a1e07`](https://github.com/hypercerts-org/hypercerts-relay/commit/23a1e074d90a68324d8455b37410d01e79448f08) Thanks [@Ashex](https://github.com/Ashex)! - Add a manual collection directory crawl to Administration. Operators can crawl one enabled, approved PDS source from the PDS sources page, or all enabled sources from the new Collection directory page, and see active crawls, repositories described, and whether each crawl finished, failed, or was already running. Each request is recorded in the audit log with the operator, time, source and result. To enable it, set `COLLECTIONDIR_CONTROL_URL` to the collection directory's private origin and `COLLECTIONDIR_CONTROL_TOKEN_FILE` to a file containing its `COLLECTIONS_ADMIN_TOKEN` (at least 32 bytes) on the Administration service; on Railway set `HC_COLLECTIONDIR_CONTROL_SECRET` instead of the file. Without these variables the action is disabled and nothing else changes. The collection directory's `POST /admin/pds/requestCrawl` now reports per host whether a crawl started or was already active, and `GET /admin/crawlStatus` additionally reports recently finished and failed crawls (`host_results`, kept in memory for up to 256 hosts) and `process_start`; existing fields are unchanged. Deploy the collection directory and Administration from the same release. Crawl results remain candidate DID/collection pairs, not an authoritative inventory.
+
+- [#122](https://github.com/hypercerts-org/hypercerts-relay/pull/122) [`41c77eb`](https://github.com/hypercerts-org/hypercerts-relay/commit/41c77eb8a628827e8af111c2e72f6757119246ab) Thanks [@Ashex](https://github.com/Ashex)! - The administration Backfill jobs table now lists the most recently created jobs first, shows each job's creation time, and has status links to show all, active (pending or running), pending, running, incomplete, failed, canceled or complete jobs. Ordering and filtering apply across pages and combine with the PDS filter. Jetstream's private `GET /hypercerts/v1/jobs` returns jobs newest first (job ID breaks ties), accepts an optional `state` filter, and rejects an unknown `after` cursor with 400 `invalid_cursor` or an unknown `state` with 400 `invalid_state`. Retrying a job does not change its position. No operator action is required.
+
+- [#132](https://github.com/hypercerts-org/hypercerts-relay/pull/132) [`723d697`](https://github.com/hypercerts-org/hypercerts-relay/commit/723d697d0ea01a4db4a4e98e42bd54a2bb427d90) Thanks [@Ashex](https://github.com/Ashex)! - Jetstream `/status` lookups refuse non-public addresses and show a generic error on verification failure.
+
+- [#121](https://github.com/hypercerts-org/hypercerts-relay/pull/121) [`11a61eb`](https://github.com/hypercerts-org/hypercerts-relay/commit/11a61eba401563fa7424c301ac81f06b0675a179) Thanks [@Ashex](https://github.com/Ashex)! - Add the optional `pdsdiscovery` service. It watches a public Bluesky Jetstream
+  for records in the retained collections. When such a record comes from a PDS
+  that is not yet a source, it asks administration to enable that PDS. It never
+  enables a PDS that already exists as a source in any state, including one an
+  operator disabled or removed.
+  
+  Before adding a PDS, the service queries the Bluesky relay with
+  `com.atproto.sync.getHostStatus` and skips hosts it reports as banned. Once the
+  new PDS is an enabled source, if the Bluesky relay reported more than 100
+  accounts and did not report the host as throttled, the service raises the
+  source's account limit to the count rounded up to the next thousand. For
+  example, 1,400 accounts gives a limit of 2,000. Administrators set the maximum
+  account limit discovery may request in the new "Automatic PDS discovery" panel
+  on the Sources screen; it defaults to 100,000 and changes are audited.
+  
+  There is no cap on how many PDSes are added and no built-in denylist;
+  `DISCOVERY_DENY_HOSTS` can exclude hosts. `DISCOVERY_DRY_RUN=true` logs
+  candidates without requesting anything. See `cmd/pdsdiscovery/README.md`.
+  
+  Administration gains discovery routes at `/api/v1/sources/discovery`. The
+  `state` and `operations` routes are mounted only when
+  `ADMIN_DISCOVERY_TOKEN_FILE` is set, or `HC_DISCOVERY_SECRET` under Railway
+  startup. They accept only the discovery token, and can only enable sources and
+  raise account limits up to the maximum. Their operations are journaled and
+  audited under the actor `service:pds-discovery`.
+
+- [#124](https://github.com/hypercerts-org/hypercerts-relay/pull/124) [`f59122d`](https://github.com/hypercerts-org/hypercerts-relay/commit/f59122d3427c13fcbc326c2dd9616dd545fb5403) Thanks [@Ashex](https://github.com/Ashex)! - Jetstream PDS backfill jobs download repositories concurrently and no longer
+  rewrite all job state after every repository. Each job now downloads two
+  repositories at once by default, which raises per-PDS request concurrency from
+  one to two on upgrade. Set `JETSTREAM_PDS_JOB_REPO_WORKERS` (or
+  `--pds-job-repo-workers`, 1–32, default 2) to change it; set `1` to keep one
+  request at a time. After an HTTP 429 the job waits for the PDS cooldown and
+  resumes with fewer workers, and it pauses before the limit when the PDS reports
+  its remaining request budget. Each worker can hold one repository of up to
+  64 MiB in memory. A downgraded release downloads repositories checkpointed by
+  this release since the job last saved its state again.
+  Acquisition evidence counts each repository once after a downgrade and upgrade,
+  and pacing waits do not use repository attempts.
+
+- [#132](https://github.com/hypercerts-org/hypercerts-relay/pull/132) [`723d697`](https://github.com/hypercerts-org/hypercerts-relay/commit/723d697d0ea01a4db4a4e98e42bd54a2bb427d90) Thanks [@Ashex](https://github.com/Ashex)! - Relay `did:web` fetches are rate-limited (10 per second, burst 30) and documents over 64 KiB are rejected.
+
+### Patch Changes
+
+- [#127](https://github.com/hypercerts-org/hypercerts-relay/pull/127) [`31db6e9`](https://github.com/hypercerts-org/hypercerts-relay/commit/31db6e9afc41430d30ca251143a0c71cdb3eaab0) Thanks [@Ashex](https://github.com/Ashex)! - Build Relay, Rainbow, the collection directory, PDS discovery, Jetstream, and Administration with Go 1.27.4, and update the command-line library, OpenTelemetry tracing libraries, and GORM tracing plugin. No operator configuration changes are required. When `--enable-db-tracing` is set, database spans now use current OpenTelemetry names (for example `select repos` instead of `gorm.Query`, and `db.query.text` instead of `db.statement`), so trace dashboards filtering on the old names need updating.
+
+- [#132](https://github.com/hypercerts-org/hypercerts-relay/pull/132) [`723d697`](https://github.com/hypercerts-org/hypercerts-relay/commit/723d697d0ea01a4db4a4e98e42bd54a2bb427d90) Thanks [@Ashex](https://github.com/Ashex)! - Jetstream live ingestion drops an upstream `#sync` event it cannot reconcile instead of stopping.
+
+- [#131](https://github.com/hypercerts-org/hypercerts-relay/pull/131) [`25e2d6e`](https://github.com/hypercerts-org/hypercerts-relay/commit/25e2d6e68405aa6c11a4d11abd99077390687d9b) Thanks [@Ashex](https://github.com/Ashex)! - A subscriber that disconnects during cursor replay no longer stops the Relay.
+
+- [#131](https://github.com/hypercerts-org/hypercerts-relay/pull/131) [`25e2d6e`](https://github.com/hypercerts-org/hypercerts-relay/commit/25e2d6e68405aa6c11a4d11abd99077390687d9b) Thanks [@Ashex](https://github.com/Ashex)! - DID documents with large method lists no longer cause excess allocation.
+
+- [#132](https://github.com/hypercerts-org/hypercerts-relay/pull/132) [`4832f4c`](https://github.com/hypercerts-org/hypercerts-relay/commit/4832f4cd8a25faeda99aaa7f89013f4ce8a63be7) Thanks [@Ashex](https://github.com/Ashex)! - Relay getRepo now returns HTTP 429 when a DID lookup is rate limited and HTTP 503 when resolution fails. A confirmed missing DID returns HTTP 404.
+
+- [#131](https://github.com/hypercerts-org/hypercerts-relay/pull/131) [`f428507`](https://github.com/hypercerts-org/hypercerts-relay/commit/f4285072930c4cf2e5389af7008c224975a34409) Thanks [@Ashex](https://github.com/Ashex)! - A Relay source whose event handler fails unexpectedly is retried with backoff and counted in `relay_handler_panics_total`.
+
+- [#131](https://github.com/hypercerts-org/hypercerts-relay/pull/131) [`25e2d6e`](https://github.com/hypercerts-org/hypercerts-relay/commit/25e2d6e68405aa6c11a4d11abd99077390687d9b) Thanks [@Ashex](https://github.com/Ashex)! - Relay commit validation is stricter; malformed upstream repository data no longer stops the Relay.
+
+- [#134](https://github.com/hypercerts-org/hypercerts-relay/pull/134) [`354e974`](https://github.com/hypercerts-org/hypercerts-relay/commit/354e974601c46cffe5b30b0a87f89bf4d3a613ed) Thanks [@Ashex](https://github.com/Ashex)! - Update administration dependencies, including request parsing security fixes.
+
 ## 0.10.1
 
 ### Patch Changes

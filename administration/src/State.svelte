@@ -21,5 +21,6 @@
     "connected",
     "available",
     "enabled",
+    "finished",
   ].includes(value)}>{value.replaceAll("_", " ")}</span
 >

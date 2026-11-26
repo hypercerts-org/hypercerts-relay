@@ -3,7 +3,9 @@ package parallel
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 
@@ -14,6 +16,9 @@ import (
 )
 
 var ErrSchedulerStopped = errors.New("parallel scheduler stopped")
+
+// hypercerts: ErrHandlerPanic marks a scheduler error that came from a recovered handler panic.
+var ErrHandlerPanic = errors.New("event handler panicked")
 
 // Scheduler is a parallel scheduler that will run work on a fixed number of workers
 type Scheduler struct {
@@ -43,6 +48,9 @@ type Scheduler struct {
 	ackQueue  []*consumerTask
 	completed map[*consumerTask]bool
 	lastSeq   atomic.Int64
+
+	// hypercerts: recovered handler panics, counted apart from the stop reason.
+	panics atomic.Int64
 
 	// metrics
 	itemsAdded     prometheus.Counter
@@ -186,6 +194,27 @@ func (p *Scheduler) AddWork(ctx context.Context, repo string, val *stream.XRPCSt
 	}
 }
 
+// doSafely runs the consumer callback, converting a panic into an error.
+//
+// hypercerts: upstream event data is untrusted, and a panic while processing
+// one event must not kill the whole relay process. Converting the panic to an
+// error stops only this source's scheduler (the same failure class as any
+// other consumer error) and surfaces the panic and stack in the log.
+func (p *Scheduler) doSafely(ctx context.Context, val *stream.XRPCStreamEvent) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			p.panics.Add(1)
+			if e, ok := r.(error); ok {
+				err = fmt.Errorf("%w: %w", ErrHandlerPanic, e)
+			} else {
+				err = fmt.Errorf("%w: %v", ErrHandlerPanic, r)
+			}
+			p.log.Error("caught panic in event handler", "ident", p.ident, "recover", r, "stack", string(debug.Stack()))
+		}
+	}()
+	return p.do(ctx, val)
+}
+
 func (p *Scheduler) worker() {
 	defer p.workers.Done()
 
@@ -200,7 +229,7 @@ func (p *Scheduler) worker() {
 				}
 
 				p.itemsActive.Inc()
-				if err := p.do(p.ctx, work.val); err != nil {
+				if err := p.doSafely(p.ctx, work.val); err != nil {
 					p.log.Error("event handler failed", "ident", p.ident, "err", err)
 					p.stop(err)
 					return
@@ -246,6 +275,11 @@ func (p *Scheduler) completeAndNext(work *consumerTask) *consumerTask {
 	next := queued[0]
 	p.active[work.repo] = queued
 	return next
+}
+
+// hypercerts: HandlerPanics reports how many handler panics were recovered. It is final once Shutdown has returned.
+func (p *Scheduler) HandlerPanics() int64 {
+	return p.panics.Load()
 }
 
 func (p *Scheduler) LastSeq() int64 {

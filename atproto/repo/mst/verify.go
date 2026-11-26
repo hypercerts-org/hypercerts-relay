@@ -9,10 +9,13 @@ func (t *Tree) Verify() error {
 	if t.Root == nil {
 		return fmt.Errorf("tree missing root node")
 	}
-	return t.Root.verifyStructure(-1, nil)
+	return t.Root.verifyStructure(-1, nil, nil)
 }
 
-func (n *Node) verifyStructure(height int, key []byte) error {
+// hypercerts: upper is the next key above this subtree (nil if none). A child's
+// key position is not carried back to its parent, so the lower bound alone
+// does not keep a subtree's keys below the key that follows it.
+func (n *Node) verifyStructure(height int, key []byte, upper []byte) error {
 	if n == nil {
 		return fmt.Errorf("nil node")
 	}
@@ -47,7 +50,7 @@ func (n *Node) verifyStructure(height int, key []byte) error {
 	}
 
 	lastWasChild := false
-	for _, e := range n.Entries {
+	for i, e := range n.Entries {
 		if e.IsChild() {
 			if lastWasChild {
 				return fmt.Errorf("sibling children in entries list")
@@ -60,7 +63,11 @@ func (n *Node) verifyStructure(height int, key []byte) error {
 				return fmt.Errorf("child below zero height")
 			}
 			if e.Child != nil {
-				if err := e.Child.verifyStructure(height-1, key); err != nil {
+				childUpper := upper
+				if i+1 < len(n.Entries) && n.Entries[i+1].IsValue() {
+					childUpper = n.Entries[i+1].Key
+				}
+				if err := e.Child.verifyStructure(height-1, key, childUpper); err != nil {
 					return err
 				}
 			}
@@ -71,6 +78,9 @@ func (n *Node) verifyStructure(height int, key []byte) error {
 			}
 			if bytes.Compare(key, e.Key) > 0 {
 				return fmt.Errorf("out of order keys")
+			}
+			if upper != nil && bytes.Compare(e.Key, upper) >= 0 {
+				return fmt.Errorf("subtree key not below the following key")
 			}
 			key = e.Key
 			if height != HeightForKey(e.Key) {
